@@ -19,6 +19,7 @@ import (
 type Snapshot struct {
 	Running                   bool
 	CanAcceptInteractiveInput bool
+	HasActiveTurn             bool
 	ActiveMeta                protocol.RuntimeMeta
 	ActiveSession             string
 	ResumeSessionID           string

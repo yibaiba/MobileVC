@@ -62,6 +62,13 @@ type InteractiveStateProvider interface {
 	CanAcceptInteractiveInput() bool
 }
 
+// TurnStateProvider reports whether the current AI turn is still actively
+// generating output, which is distinct from merely having a writable input
+// channel.
+type TurnStateProvider interface {
+	HasActiveTurn() bool
+}
+
 // PermissionResponseWriter handles permission decisions via stdio.
 type PermissionResponseWriter interface {
 	WritePermissionResponse(ctx context.Context, decision string) error

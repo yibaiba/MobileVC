@@ -45,6 +45,12 @@ func deriveClaudeLifecycleLocked(activeRunner engine.Runner, meta protocol.Runti
 		}
 		return "inactive"
 	}
+	if hasRunnerActiveTurn(activeRunner) {
+		if trimmedResume != "" {
+			return "active"
+		}
+		return "starting"
+	}
 	if provider, ok := activeRunner.(engine.InteractiveStateProvider); ok && provider.CanAcceptInteractiveInput() {
 		return "waiting_input"
 	}
@@ -52,6 +58,14 @@ func deriveClaudeLifecycleLocked(activeRunner engine.Runner, meta protocol.Runti
 		return "active"
 	}
 	return "starting"
+}
+
+func hasRunnerActiveTurn(activeRunner engine.Runner) bool {
+	if activeRunner == nil {
+		return false
+	}
+	provider, ok := activeRunner.(engine.TurnStateProvider)
+	return ok && provider.HasActiveTurn()
 }
 
 type manager struct {
@@ -176,6 +190,7 @@ func (m *manager) snapshot() Snapshot {
 	if provider, ok := m.activeRunner.(engine.InteractiveStateProvider); ok && m.activeRunner != nil {
 		canAcceptInteractiveInput = provider.CanAcceptInteractiveInput()
 	}
+	hasActiveTurn := hasRunnerActiveTurn(m.activeRunner)
 	meta := m.activeMeta
 	if strings.TrimSpace(meta.ResumeSessionID) == "" {
 		meta.ResumeSessionID = m.resumeSessionID
@@ -186,6 +201,7 @@ func (m *manager) snapshot() Snapshot {
 	return Snapshot{
 		Running:                   m.activeRunner != nil,
 		CanAcceptInteractiveInput: canAcceptInteractiveInput,
+		HasActiveTurn:             hasActiveTurn,
 		ActiveMeta:                meta,
 		ActiveSession:             m.activeSession,
 		ResumeSessionID:           m.resumeSessionID,

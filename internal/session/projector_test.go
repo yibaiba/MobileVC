@@ -533,6 +533,30 @@ func TestService_BuildTaskSnapshotEvent_RunningWaitInput(t *testing.T) {
 	}
 }
 
+func TestService_BuildTaskSnapshotEvent_CodexActiveTurnBeatsInteractiveInput(t *testing.T) {
+	runner := newPermissionStubRunner()
+	runner.interactive = true
+	runner.activeTurn = true
+	svc := makeServiceWithPermissionRunner(t, runner)
+	startPermissionRunner(t, svc, "s1", runner)
+	svc.manager.updateMeta(func(m *protocol.RuntimeMeta) {
+		m.Command = "codex"
+		m.Engine = "codex"
+		m.ResumeSessionID = "thread-1"
+	})
+
+	got := svc.BuildTaskSnapshotEvent("s1", TaskCursorSnapshot{}, "", false)
+	if got == nil {
+		t.Fatal("expected event")
+	}
+	if got.State != "RUNNING" {
+		t.Fatalf("expected RUNNING while codex turn is active, got %q", got.State)
+	}
+	if got.AwaitInput {
+		t.Fatal("active codex turn should not await input")
+	}
+}
+
 func TestService_BuildTaskSnapshotEvent_BusyControllerBeatsInteractiveRunner(t *testing.T) {
 	runner := newPermissionStubRunner()
 	runner.interactive = true

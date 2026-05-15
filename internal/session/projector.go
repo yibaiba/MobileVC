@@ -184,7 +184,14 @@ func (s *Service) BuildTaskSnapshotEvent(sessionID string, cursor TaskCursorSnap
 		if controllerState := strings.TrimSpace(strings.ToUpper(string(controller.State))); shouldPreserveBusyTaskSnapshotState(controllerState, meta.ClaudeLifecycle, snapshot.ClaudeLifecycle) {
 			state = controllerState
 			message = "Task running on desktop"
-		} else if snapshot.CanAcceptInteractiveInput || strings.EqualFold(strings.TrimSpace(snapshot.ClaudeLifecycle), "waiting_input") {
+		} else if snapshot.HasActiveTurn {
+			state = "RUNNING"
+			message = "Task running on desktop"
+		} else if strings.EqualFold(strings.TrimSpace(snapshot.ClaudeLifecycle), "waiting_input") {
+			state = "WAIT_INPUT"
+			message = "Task waiting for input"
+			awaitInput = true
+		} else if snapshot.CanAcceptInteractiveInput {
 			state = "WAIT_INPUT"
 			message = "Task waiting for input"
 			awaitInput = true

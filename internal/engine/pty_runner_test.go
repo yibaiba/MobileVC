@@ -1506,7 +1506,7 @@ func TestCodexAppSessionTurnStartPassesReasoningEffort(t *testing.T) {
 	}
 }
 
-func TestCodexAppSessionCoalescesAssistantDeltasBeforePrompt(t *testing.T) {
+func TestCodexAppSessionStreamsAssistantDeltasBeforePromptWithoutDuplicateFinalText(t *testing.T) {
 	runner := NewPtyRunner()
 	eventsCh := make(chan any, 8)
 	app := &codexAppSession{
@@ -1572,11 +1572,21 @@ collect:
 		}
 	}
 done:
-	if len(logs) != 1 {
-		t.Fatalf("expected a single coalesced log, got %#v", logs)
+	if len(logs) < 1 {
+		t.Fatalf("expected streamed assistant logs, got %#v", logs)
 	}
-	if logs[0].Message != "Tip : hello world" {
-		t.Fatalf("unexpected coalesced log message: %q", logs[0].Message)
+	finalMessage := logs[len(logs)-1].Message
+	if finalMessage != "Tip : hello world" {
+		t.Fatalf("unexpected final streamed log message: %q", finalMessage)
+	}
+	countFinal := 0
+	for _, log := range logs {
+		if log.Message == "Tip : hello world" {
+			countFinal++
+		}
+	}
+	if countFinal != 1 {
+		t.Fatalf("expected final assistant text once, got %d occurrences in %#v", countFinal, logs)
 	}
 	if len(prompts) != 1 || prompts[0].ResumeSessionID != "thread-123" {
 		t.Fatalf("expected invisible continue prompt with thread id, got %#v", prompts)

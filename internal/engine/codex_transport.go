@@ -939,6 +939,10 @@ func (s *codexAppSession) activeTurn() string {
 	return s.activeTurnID
 }
 
+func (s *codexAppSession) HasActiveTurn() bool {
+	return strings.TrimSpace(s.activeTurn()) != ""
+}
+
 func (s *codexAppSession) threadAndTurn() (string, string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -999,9 +1003,10 @@ func (s *codexAppSession) appendAssistantDelta(delta string) []string {
 		return nil
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.assistantBuffer.WriteString(delta)
-	return nil
+	emitted := codexDrainAssistantChunks(&s.assistantBuffer, false)
+	s.mu.Unlock()
+	return emitted
 }
 
 func (s *codexAppSession) flushAssistantDelta() []string {

@@ -518,6 +518,16 @@ func (r *PtyRunner) CanAcceptInteractiveInput() bool {
 	return r.interactive && r.writer != nil && !r.closed
 }
 
+func (r *PtyRunner) HasActiveTurn() bool {
+	r.mu.Lock()
+	session := r.codexSession
+	r.mu.Unlock()
+	if session == nil {
+		return false
+	}
+	return session.HasActiveTurn()
+}
+
 func (r *PtyRunner) waitForInteractiveReady(ctx context.Context) error {
 	deadlineCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()

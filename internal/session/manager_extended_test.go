@@ -16,6 +16,7 @@ import (
 type permissionStubRunner struct {
 	mu                sync.Mutex
 	interactive       bool
+	activeTurn        bool
 	hasPending        bool
 	currentRequestID  string
 	writeErr          error
@@ -61,6 +62,7 @@ func (r *permissionStubRunner) Close() error {
 }
 
 func (r *permissionStubRunner) CanAcceptInteractiveInput() bool { return r.interactive }
+func (r *permissionStubRunner) HasActiveTurn() bool             { return r.activeTurn }
 func (r *permissionStubRunner) ClaudeSessionID() string         { return "" }
 
 func (r *permissionStubRunner) WritePermissionResponse(ctx context.Context, decision string) error {
