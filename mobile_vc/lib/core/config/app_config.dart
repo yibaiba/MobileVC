@@ -45,6 +45,8 @@ class AppConfig {
 
   String get displayEndpoint => _connectionUrls(null).displayEndpoint;
 
+  String get displayHost => _connectionUrls(null).displayHost;
+
   String baseHttpUrlFor({bool? secureTransport}) =>
       _connectionUrls(secureTransport).baseHttpUrl;
 

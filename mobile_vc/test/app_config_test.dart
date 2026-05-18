@@ -61,6 +61,7 @@ void main() {
 
       expect(config.baseHttpUrl, 'http://example.com:9999');
       expect(config.displayEndpoint, 'http://example.com:9999');
+      expect(config.displayHost, 'http://example.com');
       expect(config.wsUrl, 'ws://example.com:9999/ws?token=test');
     });
 
@@ -69,6 +70,7 @@ void main() {
 
       expect(config.baseHttpUrl, 'https://example.com:9999');
       expect(config.displayEndpoint, 'https://example.com:9999');
+      expect(config.displayHost, 'https://example.com');
       expect(config.wsUrl, 'wss://example.com:9999/ws?token=test');
     });
 
@@ -170,6 +172,24 @@ void main() {
           'username': 'mobilevc',
           'credential': 'secret',
         },
+      ]);
+    });
+
+    test('auto config normalizes url host override before building ice urls',
+        () {
+      final rawJson = AppConfig.encodeAutoAdbIceConfig(
+        host: 'https://turn.example.com:9999',
+        username: 'mobilevc',
+        credential: 'secret',
+      );
+      final config = AppConfig(
+        host: '8.162.1.176',
+        adbIceServersJson: rawJson,
+      );
+
+      expect(config.adbIceHostOverride, 'turn.example.com');
+      expect(config.adbIceServers.first['urls'], <String>[
+        'stun:turn.example.com:3478',
       ]);
     });
 

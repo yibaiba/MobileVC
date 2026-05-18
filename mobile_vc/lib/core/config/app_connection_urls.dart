@@ -24,6 +24,11 @@ class AppConnectionUrls {
 
   String get displayEndpoint => _baseUri(httpScheme).toString();
 
+  String get displayHost => Uri(
+        scheme: httpScheme,
+        host: _endpoint.host,
+      ).toString();
+
   String get wsUrl => _baseUri(wsScheme).replace(
       path: _wsPath,
       queryParameters: <String, String>{'token': token}).toString();
@@ -38,15 +43,20 @@ class AppConnectionUrls {
   String get wsScheme => secureTransport ? _wssScheme : _wsScheme;
 
   Uri _baseUri(String scheme) {
-    final endpoint = AppConnectionEndpoint.parse(
-      host,
-      fallbackPort: port,
-      preferEmbeddedPort: false,
-    );
+    final endpoint = _endpoint;
     return Uri(
       scheme: scheme,
       host: endpoint.host,
       port: endpoint.portNumber,
     );
+  }
+
+  AppConnectionEndpoint get _endpoint {
+    final endpoint = AppConnectionEndpoint.parse(
+      host,
+      fallbackPort: port,
+      preferEmbeddedPort: false,
+    );
+    return endpoint;
   }
 }

@@ -1,5 +1,7 @@
 import 'dart:convert';
 
+import 'app_connection_endpoint.dart';
+
 const _adbIcePort = '3478';
 
 class AdbIceConfig {
@@ -47,7 +49,7 @@ class AdbIceConfig {
     required String username,
     required String credential,
   }) {
-    final trimmedHost = host.trim();
+    final trimmedHost = _normalizeHost(host);
     final trimmedUsername = username.trim();
     final trimmedCredential = credential.trim();
     if (trimmedHost.isEmpty &&
@@ -179,13 +181,13 @@ AdbIceSettings? _parseAutoSettings(Map decoded) {
   return AdbIceSettings(
     username: username,
     credential: credential,
-    host: host,
+    host: _normalizeHost(host),
     isAuto: true,
   );
 }
 
 String _formatHostLiteral(String rawHost) {
-  final trimmed = rawHost.trim();
+  final trimmed = _normalizeHost(rawHost);
   if (trimmed.isEmpty) {
     return '';
   }
@@ -193,6 +195,14 @@ String _formatHostLiteral(String rawHost) {
     return trimmed;
   }
   return trimmed.contains(':') ? '[$trimmed]' : trimmed;
+}
+
+String _normalizeHost(String rawHost) {
+  final trimmed = rawHost.trim();
+  if (trimmed.isEmpty) {
+    return '';
+  }
+  return AppConnectionEndpoint.parse(trimmed).host;
 }
 
 bool _isTurnUrl(Object entry) {

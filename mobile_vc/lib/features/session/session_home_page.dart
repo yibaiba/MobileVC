@@ -7,6 +7,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
 
 import '../../core/config/app_config.dart';
+import '../../core/config/app_connection_endpoint.dart';
 import '../../core/config/app_connection_environment.dart';
 import '../../data/models/session_models.dart';
 import '../../features/adb/adb_debug_page.dart';
@@ -253,7 +254,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
 
   Future<void> _openConnectionConfig(BuildContext context) async {
     final hostController =
-        TextEditingController(text: controller.config.displayEndpoint);
+        TextEditingController(text: controller.config.displayHost);
     final portController = TextEditingController(text: controller.config.port);
     final tokenController =
         TextEditingController(text: controller.config.token);
@@ -291,11 +292,13 @@ class _SessionHomePageState extends State<SessionHomePage> {
                   credential: iceCredentialController.text,
                 );
 
-            final normalizedIceHost = iceHostController.text.trim().isNotEmpty
-                ? iceHostController.text.trim()
-                : (hostController.text.trim().isEmpty
-                    ? controller.config.host
-                    : hostController.text.trim());
+            final normalizedIceHost = _iceHostLiteral(
+              iceHostController.text.trim().isNotEmpty
+                  ? iceHostController.text.trim()
+                  : (hostController.text.trim().isEmpty
+                      ? controller.config.host
+                      : hostController.text.trim()),
+            );
 
             Future<void> handleScan() async {
               final scannedRaw = await showModalBottomSheet<String>(
@@ -328,7 +331,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
                 });
                 return;
               }
-              hostController.text = scanned.displayEndpoint;
+              hostController.text = scanned.displayHost;
               portController.text = scanned.port;
               tokenController.text = scanned.token;
               cwdController.text = scanned.cwd;
@@ -340,7 +343,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
                     ? selectedEngine
                     : scanned.engine.trim();
                 scanHint =
-                    '已回填 ${scanned.displayEndpoint}${scanned.token.isNotEmpty ? ' 与 token' : ''}';
+                    '已回填 ${scanned.displayHost}:${scanned.port}${scanned.token.isNotEmpty ? ' 与 token' : ''}';
               });
             }
 
@@ -402,7 +405,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
                       controller: hostController,
                       decoration: const InputDecoration(
                         labelText: 'Host / URL',
-                        hintText: 'https://host:port',
+                        hintText: 'https://host',
                       ),
                       onChanged: (_) => setSheetState(() {}),
                     ),
@@ -1912,4 +1915,13 @@ class _ConnectionDot extends StatelessWidget {
       ),
     );
   }
+}
+
+String _iceHostLiteral(String rawHost) {
+  final endpoint = AppConnectionEndpoint.parse(rawHost);
+  final host = endpoint.host.trim();
+  if (host.startsWith('[') && host.endsWith(']')) {
+    return host;
+  }
+  return host.contains(':') ? '[$host]' : host;
 }
