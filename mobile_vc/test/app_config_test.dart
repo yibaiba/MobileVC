@@ -2,6 +2,127 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:mobile_vc/core/config/app_config.dart';
 
 void main() {
+  group('AppConfig connection urls', () {
+    test('defaults to plain http and websocket transport', () {
+      const config = AppConfig(
+        host: '127.0.0.1',
+        port: '8001',
+        token: 'test-token',
+      );
+
+      expect(
+        config.baseHttpUrlFor(secureTransport: false),
+        'http://127.0.0.1:8001',
+      );
+      expect(
+        config.wsUrlFor(secureTransport: false),
+        'ws://127.0.0.1:8001/ws?token=test-token',
+      );
+    });
+
+    test('secure transport uses https and wss before connecting', () {
+      const config = AppConfig(
+        host: 'api.example.com',
+        port: '443',
+        token: 'token with spaces',
+      );
+
+      final httpUri = Uri.parse(config.baseHttpUrlFor(secureTransport: true));
+      final wsUri = Uri.parse(config.wsUrlFor(secureTransport: true));
+      final downloadUri = config.downloadUri(
+        'logs/session.txt',
+        secureTransport: true,
+      );
+
+      expect(httpUri.scheme, 'https');
+      expect(httpUri.host, 'api.example.com');
+      expect(wsUri.scheme, 'wss');
+      expect(wsUri.path, '/ws');
+      expect(wsUri.queryParameters['token'], 'token with spaces');
+      expect(downloadUri.scheme, 'https');
+      expect(downloadUri.queryParameters['path'], 'logs/session.txt');
+    });
+
+    test('secure transport preserves non-default backend ports', () {
+      const config = AppConfig(host: 'api.example.com', port: '8443');
+
+      expect(
+        config.baseHttpUrlFor(secureTransport: true),
+        'https://api.example.com:8443',
+      );
+      expect(
+        config.wsUrlFor(secureTransport: true),
+        'wss://api.example.com:8443/ws?token=test',
+      );
+    });
+
+    test('manual host accepts http URL without treating it as a host', () {
+      const config = AppConfig(host: 'http://example.com', port: '9999');
+
+      expect(config.baseHttpUrl, 'http://example.com:9999');
+      expect(config.wsUrl, 'ws://example.com:9999/ws?token=test');
+    });
+
+    test('manual host URL can carry backend port', () {
+      const config = AppConfig(host: 'https://example.com:9999');
+
+      expect(config.baseHttpUrl, 'https://example.com:9999');
+      expect(config.wsUrl, 'wss://example.com:9999/ws?token=test');
+    });
+
+    test('manual host port accepts a trailing slash', () {
+      const config = AppConfig(host: 'example.com:9999/');
+
+      expect(config.baseHttpUrlFor(secureTransport: true),
+          'https://example.com:9999');
+      expect(config.wsUrlFor(secureTransport: true),
+          'wss://example.com:9999/ws?token=test');
+    });
+
+    test('copyWith stores manual endpoint URL as host and port', () {
+      final config = const AppConfig(port: '19000').copyWith(
+        host: 'http://example.com:9999',
+      );
+
+      expect(config.host, 'example.com');
+      expect(config.port, '9999');
+      expect(config.secureTransport, isFalse);
+      expect(config.wsUrl, 'ws://example.com:9999/ws?token=test');
+    });
+
+    test('fromJson migrates legacy endpoint URL host', () {
+      final config = AppConfig.fromJson(const {
+        'host': 'http://example.com:9999',
+        'port': '19000',
+      });
+
+      expect(config.host, 'example.com');
+      expect(config.port, '9999');
+      expect(config.secureTransport, isFalse);
+      expect(config.baseHttpUrl, 'http://example.com:9999');
+    });
+
+    test('fromJson preserves explicit secure transport for plain host', () {
+      final config = AppConfig.fromJson(const {
+        'host': 'example.com',
+        'port': '9999',
+        'secureTransport': true,
+      });
+
+      expect(config.baseHttpUrl, 'https://example.com:9999');
+      expect(config.wsUrl, 'wss://example.com:9999/ws?token=test');
+    });
+
+    test('invalid port surfaces as a format error', () {
+      const config = AppConfig(port: 'not-a-port');
+
+      expect(
+        () => config.wsUrlFor(secureTransport: false),
+        throwsA(isA<FormatException>()),
+      );
+    });
+  });
+
   group('AppConfig adb ice', () {
     test('auto config builds stun and turn from host', () {
       const config = AppConfig(
