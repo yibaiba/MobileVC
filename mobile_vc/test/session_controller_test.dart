@@ -92,6 +92,62 @@ void main() {
   });
 
   group('SessionController action needed signal', () {
+    test(
+        'initialize reconnects when previous page had active connection intent',
+        () async {
+      SharedPreferences.setMockInitialValues({
+        'mobilevc.connection_intent': true,
+        'mobilevc.app_config': jsonEncode(const AppConfig(
+          host: 'https://example.com',
+          port: '9999',
+        ).toJson()),
+      });
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+      await _flushEvents();
+
+      expect(service.connectCalls, 1);
+      expect(service.connectedUrls, ['wss://example.com:9999/ws?token=test']);
+      expect(controller.connected, isTrue);
+      expect(controller.autoReconnectEnabled, isTrue);
+    });
+
+    test('initialize does not reconnect without previous connection intent',
+        () async {
+      SharedPreferences.setMockInitialValues({
+        'mobilevc.app_config': jsonEncode(const AppConfig(
+          host: 'https://example.com',
+          port: '9999',
+        ).toJson()),
+      });
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+      await _flushEvents();
+
+      expect(service.connectCalls, 0);
+      expect(controller.connected, isFalse);
+      expect(controller.autoReconnectEnabled, isFalse);
+    });
+
+    test('manual disconnect clears persisted connection intent', () async {
+      SharedPreferences.setMockInitialValues({});
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      await controller.disconnect();
+      final prefs = await SharedPreferences.getInstance();
+
+      expect(prefs.getBool('mobilevc.connection_intent'), isFalse);
+      expect(service.disconnectCalls, 1);
+    });
+
     test('notification restore immediately loads target session when connected',
         () async {
       final service = _FakeMobileVcWsService();
@@ -7699,6 +7755,7 @@ class _FakeMobileVcWsService extends MobileVcWsService {
   final StreamController<AppEvent> _controller =
       StreamController<AppEvent>.broadcast();
   final List<Map<String, dynamic>> sentPayloads = [];
+  final List<String> connectedUrls = [];
   int connectCalls = 0;
   int disconnectCalls = 0;
 
@@ -7708,6 +7765,7 @@ class _FakeMobileVcWsService extends MobileVcWsService {
   @override
   Future<void> connect(String url) async {
     connectCalls++;
+    connectedUrls.add(url);
   }
 
   @override

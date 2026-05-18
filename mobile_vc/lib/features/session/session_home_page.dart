@@ -7,6 +7,8 @@ import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
 
 import '../../core/config/app_config.dart';
+import '../../core/config/app_connection_endpoint.dart';
+import '../../core/config/app_connection_environment.dart';
 import '../../data/models/session_models.dart';
 import '../../features/adb/adb_debug_page.dart';
 import '../../features/chat/chat_timeline.dart';
@@ -251,7 +253,8 @@ class _SessionHomePageState extends State<SessionHomePage> {
   }
 
   Future<void> _openConnectionConfig(BuildContext context) async {
-    final hostController = TextEditingController(text: controller.config.host);
+    final hostController =
+        TextEditingController(text: controller.config.displayHost);
     final portController = TextEditingController(text: controller.config.port);
     final tokenController =
         TextEditingController(text: controller.config.token);
@@ -289,11 +292,13 @@ class _SessionHomePageState extends State<SessionHomePage> {
                   credential: iceCredentialController.text,
                 );
 
-            final normalizedIceHost = iceHostController.text.trim().isNotEmpty
-                ? iceHostController.text.trim()
-                : (hostController.text.trim().isEmpty
-                    ? controller.config.host
-                    : hostController.text.trim());
+            final normalizedIceHost = _iceHostLiteral(
+              iceHostController.text.trim().isNotEmpty
+                  ? iceHostController.text.trim()
+                  : (hostController.text.trim().isEmpty
+                      ? controller.config.host
+                      : hostController.text.trim()),
+            );
 
             Future<void> handleScan() async {
               final scannedRaw = await showModalBottomSheet<String>(
@@ -326,7 +331,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
                 });
                 return;
               }
-              hostController.text = scanned.host;
+              hostController.text = scanned.displayHost;
               portController.text = scanned.port;
               tokenController.text = scanned.token;
               cwdController.text = scanned.cwd;
@@ -338,14 +343,15 @@ class _SessionHomePageState extends State<SessionHomePage> {
                     ? selectedEngine
                     : scanned.engine.trim();
                 scanHint =
-                    '已回填 ${scanned.host}:${scanned.port}${scanned.token.isNotEmpty ? ' 与 token' : ''}';
+                    '已回填 ${scanned.displayHost}:${scanned.port}${scanned.token.isNotEmpty ? ' 与 token' : ''}';
               });
             }
 
             Future<void> persistConfig({bool connect = false}) async {
+              final hostText = hostController.text.trim();
               final nextConfig = controller.config.copyWith(
-                host: hostController.text.trim(),
-                port: portController.text.trim(),
+                host: hostText,
+                port: _portForHostInput(hostText, portController.text),
                 token: tokenController.text.trim(),
                 cwd: cwdController.text.trim(),
                 engine: selectedEngine,
@@ -398,7 +404,10 @@ class _SessionHomePageState extends State<SessionHomePage> {
                     const SizedBox(height: 12),
                     TextField(
                       controller: hostController,
-                      decoration: const InputDecoration(labelText: 'Host'),
+                      decoration: const InputDecoration(
+                        labelText: 'Host / URL',
+                        hintText: 'https://host',
+                      ),
                       onChanged: (_) => setSheetState(() {}),
                     ),
                     const SizedBox(height: 10),
@@ -922,7 +931,12 @@ class _SessionHomePageState extends State<SessionHomePage> {
   Future<Uint8List> _fetchFileBytes(String path) async {
     final client = HttpClient();
     try {
-      final request = await client.getUrl(controller.config.downloadUri(path));
+      final request = await client.getUrl(
+        controller.config.downloadUri(
+          path,
+          secureTransport: defaultSecureBackendTransport ? true : null,
+        ),
+      );
       final response = await request.close();
       if (response.statusCode != HttpStatus.ok) {
         throw HttpException('下载失败，状态码 ${response.statusCode}');
@@ -1902,4 +1916,23 @@ class _ConnectionDot extends StatelessWidget {
       ),
     );
   }
+}
+
+String _iceHostLiteral(String rawHost) {
+  final endpoint = AppConnectionEndpoint.parse(rawHost);
+  final host = endpoint.host.trim();
+  if (host.startsWith('[') && host.endsWith(']')) {
+    return host;
+  }
+  return host.contains(':') ? '[$host]' : host;
+}
+
+String _portForHostInput(String rawHost, String rawPort) {
+  final uri = Uri.tryParse(rawHost);
+  if (uri == null ||
+      uri.host.trim().isEmpty ||
+      secureTransportFromScheme(uri.scheme) == null) {
+    return rawPort.trim();
+  }
+  return uri.hasPort && uri.port > 0 ? uri.port.toString() : '';
 }

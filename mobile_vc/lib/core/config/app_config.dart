@@ -43,6 +43,10 @@ class AppConfig {
 
   String get wsUrl => wsUrlFor();
 
+  String get displayEndpoint => _connectionUrls(null).displayEndpoint;
+
+  String get displayHost => _connectionUrls(null).displayHost;
+
   String baseHttpUrlFor({bool? secureTransport}) =>
       _connectionUrls(secureTransport).baseHttpUrl;
 
@@ -244,8 +248,7 @@ class AppConfig {
     if (uri == null || uri.host.trim().isEmpty) {
       return null;
     }
-    final port =
-        uri.hasPort && uri.port > 0 ? uri.port.toString() : fallback.port;
+    final port = _launchUriPort(uri, fallback.port);
     final token = (uri.queryParameters['token'] ?? fallback.token).trim();
     final ice =
         (uri.queryParameters['ice'] ?? fallback.adbIceServersJson).trim();
@@ -265,17 +268,25 @@ class AppConfig {
       host,
       fallbackPort: port,
     );
+    final effectiveSecureTransport = secureTransport ??
+        (defaultSecureBackendTransport
+            ? true
+            : endpoint.secureTransport ?? this.secureTransport ?? false);
     return AppConnectionUrls(
       host: endpoint.host,
       port: endpoint.port,
       token: token,
-      secureTransport: secureTransport ??
-          endpoint.secureTransport ??
-          this.secureTransport ??
-          defaultSecureBackendTransport,
+      secureTransport: effectiveSecureTransport,
     );
   }
 
   AdbIceConfig get _adbIceConfig =>
       AdbIceConfig(host: host, rawJson: adbIceServersJson);
+}
+
+String _launchUriPort(Uri uri, String fallbackPort) {
+  if (uri.hasPort && uri.port > 0) {
+    return uri.port.toString();
+  }
+  return secureTransportFromScheme(uri.scheme) == null ? fallbackPort : '';
 }

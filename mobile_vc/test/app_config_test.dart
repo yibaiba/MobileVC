@@ -60,6 +60,8 @@ void main() {
       const config = AppConfig(host: 'http://example.com', port: '9999');
 
       expect(config.baseHttpUrl, 'http://example.com:9999');
+      expect(config.displayEndpoint, 'http://example.com:9999');
+      expect(config.displayHost, 'http://example.com');
       expect(config.wsUrl, 'ws://example.com:9999/ws?token=test');
     });
 
@@ -67,6 +69,8 @@ void main() {
       const config = AppConfig(host: 'https://example.com:9999');
 
       expect(config.baseHttpUrl, 'https://example.com:9999');
+      expect(config.displayEndpoint, 'https://example.com:9999');
+      expect(config.displayHost, 'https://example.com');
       expect(config.wsUrl, 'wss://example.com:9999/ws?token=test');
     });
 
@@ -111,6 +115,43 @@ void main() {
 
       expect(config.baseHttpUrl, 'https://example.com:9999');
       expect(config.wsUrl, 'wss://example.com:9999/ws?token=test');
+    });
+
+    test('launch uri without port uses scheme default port', () {
+      final config = AppConfig.fromLaunchUri(
+        'https://example.com?token=test',
+        fallback: const AppConfig(port: '19080'),
+      );
+
+      expect(config, isNotNull);
+      expect(config!.host, 'example.com');
+      expect(config.port, isEmpty);
+      expect(config.baseHttpUrl, 'https://example.com');
+      expect(config.wsUrl, 'wss://example.com/ws?token=test');
+    });
+
+    test('launch uri with http scheme defaults to port 80', () {
+      final config = AppConfig.fromLaunchUri(
+        'http://example.com?token=test',
+        fallback: const AppConfig(port: '19080'),
+      );
+
+      expect(config, isNotNull);
+      expect(config!.port, isEmpty);
+      expect(config.baseHttpUrl, 'http://example.com');
+      expect(config.wsUrl, 'ws://example.com/ws?token=test');
+    });
+
+    test('launch uri keeps explicit non-default backend port', () {
+      final config = AppConfig.fromLaunchUri(
+        'https://example.com:8443?token=test',
+        fallback: const AppConfig(port: '19080'),
+      );
+
+      expect(config, isNotNull);
+      expect(config!.port, '8443');
+      expect(config.baseHttpUrl, 'https://example.com:8443');
+      expect(config.wsUrl, 'wss://example.com:8443/ws?token=test');
     });
 
     test('invalid port surfaces as a format error', () {
@@ -168,6 +209,24 @@ void main() {
           'username': 'mobilevc',
           'credential': 'secret',
         },
+      ]);
+    });
+
+    test('auto config normalizes url host override before building ice urls',
+        () {
+      final rawJson = AppConfig.encodeAutoAdbIceConfig(
+        host: 'https://turn.example.com:9999',
+        username: 'mobilevc',
+        credential: 'secret',
+      );
+      final config = AppConfig(
+        host: '8.162.1.176',
+        adbIceServersJson: rawJson,
+      );
+
+      expect(config.adbIceHostOverride, 'turn.example.com');
+      expect(config.adbIceServers.first['urls'], <String>[
+        'stun:turn.example.com:3478',
       ]);
     });
 
