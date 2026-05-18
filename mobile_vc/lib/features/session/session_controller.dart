@@ -6,6 +6,7 @@ import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../core/config/app_config.dart';
+import '../../core/config/app_connection_environment.dart';
 import '../../data/models/events.dart';
 import '../../data/models/runtime_meta.dart';
 import '../../data/models/session_models.dart';
@@ -1700,7 +1701,11 @@ class SessionController extends ChangeNotifier {
     _syncDerivedState();
     notifyListeners();
     try {
-      await _service.connect(_config.wsUrl);
+      await _service.connect(
+        _config.wsUrlFor(
+          secureTransport: defaultSecureBackendTransport ? true : null,
+        ),
+      );
       unawaited(_saveConnectionIntent(true));
       _connected = true;
       _reconnectAttempt = 0;

@@ -43,6 +43,8 @@ class AppConfig {
 
   String get wsUrl => wsUrlFor();
 
+  String get displayEndpoint => _connectionUrls(null).displayEndpoint;
+
   String baseHttpUrlFor({bool? secureTransport}) =>
       _connectionUrls(secureTransport).baseHttpUrl;
 
@@ -265,14 +267,15 @@ class AppConfig {
       host,
       fallbackPort: port,
     );
+    final effectiveSecureTransport = secureTransport ??
+        (defaultSecureBackendTransport
+            ? true
+            : endpoint.secureTransport ?? this.secureTransport ?? false);
     return AppConnectionUrls(
       host: endpoint.host,
       port: endpoint.port,
       token: token,
-      secureTransport: secureTransport ??
-          endpoint.secureTransport ??
-          this.secureTransport ??
-          defaultSecureBackendTransport,
+      secureTransport: effectiveSecureTransport,
     );
   }
 

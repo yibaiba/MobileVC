@@ -7,6 +7,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
 
 import '../../core/config/app_config.dart';
+import '../../core/config/app_connection_environment.dart';
 import '../../data/models/session_models.dart';
 import '../../features/adb/adb_debug_page.dart';
 import '../../features/chat/chat_timeline.dart';
@@ -251,7 +252,8 @@ class _SessionHomePageState extends State<SessionHomePage> {
   }
 
   Future<void> _openConnectionConfig(BuildContext context) async {
-    final hostController = TextEditingController(text: controller.config.host);
+    final hostController =
+        TextEditingController(text: controller.config.displayEndpoint);
     final portController = TextEditingController(text: controller.config.port);
     final tokenController =
         TextEditingController(text: controller.config.token);
@@ -326,7 +328,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
                 });
                 return;
               }
-              hostController.text = scanned.host;
+              hostController.text = scanned.displayEndpoint;
               portController.text = scanned.port;
               tokenController.text = scanned.token;
               cwdController.text = scanned.cwd;
@@ -338,7 +340,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
                     ? selectedEngine
                     : scanned.engine.trim();
                 scanHint =
-                    '已回填 ${scanned.host}:${scanned.port}${scanned.token.isNotEmpty ? ' 与 token' : ''}';
+                    '已回填 ${scanned.displayEndpoint}${scanned.token.isNotEmpty ? ' 与 token' : ''}';
               });
             }
 
@@ -398,7 +400,10 @@ class _SessionHomePageState extends State<SessionHomePage> {
                     const SizedBox(height: 12),
                     TextField(
                       controller: hostController,
-                      decoration: const InputDecoration(labelText: 'Host'),
+                      decoration: const InputDecoration(
+                        labelText: 'Host / URL',
+                        hintText: 'https://host:port',
+                      ),
                       onChanged: (_) => setSheetState(() {}),
                     ),
                     const SizedBox(height: 10),
@@ -922,7 +927,12 @@ class _SessionHomePageState extends State<SessionHomePage> {
   Future<Uint8List> _fetchFileBytes(String path) async {
     final client = HttpClient();
     try {
-      final request = await client.getUrl(controller.config.downloadUri(path));
+      final request = await client.getUrl(
+        controller.config.downloadUri(
+          path,
+          secureTransport: defaultSecureBackendTransport ? true : null,
+        ),
+      );
       final response = await request.close();
       if (response.statusCode != HttpStatus.ok) {
         throw HttpException('下载失败，状态码 ${response.statusCode}');

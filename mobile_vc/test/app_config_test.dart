@@ -60,6 +60,7 @@ void main() {
       const config = AppConfig(host: 'http://example.com', port: '9999');
 
       expect(config.baseHttpUrl, 'http://example.com:9999');
+      expect(config.displayEndpoint, 'http://example.com:9999');
       expect(config.wsUrl, 'ws://example.com:9999/ws?token=test');
     });
 
@@ -67,6 +68,7 @@ void main() {
       const config = AppConfig(host: 'https://example.com:9999');
 
       expect(config.baseHttpUrl, 'https://example.com:9999');
+      expect(config.displayEndpoint, 'https://example.com:9999');
       expect(config.wsUrl, 'wss://example.com:9999/ws?token=test');
     });
 

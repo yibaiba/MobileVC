@@ -22,6 +22,8 @@ class AppConnectionUrls {
 
   String get baseHttpUrl => _baseUri(httpScheme).toString();
 
+  String get displayEndpoint => _baseUri(httpScheme).toString();
+
   String get wsUrl => _baseUri(wsScheme).replace(
       path: _wsPath,
       queryParameters: <String, String>{'token': token}).toString();
