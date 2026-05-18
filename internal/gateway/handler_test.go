@@ -297,6 +297,117 @@ func newTestConn(t *testing.T, h *Handler) *websocket.Conn {
 	return conn
 }
 
+func dialTestConn(t *testing.T, h *Handler, origin string) (*websocket.Conn, *http.Response) {
+	t.Helper()
+	server := newLocalHTTPServer(t, h)
+	if h != nil && h.runtimeSessions != nil {
+		t.Cleanup(func() {
+			h.runtimeSessions.CleanupAll()
+		})
+	}
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/?token=test"
+	headers := http.Header{}
+	if origin != "" {
+		headers.Set("Origin", origin)
+	}
+	conn, resp, err := websocket.DefaultDialer.Dial(wsURL, headers)
+	if err != nil {
+		return nil, resp
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	return conn, resp
+}
+
+func TestHandlerPublicModeOriginAllowlist(t *testing.T) {
+	tests := []struct {
+		name     string
+		origin   string
+		wantDial bool
+		wantCode int
+	}{
+		{
+			name:     "allowed origin",
+			origin:   "https://example.test",
+			wantDial: true,
+		},
+		{
+			name:     "allowed origin default port",
+			origin:   "https://example.test:443",
+			wantDial: true,
+		},
+		{
+			name:     "missing origin is native client path",
+			origin:   "",
+			wantDial: true,
+		},
+		{
+			name:     "rejected origin",
+			origin:   "https://evil.example.test",
+			wantCode: http.StatusForbidden,
+		},
+		{
+			name:     "malformed origin",
+			origin:   "notaurl",
+			wantCode: http.StatusForbidden,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newTestHandler()
+			if err := h.ConfigurePublicAccess(true, []string{"https://example.test"}); err != nil {
+				t.Fatalf("ConfigurePublicAccess failed: %v", err)
+			}
+
+			conn, resp := dialTestConn(t, h, tt.origin)
+			if tt.wantDial {
+				if conn == nil {
+					t.Fatalf("expected websocket connection, status=%s", responseStatus(resp))
+				}
+				return
+			}
+			if conn != nil {
+				t.Fatal("expected websocket dial to fail")
+			}
+			if resp == nil || resp.StatusCode != tt.wantCode {
+				t.Fatalf("status: got %s, want %d", responseStatus(resp), tt.wantCode)
+			}
+		})
+	}
+}
+
+func TestHandlerPrivateModeAllowsBrowserOrigin(t *testing.T) {
+	h := newTestHandler()
+
+	conn, resp := dialTestConn(t, h, "https://example.test")
+	if conn == nil {
+		t.Fatalf("expected websocket connection, status=%s", responseStatus(resp))
+	}
+}
+
+func TestWSDebugPreviewRedactsSecrets(t *testing.T) {
+	input := `curl -H "Authorization: Bearer abc123" https://example.test api_key=key123 --token token123 password:pass123`
+	got := wsDebugPreview(input)
+
+	for _, leaked := range []string{"abc123", "key123", "token123", "pass123"} {
+		if strings.Contains(got, leaked) {
+			t.Fatalf("secret %q leaked in preview %q", leaked, got)
+		}
+	}
+	if !strings.Contains(got, "Authorization: Bearer <redacted>") {
+		t.Fatalf("authorization was not redacted: %q", got)
+	}
+}
+
+func responseStatus(resp *http.Response) string {
+	if resp == nil {
+		return "<nil>"
+	}
+	return resp.Status
+}
+
 func readEventMap(t *testing.T, conn *websocket.Conn) map[string]any {
 	t.Helper()
 	var event map[string]any

@@ -33,6 +33,9 @@ const MESSAGES = {
       '用法：',
       '  mobilevc           交互式配置并启动 MobileVC 后端',
       '  mobilevc start     启动 MobileVC 后端（默认）',
+      '  mobilevc start --public --origin https://example.com  启用公网安全模式',
+      '  mobilevc public https://example.com  保存并启动公网安全模式',
+      '  mobilevc public    使用已保存公网地址启动',
       '  mobilevc restart   重启 MobileVC 后端',
       '  mobilevc stop      停止已保存的后端进程',
       '  mobilevc status    查看保存的状态和健康检查',
@@ -69,6 +72,7 @@ const MESSAGES = {
     statusPreflight: 'preflight',
     qrTitle: 'Flutter 扫码连接局域网后端',
     qrHint: '用 Flutter 客户端扫码，可自动回填局域网地址、端口和 token',
+    qrSuppressed: '公网模式已隐藏 token 二维码；如确需扫码，设置 MOBILEVC_SHOW_TOKEN_QR=true',
     localAccess: '本机访问',
     lanAccess: '局域网访问',
     qrUnavailable: '未检测到可用的局域网 IPv4 地址，暂时无法生成二维码',
@@ -81,6 +85,7 @@ const MESSAGES = {
     binaryNotExecutable: (filePath) => `server binary 不可执行：${filePath}`,
     homeNotWritable: (homePath) => `HOME 不可写：${homePath}`,
     authTokenMissing: '未配置 AUTH_TOKEN，请先运行 mobilevc config',
+    publicOriginMissing: '公网模式需要 --origin <https://域名[:端口]> 或 ALLOWED_ORIGINS',
     aiCliMissing: '当前启动器未检测到可用的 Claude/Codex CLI；请确认 claude 或 codex 命令可在终端中直接执行。',
     portInUse: (port) => `端口 ${port} 已被其他进程占用`,
     startupFailed: '启动失败，请检查日志和 preflight 提示',
@@ -94,6 +99,9 @@ const MESSAGES = {
       'Usage:',
       '  mobilevc           Configure interactively and start the MobileVC backend',
       '  mobilevc start     Start the MobileVC backend (default)',
+      '  mobilevc start --public --origin https://example.com  Enable public-safe mode',
+      '  mobilevc public https://example.com  Save and start public-safe mode',
+      '  mobilevc public    Start with the saved public origin',
       '  mobilevc restart   Restart the MobileVC backend',
       '  mobilevc stop      Stop the saved backend process',
       '  mobilevc status    Show saved launcher state and health',
@@ -130,6 +138,7 @@ const MESSAGES = {
     statusPreflight: 'preflight',
     qrTitle: 'Flutter scan-to-connect over LAN',
     qrHint: 'Scan with the Flutter client to autofill host, port, and token',
+    qrSuppressed: 'Public mode hid the token QR. Set MOBILEVC_SHOW_TOKEN_QR=true if scanning is required.',
     localAccess: 'Local access',
     lanAccess: 'LAN access',
     qrUnavailable: 'No available LAN IPv4 address was detected, so no QR code was generated',
@@ -142,6 +151,7 @@ const MESSAGES = {
     binaryNotExecutable: (filePath) => `Server binary is not executable: ${filePath}`,
     homeNotWritable: (homePath) => `HOME is not writable: ${homePath}`,
     authTokenMissing: 'AUTH_TOKEN is missing. Run mobilevc config first.',
+    publicOriginMissing: 'Public mode requires --origin <https://host[:port]> or ALLOWED_ORIGINS.',
     aiCliMissing: 'The launcher could not find Claude/Codex CLI. Make sure `claude` or `codex` runs directly in your terminal.',
     portInUse: (port) => `Port ${port} is already in use`,
     startupFailed: 'Startup failed. Check the log and preflight output.',
@@ -184,6 +194,11 @@ function main() {
     return;
   }
 
+  if (command === 'public') {
+    runPublic(options).catch(exitWithError);
+    return;
+  }
+
   if (command === 'start') {
     runStart(options).catch(exitWithError);
     return;
@@ -195,7 +210,12 @@ function main() {
 function parseInvocation(args) {
   const hasExplicitCommand = Boolean(args[0] && !args[0].startsWith('-'));
   const command = hasExplicitCommand ? args[0] : 'start';
-  const options = parseOptions(args.slice(hasExplicitCommand ? 1 : 0));
+  const optionArgs = args.slice(hasExplicitCommand ? 1 : 0);
+  const options = parseOptions(optionArgs);
+  if (command === 'public' && optionArgs[0] && !optionArgs[0].startsWith('-')) {
+    options.public = true;
+    options.origins.push(optionArgs[0]);
+  }
   if (!hasExplicitCommand) {
     options.guided = true;
   }
@@ -203,11 +223,21 @@ function parseInvocation(args) {
 }
 
 function parseOptions(args) {
-  const options = { help: false, follow: false, guided: false };
+  const options = { help: false, follow: false, guided: false, public: false, origins: [] };
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];
     if (arg === '--help' || arg === '-h') options.help = true;
     else if (arg === '--follow' || arg === '-f') options.follow = true;
+    else if (arg === '--public') options.public = true;
+    else if (arg === '--origin') {
+      i += 1;
+      if (!args[i]) {
+        throw new Error('--origin requires a value');
+      }
+      options.origins.push(args[i]);
+    } else if (arg.startsWith('--origin=')) {
+      options.origins.push(arg.slice('--origin='.length));
+    }
   }
   return options;
 }
@@ -245,12 +275,18 @@ async function runStart(options = {}) {
   }
 
   const language = config?.language || DEFAULT_LANGUAGE;
+  if (options.public && options.origins?.length > 0) {
+    const origins = normalizeOriginList([...(config.publicOrigins || []), ...options.origins]);
+    config = { ...config, publicOrigins: origins };
+    writeJson(CONFIG_PATH, config);
+  }
+  const publicAccess = await buildPublicAccessConfig(options, config.port);
   const existingState = readJson(STATE_PATH, null);
   if (existingState?.pid && isPidAlive(existingState.pid)) {
-    if (isStateConfigMatch(existingState, config)) {
+    if (isStateConfigMatch(existingState, config, publicAccess)) {
       console.log(message(language, 'alreadyRunning', existingState.pid, existingState.port));
       if (options.guided) {
-        await printLanQr(language, existingState.port, existingState.authToken, process.cwd());
+        await printLanQr(language, existingState.port, existingState.authToken, process.cwd(), publicAccess.enabled);
       }
       return;
     }
@@ -259,7 +295,7 @@ async function runStart(options = {}) {
 
   const platformTarget = getPlatformTarget();
   const binaryInfo = resolveBinaryInfo(platformTarget);
-  const preflight = await runPreflightChecks({ config, language, platformTarget, binaryInfo });
+  const preflight = await runPreflightChecks({ config, language, platformTarget, binaryInfo, publicAccess });
   printPreflight(language, preflight);
 
   if (preflight.blocking.length > 0) {
@@ -279,6 +315,7 @@ async function runStart(options = {}) {
     PORT: String(config.port),
     AUTH_TOKEN: String(config.authToken),
     RUNTIME_WORKSPACE_ROOT: process.cwd(),
+    ...publicAccess.env,
   };
 
   fs.appendFileSync(logPath, `launcher starting binary=${binaryInfo.binaryPath} target=${platformTarget}\n`);
@@ -305,7 +342,7 @@ async function runStart(options = {}) {
   }
 
   const state = {
-    ...buildStateSkeleton(config, language, binaryInfo, platformTarget, preflight, logPath),
+    ...buildStateSkeleton(config, language, binaryInfo, platformTarget, preflight, logPath, publicAccess),
     pid: child.pid,
     startedAt: new Date().toISOString(),
     serverVersion: formatVersionInfo(startup.versionInfo),
@@ -320,7 +357,26 @@ async function runStart(options = {}) {
   if (!await checkHealth(state.port)) {
     throw new Error(message(language, 'startupFailed'));
   }
-  await printLanQr(language, state.port, state.authToken, state.cwd || process.cwd());
+  await printLanQr(language, state.port, state.authToken, state.cwd || process.cwd(), publicAccess.enabled);
+}
+
+async function runPublic(options = {}) {
+  ensureDir(STATE_DIR, 0o700);
+  ensureDir(LOG_DIR, 0o700);
+
+  let config = readJson(CONFIG_PATH, null);
+  if (!config) {
+    await runSetup(true);
+    config = readJson(CONFIG_PATH, null);
+  }
+  const origins = normalizeOriginList([
+    ...(config.publicOrigins || []),
+    ...(options.origins || []),
+  ]);
+  if (origins.length > 0) {
+    writeJson(CONFIG_PATH, { ...config, publicOrigins: origins });
+  }
+  await runStart({ ...options, public: true, origins });
 }
 
 async function runStatus() {
@@ -491,7 +547,7 @@ function getPlatformTarget() {
   return `${process.platform}-${process.arch}`;
 }
 
-async function runPreflightChecks({ config, language, platformTarget, binaryInfo }) {
+async function runPreflightChecks({ config, language, platformTarget, binaryInfo, publicAccess = { ok: true } }) {
   const blocking = [];
   const warnings = [];
 
@@ -505,6 +561,9 @@ async function runPreflightChecks({ config, language, platformTarget, binaryInfo
 
   if (!String(config?.authToken || '').trim()) {
     blocking.push(message(language, 'authTokenMissing'));
+  }
+  if (!publicAccess.ok) {
+    blocking.push(message(language, 'publicOriginMissing'));
   }
 
   if (!isHomeWritable()) {
@@ -536,7 +595,82 @@ function formatList(items, language) {
   return items.join(' | ');
 }
 
-function buildStateSkeleton(config, language, binaryInfo, platformTarget, preflight, logPath) {
+async function buildPublicAccessConfig(options, port) {
+  const existingAllowed = String(process.env.ALLOWED_ORIGINS || '').trim();
+  const config = readJson(CONFIG_PATH, null) || {};
+  const savedOrigins = options.public ? (config.publicOrigins || []) : [];
+  const enabled = Boolean(options.public || envFlag('PUBLIC_EXPOSURE_MODE') || existingAllowed);
+  if (!enabled) {
+    return { enabled: false, ok: true, env: {} };
+  }
+
+  const origins = normalizeOriginList([
+    ...String(existingAllowed || '').split(','),
+    ...savedOrigins,
+    ...(options.origins || []),
+    ...await localBrowserOrigins(port),
+  ]);
+  return {
+    enabled: true,
+    ok: origins.length > 0,
+    env: {
+      PUBLIC_EXPOSURE_MODE: 'true',
+      ALLOWED_ORIGINS: origins.join(','),
+    },
+    origins,
+  };
+}
+
+async function localBrowserOrigins(port) {
+  const origins = [
+    `http://localhost:${port}`,
+    `http://127.0.0.1:${port}`,
+  ];
+  const host = await detectLanHost();
+  if (host) {
+    origins.push(`http://${host}:${port}`);
+  }
+  return origins;
+}
+
+function normalizeOriginList(values) {
+  const origins = [];
+  const seen = new Set();
+  for (const value of values) {
+    const origin = normalizeOrigin(value);
+    if (!origin || seen.has(origin)) {
+      continue;
+    }
+    seen.add(origin);
+    origins.push(origin);
+  }
+  return origins;
+}
+
+function normalizeOrigin(value) {
+  const raw = String(value || '').trim().replace(/\/+$/, '');
+  if (!raw) {
+    return '';
+  }
+  const url = new URL(raw);
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    throw new Error(`invalid origin scheme: ${raw}`);
+  }
+  if (url.pathname !== '/' || url.search || url.hash || url.username || url.password) {
+    throw new Error(`invalid origin: ${raw}`);
+  }
+  const port = defaultOriginPort(url.protocol, url.port);
+  return `${url.protocol}//${url.hostname}${port}`;
+}
+
+function defaultOriginPort(protocol, port) {
+  if (!port || (protocol === 'http:' && port === '80') || (protocol === 'https:' && port === '443')) {
+    return '';
+  }
+  return `:${port}`;
+}
+
+function buildStateSkeleton(config, language, binaryInfo, platformTarget, preflight, logPath, publicAccess = { enabled: false, origins: [] }) {
   return {
     pid: null,
     port: String(config.port),
@@ -548,6 +682,8 @@ function buildStateSkeleton(config, language, binaryInfo, platformTarget, prefli
     binaryPath: binaryInfo.binaryPath,
     platformTarget,
     serverVersion: null,
+    publicExposureMode: Boolean(publicAccess.enabled),
+    allowedOrigins: publicAccess.origins || [],
     preflight,
   };
 }
@@ -840,9 +976,11 @@ function message(language, key, ...args) {
 
 async function printLanQr(language, port, authToken = '', cwd = process.cwd()) {
   const host = await detectLanHost();
+  const publicMode = isPublicExposureMode();
+  const showTokenQr = shouldShowTokenQr();
   const localUrl = buildLaunchUrl('127.0.0.1', port, authToken, cwd);
   console.log('');
-  console.log(`${message(language, 'localAccess')}: ${localUrl}`);
+  console.log(`${message(language, 'localAccess')}: ${formatLaunchUrlForDisplay(localUrl, publicMode)}`);
 
   if (!host) {
     console.log(message(language, 'qrUnavailable'));
@@ -850,11 +988,39 @@ async function printLanQr(language, port, authToken = '', cwd = process.cwd()) {
   }
 
   const url = buildLaunchUrl(host, port, authToken, cwd);
-  console.log(`${message(language, 'lanAccess')}: ${url}`);
+  console.log(`${message(language, 'lanAccess')}: ${formatLaunchUrlForDisplay(url, publicMode)}`);
+  if (publicMode && !showTokenQr) {
+    console.log(message(language, 'qrSuppressed'));
+    return;
+  }
   console.log('');
   console.log(message(language, 'qrTitle'));
   renderTerminalQr(url);
   console.log(message(language, 'qrHint'));
+}
+
+function isPublicExposureMode() {
+  return envFlag('PUBLIC_EXPOSURE_MODE');
+}
+
+function shouldShowTokenQr() {
+  return envFlag('MOBILEVC_SHOW_TOKEN_QR');
+}
+
+function envFlag(key) {
+  const value = String(process.env[key] || '').trim().toLowerCase();
+  return value === '1' || value === 'true' || value === 'yes' || value === 'on';
+}
+
+function formatLaunchUrlForDisplay(rawUrl, redactToken) {
+  if (!redactToken) {
+    return rawUrl;
+  }
+  const url = new URL(rawUrl);
+  if (url.searchParams.has('token')) {
+    url.searchParams.set('token', '<redacted>');
+  }
+  return url.toString();
 }
 
 function renderTerminalQr(text) {
@@ -883,9 +1049,18 @@ function buildLaunchUrl(host, port, authToken = '', cwd = '') {
   return url.toString();
 }
 
-function isStateConfigMatch(state, config) {
+function isStateConfigMatch(state, config, publicAccess = { enabled: false, origins: [] }) {
   return String(state?.port || '') === String(config?.port || '') &&
-    String(state?.authToken || '') === String(config?.authToken || '');
+    String(state?.authToken || '') === String(config?.authToken || '') &&
+    Boolean(state?.publicExposureMode) === Boolean(publicAccess.enabled) &&
+    sameStringList(state?.allowedOrigins || [], publicAccess.origins || []);
+}
+
+function sameStringList(left, right) {
+  if (left.length !== right.length) {
+    return false;
+  }
+  return left.every((item, index) => item === right[index]);
 }
 
 function formatStartupFailure(language, startup, logPath) {
@@ -1083,7 +1258,10 @@ if (require.main === module) {
 } else {
   module.exports = {
     buildLaunchUrl,
+    buildPublicAccessConfig,
+    formatLaunchUrlForDisplay,
     isPortOccupied,
+    normalizeOrigin,
     parseInvocation,
     resolveBinaryInfo,
     resolveBundledPackageRoot,

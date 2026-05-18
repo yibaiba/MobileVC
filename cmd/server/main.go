@@ -52,9 +52,11 @@ func main() {
 	summary := cfg.Summary()
 	addr := ":" + cfg.Port
 
-	logx.Info("bootstrap", "Configuration summary: port=%s authToken=%s runtime.defaultCommand=%s runtime.defaultMode=%s runtime.debug=%v workspaceRoot=%s projection.enhanced=%v projection.step=%v projection.diff=%v projection.prompt=%v tts.enabled=%v tts.provider=%s tts.url=%s tts.timeout=%ds tts.maxTextLength=%d tts.format=%s",
+	logx.Info("bootstrap", "Configuration summary: port=%s authToken=%s publicExposureMode=%v allowedOrigins=%d runtime.defaultCommand=%s runtime.defaultMode=%s runtime.debug=%v workspaceRoot=%s projection.enhanced=%v projection.step=%v projection.diff=%v projection.prompt=%v tts.enabled=%v tts.provider=%s tts.url=%s tts.timeout=%ds tts.maxTextLength=%d tts.format=%s",
 		summary.Port,
 		logx.AuthTokenSummary(cfg.AuthToken),
+		summary.PublicExposureMode,
+		len(summary.AllowedOrigins),
 		summary.DefaultCommand,
 		summary.DefaultMode,
 		summary.Debug,
@@ -109,6 +111,10 @@ func main() {
 
 	logx.Info("bootstrap", "Preparing websocket handler")
 	wsHandler := gateway.NewHandler(cfg.AuthToken, sessionStore)
+	if err := wsHandler.ConfigurePublicAccess(cfg.Security.PublicExposureMode, cfg.Security.AllowedOrigins); err != nil {
+		logx.Error("bootstrap", "configure public access failed: %v", err)
+		panic(err)
+	}
 	wsHandler.PushService = pushService
 	logx.Info("bootstrap", "WebSocket handler ready")
 

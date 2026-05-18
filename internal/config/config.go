@@ -2,9 +2,16 @@ package config
 
 import (
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
+)
+
+const (
+	defaultHTTPPort  = "80"
+	defaultHTTPSPort = "443"
 )
 
 type RuntimeConfig struct {
@@ -27,11 +34,17 @@ type TTSConfig struct {
 	DefaultFormat         string
 }
 
+type SecurityConfig struct {
+	PublicExposureMode bool
+	AllowedOrigins     []string
+}
+
 type Config struct {
 	Port      string
 	AuthToken string
 	Runtime   RuntimeConfig
 	TTS       TTSConfig
+	Security  SecurityConfig
 }
 
 type Summary struct {
@@ -51,6 +64,8 @@ type Summary struct {
 	TTSRequestTimeout      int
 	TTSMaxTextLength       int
 	TTSDefaultFormat       string
+	PublicExposureMode     bool
+	AllowedOrigins         []string
 }
 
 func Load() (Config, error) {
@@ -75,12 +90,19 @@ func Load() (Config, error) {
 			MaxTextLength:         getEnvInt("TTS_MAX_TEXT_LENGTH", 200),
 			DefaultFormat:         strings.TrimSpace(getEnv("TTS_DEFAULT_FORMAT", "wav")),
 		},
+		Security: SecurityConfig{
+			PublicExposureMode: getEnvBool("PUBLIC_EXPOSURE_MODE", false),
+			AllowedOrigins:     getEnvCommaList("ALLOWED_ORIGINS"),
+		},
 	}
 
 	if cfg.AuthToken == "" {
 		return Config{}, fmt.Errorf("AUTH_TOKEN is required")
 	}
 	if err := cfg.validateTTS(); err != nil {
+		return Config{}, err
+	}
+	if err := cfg.validateSecurity(); err != nil {
 		return Config{}, err
 	}
 
@@ -105,7 +127,56 @@ func (c Config) Summary() Summary {
 		TTSRequestTimeout:      c.TTS.RequestTimeoutSeconds,
 		TTSMaxTextLength:       c.TTS.MaxTextLength,
 		TTSDefaultFormat:       c.TTS.DefaultFormat,
+		PublicExposureMode:     c.Security.PublicExposureMode,
+		AllowedOrigins:         append([]string(nil), c.Security.AllowedOrigins...),
 	}
+}
+
+func (c Config) validateSecurity() error {
+	if c.Security.PublicExposureMode && len(c.Security.AllowedOrigins) == 0 {
+		return fmt.Errorf("ALLOWED_ORIGINS is required when PUBLIC_EXPOSURE_MODE is true")
+	}
+	for _, origin := range c.Security.AllowedOrigins {
+		if _, err := NormalizeOrigin(origin); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func NormalizeOrigin(origin string) (string, error) {
+	parsed, err := url.Parse(origin)
+	if err != nil {
+		return "", fmt.Errorf("invalid origin %q: %w", origin, err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return "", fmt.Errorf("invalid origin %q: scheme must be http or https", origin)
+	}
+	if parsed.Host == "" || parsed.User != nil || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", fmt.Errorf("invalid origin %q: expected scheme://host[:port]", origin)
+	}
+	return canonicalOrigin(parsed), nil
+}
+
+func canonicalOrigin(parsed *url.URL) string {
+	scheme := strings.ToLower(parsed.Scheme)
+	host := strings.ToLower(parsed.Hostname())
+	port := parsed.Port()
+	if port == "" || isDefaultOriginPort(scheme, port) {
+		return scheme + "://" + formatOriginHost(host)
+	}
+	return scheme + "://" + net.JoinHostPort(host, port)
+}
+
+func isDefaultOriginPort(scheme string, port string) bool {
+	return (scheme == "http" && port == defaultHTTPPort) || (scheme == "https" && port == defaultHTTPSPort)
+}
+
+func formatOriginHost(host string) string {
+	if strings.Contains(host, ":") {
+		return "[" + host + "]"
+	}
+	return host
 }
 
 func (c Config) validateTTS() error {
@@ -162,4 +233,25 @@ func getEnvInt(key string, fallback int) int {
 		return fallback
 	}
 	return parsed
+}
+
+func getEnvCommaList(key string) []string {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return nil
+	}
+	parts := strings.Split(value, ",")
+	items := make([]string, 0, len(parts))
+	for _, part := range parts {
+		item := strings.TrimRight(strings.TrimSpace(part), "/")
+		if item != "" {
+			origin, err := NormalizeOrigin(item)
+			if err != nil {
+				items = append(items, item)
+				continue
+			}
+			items = append(items, origin)
+		}
+	}
+	return items
 }

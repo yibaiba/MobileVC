@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -17,6 +18,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"mobilevc/internal/adb"
+	"mobilevc/internal/config"
 	"mobilevc/internal/data"
 	"mobilevc/internal/data/claudesync"
 	"mobilevc/internal/data/codexsync"
@@ -30,12 +32,34 @@ import (
 
 const wsDebugPreviewLimit = 240
 
+type secretLogPattern struct {
+	re          *regexp.Regexp
+	replacement string
+}
+
+var secretLogPatterns = []secretLogPattern{
+	{
+		re:          regexp.MustCompile(`(?i)(authorization\s*[:=]\s*bearer\s+)[^\s"'\\]+`),
+		replacement: `${1}<redacted>`,
+	},
+	{
+		re:          regexp.MustCompile(`(?i)((?:api[_-]?key|token|password|secret|auth[_-]?token)\s*[:=]\s*)[^\s"'\\]+`),
+		replacement: `${1}<redacted>`,
+	},
+	{
+		re:          regexp.MustCompile(`(?i)((?:--(?:api-key|token|password|secret|auth-token))(?:=|\s+))[^\s"'\\]+`),
+		replacement: `${1}<redacted>`,
+	},
+}
+
 func normalizePermissionModeForClaude(mode string) string {
 	return session.NormalizeClaudePermissionMode(mode)
 }
 
 type Handler struct {
 	AuthToken       string
+	PublicMode      bool
+	AllowedOrigins  map[string]struct{}
 	NewExecRunner   func() engine.Runner
 	NewPtyRunner    func() engine.Runner
 	Upgrader        websocket.Upgrader
@@ -64,11 +88,9 @@ func NewHandler(authToken string, sessionStore data.Store) *Handler {
 		Upgrader: websocket.Upgrader{
 			ReadBufferSize:  1024,
 			WriteBufferSize: 1024,
-			CheckOrigin: func(r *http.Request) bool {
-				return true
-			},
 		},
 	}
+	handler.Upgrader.CheckOrigin = handler.checkOrigin
 	handler.runtimeSessions = newRuntimeSessionRegistry(func(sessionID string) *session.Service {
 		return session.NewService(sessionID, session.Dependencies{
 			NewExecRunner: handler.NewExecRunner,
@@ -88,6 +110,55 @@ func NewHandler(authToken string, sessionStore data.Store) *Handler {
 		sessionStore.UpsertSession(ctx, record)
 	})
 	return handler
+}
+
+func (h *Handler) ConfigurePublicAccess(publicMode bool, allowedOrigins []string) error {
+	origins, err := makeAllowedOrigins(allowedOrigins)
+	if err != nil {
+		return err
+	}
+	if publicMode && len(origins) == 0 {
+		return fmt.Errorf("allowed origins are required in public mode")
+	}
+	h.PublicMode = publicMode
+	h.AllowedOrigins = origins
+	h.Upgrader.CheckOrigin = h.checkOrigin
+	return nil
+}
+
+func makeAllowedOrigins(origins []string) (map[string]struct{}, error) {
+	if len(origins) == 0 {
+		return nil, nil
+	}
+	allowed := make(map[string]struct{}, len(origins))
+	for _, origin := range origins {
+		normalized, err := config.NormalizeOrigin(strings.TrimSpace(origin))
+		if err != nil {
+			return nil, err
+		}
+		allowed[normalized] = struct{}{}
+	}
+	return allowed, nil
+}
+
+func (h *Handler) checkOrigin(r *http.Request) bool {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		return true
+	}
+	if !h.PublicMode {
+		return true
+	}
+	normalized, err := config.NormalizeOrigin(origin)
+	if err != nil {
+		logx.Warn("ws", "reject websocket origin: remoteAddr=%s origin=%q err=%v", r.RemoteAddr, origin, err)
+		return false
+	}
+	if _, ok := h.AllowedOrigins[normalized]; ok {
+		return true
+	}
+	logx.Warn("ws", "reject websocket origin: remoteAddr=%s origin=%q", r.RemoteAddr, normalized)
+	return false
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -2328,7 +2399,8 @@ func fallback(value, defaultValue string) string {
 }
 
 func wsDebugPreview(value string) string {
-	trimmed := strings.ReplaceAll(strings.TrimSpace(value), "\n", `\n`)
+	trimmed := redactLogSecrets(value)
+	trimmed = strings.ReplaceAll(strings.TrimSpace(trimmed), "\n", `\n`)
 	trimmed = strings.ReplaceAll(trimmed, "\r", `\r`)
 	if trimmed == "" {
 		return ""
@@ -2338,6 +2410,14 @@ func wsDebugPreview(value string) string {
 		return trimmed
 	}
 	return string(runes[:wsDebugPreviewLimit]) + "…"
+}
+
+func redactLogSecrets(value string) string {
+	redacted := value
+	for _, pattern := range secretLogPatterns {
+		redacted = pattern.re.ReplaceAllString(redacted, pattern.replacement)
+	}
+	return redacted
 }
 
 func wsDebugBoolLabel(value bool) string {
