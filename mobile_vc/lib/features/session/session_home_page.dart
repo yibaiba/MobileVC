@@ -348,9 +348,10 @@ class _SessionHomePageState extends State<SessionHomePage> {
             }
 
             Future<void> persistConfig({bool connect = false}) async {
+              final hostText = hostController.text.trim();
               final nextConfig = controller.config.copyWith(
-                host: hostController.text.trim(),
-                port: portController.text.trim(),
+                host: hostText,
+                port: _portForHostInput(hostText, portController.text),
                 token: tokenController.text.trim(),
                 cwd: cwdController.text.trim(),
                 engine: selectedEngine,
@@ -1924,4 +1925,14 @@ String _iceHostLiteral(String rawHost) {
     return host;
   }
   return host.contains(':') ? '[$host]' : host;
+}
+
+String _portForHostInput(String rawHost, String rawPort) {
+  final uri = Uri.tryParse(rawHost);
+  if (uri == null ||
+      uri.host.trim().isEmpty ||
+      secureTransportFromScheme(uri.scheme) == null) {
+    return rawPort.trim();
+  }
+  return uri.hasPort && uri.port > 0 ? uri.port.toString() : '';
 }

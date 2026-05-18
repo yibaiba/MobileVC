@@ -117,6 +117,43 @@ void main() {
       expect(config.wsUrl, 'wss://example.com:9999/ws?token=test');
     });
 
+    test('launch uri without port uses scheme default port', () {
+      final config = AppConfig.fromLaunchUri(
+        'https://example.com?token=test',
+        fallback: const AppConfig(port: '19080'),
+      );
+
+      expect(config, isNotNull);
+      expect(config!.host, 'example.com');
+      expect(config.port, isEmpty);
+      expect(config.baseHttpUrl, 'https://example.com');
+      expect(config.wsUrl, 'wss://example.com/ws?token=test');
+    });
+
+    test('launch uri with http scheme defaults to port 80', () {
+      final config = AppConfig.fromLaunchUri(
+        'http://example.com?token=test',
+        fallback: const AppConfig(port: '19080'),
+      );
+
+      expect(config, isNotNull);
+      expect(config!.port, isEmpty);
+      expect(config.baseHttpUrl, 'http://example.com');
+      expect(config.wsUrl, 'ws://example.com/ws?token=test');
+    });
+
+    test('launch uri keeps explicit non-default backend port', () {
+      final config = AppConfig.fromLaunchUri(
+        'https://example.com:8443?token=test',
+        fallback: const AppConfig(port: '19080'),
+      );
+
+      expect(config, isNotNull);
+      expect(config!.port, '8443');
+      expect(config.baseHttpUrl, 'https://example.com:8443');
+      expect(config.wsUrl, 'wss://example.com:8443/ws?token=test');
+    });
+
     test('invalid port surfaces as a format error', () {
       const config = AppConfig(port: 'not-a-port');
 

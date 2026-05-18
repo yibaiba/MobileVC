@@ -248,8 +248,7 @@ class AppConfig {
     if (uri == null || uri.host.trim().isEmpty) {
       return null;
     }
-    final port =
-        uri.hasPort && uri.port > 0 ? uri.port.toString() : fallback.port;
+    final port = _launchUriPort(uri, fallback.port);
     final token = (uri.queryParameters['token'] ?? fallback.token).trim();
     final ice =
         (uri.queryParameters['ice'] ?? fallback.adbIceServersJson).trim();
@@ -283,4 +282,11 @@ class AppConfig {
 
   AdbIceConfig get _adbIceConfig =>
       AdbIceConfig(host: host, rawJson: adbIceServersJson);
+}
+
+String _launchUriPort(Uri uri, String fallbackPort) {
+  if (uri.hasPort && uri.port > 0) {
+    return uri.port.toString();
+  }
+  return secureTransportFromScheme(uri.scheme) == null ? fallbackPort : '';
 }
