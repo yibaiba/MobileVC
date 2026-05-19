@@ -19,6 +19,7 @@ const (
 	EventTypeAIStatus                 = "ai_status"
 	EventTypeRuntimePhase             = "runtime_phase"
 	EventTypeTaskSnapshot             = "task_snapshot"
+	EventTypeFileAccessConfigResult   = "file_access_config_result"
 	EventTypeFSListResult             = "fs_list_result"
 	EventTypeFSReadResult             = "fs_read_result"
 	EventTypeStepUpdate               = "step_update"
@@ -285,6 +286,11 @@ type FSListRequestEvent struct {
 type FSReadRequestEvent struct {
 	ClientEvent
 	Path string `json:"path,omitempty"`
+}
+
+type FileAccessConfigRequestEvent struct {
+	ClientEvent
+	TrustedRoots []string `json:"trustedRoots,omitempty"`
 }
 
 type ADBDevicesRequestEvent struct {
@@ -853,6 +859,11 @@ type FSReadResultEvent struct {
 	IsText   bool   `json:"isText"`
 }
 
+type FileAccessConfigResultEvent struct {
+	Event
+	TrustedRoots []string `json:"trustedRoots"`
+}
+
 type RuntimeInfoResultEvent struct {
 	Event
 	Query       string            `json:"query,omitempty"`
@@ -1095,6 +1106,13 @@ func NewFSReadResultEvent(sessionID, path, content string, size int64, lang, enc
 		Lang:     lang,
 		Encoding: encoding,
 		IsText:   isText,
+	}
+}
+
+func NewFileAccessConfigResultEvent(sessionID string, trustedRoots []string) FileAccessConfigResultEvent {
+	return FileAccessConfigResultEvent{
+		Event:        NewBaseEvent(EventTypeFileAccessConfigResult, sessionID),
+		TrustedRoots: append([]string(nil), trustedRoots...),
 	}
 }
 
