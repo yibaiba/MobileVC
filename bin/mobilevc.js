@@ -17,6 +17,8 @@ const CONFIG_PATH = path.join(STATE_DIR, 'config.json');
 const STATE_PATH = path.join(STATE_DIR, 'state.json');
 const DEFAULT_PORT = '8001';
 const DEFAULT_LANGUAGE = 'zh';
+const DEFAULT_RELAY_URL = 'ws://127.0.0.1:9000';
+const RELAY_PAIRING_EVENT_PREFIX = 'mobilevc-relay-pairing-';
 
 const PLATFORM_PACKAGES = {
   'darwin-arm64': '@justprove/mobilevc-server-darwin-arm64',
@@ -34,8 +36,8 @@ const MESSAGES = {
       '  mobilevc           交互式配置并启动 MobileVC 后端',
       '  mobilevc start     启动 MobileVC 后端（默认）',
       '  mobilevc start --public --origin https://example.com  启用公网安全模式',
-      '  mobilevc public https://example.com  保存并启动公网安全模式',
-      '  mobilevc public    使用已保存公网地址启动',
+      '  mobilevc public --relay wss://relay.example.com  保存并启动 Relay 公网模式',
+      '  mobilevc public    使用已保存 Relay，或本地开发 Relay',
       '  mobilevc restart   重启 MobileVC 后端',
       '  mobilevc stop      停止已保存的后端进程',
       '  mobilevc status    查看保存的状态和健康检查',
@@ -86,6 +88,11 @@ const MESSAGES = {
     homeNotWritable: (homePath) => `HOME 不可写：${homePath}`,
     authTokenMissing: '未配置 AUTH_TOKEN，请先运行 mobilevc config',
     publicOriginMissing: '公网模式需要 --origin <https://域名[:端口]> 或 ALLOWED_ORIGINS',
+    relayURLInvalid: (detail) => `Relay URL 无效：${detail}`,
+    relayPairingTimedOut: (filePath) => `Relay 配对信息未就绪，请检查日志：${filePath}`,
+    relayQrTitle: '扫码连接 MobileVC Relay',
+    relayQrHint: '二维码包含一次性配对 secret，请在过期前使用',
+    relayAccess: 'Relay 连接',
     aiCliMissing: '当前启动器未检测到可用的 Claude/Codex CLI；请确认 claude 或 codex 命令可在终端中直接执行。',
     portInUse: (port) => `端口 ${port} 已被其他进程占用`,
     startupFailed: '启动失败，请检查日志和 preflight 提示',
@@ -100,8 +107,8 @@ const MESSAGES = {
       '  mobilevc           Configure interactively and start the MobileVC backend',
       '  mobilevc start     Start the MobileVC backend (default)',
       '  mobilevc start --public --origin https://example.com  Enable public-safe mode',
-      '  mobilevc public https://example.com  Save and start public-safe mode',
-      '  mobilevc public    Start with the saved public origin',
+      '  mobilevc public --relay wss://relay.example.com  Save and start Relay public mode',
+      '  mobilevc public    Start with the saved Relay, or the local development Relay',
       '  mobilevc restart   Restart the MobileVC backend',
       '  mobilevc stop      Stop the saved backend process',
       '  mobilevc status    Show saved launcher state and health',
@@ -152,6 +159,11 @@ const MESSAGES = {
     homeNotWritable: (homePath) => `HOME is not writable: ${homePath}`,
     authTokenMissing: 'AUTH_TOKEN is missing. Run mobilevc config first.',
     publicOriginMissing: 'Public mode requires --origin <https://host[:port]> or ALLOWED_ORIGINS.',
+    relayURLInvalid: (detail) => `Invalid relay URL: ${detail}`,
+    relayPairingTimedOut: (filePath) => `Relay pairing data was not ready. Check the log: ${filePath}`,
+    relayQrTitle: 'Scan to connect MobileVC Relay',
+    relayQrHint: 'The QR contains a one-time pairing secret. Use it before it expires.',
+    relayAccess: 'Relay access',
     aiCliMissing: 'The launcher could not find Claude/Codex CLI. Make sure `claude` or `codex` runs directly in your terminal.',
     portInUse: (port) => `Port ${port} is already in use`,
     startupFailed: 'Startup failed. Check the log and preflight output.',
@@ -214,7 +226,7 @@ function parseInvocation(args) {
   const options = parseOptions(optionArgs);
   if (command === 'public' && optionArgs[0] && !optionArgs[0].startsWith('-')) {
     options.public = true;
-    options.origins.push(optionArgs[0]);
+    options.relay = optionArgs[0];
   }
   if (!hasExplicitCommand) {
     options.guided = true;
@@ -223,13 +235,21 @@ function parseInvocation(args) {
 }
 
 function parseOptions(args) {
-  const options = { help: false, follow: false, guided: false, public: false, origins: [] };
+  const options = { help: false, follow: false, guided: false, public: false, origins: [], relay: '' };
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];
     if (arg === '--help' || arg === '-h') options.help = true;
     else if (arg === '--follow' || arg === '-f') options.follow = true;
     else if (arg === '--public') options.public = true;
-    else if (arg === '--origin') {
+    else if (arg === '--relay') {
+      i += 1;
+      if (!args[i]) {
+        throw new Error('--relay requires a value');
+      }
+      options.relay = args[i];
+    } else if (arg.startsWith('--relay=')) {
+      options.relay = arg.slice('--relay='.length);
+    } else if (arg === '--origin') {
       i += 1;
       if (!args[i]) {
         throw new Error('--origin requires a value');
@@ -280,10 +300,13 @@ async function runStart(options = {}) {
     config = { ...config, publicOrigins: origins };
     writeJson(CONFIG_PATH, config);
   }
-  const publicAccess = await buildPublicAccessConfig(options, config.port);
+  const relayAccess = buildRelayAccessConfig(config, options);
+  const publicAccess = relayAccess.enabled
+    ? { enabled: false, ok: true, env: {}, origins: [] }
+    : await buildPublicAccessConfig(options, config.port);
   const existingState = readJson(STATE_PATH, null);
   if (existingState?.pid && isPidAlive(existingState.pid)) {
-    if (isStateConfigMatch(existingState, config, publicAccess)) {
+    if (isStateConfigMatch(existingState, config, publicAccess, relayAccess)) {
       console.log(message(language, 'alreadyRunning', existingState.pid, existingState.port));
       if (options.guided) {
         await printLanQr(language, existingState.port, existingState.authToken, process.cwd(), publicAccess.enabled);
@@ -305,6 +328,7 @@ async function runStart(options = {}) {
   }
 
   const logPath = path.join(LOG_DIR, `mobilevc-${timestampForFile()}.log`);
+  const pairingEventPath = relayAccess.enabled ? createRelayPairingEventPath() : '';
   fs.writeFileSync(logPath, '', { mode: 0o600 });
   try {
     fs.chmodSync(logPath, 0o600);
@@ -316,7 +340,11 @@ async function runStart(options = {}) {
     AUTH_TOKEN: String(config.authToken),
     RUNTIME_WORKSPACE_ROOT: process.cwd(),
     ...publicAccess.env,
+    ...relayAccess.env,
   };
+  if (relayAccess.enabled) {
+    env.RELAY_PAIRING_EVENT_PATH = pairingEventPath;
+  }
 
   fs.appendFileSync(logPath, `launcher starting binary=${binaryInfo.binaryPath} target=${platformTarget}\n`);
   const logFd = fs.openSync(logPath, 'a');
@@ -338,7 +366,19 @@ async function runStart(options = {}) {
       await waitForExit(child.pid, 2000);
     }
     clearState();
+    removeRelayPairingEventFile(pairingEventPath);
     throw new Error(formatStartupFailure(language, startup, logPath));
+  }
+
+  const pairing = relayAccess.enabled ? await waitForRelayPairing(pairingEventPath, 10000) : null;
+  if (relayAccess.enabled && !pairing) {
+    if (child.pid && isPidAlive(child.pid)) {
+      killProcessGroup(child.pid, 'SIGTERM');
+      await waitForExit(child.pid, 2000);
+    }
+    clearState();
+    removeRelayPairingEventFile(pairingEventPath);
+    throw new Error(message(language, 'relayPairingTimedOut', logPath));
   }
 
   const state = {
@@ -347,6 +387,8 @@ async function runStart(options = {}) {
     startedAt: new Date().toISOString(),
     serverVersion: formatVersionInfo(startup.versionInfo),
     serverVersionRaw: startup.versionInfo,
+    relayMode: relayAccess.enabled,
+    relayUrl: relayAccess.url || '',
   };
   writeJson(STATE_PATH, state);
 
@@ -357,7 +399,11 @@ async function runStart(options = {}) {
   if (!await checkHealth(state.port)) {
     throw new Error(message(language, 'startupFailed'));
   }
-  await printLanQr(language, state.port, state.authToken, state.cwd || process.cwd(), publicAccess.enabled);
+  if (relayAccess.enabled) {
+    printRelayQr(language, pairing);
+  } else {
+    await printLanQr(language, state.port, state.authToken, state.cwd || process.cwd(), publicAccess.enabled);
+  }
 }
 
 async function runPublic(options = {}) {
@@ -369,14 +415,10 @@ async function runPublic(options = {}) {
     await runSetup(true);
     config = readJson(CONFIG_PATH, null);
   }
-  const origins = normalizeOriginList([
-    ...(config.publicOrigins || []),
-    ...(options.origins || []),
-  ]);
-  if (origins.length > 0) {
-    writeJson(CONFIG_PATH, { ...config, publicOrigins: origins });
-  }
-  await runStart({ ...options, public: true, origins });
+  const relayUrl = resolveRelayURL(config, options);
+  assertValidRelayURL(relayUrl);
+  writeJson(CONFIG_PATH, { ...config, relayUrl });
+  await runStart({ ...options, public: false, relay: relayUrl });
 }
 
 async function runStatus() {
@@ -619,6 +661,149 @@ async function buildPublicAccessConfig(options, port) {
     },
     origins,
   };
+}
+
+function buildRelayAccessConfig(config, options) {
+  const url = String(options.relay || '').trim();
+  if (!url) {
+    return { enabled: false, env: {}, url: '' };
+  }
+  assertValidRelayURL(url);
+  return {
+    enabled: true,
+    url,
+    env: {
+      RELAY_MODE: 'true',
+      RELAY_URL: url,
+    },
+  };
+}
+
+function resolveRelayURL(config, options) {
+  return String(options.relay || config.relayUrl || DEFAULT_RELAY_URL).trim();
+}
+
+function assertValidRelayURL(raw) {
+  const url = new URL(String(raw || '').trim());
+  if (url.protocol === 'wss:') {
+    validateRelayURLShape(url);
+    return;
+  }
+  if (url.protocol !== 'ws:') {
+    throw new Error(message(DEFAULT_LANGUAGE, 'relayURLInvalid', 'must use ws:// or wss://'));
+  }
+  validateRelayURLShape(url);
+  if (!isDevelopmentRelayHost(url.hostname)) {
+    throw new Error(message(DEFAULT_LANGUAGE, 'relayURLInvalid', 'ws:// is only allowed for loopback or LAN hosts'));
+  }
+}
+
+function validateRelayURLShape(url) {
+  if (!url.hostname || url.username || url.password) {
+    throw new Error(message(DEFAULT_LANGUAGE, 'relayURLInvalid', 'expected scheme://host[:port]'));
+  }
+  if (url.pathname !== '/' || url.search || url.hash) {
+    throw new Error(message(DEFAULT_LANGUAGE, 'relayURLInvalid', 'path, query, and fragment are not allowed'));
+  }
+}
+
+function isDevelopmentRelayHost(host) {
+  const normalized = String(host || '').toLowerCase();
+  if (normalized === 'localhost') {
+    return true;
+  }
+  if (net.isIP(normalized) === 0) {
+    return false;
+  }
+  if (normalized === '127.0.0.1' || normalized === '::1') {
+    return true;
+  }
+  return isPrivateIPv4(normalized) || normalized.startsWith('fc') || normalized.startsWith('fd') || normalized.startsWith('fe80');
+}
+
+function isPrivateIPv4(host) {
+  const parts = host.split('.').map((part) => Number(part));
+  if (parts.length !== 4 || parts.some((part) => Number.isNaN(part))) {
+    return false;
+  }
+  return parts[0] === 10 ||
+    (parts[0] === 192 && parts[1] === 168) ||
+    (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31);
+}
+
+function createRelayPairingEventPath() {
+  const suffix = `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return path.join(STATE_DIR, `${RELAY_PAIRING_EVENT_PREFIX}${suffix}.json`);
+}
+
+function waitForRelayPairing(eventPath, timeoutMs) {
+  return new Promise((resolve) => {
+    const started = Date.now();
+    const timer = setInterval(() => {
+      const pairing = readRelayPairingEventFile(eventPath);
+      if (pairing) {
+        clearInterval(timer);
+        removeRelayPairingEventFile(eventPath);
+        resolve(pairing);
+        return;
+      }
+      if (Date.now() - started >= timeoutMs) {
+        clearInterval(timer);
+        resolve(null);
+      }
+    }, 250);
+  });
+}
+
+function readRelayPairingEventFile(eventPath) {
+  if (!eventPath || !fs.existsSync(eventPath)) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(fs.readFileSync(eventPath, 'utf8'));
+    if (parsed.type === 'mobilevc.relay.pairing_ready') {
+      return parsed;
+    }
+  } catch (_) {
+    return null;
+  }
+  return null;
+}
+
+function removeRelayPairingEventFile(eventPath) {
+  if (!eventPath) {
+    return;
+  }
+  try {
+    fs.unlinkSync(eventPath);
+  } catch (_) {}
+}
+
+function printRelayQr(language, pairing) {
+  const uri = buildRelayPairingUri(pairing);
+  console.log('');
+  console.log(`${message(language, 'relayAccess')}: ${redactRelaySecret(uri)}`);
+  console.log('');
+  console.log(message(language, 'relayQrTitle'));
+  renderTerminalQr(uri);
+  console.log(message(language, 'relayQrHint'));
+}
+
+function buildRelayPairingUri(pairing) {
+  const uri = new URL('mobilevc://relay/v1');
+  uri.searchParams.set('relay', pairing.relayUrl);
+  uri.searchParams.set('session', pairing.sessionId);
+  uri.searchParams.set('secret', pairing.pairingSecret);
+  uri.searchParams.set('exp', String(pairing.expiresAt));
+  return uri.toString();
+}
+
+function redactRelaySecret(rawUri) {
+  const uri = new URL(rawUri);
+  if (uri.searchParams.has('secret')) {
+    uri.searchParams.set('secret', '<redacted>');
+  }
+  return uri.toString();
 }
 
 async function localBrowserOrigins(port) {
@@ -1049,11 +1234,18 @@ function buildLaunchUrl(host, port, authToken = '', cwd = '') {
   return url.toString();
 }
 
-function isStateConfigMatch(state, config, publicAccess = { enabled: false, origins: [] }) {
+function isStateConfigMatch(
+  state,
+  config,
+  publicAccess = { enabled: false, origins: [] },
+  relayAccess = { enabled: false, url: '' },
+) {
   return String(state?.port || '') === String(config?.port || '') &&
     String(state?.authToken || '') === String(config?.authToken || '') &&
     Boolean(state?.publicExposureMode) === Boolean(publicAccess.enabled) &&
-    sameStringList(state?.allowedOrigins || [], publicAccess.origins || []);
+    sameStringList(state?.allowedOrigins || [], publicAccess.origins || []) &&
+    Boolean(state?.relayMode) === Boolean(relayAccess.enabled) &&
+    String(state?.relayUrl || '') === String(relayAccess.url || '');
 }
 
 function sameStringList(left, right) {
@@ -1259,9 +1451,13 @@ if (require.main === module) {
   module.exports = {
     buildLaunchUrl,
     buildPublicAccessConfig,
+    assertValidRelayURL,
+    buildRelayPairingUri,
+    readRelayPairingEventFile,
     formatLaunchUrlForDisplay,
     isPortOccupied,
     normalizeOrigin,
+    removeRelayPairingEventFile,
     parseInvocation,
     resolveBinaryInfo,
     resolveBundledPackageRoot,

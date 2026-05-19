@@ -7,6 +7,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../core/config/app_config.dart';
 import '../../core/config/app_connection_environment.dart';
+import '../../core/config/relay_config.dart';
 import '../../data/models/events.dart';
 import '../../data/models/runtime_meta.dart';
 import '../../data/models/session_models.dart';
@@ -1246,6 +1247,7 @@ class SessionController extends ChangeNotifier {
       );
       _pushSystem('error', '保存连接配置失败：$error');
     }
+    _sendFileAccessConfig();
     notifyListeners();
   }
 
@@ -1679,7 +1681,7 @@ class SessionController extends ChangeNotifier {
       return;
     }
     _cancelReconnectTimer();
-    if (_isInvalidLoopbackHostForMobile()) {
+    if (!_config.isRelayMode && _isInvalidLoopbackHostForMobile()) {
       _connectionStage = SessionConnectionStage.failed;
       _connecting = false;
       _connected = false;
@@ -1701,11 +1703,15 @@ class SessionController extends ChangeNotifier {
     _syncDerivedState();
     notifyListeners();
     try {
-      await _service.connect(
-        _config.wsUrlFor(
-          secureTransport: defaultSecureBackendTransport ? true : null,
-        ),
-      );
+      if (_config.isRelayMode) {
+        await _connectRelay();
+      } else {
+        await _service.connect(
+          _config.wsUrlFor(
+            secureTransport: defaultSecureBackendTransport ? true : null,
+          ),
+        );
+      }
       unawaited(_saveConnectionIntent(true));
       _connected = true;
       _reconnectAttempt = 0;
@@ -1724,6 +1730,7 @@ class SessionController extends ChangeNotifier {
       _claudeModelCatalogUnavailable = false;
       _claudeModelCatalog.clear();
       await switchWorkingDirectory(_config.cwd);
+      _sendFileAccessConfig();
       requestRuntimeInfo('context');
       requestSkillCatalog();
       requestMemoryList();
@@ -1774,6 +1781,27 @@ class SessionController extends ChangeNotifier {
       _syncDerivedState();
       notifyListeners();
     }
+  }
+
+  Future<void> _connectRelay() async {
+    final relayUrl = _config.relayUrl.trim();
+    final sessionId = _config.relaySessionId.trim();
+    final pairingSecret = _config.relayPairingSecret.trim();
+    if (relayUrl.isEmpty || sessionId.isEmpty || pairingSecret.isEmpty) {
+      throw const FormatException('Relay 配对信息不完整，请重新扫码');
+    }
+    validateRelayUrl(relayUrl);
+    await _service.connectRelay(
+      relayUrl: relayUrl,
+      sessionId: sessionId,
+      pairingSecret: pairingSecret,
+    );
+    _config = _config.copyWith(
+      relaySessionId: '',
+      relayPairingSecret: '',
+      relayPairingExpiresAt: 0,
+    );
+    unawaited(_persistCurrentConfig());
   }
 
   Future<void> disconnect() async {
@@ -1873,6 +1901,16 @@ class SessionController extends ChangeNotifier {
     _resetActionNeededTracking();
     _syncDerivedState();
     notifyListeners();
+  }
+
+  void _sendFileAccessConfig() {
+    if (!_connected) {
+      return;
+    }
+    _service.send({
+      'action': 'file_access_config',
+      'trustedRoots': _config.trustedFileRoots,
+    });
   }
 
   void _handleUnexpectedSocketDisconnect(String message) {

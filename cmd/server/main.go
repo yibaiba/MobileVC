@@ -1,10 +1,10 @@
 package main
 
 import (
+	"context"
 	"embed"
 	"fmt"
 	"io/fs"
-	"mime"
 	"net"
 	"net/http"
 	"os"
@@ -13,9 +13,11 @@ import (
 
 	"mobilevc/internal/config"
 	"mobilevc/internal/data"
+	"mobilevc/internal/fileaccess"
 	"mobilevc/internal/gateway"
 	"mobilevc/internal/logx"
 	"mobilevc/internal/push"
+	"mobilevc/internal/relayclient"
 	"mobilevc/internal/tts"
 )
 
@@ -35,7 +37,20 @@ var (
 func main() {
 	startedAt := time.Now()
 	defer logx.Recover("bootstrap", "server startup panic")
+	cfg, filePolicy, sessionStore := bootstrap()
+	summary := cfg.Summary()
+	addr := ":" + cfg.Port
 
+	logConfigSummary(summary, cfg.AuthToken)
+	pushService := initPushService()
+	wsHandler := initWebSocketHandler(cfg, sessionStore, filePolicy, pushService)
+	startRelayClient(cfg, wsHandler)
+	ttsHandler := initTTSHandler(cfg)
+	mux := buildMux(cfg, wsHandler, ttsHandler, filePolicy)
+	startHTTPServer(addr, mux, startedAt)
+}
+
+func bootstrap() (config.Config, fileaccess.Policy, *data.FileStore) {
 	logx.Info("bootstrap", "========================================")
 	logx.Info("bootstrap", "%s backend %s", appName, version)
 	logx.Info("bootstrap", "build metadata: commit=%s buildDate=%s", commit, buildDate)
@@ -48,15 +63,30 @@ func main() {
 		logx.Error("bootstrap", "load configuration failed: %v", err)
 		panic(err)
 	}
+	filePolicy, err := fileaccess.NewPolicy(cfg.Runtime.WorkspaceRoot, cfg.Runtime.TrustedFileRoots)
+	if err != nil {
+		logx.Error("bootstrap", "initialize file access policy failed: %v", err)
+		panic(err)
+	}
 
-	summary := cfg.Summary()
-	addr := ":" + cfg.Port
+	logx.Info("bootstrap", "Initializing session store")
+	sessionStore, err := data.NewFileStore("")
+	if err != nil {
+		logx.Error("bootstrap", "initialize session store failed: %v", err)
+		panic(err)
+	}
+	logx.Info("bootstrap", "Session store ready: driver=file dir=%s", sessionStore.BaseDir())
+	return cfg, filePolicy, sessionStore
+}
 
-	logx.Info("bootstrap", "Configuration summary: port=%s authToken=%s publicExposureMode=%v allowedOrigins=%d runtime.defaultCommand=%s runtime.defaultMode=%s runtime.debug=%v workspaceRoot=%s projection.enhanced=%v projection.step=%v projection.diff=%v projection.prompt=%v tts.enabled=%v tts.provider=%s tts.url=%s tts.timeout=%ds tts.maxTextLength=%d tts.format=%s",
+func logConfigSummary(summary config.Summary, authToken string) {
+	logx.Info("bootstrap", "Configuration summary: port=%s authToken=%s publicExposureMode=%v allowedOrigins=%d relayMode=%v relayURL=%s runtime.defaultCommand=%s runtime.defaultMode=%s runtime.debug=%v workspaceRoot=%s projection.enhanced=%v projection.step=%v projection.diff=%v projection.prompt=%v tts.enabled=%v tts.provider=%s tts.url=%s tts.timeout=%ds tts.maxTextLength=%d tts.format=%s",
 		summary.Port,
-		logx.AuthTokenSummary(cfg.AuthToken),
+		logx.AuthTokenSummary(authToken),
 		summary.PublicExposureMode,
 		len(summary.AllowedOrigins),
+		summary.RelayMode,
+		fallback(summary.RelayURL, "-"),
 		summary.DefaultCommand,
 		summary.DefaultMode,
 		summary.Debug,
@@ -72,15 +102,9 @@ func main() {
 		summary.TTSMaxTextLength,
 		summary.TTSDefaultFormat,
 	)
+}
 
-	logx.Info("bootstrap", "Initializing session store")
-	sessionStore, err := data.NewFileStore("")
-	if err != nil {
-		logx.Error("bootstrap", "initialize session store failed: %v", err)
-		panic(err)
-	}
-	logx.Info("bootstrap", "Session store ready: driver=file dir=%s", sessionStore.BaseDir())
-
+func initPushService() push.Service {
 	logx.Info("bootstrap", "Initializing push service")
 	var pushService push.Service
 	apnsAuthKeyPath := os.Getenv("APNS_AUTH_KEY_PATH")
@@ -108,16 +132,44 @@ func main() {
 		logx.Info("bootstrap", "APNs not configured, push notifications disabled")
 		pushService = &push.NoopService{}
 	}
+	return pushService
+}
 
+func initWebSocketHandler(cfg config.Config, sessionStore *data.FileStore, filePolicy fileaccess.Policy, pushService push.Service) *gateway.Handler {
 	logx.Info("bootstrap", "Preparing websocket handler")
 	wsHandler := gateway.NewHandler(cfg.AuthToken, sessionStore)
 	if err := wsHandler.ConfigurePublicAccess(cfg.Security.PublicExposureMode, cfg.Security.AllowedOrigins); err != nil {
 		logx.Error("bootstrap", "configure public access failed: %v", err)
 		panic(err)
 	}
+	wsHandler.FilePolicy = filePolicy
 	wsHandler.PushService = pushService
 	logx.Info("bootstrap", "WebSocket handler ready")
+	return wsHandler
+}
 
+func startRelayClient(cfg config.Config, wsHandler *gateway.Handler) {
+	if !cfg.Relay.Enabled {
+		return
+	}
+	go func() {
+		err := relayclient.Run(context.Background(), relayConfig(cfg), wsHandler, relayclient.EmitPairingFile)
+		if err != nil {
+			logx.Error("relay", "relay client stopped: %v", err)
+		}
+	}()
+}
+
+func relayConfig(cfg config.Config) relayclient.Config {
+	return relayclient.Config{
+		RelayURL:         cfg.Relay.URL,
+		PairingTTL:       cfg.Relay.PairingTTL,
+		AgentGracePeriod: cfg.Relay.AgentGracePeriod,
+		PairingEventPath: cfg.Relay.PairingEventPath,
+	}
+}
+
+func initTTSHandler(cfg config.Config) *tts.HTTPHandler {
 	var ttsHandler *tts.HTTPHandler
 	if cfg.TTS.Enabled {
 		logx.Info("bootstrap", "Preparing TTS handler")
@@ -128,7 +180,10 @@ func main() {
 	} else {
 		logx.Info("bootstrap", "TTS handler disabled")
 	}
+	return ttsHandler
+}
 
+func buildMux(cfg config.Config, wsHandler *gateway.Handler, ttsHandler *tts.HTTPHandler, filePolicy fileaccess.Policy) *http.ServeMux {
 	staticFS, err := fs.Sub(webAssets, "web")
 	if err != nil {
 		logx.Error("bootstrap", "prepare embedded web assets failed: %v", err)
@@ -147,36 +202,7 @@ func main() {
 		_, _ = fmt.Fprintf(w, "{\"version\":%q,\"commit\":%q,\"buildDate\":%q}", version, commit, buildDate)
 	})
 	mux.HandleFunc("/download", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Get("token") != cfg.AuthToken {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-		target := filepath.Clean(r.URL.Query().Get("path"))
-		if target == "" || target == "." {
-			http.Error(w, "path is required", http.StatusBadRequest)
-			return
-		}
-		absPath, err := filepath.Abs(target)
-		if err != nil {
-			http.Error(w, "invalid path", http.StatusBadRequest)
-			return
-		}
-		info, err := os.Stat(absPath)
-		if err != nil {
-			http.Error(w, "file not found", http.StatusNotFound)
-			return
-		}
-		if info.IsDir() {
-			http.Error(w, "path is a directory", http.StatusBadRequest)
-			return
-		}
-		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filepath.Base(absPath)))
-		if contentType := mime.TypeByExtension(filepath.Ext(absPath)); contentType != "" {
-			w.Header().Set("Content-Type", contentType)
-		} else {
-			w.Header().Set("Content-Type", "application/octet-stream")
-		}
-		http.ServeFile(w, r, absPath)
+		serveDownload(w, r, cfg.AuthToken, filePolicy)
 	})
 	if ttsHandler != nil {
 		mux.HandleFunc("/api/tts/synthesize", ttsHandler.HandleSynthesize)
@@ -194,7 +220,10 @@ func main() {
 		}
 		http.FileServer(http.FS(staticFS)).ServeHTTP(w, r)
 	})
+	return mux
+}
 
+func startHTTPServer(addr string, mux *http.ServeMux, startedAt time.Time) {
 	server := &http.Server{
 		Addr:    addr,
 		Handler: mux,
@@ -222,11 +251,4 @@ func main() {
 		logx.Error("bootstrap", "HTTP server stopped unexpectedly: %v", err)
 		panic(fmt.Errorf("serve http: %w", err))
 	}
-}
-
-func fallback(value, defaultValue string) string {
-	if value == "" {
-		return defaultValue
-	}
-	return value
 }

@@ -1,0 +1,273 @@
+package relay
+
+import (
+	"net/http"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gorilla/websocket"
+)
+
+func TestRelayPairingAndOpaqueForwarding(t *testing.T) {
+	server := newTestRelayServer(t)
+	defer server.Close()
+
+	sessionID := "rs_test"
+	pairingSecret := "pair-secret-128-bit-minimum"
+	reconnectSecret := "agent-secret-128-bit-minimum"
+	agent := dialRelay(t, server.URL, "/relay/agent")
+	defer agent.Close()
+	registerAgent(t, agent, sessionID, pairingSecret, reconnectSecret, time.Now().Add(time.Minute))
+
+	client := dialRelay(t, server.URL, "/relay/client")
+	defer client.Close()
+	if err := client.WriteJSON(ClientPairFrame{
+		Type: TypeClientPair, Version: Version, SessionID: sessionID, PairingSecret: pairingSecret,
+	}); err != nil {
+		t.Fatalf("pair client: %v", err)
+	}
+	var paired ClientPairedFrame
+	if err := client.ReadJSON(&paired); err != nil {
+		t.Fatalf("read paired: %v", err)
+	}
+
+	payload := []byte(`{"action":"unknown_business_action","secret":"opaque"}`)
+	env := testEnvelope(sessionID, paired.ClientID, DirectionClientToAgent, payload)
+	if err := client.WriteJSON(env); err != nil {
+		t.Fatalf("forward from client: %v", err)
+	}
+	readAttached(t, agent, paired.ClientID)
+	var got ForwardEnvelope
+	if err := agent.ReadJSON(&got); err != nil {
+		t.Fatalf("agent read forward: %v", err)
+	}
+	if got.Payload != env.Payload {
+		t.Fatalf("payload changed: got %q want %q", got.Payload, env.Payload)
+	}
+
+	agentEnv := testEnvelope(sessionID, paired.ClientID, DirectionAgentToClient, []byte(`{"event":"opaque_agent_event"}`))
+	if err := agent.WriteJSON(agentEnv); err != nil {
+		t.Fatalf("forward from agent: %v", err)
+	}
+	var clientGot ForwardEnvelope
+	if err := client.ReadJSON(&clientGot); err != nil {
+		t.Fatalf("client read forward: %v", err)
+	}
+	if clientGot.Payload != agentEnv.Payload {
+		t.Fatalf("agent payload changed: got %q want %q", clientGot.Payload, agentEnv.Payload)
+	}
+}
+
+func TestRelayPairingSecretConsumed(t *testing.T) {
+	server := newTestRelayServer(t)
+	defer server.Close()
+
+	sessionID := "rs_reuse"
+	pairingSecret := "pair-secret-128-bit-minimum"
+	agent := dialRelay(t, server.URL, "/relay/agent")
+	defer agent.Close()
+	registerAgent(t, agent, sessionID, pairingSecret, "reconnect-secret", time.Now().Add(time.Minute))
+
+	first := dialRelay(t, server.URL, "/relay/client")
+	defer first.Close()
+	pairClient(t, first, sessionID, pairingSecret)
+	second := dialRelay(t, server.URL, "/relay/client")
+	defer second.Close()
+	if err := second.WriteJSON(ClientPairFrame{
+		Type: TypeClientPair, Version: Version, SessionID: sessionID, PairingSecret: pairingSecret,
+	}); err != nil {
+		t.Fatalf("pair second client: %v", err)
+	}
+	var errFrame ErrorFrame
+	if err := second.ReadJSON(&errFrame); err != nil {
+		t.Fatalf("read second pair error: %v", err)
+	}
+	if errFrame.Code != CodePairingRejected || errFrame.Message != "pairing rejected" {
+		t.Fatalf("unexpected error frame: %#v", errFrame)
+	}
+	if errFrame.Type != TypeRelayError || errFrame.Version != Version {
+		t.Fatalf("unexpected error frame metadata: %#v", errFrame)
+	}
+}
+
+func TestRelayRejectsForwardWithWrongClientID(t *testing.T) {
+	server := newTestRelayServer(t)
+	defer server.Close()
+
+	sessionID := "rs_wrong_client"
+	secret := "pair-secret-128-bit-minimum"
+	agent := dialRelay(t, server.URL, "/relay/agent")
+	defer agent.Close()
+	registerAgent(t, agent, sessionID, secret, "reconnect-secret", time.Now().Add(time.Minute))
+	client := dialRelay(t, server.URL, "/relay/client")
+	defer client.Close()
+	pairClient(t, client, sessionID, secret)
+
+	env := testEnvelope(sessionID, "rc_wrong", DirectionClientToAgent, []byte(`{"action":"x"}`))
+	if err := client.WriteJSON(env); err != nil {
+		t.Fatalf("send wrong client id forward: %v", err)
+	}
+	var errFrame ErrorFrame
+	if err := client.ReadJSON(&errFrame); err != nil {
+		t.Fatalf("read wrong client id error: %v", err)
+	}
+	if errFrame.Code != CodeProtocolError {
+		t.Fatalf("unexpected error frame: %#v", errFrame)
+	}
+}
+
+func TestRelayRejectsSessionIDReuseAfterAgentDisconnect(t *testing.T) {
+	server := newTestRelayServer(t)
+	defer server.Close()
+
+	sessionID := "rs_reuse_session"
+	first := dialRelay(t, server.URL, "/relay/agent")
+	registerAgent(t, first, sessionID, "pair-secret-one", "reconnect-secret-one", time.Now().Add(time.Minute))
+	_ = first.Close()
+	time.Sleep(20 * time.Millisecond)
+
+	second := dialRelay(t, server.URL, "/relay/agent")
+	defer second.Close()
+	if err := second.WriteJSON(AgentRegisterFrame{
+		Type:                     TypeAgentRegister,
+		Version:                  Version,
+		SessionID:                sessionID,
+		PairingSecretHash:        SecretHash("pair-secret-two"),
+		AgentReconnectSecretHash: SecretHash("reconnect-secret-two"),
+		PairingExpiresAt:         time.Now().Add(time.Minute).Unix(),
+	}); err != nil {
+		t.Fatalf("register reused session id: %v", err)
+	}
+	var errFrame ErrorFrame
+	if err := second.ReadJSON(&errFrame); err != nil {
+		t.Fatalf("read reused session error: %v", err)
+	}
+	if errFrame.Code != CodeUnauthorized {
+		t.Fatalf("unexpected error frame: %#v", errFrame)
+	}
+}
+
+func TestRelayRejectsOversizedDecodedPayload(t *testing.T) {
+	server := newTestRelayServer(t)
+	defer server.Close()
+
+	sessionID := "rs_large"
+	secret := "pair-secret-128-bit-minimum"
+	agent := dialRelay(t, server.URL, "/relay/agent")
+	defer agent.Close()
+	registerAgent(t, agent, sessionID, secret, "reconnect-secret", time.Now().Add(time.Minute))
+	client := dialRelay(t, server.URL, "/relay/client")
+	defer client.Close()
+	clientID := pairClient(t, client, sessionID, secret)
+
+	payload := strings.Repeat("x", MaxPayloadBytes+1)
+	if err := client.WriteJSON(testEnvelope(sessionID, clientID, DirectionClientToAgent, []byte(payload))); err != nil {
+		t.Fatalf("send oversized forward: %v", err)
+	}
+	var errFrame ErrorFrame
+	if err := client.ReadJSON(&errFrame); err != nil {
+		t.Fatalf("read oversized error: %v", err)
+	}
+	if errFrame.Code != CodePayloadTooLarge {
+		t.Fatalf("unexpected error frame: %#v", errFrame)
+	}
+}
+
+func TestRelayAllowsAgentReconnectWithinGrace(t *testing.T) {
+	server := newTestRelayServer(t)
+	defer server.Close()
+
+	sessionID := "rs_reconnect"
+	secret := "pair-secret-128-bit-minimum"
+	reconnectSecret := "agent-secret-128-bit-minimum"
+	agent := dialRelay(t, server.URL, "/relay/agent")
+	registerAgent(t, agent, sessionID, secret, reconnectSecret, time.Now().Add(time.Minute))
+	_ = agent.Close()
+	time.Sleep(20 * time.Millisecond)
+
+	reconnected := dialRelay(t, server.URL, "/relay/agent")
+	defer reconnected.Close()
+	if err := reconnected.WriteJSON(AgentReconnectFrame{
+		Type:                 TypeAgentReconnect,
+		Version:              Version,
+		SessionID:            sessionID,
+		AgentReconnectSecret: reconnectSecret,
+	}); err != nil {
+		t.Fatalf("reconnect agent: %v", err)
+	}
+	var registered AgentRegisteredFrame
+	if err := reconnected.ReadJSON(&registered); err != nil {
+		t.Fatalf("read reconnect registered: %v", err)
+	}
+	if registered.SessionID != sessionID {
+		t.Fatalf("reconnected session: got %q want %q", registered.SessionID, sessionID)
+	}
+}
+
+func TestRelayRejectsPerIPConnectionCapacity(t *testing.T) {
+	server := newLimitedTestRelayServer(t, Config{MaxConnsPerIP: 1})
+	defer server.Close()
+
+	first := dialRelay(t, server.URL, "/relay/agent")
+	defer first.Close()
+	_, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http")+"/relay/agent", nil)
+	if err == nil {
+		t.Fatal("expected second connection to be rejected")
+	}
+}
+
+func TestRelayUsesTrustedForwardedIPForConnectionCapacity(t *testing.T) {
+	server := newLimitedTestRelayServer(t, Config{
+		MaxConnsPerIP:     1,
+		TrustedProxyCIDRs: "127.0.0.1/32",
+	})
+	defer server.Close()
+
+	first := dialRelayWithHeader(t, server.URL, "/relay/agent", http.Header{
+		"X-Forwarded-For": []string{"198.51.100.10"},
+	})
+	defer first.Close()
+	second := dialRelayWithHeader(t, server.URL, "/relay/agent", http.Header{
+		"X-Forwarded-For": []string{"198.51.100.11"},
+	})
+	defer second.Close()
+}
+
+func TestRelayIgnoresForwardedIPWithoutTrustedProxy(t *testing.T) {
+	server := newLimitedTestRelayServer(t, Config{MaxConnsPerIP: 1})
+	defer server.Close()
+
+	first := dialRelayWithHeader(t, server.URL, "/relay/agent", http.Header{
+		"X-Forwarded-For": []string{"198.51.100.10"},
+	})
+	defer first.Close()
+	_, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http")+"/relay/agent", http.Header{
+		"X-Forwarded-For": []string{"198.51.100.11"},
+	})
+	if err == nil {
+		t.Fatal("expected untrusted forwarded IP to be ignored for capacity")
+	}
+}
+
+func TestValidateRelayURL(t *testing.T) {
+	valid := []string{
+		"wss://relay.example.com",
+		"ws://127.0.0.1:9000",
+		"ws://localhost:9000",
+		"ws://192.168.1.10:9000",
+		"ws://10.0.0.5:9000",
+		"ws://172.16.0.5:9000",
+	}
+	for _, raw := range valid {
+		if err := ValidateRelayURL(raw); err != nil {
+			t.Fatalf("ValidateRelayURL(%q) failed: %v", raw, err)
+		}
+	}
+	invalid := []string{"http://relay.example.com", "https://relay.example.com", "ws://relay.example.com"}
+	for _, raw := range invalid {
+		if err := ValidateRelayURL(raw); err == nil {
+			t.Fatalf("ValidateRelayURL(%q) should fail", raw)
+		}
+	}
+}

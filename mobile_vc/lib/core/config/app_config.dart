@@ -3,6 +3,7 @@ import 'app_config_engine_models.dart';
 import 'app_connection_endpoint.dart';
 import 'app_connection_environment.dart';
 import 'app_connection_urls.dart';
+import 'relay_config.dart';
 
 class AppConfig {
   static const String adbIcePort = AdbIceConfig.port;
@@ -22,6 +23,12 @@ class AppConfig {
     this.fastMode = false,
     this.adbIceServersJson = '',
     this.secureTransport,
+    this.trustedFileRoots = const <String>[],
+    this.connectionMode = 'direct',
+    this.relayUrl = '',
+    this.relaySessionId = '',
+    this.relayPairingSecret = '',
+    this.relayPairingExpiresAt = 0,
   });
 
   final String host;
@@ -38,6 +45,14 @@ class AppConfig {
   final bool fastMode;
   final String adbIceServersJson;
   final bool? secureTransport;
+  final List<String> trustedFileRoots;
+  final String connectionMode;
+  final String relayUrl;
+  final String relaySessionId;
+  final String relayPairingSecret;
+  final int relayPairingExpiresAt;
+
+  bool get isRelayMode => connectionMode == ConnectionMode.relay.name;
 
   String get baseHttpUrl => baseHttpUrlFor();
 
@@ -97,6 +112,12 @@ class AppConfig {
     bool? fastMode,
     String? adbIceServersJson,
     bool? secureTransport,
+    List<String>? trustedFileRoots,
+    String? connectionMode,
+    String? relayUrl,
+    String? relaySessionId,
+    String? relayPairingSecret,
+    int? relayPairingExpiresAt,
   }) {
     final nextEngine = engine ?? this.engine;
     final nextModels = AppConfigEngineModels.resolve(
@@ -132,6 +153,15 @@ class AppConfig {
       adbIceServersJson: adbIceServersJson ?? this.adbIceServersJson,
       secureTransport:
           secureTransport ?? endpoint.secureTransport ?? this.secureTransport,
+      trustedFileRoots:
+          _normalizeTrustedFileRoots(trustedFileRoots ?? this.trustedFileRoots),
+      connectionMode:
+          normalizeConnectionMode(connectionMode ?? this.connectionMode),
+      relayUrl: relayUrl ?? this.relayUrl,
+      relaySessionId: relaySessionId ?? this.relaySessionId,
+      relayPairingSecret: relayPairingSecret ?? this.relayPairingSecret,
+      relayPairingExpiresAt:
+          relayPairingExpiresAt ?? this.relayPairingExpiresAt,
     );
   }
 
@@ -185,6 +215,9 @@ class AppConfig {
         'permissionMode': permissionMode,
         'fastMode': fastMode,
         'adbIceServersJson': adbIceServersJson,
+        'trustedFileRoots': trustedFileRoots,
+        'connectionMode': connectionMode,
+        if (relayUrl.trim().isNotEmpty) 'relayUrl': relayUrl,
         if (secureTransport != null) 'secureTransport': secureTransport!,
       };
 
@@ -222,6 +255,9 @@ class AppConfig {
       adbIceServersJson: (json['adbIceServersJson'] ?? '').toString(),
       secureTransport: endpoint.secureTransport ??
           parseSecureTransport(json['secureTransport']),
+      trustedFileRoots: _parseTrustedFileRoots(json['trustedFileRoots']),
+      connectionMode: normalizeConnectionMode(json['connectionMode']),
+      relayUrl: (json['relayUrl'] ?? '').toString(),
     );
   }
 
@@ -236,6 +272,30 @@ class AppConfig {
     }
   }
 
+  static List<String> _parseTrustedFileRoots(Object? value) {
+    if (value is List) {
+      return _normalizeTrustedFileRoots(value.map((item) => item.toString()));
+    }
+    if (value is String) {
+      return _normalizeTrustedFileRoots(value.split('\n'));
+    }
+    return const <String>[];
+  }
+
+  static List<String> _normalizeTrustedFileRoots(Iterable<String> roots) {
+    final seen = <String>{};
+    final normalized = <String>[];
+    for (final root in roots) {
+      final item = root.trim();
+      if (item.isEmpty || seen.contains(item)) {
+        continue;
+      }
+      seen.add(item);
+      normalized.add(item);
+    }
+    return List.unmodifiable(normalized);
+  }
+
   static AppConfig? fromLaunchUri(
     String raw, {
     AppConfig fallback = const AppConfig(),
@@ -243,6 +303,16 @@ class AppConfig {
     final trimmed = raw.trim();
     if (trimmed.isEmpty) {
       return null;
+    }
+    final relayPairing = parseRelayPairingUri(trimmed);
+    if (relayPairing != null) {
+      return fallback.copyWith(
+        connectionMode: ConnectionMode.relay.name,
+        relayUrl: relayPairing.relayUrl,
+        relaySessionId: relayPairing.sessionId,
+        relayPairingSecret: relayPairing.pairingSecret,
+        relayPairingExpiresAt: relayPairing.expiresAt,
+      );
     }
     final uri = Uri.tryParse(trimmed);
     if (uri == null || uri.host.trim().isEmpty) {

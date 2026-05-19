@@ -24,6 +24,7 @@ import (
 	"mobilevc/internal/data/codexsync"
 	"mobilevc/internal/data/skills"
 	"mobilevc/internal/engine"
+	"mobilevc/internal/fileaccess"
 	"mobilevc/internal/logx"
 	"mobilevc/internal/protocol"
 	"mobilevc/internal/push"
@@ -66,10 +67,12 @@ type Handler struct {
 	SkillLauncher   *skills.Launcher
 	SessionStore    data.Store
 	PushService     push.Service
+	FilePolicy      fileaccess.Policy
 	runtimeSessions *runtimeSessionRegistry
 
 	muProgressPush   sync.Mutex
 	lastProgressPush map[string]time.Time
+	muFilePolicy     sync.RWMutex
 }
 
 func NewHandler(authToken string, sessionStore data.Store) *Handler {
@@ -84,6 +87,7 @@ func NewHandler(authToken string, sessionStore data.Store) *Handler {
 		SkillLauncher:    skills.NewLauncher(sessionStore),
 		SessionStore:     sessionStore,
 		PushService:      &push.NoopService{},
+		FilePolicy:       mustDefaultFilePolicy(),
 		lastProgressPush: make(map[string]time.Time),
 		Upgrader: websocket.Upgrader{
 			ReadBufferSize:  1024,
@@ -161,19 +165,98 @@ func (h *Handler) checkOrigin(r *http.Request) bool {
 	return false
 }
 
+func mustDefaultFilePolicy() fileaccess.Policy {
+	policy, err := fileaccess.NewPolicy("", nil)
+	if err != nil {
+		panic(err)
+	}
+	return policy
+}
+
+func (h *Handler) currentFilePolicy() fileaccess.Policy {
+	h.muFilePolicy.RLock()
+	defer h.muFilePolicy.RUnlock()
+	return h.FilePolicy
+}
+
+func (h *Handler) applyClientTrustedFileRoots(roots []string) ([]string, error) {
+	h.muFilePolicy.Lock()
+	defer h.muFilePolicy.Unlock()
+	nextPolicy, err := h.FilePolicy.WithClientTrustedRoots(roots)
+	if err != nil {
+		return nil, err
+	}
+	h.FilePolicy = nextPolicy
+	return nextPolicy.Roots(), nil
+}
+
+type ClientConn interface {
+	ReadJSON(v any) error
+	WriteJSON(v any) error
+	Close() error
+	RemoteAddr() string
+	Origin() string
+}
+
+type websocketClientConn struct {
+	conn       *websocket.Conn
+	remoteAddr string
+	origin     string
+}
+
+func (c *websocketClientConn) ReadJSON(v any) error {
+	messageType, payload, err := c.conn.ReadMessage()
+	if err != nil {
+		return err
+	}
+	if messageType != websocket.TextMessage {
+		return fmt.Errorf("only text messages are supported")
+	}
+	return json.Unmarshal(payload, v)
+}
+
+func (c *websocketClientConn) WriteJSON(v any) error {
+	if err := c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		return err
+	}
+	return c.conn.WriteJSON(v)
+}
+
+func (c *websocketClientConn) Close() error       { return c.conn.Close() }
+func (c *websocketClientConn) RemoteAddr() string { return c.remoteAddr }
+func (c *websocketClientConn) Origin() string     { return c.origin }
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	token := r.URL.Query().Get("token")
+	if token == "" || token != h.AuthToken {
+		logx.Warn("ws", "reject unauthorized request: remoteAddr=%s", r.RemoteAddr)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	conn, err := h.Upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		logx.Error("ws", "websocket upgrade failed: remoteAddr=%s err=%v", r.RemoteAddr, err)
+		return
+	}
+	conn.SetPingHandler(func(appData string) error {
+		return conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(10*time.Second))
+	})
+	h.ServeClientConn(r.Context(), &websocketClientConn{
+		conn:       conn,
+		remoteAddr: r.RemoteAddr,
+		origin:     strings.TrimSpace(r.Header.Get("Origin")),
+	})
+}
+
+func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) {
 	connectionID := fmt.Sprintf("conn-%d", time.Now().UTC().UnixNano())
 	selectedSessionID := ""
-	remoteAddr := r.RemoteAddr
+	remoteAddr := client.RemoteAddr()
 	connected := false
-	var conn *websocket.Conn
 	sessionListFilterCWD := ""
 
 	emitIfPossible := func(event any) {
-		if conn == nil {
-			return
-		}
-		_ = conn.WriteJSON(event)
+		_ = client.WriteJSON(event)
 	}
 
 	defer func() {
@@ -186,33 +269,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	token := r.URL.Query().Get("token")
-	if token == "" || token != h.AuthToken {
-		logx.Warn("ws", "reject unauthorized request: connectionID=%s remoteAddr=%s", connectionID, remoteAddr)
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
-	}
-
-	upgradedConn, err := h.Upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		logx.Error("ws", "websocket upgrade failed: connectionID=%s remoteAddr=%s err=%v", connectionID, remoteAddr, err)
-		return
-	}
-	conn = upgradedConn
 	connected = true
-	defer conn.Close()
+	defer client.Close()
 
-	// 设置 ping handler，确保及时响应客户端的 ping 消息
-	conn.SetPingHandler(func(appData string) error {
-		// 响应 pong
-		if err := conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(10*time.Second)); err != nil {
-			logx.Warn("ws", "send pong failed: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
-			return err
-		}
-		return nil
-	})
-
-	ctx, cancel := context.WithCancel(r.Context())
+	ctx, cancel := context.WithCancel(parentCtx)
 	defer cancel()
 
 	newDetachedRuntimeService := func() *session.Service {
@@ -247,15 +307,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				if !ok {
 					return
 				}
-				if err := conn.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
-					logx.Error("ws", "set websocket write deadline failed: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
-					select {
-					case writeErrCh <- err:
-					default:
-					}
-					return
-				}
-				if err := conn.WriteJSON(event); err != nil {
+				if err := client.WriteJSON(event); err != nil {
 					logx.Error("ws", "write websocket event failed: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
 					select {
 					case writeErrCh <- err:
@@ -742,24 +794,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		default:
 		}
 
-		messageType, payload, err := conn.ReadMessage()
-		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				logx.Warn("ws", "unexpected websocket close: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
-			} else {
-				logx.Info("ws", "websocket read loop ended: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
-			}
+		payload := map[string]any{}
+		if err := client.ReadJSON(&payload); err != nil {
+			logx.Info("ws", "connection read loop ended: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
 			return
 		}
-
-		if messageType != websocket.TextMessage {
-			logx.Warn("ws", "reject non-text websocket message: connectionID=%s sessionID=%s remoteAddr=%s type=%d", connectionID, selectedSessionID, remoteAddr, messageType)
-			emit(protocol.NewErrorEvent(selectedSessionID, "only text messages are supported", ""))
+		payloadBytes, err := json.Marshal(payload)
+		if err != nil {
+			logx.Warn("ws", "invalid websocket json payload: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
+			emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid json: %v", err), ""))
 			continue
 		}
 
 		var clientEvent protocol.ClientEvent
-		if err := json.Unmarshal(payload, &clientEvent); err != nil {
+		if err := json.Unmarshal(payloadBytes, &clientEvent); err != nil {
 			logx.Warn("ws", "invalid websocket json payload: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
 			emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid json: %v", err), ""))
 			continue
@@ -768,7 +816,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		switch clientEvent.Action {
 		case "session_create":
 			var req protocol.SessionCreateRequestEvent
-			if err := json.Unmarshal(payload, &req); err != nil {
+			if err := json.Unmarshal(payloadBytes, &req); err != nil {
 				logx.Warn("ws", "invalid session_create request: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
 				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid session_create request: %v", err), ""))
 				continue
@@ -826,7 +874,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		case "session_list":
 			var req protocol.SessionListRequestEvent
-			if err := json.Unmarshal(payload, &req); err != nil {
+			if err := json.Unmarshal(payloadBytes, &req); err != nil {
 				logx.Warn("ws", "invalid session_list request: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
 				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid session_list request: %v", err), ""))
 				continue
@@ -839,7 +887,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			emitSessionList(req.CWD)
 		case "session_load":
 			var req protocol.SessionLoadRequestEvent
-			if err := json.Unmarshal(payload, &req); err != nil {
+			if err := json.Unmarshal(payloadBytes, &req); err != nil {
 				logx.Warn("ws", "invalid session_load request: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
 				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid session_load request: %v", err), ""))
 				continue
@@ -891,7 +939,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			emit(protocol.NewSessionStateEvent(selectedSessionID, string(session.StateActive), "history loaded"))
 		case "register_push_token":
 			var req protocol.RegisterPushTokenRequestEvent
-			if err := json.Unmarshal(payload, &req); err != nil {
+			if err := json.Unmarshal(payloadBytes, &req); err != nil {
 				logx.Warn("ws", "invalid register_push_token request: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
 				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid register_push_token request: %v", err), ""))
 				continue
@@ -902,11 +950,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			token := strings.TrimSpace(req.Token)
 			platform := strings.TrimSpace(req.Platform)
-			logx.Info("ws", "register push token: connectionID=%s sessionID=%s remoteAddr=%s requestedSessionID=%s resolvedSessionID=%s platform=%s token=%s", connectionID, selectedSessionID, remoteAddr, req.SessionID, targetSessionID, platform, token)
+			logx.Info("ws", "register push token: connectionID=%s sessionID=%s remoteAddr=%s requestedSessionID=%s resolvedSessionID=%s platform=%s tokenPresent=%v", connectionID, selectedSessionID, remoteAddr, req.SessionID, targetSessionID, platform, token != "")
 			h.handleRegisterPushToken(ctx, targetSessionID, token, platform, emit)
 		case "session_delta_get":
 			var req protocol.SessionDeltaRequestEvent
-			if err := json.Unmarshal(payload, &req); err != nil {
+			if err := json.Unmarshal(payloadBytes, &req); err != nil {
 				logx.Warn("ws", "invalid session_delta_get request: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
 				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid session_delta_get request: %v", err), ""))
 				continue
@@ -946,7 +994,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		case "session_resume":
 			var req protocol.SessionResumeRequestEvent
-			if err := json.Unmarshal(payload, &req); err != nil {
+			if err := json.Unmarshal(payloadBytes, &req); err != nil {
 				logx.Warn("ws", "invalid session_resume request: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
 				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid session_resume request: %v", err), ""))
 				continue
@@ -1069,7 +1117,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			))
 		case "session_delete":
 			var req protocol.SessionDeleteRequestEvent
-			if err := json.Unmarshal(payload, &req); err != nil {
+			if err := json.Unmarshal(payloadBytes, &req); err != nil {
 				logx.Warn("ws", "invalid session_delete request: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
 				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid session_delete request: %v", err), ""))
 				continue
@@ -1139,7 +1187,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			emitPermissionRuleList(emit, h.SessionStore, ctx, selectedSessionID)
 		case "permission_rule_upsert":
 			var req protocol.PermissionRuleRequestEvent
-			if err := json.Unmarshal(payload, &req); err != nil {
+			if err := json.Unmarshal(payloadBytes, &req); err != nil {
 				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid permission_rule_upsert request: %v", err), ""))
 				continue
 			}
@@ -1174,7 +1222,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			emitPermissionRuleList(emit, h.SessionStore, ctx, selectedSessionID)
 		case "permission_rule_delete":
 			var req protocol.PermissionRuleDeleteRequestEvent
-			if err := json.Unmarshal(payload, &req); err != nil {
+			if err := json.Unmarshal(payloadBytes, &req); err != nil {
 				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid permission_rule_delete request: %v", err), ""))
 				continue
 			}
@@ -1204,7 +1252,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			emitPermissionRuleList(emit, h.SessionStore, ctx, selectedSessionID)
 		case "permission_rules_set_enabled":
 			var req protocol.PermissionRuleToggleRequestEvent
-			if err := json.Unmarshal(payload, &req); err != nil {
+			if err := json.Unmarshal(payloadBytes, &req); err != nil {
 				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid permission_rules_set_enabled request: %v", err), ""))
 				continue
 			}
@@ -1236,7 +1284,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			emitReviewStateFromProjection(emit, selectedSessionID, buildProjectionSnapshotFor(selectedSessionID))
 		case "session_context_update":
 			var req protocol.SessionContextUpdateRequestEvent
-			if err := json.Unmarshal(payload, &req); err != nil {
+			if err := json.Unmarshal(payloadBytes, &req); err != nil {
 				logx.Warn("ws", "invalid session_context_update request: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
 				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid session_context_update request: %v", err), ""))
 				continue
@@ -1264,7 +1312,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			emitSkillCatalogResult(emit, h.SessionStore, ctx, selectedSessionID)
 		case "skill_catalog_upsert":
 			var req protocol.SkillCatalogRequestEvent
-			if err := json.Unmarshal(payload, &req); err != nil {
+			if err := json.Unmarshal(payloadBytes, &req); err != nil {
 				logx.Warn("ws", "invalid skill_catalog_upsert request: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
 				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid skill_catalog_upsert request: %v", err), ""))
 				continue
@@ -1315,7 +1363,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			emitMemoryListResult(emit, h.SessionStore, ctx, selectedSessionID)
 		case "memory_sync_pull":
 			var req protocol.MemoryRequestEvent
-			if err := json.Unmarshal(payload, &req); err != nil {
+			if err := json.Unmarshal(payloadBytes, &req); err != nil {
 				logx.Warn("ws", "invalid memory_sync_pull request: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
 				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid memory_sync_pull request: %v", err), ""))
 				continue
@@ -1357,7 +1405,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			emitMemoryListResult(emit, h.SessionStore, ctx, selectedSessionID)
 		case "memory_upsert":
 			var req protocol.MemoryRequestEvent
-			if err := json.Unmarshal(payload, &req); err != nil {
+			if err := json.Unmarshal(payloadBytes, &req); err != nil {
 				logx.Warn("ws", "invalid memory_upsert request: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
 				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid memory_upsert request: %v", err), ""))
 				continue
@@ -1369,7 +1417,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			emitMemoryListResult(emit, h.SessionStore, ctx, selectedSessionID)
 		case "ai_turn":
 			var aiReq protocol.AITurnRequestEvent
-			if err := json.Unmarshal(payload, &aiReq); err != nil {
+			if err := json.Unmarshal(payloadBytes, &aiReq); err != nil {
 				logx.Warn("ws", "invalid ai_turn request: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
 				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid ai_turn request: %v", err), ""))
 				continue
@@ -1531,12 +1579,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			appendUserProjectionEntry(h.SessionStore, ctx, sessionID, rawUserText, "回复", connectionID, remoteAddr)
 		case "exec":
 			var reqEvent protocol.ExecRequestEvent
-			if err := json.Unmarshal(payload, &reqEvent); err != nil {
+			if err := json.Unmarshal(payloadBytes, &reqEvent); err != nil {
 				logx.Warn("ws", "invalid exec request: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
 				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid exec request: %v", err), ""))
 				continue
 			}
-			logx.Info("ws", "incoming action: connectionID=%s sessionID=%s remoteAddr=%s action=exec cmd=%q cwd=%q mode=%q permissionMode=%q source=%q target=%q targetType=%q contextID=%q preview=%q", connectionID, selectedSessionID, remoteAddr, reqEvent.Command, reqEvent.CWD, reqEvent.Mode, reqEvent.PermissionMode, reqEvent.Source, reqEvent.Target, reqEvent.TargetType, reqEvent.ContextID, wsDebugPreview(reqEvent.Command))
+			logx.Info("ws", "incoming action: connectionID=%s sessionID=%s remoteAddr=%s action=exec cwd=%q mode=%q permissionMode=%q source=%q target=%q targetType=%q contextID=%q preview=%q", connectionID, selectedSessionID, remoteAddr, reqEvent.CWD, reqEvent.Mode, reqEvent.PermissionMode, reqEvent.Source, reqEvent.Target, reqEvent.TargetType, reqEvent.ContextID, wsDebugPreview(reqEvent.Command))
 			if strings.TrimSpace(reqEvent.Command) == "" {
 				logx.Warn("ws", "reject empty exec command: connectionID=%s sessionID=%s remoteAddr=%s", connectionID, selectedSessionID, remoteAddr)
 				emit(protocol.NewErrorEvent(selectedSessionID, "cmd is required", ""))
@@ -1617,7 +1665,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		case "input":
 			var inputEvent protocol.InputRequestEvent
-			if err := json.Unmarshal(payload, &inputEvent); err != nil {
+			if err := json.Unmarshal(payloadBytes, &inputEvent); err != nil {
 				logx.Warn("ws", "invalid input request: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
 				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid input request: %v", err), ""))
 				continue
@@ -1807,7 +1855,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		case "permission_decision":
 			var permissionEvent protocol.PermissionDecisionRequestEvent
-			if err := json.Unmarshal(payload, &permissionEvent); err != nil {
+			if err := json.Unmarshal(payloadBytes, &permissionEvent); err != nil {
 				logx.Warn("ws", "invalid permission decision request: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
 				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid permission decision request: %v", err), ""))
 				continue
@@ -1827,25 +1875,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if requestedID := strings.TrimSpace(permissionEvent.PermissionRequestID); requestedID != "" {
 				currentID := strings.TrimSpace(service.CurrentPermissionRequestID(sessionID))
 				if currentID != "" && currentID != requestedID {
-					// 用户的 approve 是"对当前可见提示放行"的意图。若客户端拿到的还是上一轮提示的 id，
-					// 直接把当前 pending 的 id 套上去执行，避免出现"点击没反应"的二次往返。
-					// deny 仍走 refresh 路径，要求用户对真正的当前请求做明确拒绝。
-					if decision == "approve" {
-						logx.Info("ws", "permission decision request id stale, auto-applying approve to current pending: connectionID=%s sessionID=%s remoteAddr=%s clientRequestID=%q currentRequestID=%q", connectionID, sessionID, remoteAddr, requestedID, currentID)
-						permissionEvent.PermissionRequestID = currentID
-					} else {
-						var refreshed *protocol.PromptRequestEvent
-						if sessionRuntime != nil {
-							refreshed = sessionRuntime.latestPendingPermissionPrompt(currentID)
-						}
-						if refreshed == nil {
-							refreshed = session.RefreshedPermissionPromptEvent(sessionID, permissionEvent, service)
-						}
-						if refreshed != nil {
-							logx.Info("ws", "permission decision request id stale, refreshing current request id: connectionID=%s sessionID=%s remoteAddr=%s clientRequestID=%q currentRequestID=%q decision=%q", connectionID, sessionID, remoteAddr, requestedID, currentID, decision)
-							emit(*refreshed)
-							continue
-						}
+					var refreshed *protocol.PromptRequestEvent
+					if sessionRuntime != nil {
+						refreshed = sessionRuntime.latestPendingPermissionPrompt(currentID)
+					}
+					if refreshed == nil {
+						refreshed = session.RefreshedPermissionPromptEvent(sessionID, permissionEvent, service)
+					}
+					if refreshed != nil {
+						logx.Info("ws", "permission decision request id stale, refreshing current request id: connectionID=%s sessionID=%s remoteAddr=%s clientRequestID=%q currentRequestID=%q decision=%q", connectionID, sessionID, remoteAddr, requestedID, currentID, decision)
+						emit(*refreshed)
+						continue
 					}
 				}
 			}
@@ -1900,7 +1940,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		case "review_decision":
 			var reviewEvent protocol.ReviewDecisionRequestEvent
-			if err := json.Unmarshal(payload, &reviewEvent); err != nil {
+			if err := json.Unmarshal(payloadBytes, &reviewEvent); err != nil {
 				logx.Warn("ws", "invalid review decision request: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
 				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid review decision request: %v", err), ""))
 				continue
@@ -1974,7 +2014,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			emitReviewStateFromProjection(emit, sessionID, projection)
 		case "plan_decision":
 			var planEvent protocol.PlanDecisionRequestEvent
-			if err := json.Unmarshal(payload, &planEvent); err != nil {
+			if err := json.Unmarshal(payloadBytes, &planEvent); err != nil {
 				logx.Warn("ws", "invalid plan decision request: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
 				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid plan decision request: %v", err), ""))
 				continue
@@ -2014,7 +2054,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		case "set_permission_mode":
 			var modeEvent protocol.PermissionModeUpdateRequestEvent
-			if err := json.Unmarshal(payload, &modeEvent); err != nil {
+			if err := json.Unmarshal(payloadBytes, &modeEvent); err != nil {
 				logx.Warn("ws", "invalid permission mode request: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
 				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid permission mode request: %v", err), ""))
 				continue
@@ -2030,7 +2070,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		case "skill_exec":
 			var skillEvent protocol.SkillRequestEvent
-			if err := json.Unmarshal(payload, &skillEvent); err != nil {
+			if err := json.Unmarshal(payloadBytes, &skillEvent); err != nil {
 				logx.Warn("ws", "invalid skill request: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
 				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid skill request: %v", err), ""))
 				continue
@@ -2057,7 +2097,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		case "runtime_info":
 			var infoReq protocol.RuntimeInfoRequestEvent
-			if err := json.Unmarshal(payload, &infoReq); err != nil {
+			if err := json.Unmarshal(payloadBytes, &infoReq); err != nil {
 				logx.Warn("ws", "invalid runtime_info request: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
 				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid runtime_info request: %v", err), ""))
 				continue
@@ -2083,7 +2123,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			emit(protocol.NewRuntimeProcessListResultEvent(selectedSessionID, rootPID, items, message))
 		case "runtime_process_log_get":
 			var processReq protocol.RuntimeProcessLogRequestEvent
-			if err := json.Unmarshal(payload, &processReq); err != nil {
+			if err := json.Unmarshal(payloadBytes, &processReq); err != nil {
 				logx.Warn("ws", "invalid runtime_process_log_get request: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
 				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid runtime_process_log_get request: %v", err), ""))
 				continue
@@ -2118,7 +2158,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			))
 		case "adb_devices":
 			var adbReq protocol.ADBDevicesRequestEvent
-			if err := json.Unmarshal(payload, &adbReq); err != nil {
+			if err := json.Unmarshal(payloadBytes, &adbReq); err != nil {
 				logx.Warn("ws", "invalid adb_devices request: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
 				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid adb_devices request: %v", err), ""))
 				continue
@@ -2126,7 +2166,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			emitADBDevices("ADB 设备列表已刷新")
 		case "adb_stream_start":
 			var adbReq protocol.ADBStreamStartRequestEvent
-			if err := json.Unmarshal(payload, &adbReq); err != nil {
+			if err := json.Unmarshal(payloadBytes, &adbReq); err != nil {
 				logx.Warn("ws", "invalid adb_stream_start request: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
 				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid adb_stream_start request: %v", err), ""))
 				continue
@@ -2142,7 +2182,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			startADBStream(adbReq.Serial, interval)
 		case "adb_stream_stop":
 			var adbReq protocol.ADBStreamStopRequestEvent
-			if err := json.Unmarshal(payload, &adbReq); err != nil {
+			if err := json.Unmarshal(payloadBytes, &adbReq); err != nil {
 				logx.Warn("ws", "invalid adb_stream_stop request: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
 				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid adb_stream_stop request: %v", err), ""))
 				continue
@@ -2151,7 +2191,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			adbRTC.Stop("")
 		case "adb_emulator_start":
 			var adbReq protocol.ADBEmulatorStartRequestEvent
-			if err := json.Unmarshal(payload, &adbReq); err != nil {
+			if err := json.Unmarshal(payloadBytes, &adbReq); err != nil {
 				logx.Warn("ws", "invalid adb_emulator_start request: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
 				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid adb_emulator_start request: %v", err), ""))
 				continue
@@ -2163,7 +2203,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			emitADBDevices("模拟器启动中，等待设备上线…")
 		case "adb_tap":
 			var adbReq protocol.ADBTapRequestEvent
-			if err := json.Unmarshal(payload, &adbReq); err != nil {
+			if err := json.Unmarshal(payloadBytes, &adbReq); err != nil {
 				logx.Warn("ws", "invalid adb_tap request: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
 				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid adb_tap request: %v", err), ""))
 				continue
@@ -2185,7 +2225,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		case "adb_swipe":
 			var adbReq protocol.ADBSwipeRequestEvent
-			if err := json.Unmarshal(payload, &adbReq); err != nil {
+			if err := json.Unmarshal(payloadBytes, &adbReq); err != nil {
 				logx.Warn("ws", "invalid adb_swipe request: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
 				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid adb_swipe request: %v", err), ""))
 				continue
@@ -2207,7 +2247,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		case "adb_keyevent":
 			var adbReq protocol.ADBKeyeventRequestEvent
-			if err := json.Unmarshal(payload, &adbReq); err != nil {
+			if err := json.Unmarshal(payloadBytes, &adbReq); err != nil {
 				logx.Warn("ws", "invalid adb_keyevent request: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
 				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid adb_keyevent request: %v", err), ""))
 				continue
@@ -2229,7 +2269,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		case "adb_webrtc_offer":
 			var adbReq protocol.ADBWebRTCOfferRequestEvent
-			if err := json.Unmarshal(payload, &adbReq); err != nil {
+			if err := json.Unmarshal(payloadBytes, &adbReq); err != nil {
 				logx.Warn("ws", "invalid adb_webrtc_offer request: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
 				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid adb_webrtc_offer request: %v", err), ""))
 				continue
@@ -2269,7 +2309,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			)
 		case "adb_webrtc_stop":
 			var adbReq protocol.ADBWebRTCStopRequestEvent
-			if err := json.Unmarshal(payload, &adbReq); err != nil {
+			if err := json.Unmarshal(payloadBytes, &adbReq); err != nil {
 				logx.Warn("ws", "invalid adb_webrtc_stop request: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
 				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid adb_webrtc_stop request: %v", err), ""))
 				continue
@@ -2284,7 +2324,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			adbRTC.Stop("ADB WebRTC 调试已停止")
 		case "slash_command":
 			var slashReq protocol.SlashCommandRequestEvent
-			if err := json.Unmarshal(payload, &slashReq); err != nil {
+			if err := json.Unmarshal(payloadBytes, &slashReq); err != nil {
 				logx.Warn("ws", "invalid slash_command request: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
 				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid slash_command request: %v", err), ""))
 				continue
@@ -2334,12 +2374,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		case "fs_list":
 			var fsListReq protocol.FSListRequestEvent
-			if err := json.Unmarshal(payload, &fsListReq); err != nil {
+			if err := json.Unmarshal(payloadBytes, &fsListReq); err != nil {
 				logx.Warn("ws", "invalid fs_list request: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
 				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid fs_list request: %v", err), ""))
 				continue
 			}
-			result, err := listDirectory(selectedSessionID, fsListReq.Path)
+			result, err := listDirectory(selectedSessionID, fsListReq.Path, h.currentFilePolicy())
 			if err != nil {
 				logx.Warn("ws", "list directory failed: connectionID=%s sessionID=%s remoteAddr=%s path=%q err=%v", connectionID, selectedSessionID, remoteAddr, fsListReq.Path, err)
 				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("list directory: %v", err), ""))
@@ -2348,23 +2388,38 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			emit(result)
 		case "fs_read":
 			var fsReadReq protocol.FSReadRequestEvent
-			if err := json.Unmarshal(payload, &fsReadReq); err != nil {
+			if err := json.Unmarshal(payloadBytes, &fsReadReq); err != nil {
 				logx.Warn("ws", "invalid fs_read request: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
 				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid fs_read request: %v", err), ""))
 				continue
 			}
-			result, err := readFile(selectedSessionID, fsReadReq.Path)
+			result, err := readFile(selectedSessionID, fsReadReq.Path, h.currentFilePolicy())
 			if err != nil {
 				logx.Warn("ws", "read file failed: connectionID=%s sessionID=%s remoteAddr=%s path=%q err=%v", connectionID, selectedSessionID, remoteAddr, fsReadReq.Path, err)
 				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("read file: %v", err), ""))
 				continue
 			}
 			emit(result)
+		case "file_access_config":
+			var configReq protocol.FileAccessConfigRequestEvent
+			if err := json.Unmarshal(payloadBytes, &configReq); err != nil {
+				logx.Warn("ws", "invalid file access config request: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
+				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid file access config request: %v", err), ""))
+				continue
+			}
+			roots, err := h.applyClientTrustedFileRoots(configReq.TrustedRoots)
+			if err != nil {
+				logx.Warn("ws", "apply file access config failed: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
+				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("file access config: %v", err), ""))
+				continue
+			}
+			emit(protocol.NewFileAccessConfigResultEvent(selectedSessionID, roots))
 		default:
 			logx.Warn("ws", "unknown action: connectionID=%s sessionID=%s remoteAddr=%s action=%s", connectionID, selectedSessionID, remoteAddr, clientEvent.Action)
 			emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("unknown action: %s", clientEvent.Action), ""))
 		}
 	}
+
 }
 
 func appendUserProjectionEntry(sessionStore data.Store, ctx context.Context, sessionID, text, label, connectionID, remoteAddr string) {
@@ -3480,14 +3535,8 @@ func parseMode(raw string) (engine.Mode, error) {
 	return session.ParseMode(raw)
 }
 
-func listDirectory(sessionID, rawPath string) (protocol.FSListResultEvent, error) {
-	target := strings.TrimSpace(rawPath)
-	if target == "" {
-		target = "."
-	}
-
-	cleanTarget := filepath.Clean(target)
-	absPath, err := filepath.Abs(cleanTarget)
+func listDirectory(sessionID, rawPath string, policy fileaccess.Policy) (protocol.FSListResultEvent, error) {
+	absPath, err := policy.Resolve(rawPath)
 	if err != nil {
 		return protocol.FSListResultEvent{}, err
 	}
@@ -3519,14 +3568,13 @@ func listDirectory(sessionID, rawPath string) (protocol.FSListResultEvent, error
 	return protocol.NewFSListResultEvent(sessionID, absPath, items), nil
 }
 
-func readFile(sessionID, rawPath string) (protocol.FSReadResultEvent, error) {
+func readFile(sessionID, rawPath string, policy fileaccess.Policy) (protocol.FSReadResultEvent, error) {
 	target := strings.TrimSpace(rawPath)
 	if target == "" {
 		return protocol.FSReadResultEvent{}, fmt.Errorf("path is required")
 	}
 
-	cleanTarget := filepath.Clean(target)
-	absPath, err := filepath.Abs(cleanTarget)
+	absPath, err := policy.Resolve(target)
 	if err != nil {
 		return protocol.FSReadResultEvent{}, err
 	}

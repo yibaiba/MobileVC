@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
+import 'package:uuid/uuid.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:web_socket_channel/io.dart';
 
@@ -24,15 +25,35 @@ class MobileVcWsService {
   bool get isConnected => _channel != null;
 
   Future<void> connect(String url) async {
+    await _connectChannel(Uri.parse(url));
+  }
+
+  Future<void> connectRelay({
+    required String relayUrl,
+    required String sessionId,
+    required String pairingSecret,
+  }) async {
+    final uri = Uri.parse(relayUrl).replace(path: '/relay/client');
+    await _connectChannel(
+      uri,
+      relaySessionId: sessionId,
+      relayPairingSecret: pairingSecret,
+    );
+  }
+
+  Future<void> _connectChannel(
+    Uri uri, {
+    String relaySessionId = '',
+    String relayPairingSecret = '',
+  }) async {
     final previousSubscription = _subscription;
     final previousChannel = _channel;
     _subscription = null;
     _channel = null;
+    _relayContext = const _RelayContext();
     _connectionEpoch++;
     await previousSubscription?.cancel();
     await previousChannel?.sink.close();
-
-    final uri = Uri.parse(url);
     final channel = kIsWeb
         ? WebSocketChannel.connect(uri)
         : IOWebSocketChannel.connect(
@@ -42,13 +63,26 @@ class MobileVcWsService {
           );
     _channel = channel;
     final epoch = _connectionEpoch;
+    String relayClientId = '';
+    final pairedCompleter =
+        relaySessionId.isNotEmpty ? Completer<void>() : null;
+    if (relaySessionId.isNotEmpty) {
+      channel.sink.add(jsonEncode(<String, dynamic>{
+        'type': 'client.pair',
+        'version': 1,
+        'sessionId': relaySessionId,
+        'pairingSecret': relayPairingSecret,
+      }));
+    }
     var disconnectEmitted = false;
     void emitDisconnect({
       required String code,
       required String message,
       Map<String, dynamic> raw = const <String, dynamic>{},
     }) {
-      if (disconnectEmitted || epoch != _connectionEpoch || _channel != channel) {
+      if (disconnectEmitted ||
+          epoch != _connectionEpoch ||
+          _channel != channel) {
         return;
       }
       disconnectEmitted = true;
@@ -71,17 +105,42 @@ class MobileVcWsService {
       );
     }
 
+    void completePairingError(Object error) {
+      final completer = pairedCompleter;
+      if (completer != null && !completer.isCompleted) {
+        completer.completeError(error);
+      }
+    }
+
     _subscription = channel.stream.listen(
       (dynamic data) {
         if (epoch != _connectionEpoch || _channel != channel) {
           return;
         }
         final decoded = jsonDecode(data as String);
-        if (decoded is Map<String, dynamic>) {
+        if (decoded is! Map<String, dynamic>) {
+          return;
+        }
+        if (relaySessionId.isEmpty) {
           _events.add(_mapper.mapEvent(decoded));
+          return;
+        }
+        if (isRelayPairingError(decoded, relayClientId)) {
+          completePairingError(StateError(relayErrorMessage(decoded)));
+        }
+        final relayEvent = _decodeRelayFrame(decoded, (clientId) {
+          relayClientId = clientId;
+          final completer = pairedCompleter;
+          if (completer != null && !completer.isCompleted) {
+            completer.complete();
+          }
+        });
+        if (relayEvent != null) {
+          _events.add(_mapper.mapEvent(relayEvent));
         }
       },
       onError: (Object error, StackTrace stackTrace) {
+        completePairingError(error);
         emitDisconnect(
           code: 'ws_stream_error',
           message: 'WebSocket 连接异常：$error',
@@ -98,6 +157,7 @@ class MobileVcWsService {
             : closeReason == null || closeReason.isEmpty
                 ? 'WebSocket 连接已断开（$closeCode）'
                 : 'WebSocket 连接已断开（$closeCode: $closeReason）';
+        completePairingError(StateError(message));
         emitDisconnect(
           code: 'ws_closed',
           message: message,
@@ -109,6 +169,23 @@ class MobileVcWsService {
       },
       cancelOnError: false,
     );
+    _relayContext = _RelayContext(
+      sessionId: relaySessionId,
+      clientIdProvider: () => relayClientId,
+    );
+    if (pairedCompleter != null) {
+      try {
+        await pairedCompleter.future.timeout(
+          const Duration(seconds: 10),
+          onTimeout: () {
+            throw TimeoutException('Relay 配对超时');
+          },
+        );
+      } catch (_) {
+        await disconnect();
+        rethrow;
+      }
+    }
   }
 
   Future<void> disconnect() async {
@@ -141,6 +218,11 @@ class MobileVcWsService {
       return false;
     }
     try {
+      final relayContext = _relayContext;
+      if (relayContext.sessionId.isNotEmpty) {
+        channel.sink.add(jsonEncode(_encodeRelayFrame(payload, relayContext)));
+        return true;
+      }
       channel.sink.add(jsonEncode(payload));
       return true;
     } catch (error, stackTrace) {
@@ -169,4 +251,68 @@ class MobileVcWsService {
     await disconnect();
     await _events.close();
   }
+
+  _RelayContext _relayContext = const _RelayContext();
+
+  Map<String, dynamic>? _decodeRelayFrame(
+    Map<String, dynamic> frame,
+    void Function(String clientId) setClientId,
+  ) {
+    final type = (frame['type'] ?? '').toString();
+    if (type == 'client.paired') {
+      setClientId((frame['clientId'] ?? '').toString());
+      return null;
+    }
+    if (type == 'relay.error') {
+      return <String, dynamic>{
+        'type': 'error',
+        'code': frame['code'] ?? 'relay_error',
+        'msg': frame['message'] ?? 'Relay error',
+      };
+    }
+    if (type != 'relay.forward') {
+      return null;
+    }
+    final raw =
+        base64Url.decode(base64Url.normalize(frame['payload'].toString()));
+    final decoded = jsonDecode(utf8.decode(raw));
+    return decoded is Map<String, dynamic> ? decoded : null;
+  }
+
+  Map<String, dynamic> _encodeRelayFrame(
+    Map<String, dynamic> payload,
+    _RelayContext relayContext,
+  ) {
+    return <String, dynamic>{
+      'type': 'relay.forward',
+      'version': 1,
+      'sessionId': relayContext.sessionId,
+      'clientId': relayContext.clientIdProvider(),
+      'direction': 'client_to_agent',
+      'messageId': 'msg_${const Uuid().v4()}',
+      'contentType': 'mobilevc.ws.v1',
+      'encryption': 'none',
+      'payloadEncoding': 'base64url',
+      'payload': base64UrlEncode(utf8.encode(jsonEncode(payload))),
+    };
+  }
 }
+
+class _RelayContext {
+  const _RelayContext({
+    this.sessionId = '',
+    this.clientIdProvider = _emptyClientId,
+  });
+
+  final String sessionId;
+  final String Function() clientIdProvider;
+}
+
+String _emptyClientId() => '';
+
+@visibleForTesting
+bool isRelayPairingError(Map<String, dynamic> frame, String clientId) =>
+    (frame['type'] ?? '').toString() == 'relay.error' && clientId.isEmpty;
+
+String relayErrorMessage(Map<String, dynamic> frame) =>
+    (frame['message'] ?? 'Relay error').toString();

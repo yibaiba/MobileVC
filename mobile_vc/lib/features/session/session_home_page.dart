@@ -259,6 +259,9 @@ class _SessionHomePageState extends State<SessionHomePage> {
     final tokenController =
         TextEditingController(text: controller.config.token);
     final cwdController = TextEditingController(text: controller.config.cwd);
+    final trustedRootsController = TextEditingController(
+      text: controller.config.trustedFileRoots.join('\n'),
+    );
     final permissionController =
         TextEditingController(text: controller.config.permissionMode);
     final iceHostController = TextEditingController(
@@ -323,6 +326,8 @@ class _SessionHomePageState extends State<SessionHomePage> {
                   permissionMode: permissionController.text.trim(),
                   fastMode: controller.fastMode,
                   adbIceServersJson: encodedIceConfig(),
+                  trustedFileRoots:
+                      _trustedRootsFromText(trustedRootsController.text),
                 ),
               );
               if (scanned == null) {
@@ -335,6 +340,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
               portController.text = scanned.port;
               tokenController.text = scanned.token;
               cwdController.text = scanned.cwd;
+              trustedRootsController.text = scanned.trustedFileRoots.join('\n');
               iceHostController.text = scanned.adbIceHostOverride;
               iceUsernameController.text = scanned.adbIceUsername;
               iceCredentialController.text = scanned.adbIceCredential;
@@ -358,6 +364,8 @@ class _SessionHomePageState extends State<SessionHomePage> {
                 permissionMode: permissionController.text.trim(),
                 fastMode: controller.fastMode,
                 adbIceServersJson: encodedIceConfig(),
+                trustedFileRoots:
+                    _trustedRootsFromText(trustedRootsController.text),
               );
               await controller.saveConfig(nextConfig);
               if (connect) {
@@ -422,6 +430,21 @@ class _SessionHomePageState extends State<SessionHomePage> {
                     TextField(
                         controller: cwdController,
                         decoration: const InputDecoration(labelText: 'CWD')),
+                    const SizedBox(height: 10),
+                    TextField(
+                      controller: trustedRootsController,
+                      minLines: 2,
+                      maxLines: 4,
+                      decoration: const InputDecoration(
+                        labelText: '可信文件目录',
+                        hintText: '/Users/me/project\n/Users/me/Downloads',
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    Text(
+                      '每行一个目录；后端会校验目录存在后才允许文件浏览和下载访问。',
+                      style: Theme.of(context).textTheme.bodySmall,
+                    ),
                     const SizedBox(height: 10),
                     DropdownButtonFormField<String>(
                       initialValue: selectedEngine,
@@ -894,6 +917,12 @@ class _SessionHomePageState extends State<SessionHomePage> {
 
   Future<void> _downloadFile(String path) async {
     final messenger = ScaffoldMessenger.of(context);
+    if (controller.config.isRelayMode) {
+      messenger
+        ..hideCurrentSnackBar()
+        ..showSnackBar(const SnackBar(content: Text('Relay 模式暂不支持下载')));
+      return;
+    }
     final scaffoldContext = context;
     final fileName = _fileNameOf(path);
     messenger
@@ -1935,4 +1964,18 @@ String _portForHostInput(String rawHost, String rawPort) {
     return rawPort.trim();
   }
   return uri.hasPort && uri.port > 0 ? uri.port.toString() : '';
+}
+
+List<String> _trustedRootsFromText(String text) {
+  final seen = <String>{};
+  final roots = <String>[];
+  for (final line in text.split('\n')) {
+    final item = line.trim();
+    if (item.isEmpty || seen.contains(item)) {
+      continue;
+    }
+    seen.add(item);
+    roots.add(item);
+  }
+  return roots;
 }

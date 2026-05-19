@@ -148,6 +148,103 @@ void main() {
       expect(service.disconnectCalls, 1);
     });
 
+    test('connect sends trusted file roots config to backend', () async {
+      SharedPreferences.setMockInitialValues({
+        'mobilevc.app_config': jsonEncode(const AppConfig(
+          trustedFileRoots: ['/Users/me/project', '/Users/me/Downloads'],
+        ).toJson()),
+      });
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+
+      final payload = service.sentPayloads.firstWhere(
+        (item) => item['action'] == 'file_access_config',
+      );
+      expect(payload['trustedRoots'], [
+        '/Users/me/project',
+        '/Users/me/Downloads',
+      ]);
+    });
+
+    test('relay connect validates url and clears one-time pairing fields',
+        () async {
+      SharedPreferences.setMockInitialValues({
+        'mobilevc.app_config': jsonEncode(const AppConfig(
+          connectionMode: 'relay',
+          relayUrl: 'wss://relay.example.test',
+          relaySessionId: 'rs_test',
+          relayPairingSecret: 'pair_secret',
+          relayPairingExpiresAt: 1760000000,
+        ).toJson()),
+      });
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.saveConfig(const AppConfig(
+        connectionMode: 'relay',
+        relayUrl: 'wss://relay.example.test',
+        relaySessionId: 'rs_test',
+        relayPairingSecret: 'pair_secret',
+        relayPairingExpiresAt: 1760000000,
+      ));
+      await controller.connect();
+
+      expect(
+          service.connectedRelays.single.relayUrl, 'wss://relay.example.test');
+      expect(controller.config.relayUrl, 'wss://relay.example.test');
+      expect(controller.config.relaySessionId, isEmpty);
+      expect(controller.config.relayPairingSecret, isEmpty);
+      final prefs = await SharedPreferences.getInstance();
+      final persisted = jsonDecode(prefs.getString('mobilevc.app_config')!)
+          as Map<String, dynamic>;
+      expect(persisted['relayUrl'], 'wss://relay.example.test');
+      expect(persisted.containsKey('relaySessionId'), isFalse);
+      expect(persisted.containsKey('relayPairingSecret'), isFalse);
+    });
+
+    test('relay connect rejects public ws url before service connect',
+        () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.saveConfig(const AppConfig(
+        connectionMode: 'relay',
+        relayUrl: 'ws://relay.example.test',
+        relaySessionId: 'rs_test',
+        relayPairingSecret: 'pair_secret',
+      ));
+      await controller.connect();
+
+      expect(service.connectedRelays, isEmpty);
+      expect(controller.connected, isFalse);
+      expect(controller.connectionStage, SessionConnectionStage.failed);
+    });
+
+    test('save config while connected resends trusted file roots', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+      await controller.connect();
+      service.sentPayloads.clear();
+
+      await controller.saveConfig(
+        controller.config.copyWith(trustedFileRoots: ['/tmp/shared']),
+      );
+
+      expect(service.sentPayloads, hasLength(1));
+      expect(service.sentPayloads.single['action'], 'file_access_config');
+      expect(service.sentPayloads.single['trustedRoots'], ['/tmp/shared']);
+    });
+
     test('notification restore immediately loads target session when connected',
         () async {
       final service = _FakeMobileVcWsService();
@@ -7756,6 +7853,7 @@ class _FakeMobileVcWsService extends MobileVcWsService {
       StreamController<AppEvent>.broadcast();
   final List<Map<String, dynamic>> sentPayloads = [];
   final List<String> connectedUrls = [];
+  final List<_RelayConnectCall> connectedRelays = [];
   int connectCalls = 0;
   int disconnectCalls = 0;
 
@@ -7766,6 +7864,20 @@ class _FakeMobileVcWsService extends MobileVcWsService {
   Future<void> connect(String url) async {
     connectCalls++;
     connectedUrls.add(url);
+  }
+
+  @override
+  Future<void> connectRelay({
+    required String relayUrl,
+    required String sessionId,
+    required String pairingSecret,
+  }) async {
+    connectCalls++;
+    connectedRelays.add(_RelayConnectCall(
+      relayUrl: relayUrl,
+      sessionId: sessionId,
+      pairingSecret: pairingSecret,
+    ));
   }
 
   @override
@@ -7787,4 +7899,16 @@ class _FakeMobileVcWsService extends MobileVcWsService {
   Future<void> dispose() async {
     await _controller.close();
   }
+}
+
+class _RelayConnectCall {
+  const _RelayConnectCall({
+    required this.relayUrl,
+    required this.sessionId,
+    required this.pairingSecret,
+  });
+
+  final String relayUrl;
+  final String sessionId;
+  final String pairingSecret;
 }

@@ -2,16 +2,9 @@ package config
 
 import (
 	"fmt"
-	"net"
-	"net/url"
 	"os"
-	"strconv"
 	"strings"
-)
-
-const (
-	defaultHTTPPort  = "80"
-	defaultHTTPSPort = "443"
+	"time"
 )
 
 type RuntimeConfig struct {
@@ -19,6 +12,7 @@ type RuntimeConfig struct {
 	DefaultMode            string
 	Debug                  bool
 	WorkspaceRoot          string
+	TrustedFileRoots       []string
 	EnhancedProjection     bool
 	EnableStepProjection   bool
 	EnableDiffProjection   bool
@@ -39,12 +33,21 @@ type SecurityConfig struct {
 	AllowedOrigins     []string
 }
 
+type RelayConfig struct {
+	Enabled          bool
+	URL              string
+	PairingTTL       time.Duration
+	AgentGracePeriod time.Duration
+	PairingEventPath string
+}
+
 type Config struct {
 	Port      string
 	AuthToken string
 	Runtime   RuntimeConfig
 	TTS       TTSConfig
 	Security  SecurityConfig
+	Relay     RelayConfig
 }
 
 type Summary struct {
@@ -54,6 +57,7 @@ type Summary struct {
 	DefaultMode            string
 	Debug                  bool
 	WorkspaceRoot          string
+	TrustedFileRoots       []string
 	EnhancedProjection     bool
 	EnableStepProjection   bool
 	EnableDiffProjection   bool
@@ -66,34 +70,22 @@ type Summary struct {
 	TTSDefaultFormat       string
 	PublicExposureMode     bool
 	AllowedOrigins         []string
+	RelayMode              bool
+	RelayURL               string
 }
 
 func Load() (Config, error) {
+	relayCfg, err := loadRelayConfig()
+	if err != nil {
+		return Config{}, err
+	}
 	cfg := Config{
 		Port:      getEnv("PORT", "8001"),
 		AuthToken: os.Getenv("AUTH_TOKEN"),
-		Runtime: RuntimeConfig{
-			DefaultCommand:         getEnv("RUNTIME_DEFAULT_COMMAND", "claude"),
-			DefaultMode:            getEnv("RUNTIME_DEFAULT_MODE", "pty"),
-			Debug:                  getEnvBool("RUNTIME_DEBUG", false),
-			WorkspaceRoot:          strings.TrimSpace(os.Getenv("RUNTIME_WORKSPACE_ROOT")),
-			EnhancedProjection:     getEnvBool("RUNTIME_ENHANCED_PROJECTION", true),
-			EnableStepProjection:   getEnvBool("RUNTIME_ENABLE_STEP_PROJECTION", true),
-			EnableDiffProjection:   getEnvBool("RUNTIME_ENABLE_DIFF_PROJECTION", true),
-			EnablePromptProjection: getEnvBool("RUNTIME_ENABLE_PROMPT_PROJECTION", true),
-		},
-		TTS: TTSConfig{
-			Enabled:               getEnvBool("TTS_ENABLED", false),
-			Provider:              strings.TrimSpace(getEnv("TTS_PROVIDER", "chattts-http")),
-			PythonServiceURL:      strings.TrimSpace(getEnv("TTS_PYTHON_SERVICE_URL", "http://127.0.0.1:9966")),
-			RequestTimeoutSeconds: getEnvInt("TTS_REQUEST_TIMEOUT_SECONDS", 30),
-			MaxTextLength:         getEnvInt("TTS_MAX_TEXT_LENGTH", 200),
-			DefaultFormat:         strings.TrimSpace(getEnv("TTS_DEFAULT_FORMAT", "wav")),
-		},
-		Security: SecurityConfig{
-			PublicExposureMode: getEnvBool("PUBLIC_EXPOSURE_MODE", false),
-			AllowedOrigins:     getEnvCommaList("ALLOWED_ORIGINS"),
-		},
+		Runtime:   loadRuntimeConfig(),
+		TTS:       loadTTSConfig(),
+		Security:  loadSecurityConfig(),
+		Relay:     relayCfg,
 	}
 
 	if cfg.AuthToken == "" {
@@ -103,6 +95,9 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	if err := cfg.validateSecurity(); err != nil {
+		return Config{}, err
+	}
+	if err := cfg.validateRelay(); err != nil {
 		return Config{}, err
 	}
 
@@ -117,6 +112,7 @@ func (c Config) Summary() Summary {
 		DefaultMode:            c.Runtime.DefaultMode,
 		Debug:                  c.Runtime.Debug,
 		WorkspaceRoot:          c.Runtime.WorkspaceRoot,
+		TrustedFileRoots:       append([]string(nil), c.Runtime.TrustedFileRoots...),
 		EnhancedProjection:     c.Runtime.EnhancedProjection,
 		EnableStepProjection:   c.Runtime.EnableStepProjection,
 		EnableDiffProjection:   c.Runtime.EnableDiffProjection,
@@ -129,129 +125,7 @@ func (c Config) Summary() Summary {
 		TTSDefaultFormat:       c.TTS.DefaultFormat,
 		PublicExposureMode:     c.Security.PublicExposureMode,
 		AllowedOrigins:         append([]string(nil), c.Security.AllowedOrigins...),
+		RelayMode:              c.Relay.Enabled,
+		RelayURL:               c.Relay.URL,
 	}
-}
-
-func (c Config) validateSecurity() error {
-	if c.Security.PublicExposureMode && len(c.Security.AllowedOrigins) == 0 {
-		return fmt.Errorf("ALLOWED_ORIGINS is required when PUBLIC_EXPOSURE_MODE is true")
-	}
-	for _, origin := range c.Security.AllowedOrigins {
-		if _, err := NormalizeOrigin(origin); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func NormalizeOrigin(origin string) (string, error) {
-	parsed, err := url.Parse(origin)
-	if err != nil {
-		return "", fmt.Errorf("invalid origin %q: %w", origin, err)
-	}
-	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return "", fmt.Errorf("invalid origin %q: scheme must be http or https", origin)
-	}
-	if parsed.Host == "" || parsed.User != nil || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
-		return "", fmt.Errorf("invalid origin %q: expected scheme://host[:port]", origin)
-	}
-	return canonicalOrigin(parsed), nil
-}
-
-func canonicalOrigin(parsed *url.URL) string {
-	scheme := strings.ToLower(parsed.Scheme)
-	host := strings.ToLower(parsed.Hostname())
-	port := parsed.Port()
-	if port == "" || isDefaultOriginPort(scheme, port) {
-		return scheme + "://" + formatOriginHost(host)
-	}
-	return scheme + "://" + net.JoinHostPort(host, port)
-}
-
-func isDefaultOriginPort(scheme string, port string) bool {
-	return (scheme == "http" && port == defaultHTTPPort) || (scheme == "https" && port == defaultHTTPSPort)
-}
-
-func formatOriginHost(host string) string {
-	if strings.Contains(host, ":") {
-		return "[" + host + "]"
-	}
-	return host
-}
-
-func (c Config) validateTTS() error {
-	if !c.TTS.Enabled {
-		return nil
-	}
-	if c.TTS.Provider != "chattts-http" {
-		return fmt.Errorf("TTS_PROVIDER must be chattts-http")
-	}
-	if strings.TrimSpace(c.TTS.PythonServiceURL) == "" {
-		return fmt.Errorf("TTS_PYTHON_SERVICE_URL is required when TTS is enabled")
-	}
-	if c.TTS.RequestTimeoutSeconds <= 0 {
-		return fmt.Errorf("TTS_REQUEST_TIMEOUT_SECONDS must be greater than 0")
-	}
-	if c.TTS.MaxTextLength <= 0 {
-		return fmt.Errorf("TTS_MAX_TEXT_LENGTH must be greater than 0")
-	}
-	if strings.ToLower(strings.TrimSpace(c.TTS.DefaultFormat)) != "wav" {
-		return fmt.Errorf("TTS_DEFAULT_FORMAT must be wav")
-	}
-	return nil
-}
-
-func getEnv(key, fallback string) string {
-	if value := os.Getenv(key); value != "" {
-		return value
-	}
-	return fallback
-}
-
-func getEnvBool(key string, fallback bool) bool {
-	value := strings.TrimSpace(os.Getenv(key))
-	if value == "" {
-		return fallback
-	}
-	switch strings.ToLower(value) {
-	case "1", "true", "yes", "on":
-		return true
-	case "0", "false", "no", "off":
-		return false
-	default:
-		return fallback
-	}
-}
-
-func getEnvInt(key string, fallback int) int {
-	value := strings.TrimSpace(os.Getenv(key))
-	if value == "" {
-		return fallback
-	}
-	parsed, err := strconv.Atoi(value)
-	if err != nil {
-		return fallback
-	}
-	return parsed
-}
-
-func getEnvCommaList(key string) []string {
-	value := strings.TrimSpace(os.Getenv(key))
-	if value == "" {
-		return nil
-	}
-	parts := strings.Split(value, ",")
-	items := make([]string, 0, len(parts))
-	for _, part := range parts {
-		item := strings.TrimRight(strings.TrimSpace(part), "/")
-		if item != "" {
-			origin, err := NormalizeOrigin(item)
-			if err != nil {
-				items = append(items, item)
-				continue
-			}
-			items = append(items, origin)
-		}
-	}
-	return items
 }

@@ -162,6 +162,77 @@ void main() {
         throwsA(isA<FormatException>()),
       );
     });
+
+    test('trusted file roots round trip and drop blanks', () {
+      final config = AppConfig.fromJson(const {
+        'host': 'example.com',
+        'trustedFileRoots': [' /Users/me/project ', '', '/Users/me/project'],
+      });
+
+      expect(config.trustedFileRoots, ['/Users/me/project']);
+      expect(
+        AppConfig.fromJson(config.toJson()).trustedFileRoots,
+        ['/Users/me/project'],
+      );
+      expect(
+        config
+            .copyWith(trustedFileRoots: [' /tmp/shared ', '']).trustedFileRoots,
+        ['/tmp/shared'],
+      );
+    });
+
+    test('relay pairing uri selects relay mode without changing direct fields',
+        () {
+      final config = AppConfig.fromLaunchUri(
+        'mobilevc://relay/v1?relay=wss%3A%2F%2Frelay.example.test&session=rs_test&secret=pair_secret&exp=1760000000',
+        fallback: const AppConfig(
+          host: '192.168.1.2',
+          port: '8001',
+          token: 'direct-token',
+        ),
+      );
+
+      expect(config, isNotNull);
+      expect(config!.isRelayMode, isTrue);
+      expect(config.host, '192.168.1.2');
+      expect(config.port, '8001');
+      expect(config.token, 'direct-token');
+      expect(config.relayUrl, 'wss://relay.example.test');
+      expect(config.relaySessionId, 'rs_test');
+      expect(config.relayPairingSecret, 'pair_secret');
+      expect(config.relayPairingExpiresAt, 1760000000);
+    });
+
+    test('relay config persists url only', () {
+      const config = AppConfig(
+        connectionMode: 'relay',
+        relayUrl: 'wss://relay.example.test',
+        relaySessionId: 'rs_test',
+        relayPairingSecret: 'pair_secret',
+        relayPairingExpiresAt: 1760000000,
+      );
+
+      final json = config.toJson();
+      expect(json['relayUrl'], 'wss://relay.example.test');
+      expect(json.containsKey('relaySessionId'), isFalse);
+      expect(json.containsKey('relayPairingSecret'), isFalse);
+      expect(json.containsKey('relayPairingExpiresAt'), isFalse);
+    });
+
+    test('relay url validation rejects public ws and http schemes', () {
+      expect(
+        () => AppConfig.fromLaunchUri(
+          'mobilevc://relay/v1?relay=ws%3A%2F%2Frelay.example.test&session=rs&secret=secret',
+        ),
+        throwsFormatException,
+      );
+      expect(
+        () => AppConfig.fromLaunchUri(
+          'mobilevc://relay/v1?relay=https%3A%2F%2Frelay.example.test&session=rs&secret=secret',
+        ),
+        throwsFormatException,
+      );
+    });
   });
 
   group('AppConfig adb ice', () {

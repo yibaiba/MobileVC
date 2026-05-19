@@ -23,6 +23,7 @@ import (
 	"mobilevc/internal/data"
 	"mobilevc/internal/data/codexsync"
 	"mobilevc/internal/engine"
+	"mobilevc/internal/fileaccess"
 	"mobilevc/internal/protocol"
 	"mobilevc/internal/push"
 	"mobilevc/internal/session"
@@ -441,6 +442,148 @@ func requireAgentState(t *testing.T, event map[string]any, wantState string, wan
 	if await != wantAwait {
 		t.Fatalf("expected awaitInput=%v, got %#v", wantAwait, event)
 	}
+}
+
+func TestHandlerFileAccessPolicy(t *testing.T) {
+	workspace := t.TempDir()
+	inside := filepath.Join(workspace, "inside.txt")
+	if err := os.WriteFile(inside, []byte("ok"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(t.TempDir(), "secret.txt")
+	if err := os.WriteFile(outside, []byte("secret"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h := newTestHandler()
+	h.FilePolicy = newGatewayTestFilePolicy(t, workspace, nil)
+	conn := newTestConn(t, h)
+
+	if err := conn.WriteJSON(protocol.FSReadRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "fs_read"},
+		Path:        inside,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	readEvent := readUntilType(t, conn, protocol.EventTypeFSReadResult)
+	if readEvent["content"] != "ok" {
+		t.Fatalf("content: got %#v", readEvent["content"])
+	}
+	if err := conn.WriteJSON(protocol.FSReadRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "fs_read"},
+		Path:        outside,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	errorEvent := readUntilType(t, conn, protocol.EventTypeError)
+	msg, _ := errorEvent["msg"].(string)
+	if !strings.Contains(msg, "outside trusted file roots") {
+		t.Fatalf("error message: got %#v", errorEvent)
+	}
+}
+
+func TestHandlerFileAccessPolicyAllowsTrustedRoot(t *testing.T) {
+	workspace := t.TempDir()
+	trusted := t.TempDir()
+	filePath := filepath.Join(trusted, "shared.txt")
+	if err := os.WriteFile(filePath, []byte("ok"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h := newTestHandler()
+	h.FilePolicy = newGatewayTestFilePolicy(t, workspace, []string{trusted})
+	conn := newTestConn(t, h)
+
+	if err := conn.WriteJSON(protocol.FSListRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "fs_list"},
+		Path:        trusted,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	listEvent := readUntilType(t, conn, protocol.EventTypeFSListResult)
+	items, _ := listEvent["items"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("items: got %#v", listEvent["items"])
+	}
+	item, _ := items[0].(map[string]any)
+	if item["name"] != "shared.txt" {
+		t.Fatalf("item: got %#v", item)
+	}
+}
+
+func TestHandlerFileAccessConfigUpdatesTrustedRoots(t *testing.T) {
+	workspace := t.TempDir()
+	clientRoot := t.TempDir()
+	filePath := filepath.Join(clientRoot, "shared.txt")
+	if err := os.WriteFile(filePath, []byte("ok"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h := newTestHandler()
+	h.FilePolicy = newGatewayTestFilePolicy(t, workspace, nil)
+	conn := newTestConn(t, h)
+
+	if err := conn.WriteJSON(protocol.FileAccessConfigRequestEvent{
+		ClientEvent:  protocol.ClientEvent{Action: "file_access_config"},
+		TrustedRoots: []string{clientRoot},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	resultEvent := readUntilType(t, conn, protocol.EventTypeFileAccessConfigResult)
+	roots, _ := resultEvent["trustedRoots"].([]any)
+	if len(roots) != 2 {
+		t.Fatalf("trusted roots: got %#v", resultEvent["trustedRoots"])
+	}
+	if err := conn.WriteJSON(protocol.FSReadRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "fs_read"},
+		Path:        filePath,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	readEvent := readUntilType(t, conn, protocol.EventTypeFSReadResult)
+	if readEvent["content"] != "ok" {
+		t.Fatalf("content: got %#v", readEvent["content"])
+	}
+}
+
+func TestHandlerFileAccessConfigRejectsInvalidRootWithoutMutatingPolicy(t *testing.T) {
+	workspace := t.TempDir()
+	initialRoot := t.TempDir()
+	filePath := filepath.Join(initialRoot, "allowed.txt")
+	if err := os.WriteFile(filePath, []byte("ok"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h := newTestHandler()
+	h.FilePolicy = newGatewayTestFilePolicy(t, workspace, []string{initialRoot})
+	conn := newTestConn(t, h)
+
+	if err := conn.WriteJSON(protocol.FileAccessConfigRequestEvent{
+		ClientEvent:  protocol.ClientEvent{Action: "file_access_config"},
+		TrustedRoots: []string{filepath.Join(t.TempDir(), "missing")},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	errorEvent := readUntilType(t, conn, protocol.EventTypeError)
+	msg, _ := errorEvent["msg"].(string)
+	if !strings.Contains(msg, "invalid trusted file root") {
+		t.Fatalf("error message: got %#v", errorEvent)
+	}
+	if err := conn.WriteJSON(protocol.FSReadRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "fs_read"},
+		Path:        filePath,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	readEvent := readUntilType(t, conn, protocol.EventTypeFSReadResult)
+	if readEvent["content"] != "ok" {
+		t.Fatalf("policy was mutated after invalid config: %#v", readEvent)
+	}
+}
+
+func newGatewayTestFilePolicy(t *testing.T, workspace string, trusted []string) fileaccess.Policy {
+	t.Helper()
+	policy, err := fileaccess.NewPolicy(workspace, trusted)
+	if err != nil {
+		t.Fatalf("NewPolicy failed: %v", err)
+	}
+	return policy
 }
 
 type switchableStubRunner struct {
@@ -4263,7 +4406,7 @@ func TestHandlerPermissionDecisionApproveForCodexWithExpiredPendingRequestReturn
 	}
 }
 
-func TestHandlerPermissionDecisionApproveForCodexWithMismatchedRequestIDAutoAppliesToCurrent(t *testing.T) {
+func TestHandlerPermissionDecisionApproveForCodexWithMismatchedRequestIDRefreshesPrompt(t *testing.T) {
 	firstRunner := newHoldingStubRunner(protocol.NewPromptRequestEvent("ignored", "需要权限确认", []string{"approve", "deny"}))
 	firstRunner.currentPermissionRequestID = "perm-codex-1"
 	h := newTestHandler()
@@ -4301,15 +4444,14 @@ func TestHandlerPermissionDecisionApproveForCodexWithMismatchedRequestIDAutoAppl
 		t.Fatalf("write permission decision request: %v", err)
 	}
 
-	// 客户端的 approve 用的是已经过期的 perm-codex-2，但当前 pending 是 perm-codex-1。
-	// 新行为：服务端把 approve 套到当前 pending 上直接执行，runner 应该收到 approve。
+	event := readUntilType(t, conn, protocol.EventTypePromptRequest)
+	if event["permissionRequestId"] != "perm-codex-1" {
+		t.Fatalf("expected refreshed prompt for current request, got %#v", event)
+	}
 	select {
 	case decision := <-firstRunner.permissionResponseWriteCh:
-		if decision != "approve" {
-			t.Fatalf("expected runner to receive approve, got %q", decision)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("runner did not receive auto-applied approve decision")
+		t.Fatalf("unexpected direct permission response: %q", decision)
+	case <-time.After(200 * time.Millisecond):
 	}
 }
 

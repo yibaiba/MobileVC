@@ -1,0 +1,73 @@
+package relay
+
+import (
+	"fmt"
+	"net"
+	"net/http"
+	"sync"
+	"time"
+
+	"github.com/gorilla/websocket"
+)
+
+type Server struct {
+	cfg            Config
+	upgrader       websocket.Upgrader
+	trustedProxies []*net.IPNet
+	mu             sync.Mutex
+	sessions       map[string]*sessionState
+	agentConns     int
+	clientConns    int
+	connCountByIP  map[string]int
+}
+
+type sessionState struct {
+	id                   string
+	pairingHash          string
+	agentReconnectHash   string
+	pairingExpiresAt     time.Time
+	agentDisconnectedAt  time.Time
+	agent                *peerConn
+	client               *peerConn
+	clientID             string
+	pairingConsumed      bool
+	pairFailuresByRemote map[string]int
+}
+
+func NewServer(cfg Config) (*Server, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	trustedProxies, err := parseTrustedProxyCIDRs(cfg.TrustedProxyCIDRs)
+	if err != nil {
+		return nil, err
+	}
+	return &Server{
+		cfg:            cfg,
+		trustedProxies: trustedProxies,
+		upgrader: websocket.Upgrader{
+			ReadBufferSize:  1024,
+			WriteBufferSize: 1024,
+			CheckOrigin:     func(*http.Request) bool { return true },
+		},
+		sessions:      make(map[string]*sessionState),
+		connCountByIP: make(map[string]int),
+	}, nil
+}
+
+func (s *Server) Handler(version string) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", s.healthz)
+	mux.HandleFunc("/version", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"version":%q}`, version)
+	})
+	mux.HandleFunc("/relay/agent", s.handleAgent)
+	mux.HandleFunc("/relay/client", s.handleClient)
+	return mux
+}
+
+func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("ok"))
+}
