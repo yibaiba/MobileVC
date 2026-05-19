@@ -1,0 +1,3 @@
+{"type":"test-plan","path":".trellis/tasks/05-18-public-internet-security-hardening-plan/prd.md","note":"Public exposure hardening acceptance criteria and verification scope."}
+{"type":"research","path":".trellis/tasks/05-18-public-internet-security-hardening-plan/research/owasp-public-exposure-notes.md","note":"External security guidance used for review checks."}
+{"type":"research","path":".trellis/tasks/05-18-security-audit-plan/research/security-audit-report.md","note":"Baseline audit report for regression comparison."}

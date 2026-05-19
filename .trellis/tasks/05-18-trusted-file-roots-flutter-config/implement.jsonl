@@ -1,0 +1,2 @@
+{"type":"spec","path":".trellis/spec/guides/cross-layer-thinking-guide.md","note":"Feature spans Flutter config, WebSocket protocol, and backend file policy."}
+{"type":"spec","path":".trellis/spec/guides/code-reuse-thinking-guide.md","note":"Use shared backend fileaccess policy for env and Flutter roots."}

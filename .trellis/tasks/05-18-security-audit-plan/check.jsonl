@@ -1,0 +1,5 @@
+{"file": ".trellis/spec/backend/index.md", "reason": "Check agent needs backend quality, logging, and error-handling expectations for security findings."}
+{"file": ".trellis/spec/frontend/index.md", "reason": "Check agent needs frontend quality expectations for Flutter-side security findings."}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "Check agent should verify cross-layer security contracts and boundary assumptions."}
+{"file": ".trellis/tasks/05-18-security-audit-plan/research/local-security-surface.md", "reason": "Check agent should verify the audit covers the initially identified high-risk surfaces."}
+{"file": ".trellis/tasks/05-18-security-audit-plan/research/security-audit-report.md", "reason": "Check agent should verify reported findings are supported and prioritized."}
