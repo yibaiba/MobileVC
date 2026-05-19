@@ -1,0 +1,146 @@
+# Quality Guidelines
+
+> Code quality standards for frontend development.
+
+---
+
+## Overview
+
+<!--
+Document your project's quality standards here.
+
+Questions to answer:
+- What patterns are forbidden?
+- What linting rules do you enforce?
+- What are your testing requirements?
+- What code review standards apply?
+-->
+
+(To be filled by the team)
+
+---
+
+## Forbidden Patterns
+
+<!-- Patterns that should never be used and why -->
+
+(To be filled by the team)
+
+---
+
+## Required Patterns
+
+### Scenario: Flutter Web Backend URL Scheme Derivation
+
+#### 1. Scope / Trigger
+- Trigger: any change that constructs backend HTTP, download, or WebSocket URLs from `AppConfig`.
+- Applies to: Flutter native, Flutter Web over HTTP, and Flutter Web over HTTPS.
+
+#### 2. Signatures
+- `AppConfig.baseHttpUrlFor({bool? secureTransport}) -> String`
+- `AppConfig.wsUrlFor({bool? secureTransport}) -> String`
+- `AppConfig.downloadUri(String path, {bool? secureTransport}) -> Uri`
+
+#### 3. Contracts
+- `secureTransport == false` derives `http://...` and `ws://...`.
+- `secureTransport == true` derives `https://...` and `wss://...`.
+- `secureTransport == null` uses the runtime default; Flutter Web loaded from `https://` must derive secure transport before `WebSocketChannel.connect(...)` is called.
+- Persisted config remains host/port/token/cwd focused; callers must not store a generated `wsUrl` string as source-of-truth state.
+
+#### 4. Validation & Error Matrix
+- Empty host -> `FormatException('host is required')`.
+- Non-numeric or non-positive port -> `FormatException('invalid port: <value>')`.
+- HTTPS page plus `ws://` URL -> browser `SecurityError`; this is a bug in URL derivation, not a backend retry case.
+
+#### 5. Good/Base/Bad Cases
+- Good: HTTPS Flutter Web calls `AppConfig.wsUrlFor()` and gets `wss://host:port/ws?token=...`.
+- Base: local native or HTTP web calls `AppConfig.wsUrlFor()` and gets `ws://host:port/ws?token=...`.
+- Bad: hand-building `ws://$host:$port/ws?token=$token` outside the URL helper.
+
+#### 6. Tests Required
+- Assert plain transport produces `http` and `ws`.
+- Assert secure transport produces `https` and `wss`.
+- Assert download URLs use the same HTTP scheme as the WebSocket scheme pair.
+- Assert invalid ports surface as `FormatException`.
+
+#### 7. Wrong vs Correct
+
+Wrong:
+
+```dart
+final wsUrl = 'ws://$host:$port/ws?token=$token';
+```
+
+Correct:
+
+```dart
+final wsUrl = config.wsUrlFor();
+```
+
+### Scenario: Flutter Relay Pairing Config
+
+#### 1. Scope / Trigger
+- Trigger: any Flutter change that parses relay QR URIs, stores relay config, connects relay WebSockets, or handles file actions in relay mode.
+- Applies to `AppConfig`, `relay_config.dart`, `MobileVcWsService`, and `SessionController`.
+
+#### 2. Signatures
+- `AppConfig.fromLaunchUri(String raw, {AppConfig fallback}) -> AppConfig?`
+- `validateRelayUrl(String raw) -> void`
+- `MobileVcWsService.connectRelay({required relayUrl, required sessionId, required pairingSecret})`
+- Relay QR: `mobilevc://relay/v1?relay=<url>&session=<id>&secret=<secret>&exp=<unix-seconds>`
+
+#### 3. Contracts
+- Parse `mobilevc://relay/v1` before direct launch URI parsing.
+- Relay scan selects `ConnectionMode.relay` without overwriting direct `host`, `port`, or `token`.
+- Persist only `connectionMode` and `relayUrl`; never persist `relaySessionId`, `relayPairingSecret`, or `relayPairingExpiresAt`.
+- Relay connect must wait for `client.paired`; pairing `relay.error` is a connection failure, not a successful connection.
+- Relay mode must not send direct backend `AUTH_TOKEN` in relay envelopes or control frames.
+- HTTP `/download` is disabled in relay mode and must show `Relay 模式暂不支持下载`.
+
+#### 4. Validation & Error Matrix
+- `http://` or `https://` relay URL -> `FormatException`.
+- Public-host `ws://` relay URL -> `FormatException`.
+- Missing relay URL/session/secret before connect -> `FormatException`.
+- `relay.error` during pairing -> connection failure and channel close.
+
+#### 5. Good/Base/Bad Cases
+- Good: scan relay QR, connect through `/relay/client`, clear one-time fields after successful pairing, persist only URL.
+- Base: direct LAN config remains default and continues using `AppConfig.wsUrlFor()`.
+- Bad: storing the pairing secret in `SharedPreferences`, or falling back to direct `/download` in relay mode.
+
+#### 6. Tests Required
+- Relay URI parsing preserves direct host/port/token and fills in-memory relay fields.
+- `toJson()` omits relay session and pairing secret fields.
+- Relay URL validation rejects `http(s)://` and public `ws://`.
+- Controller relay connect validates URL and clears one-time fields after success.
+
+#### 7. Wrong vs Correct
+
+Wrong:
+
+```dart
+await prefs.setString('relayPairingSecret', secret);
+```
+
+Correct:
+
+```dart
+await prefs.setString('mobilevc.app_config', jsonEncode(config.toJson()));
+```
+
+
+---
+
+## Testing Requirements
+
+<!-- What level of testing is expected -->
+
+(To be filled by the team)
+
+---
+
+## Code Review Checklist
+
+<!-- What reviewers should check -->
+
+(To be filled by the team)
