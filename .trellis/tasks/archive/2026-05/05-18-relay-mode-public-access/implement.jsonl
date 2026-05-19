@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/backend/index.md", "reason": "Backend relay/gateway/session implementation guidelines"}
+{"file": ".trellis/spec/frontend/index.md", "reason": "Flutter relay connection UI and state guidelines"}
+{"file": ".trellis/tasks/05-18-relay-mode-public-access/research/relay-mode-notes.md", "reason": "Relay architecture and security notes"}
+{"file": ".trellis/tasks/05-18-relay-mode-public-access/info.md", "reason": "Relay mode technical design"}
