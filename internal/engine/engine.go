@@ -80,3 +80,15 @@ type PermissionResponseWriter interface {
 type ClaudeSessionProvider interface {
 	ClaudeSessionID() string
 }
+
+// ContextCompactor exposes first-class context compaction for runtimes that
+// support it directly, instead of routing through a textual slash command.
+type ContextCompactor interface {
+	Compact(ctx context.Context) error
+}
+
+// ContextWindowUsageProvider exposes the latest known context window usage for
+// runtimes that can resolve it from their native transport.
+type ContextWindowUsageProvider interface {
+	ContextWindowUsage(ctx context.Context) (protocol.ContextWindowUsage, bool, error)
+}

@@ -69,6 +69,25 @@ class AppNotificationSignal {
   final DateTime createdAt;
 }
 
+enum CompactFeedbackTone {
+  success,
+  error,
+}
+
+class CompactFeedbackSignal {
+  const CompactFeedbackSignal({
+    required this.id,
+    required this.message,
+    required this.tone,
+    required this.createdAt,
+  });
+
+  final int id;
+  final String message;
+  final CompactFeedbackTone tone;
+  final DateTime createdAt;
+}
+
 class _ActionNeededSnapshot {
   const _ActionNeededSnapshot({
     required this.type,
@@ -206,6 +225,7 @@ class SessionController extends ChangeNotifier {
   bool _continueSameSessionEnabled = false;
   String _continuedSameSessionId = '';
   bool _isStopping = false;
+  bool _isCompacting = false;
   Timer? _sessionLoadingTimeout;
   static const Duration _sessionLoadingTimeoutDuration = Duration(seconds: 15);
   String _connectionMessage = '未连接';
@@ -246,6 +266,7 @@ class SessionController extends ChangeNotifier {
   RuntimeMeta _resumeRuntimeMeta = const RuntimeMeta();
   String _runtimePermissionMode = '';
   String _userSelectedPermissionMode = '';
+  ContextWindowUsage _contextWindowUsage = const ContextWindowUsage();
   SessionContext _sessionContext = const SessionContext();
   CatalogMetadata _skillCatalogMeta = const CatalogMetadata(domain: 'skill');
   CatalogMetadata _memoryCatalogMeta = const CatalogMetadata(domain: 'memory');
@@ -287,6 +308,8 @@ class SessionController extends ChangeNotifier {
   ActionNeededSignal? _actionNeededSignal;
   int _nextNotificationSignalId = 0;
   AppNotificationSignal? _notificationSignal;
+  int _nextCompactFeedbackSignalId = 0;
+  CompactFeedbackSignal? _compactFeedbackSignal;
   _ActionNeededSnapshot? _activeActionNeededSnapshot;
   bool _shouldSuppressNextActionNeededSignal = false;
   bool _autoSessionRequested = false;
@@ -481,6 +504,7 @@ class SessionController extends ChangeNotifier {
   bool get persistentPermissionRulesEnabled =>
       _persistentPermissionRulesEnabled;
   SessionContext get sessionContext => _sessionContext;
+  ContextWindowUsage get contextWindowUsage => _contextWindowUsage;
   CatalogMetadata get skillCatalogMeta => _skillCatalogMeta;
   CatalogMetadata get memoryCatalogMeta => _memoryCatalogMeta;
   String get skillSyncStatus => _skillSyncStatus;
@@ -654,6 +678,7 @@ class SessionController extends ChangeNotifier {
 
   ActionNeededSignal? get actionNeededSignal => _actionNeededSignal;
   AppNotificationSignal? get notificationSignal => _notificationSignal;
+  CompactFeedbackSignal? get compactFeedbackSignal => _compactFeedbackSignal;
   bool get fastMode => _config.fastMode;
   String get displayPermissionMode => _normalizeDisplayPermissionMode(
         _config.permissionMode.isNotEmpty
@@ -950,6 +975,43 @@ class SessionController extends ChangeNotifier {
         _executionActive;
   }
 
+  bool get canCompactCurrentSession {
+    if (!connected || _isLoadingSession) {
+      return false;
+    }
+    if (!shouldShowClaudeMode) {
+      return false;
+    }
+    final engine = currentMeta.engine.trim().toLowerCase();
+    if (engine != 'codex') {
+      return false;
+    }
+    if (hasPendingPermissionPrompt ||
+        shouldShowPermissionChoices ||
+        shouldShowReviewChoices ||
+        hasPendingPlanQuestions ||
+        hasPendingPlanPrompt ||
+        shouldShowPlanChoices) {
+      return false;
+    }
+    return !_isCompacting && !isSessionBusy && !canStopCurrentRun;
+  }
+
+  bool get shouldShowCompactButton {
+    if (_isLoadingSession) {
+      return false;
+    }
+    final engine = currentMeta.engine.trim().toLowerCase();
+    if (engine == 'codex') {
+      return true;
+    }
+    final command = currentMeta.command.trim().toLowerCase();
+    if (command == 'codex' || command.startsWith('codex ')) {
+      return true;
+    }
+    return currentAiEngine == 'codex';
+  }
+
   bool get _canBypassBusyGuardForCodexContinuation {
     if (!shouldShowClaudeMode) {
       return false;
@@ -968,6 +1030,8 @@ class SessionController extends ChangeNotifier {
   String get agentPhaseLabel => _agentPhaseLabel;
   bool get aiStatusIndicatorVisible => _aiStatusIndicatorVisible;
   String get aiStatusIndicatorLabel => _aiStatusIndicatorLabel;
+  bool get isCompacting => _isCompacting;
+  String get compactStatusLabel => _isCompacting ? '正在压缩上下文…' : '';
 
   bool get activityVisible => _activityVisible;
   bool get activityBannerVisible =>
@@ -1140,6 +1204,7 @@ class SessionController extends ChangeNotifier {
     _pushDebug('initialize start');
     try {
       await _restoreConfigFromPrefs();
+      _applyLaunchUriOverrides();
     } catch (error, stack) {
       _pushDebug(
           'initialize prefs restore failed', 'errorType=${error.runtimeType}');
@@ -1153,6 +1218,32 @@ class SessionController extends ChangeNotifier {
     _syncDerivedState();
     notifyListeners();
     _pushDebug('initialize end');
+  }
+
+  void _applyLaunchUriOverrides() {
+    if (!kIsWeb) {
+      return;
+    }
+    final next = AppConfig.fromLaunchUri(
+      Uri.base.toString(),
+      fallback: _config,
+    );
+    if (next == null) {
+      _pushDebug('launch uri override skip', 'web=true parsed=false');
+      return;
+    }
+    final changed = next.host != _config.host ||
+        next.port != _config.port ||
+        next.token != _config.token ||
+        next.cwd != _config.cwd;
+    if (!changed) {
+      _pushDebug('launch uri override noop', 'web=true changed=false');
+      return;
+    }
+    _config = next;
+    _currentDirectoryPath = next.cwd.trim();
+    _pushDebug('launch uri override applied',
+        'host=${next.host} port=${next.port} cwd=${next.cwd}');
   }
 
   Future<void> _restoreConfigFromPrefs() async {
@@ -1699,6 +1790,7 @@ class SessionController extends ChangeNotifier {
       requestPermissionRuleList();
       requestReviewState();
       requestTaskSnapshot();
+      requestContextWindowUsage();
       if (_selectedSessionId.trim().isNotEmpty) {
         _requestSessionResume(reason: silently ? 'reconnect' : 'connect');
       } else {
@@ -1783,6 +1875,7 @@ class SessionController extends ChangeNotifier {
     _lastServerEventAt = null;
     _canResumeCurrentSession = false;
     _resumeRuntimeMeta = const RuntimeMeta();
+    _contextWindowUsage = const ContextWindowUsage();
     _runtimePermissionMode = '';
     _sessionContext = const SessionContext();
     _skillCatalogMeta = const CatalogMetadata(domain: 'skill');
@@ -2156,6 +2249,7 @@ class SessionController extends ChangeNotifier {
   void _resetNewSessionState() {
     _canResumeCurrentSession = false;
     _resumeRuntimeMeta = const RuntimeMeta();
+    _contextWindowUsage = const ContextWindowUsage();
     _runtimePermissionMode = '';
     _runtimeInfo = null;
     _agentState = null;
@@ -2556,6 +2650,17 @@ class SessionController extends ChangeNotifier {
     }
     _service.send({
       'action': 'task_snapshot_get',
+      'sessionId': _selectedSessionId.trim(),
+      'cwd': effectiveCwd,
+    });
+  }
+
+  void requestContextWindowUsage() {
+    if (!_connected || _connecting) {
+      return;
+    }
+    _service.send({
+      'action': 'context_window_usage_get',
       'sessionId': _selectedSessionId.trim(),
       'cwd': effectiveCwd,
     });
@@ -3187,6 +3292,70 @@ class SessionController extends ChangeNotifier {
     }
   }
 
+  void compactCurrentSession() {
+    if (_isLoadingSession) {
+      _pushSystem('session', '会话切换中，请等待加载完成');
+      return;
+    }
+    if (!canCompactCurrentSession) {
+      _pushSystem('session', '当前状态暂不支持手动 Compact');
+      return;
+    }
+    final sessionId = _selectedSessionId.trim();
+    if (sessionId.isEmpty) {
+      _pushSystem('session', '请先创建或加载会话后再执行 Compact');
+      return;
+    }
+    if (currentMeta.engine.trim().toLowerCase() != 'codex' &&
+        currentAiEngine.trim().toLowerCase() != 'codex') {
+      _pushSystem('session', '当前会话暂不支持原生 Compact');
+      return;
+    }
+    final sent = _service.send({
+      'action': 'compact',
+      'sessionId': sessionId,
+      'cwd': effectiveCwd,
+      'engine': _config.engine,
+      'permissionMode': _config.permissionMode,
+    });
+    if (!sent) {
+      _isCompacting = false;
+      _setAiStatusVisible(false, immediate: true);
+      _emitCompactFeedback(
+        'Compact 请求发送失败：WebSocket 未连接或写入失败',
+        CompactFeedbackTone.error,
+      );
+      _pushSystem('error', 'Compact 请求发送失败：WebSocket 未连接或写入失败');
+      notifyListeners();
+      return;
+    }
+    _isCompacting = true;
+    _setAiStatusVisible(true, label: compactStatusLabel);
+    _upsertCompactionTimelineItem(
+      contextId: '',
+      status: 'loading',
+      trigger: 'manual',
+      message: '',
+      timestamp: DateTime.now(),
+      meta: currentMeta.merge(
+        RuntimeMeta(
+          source: 'compact',
+          target: 'compact',
+          targetType: 'compact',
+          targetText: 'manual',
+          command: currentMeta.command.trim().isNotEmpty
+              ? currentMeta.command
+              : 'codex',
+          engine: 'codex',
+          cwd: effectiveCwd,
+          permissionMode: _config.permissionMode,
+          claudeLifecycle: 'active',
+        ),
+      ),
+    );
+    notifyListeners();
+  }
+
   void submitPromptOption(String value) {
     final normalized = value.trim();
     if (normalized.isEmpty) {
@@ -3667,6 +3836,7 @@ class SessionController extends ChangeNotifier {
     }
     _canResumeCurrentSession = false;
     _resumeRuntimeMeta = const RuntimeMeta();
+    _contextWindowUsage = const ContextWindowUsage();
     _runtimeInfo = null;
     _pendingPrompt = null;
     _pendingInteraction = null;
@@ -3749,7 +3919,12 @@ class SessionController extends ChangeNotifier {
   }
 
   void _handleSlashCommand(String raw) {
-    switch (raw.trim()) {
+    final trimmed = raw.trim();
+    if (trimmed.isEmpty) {
+      return;
+    }
+    final normalized = trimmed.startsWith('/') ? trimmed : '/$trimmed';
+    switch (normalized) {
       case '/clear':
         clearTimeline();
         _pushSystem('session', '已清空当前前端时间线');
@@ -3773,18 +3948,27 @@ class SessionController extends ChangeNotifier {
         break;
       default:
         final meta = currentMeta;
-        final payload = {
+        final payload = <String, dynamic>{
           'action': 'slash_command',
-          'command': raw,
+          ...meta.toJson(),
+          'command': normalized,
           'cwd': effectiveCwd,
           'engine': _config.engine,
-          ...meta.toJson(),
           'permissionMode': _config.permissionMode,
         };
-        if (!_sendUserVisibleAction(payload, userText: raw, label: 'Slash')) {
+        if (!_sendUserVisibleAction(
+          payload,
+          userText: normalized,
+          label: 'Slash',
+        )) {
           return;
         }
     }
+  }
+
+  @visibleForTesting
+  void handleSlashCommandForTesting(String raw) {
+    _handleSlashCommand(raw);
   }
 
   void _handleEvent(AppEvent event) async {
@@ -3794,6 +3978,32 @@ class SessionController extends ChangeNotifier {
     switch (event) {
       case ClientActionAckEvent ack:
         _handleClientActionAck(ack);
+        break;
+      case CompactionEvent compaction:
+        if (!_eventTargetsCurrentSession(compaction.sessionId)) {
+          break;
+        }
+        _handleCompactionEvent(compaction);
+        break;
+      case ContextWindowUsageEvent usageEvent:
+        if (!_eventTargetsCurrentSession(usageEvent.sessionId)) {
+          break;
+        }
+        _contextWindowUsage = usageEvent.usage;
+        break;
+      case CompactResultEvent result:
+        if (_eventTargetsCurrentSession(result.sessionId) ||
+            result.sessionId.trim().isEmpty) {
+          if (!result.accepted) {
+            _isCompacting = false;
+            _setAiStatusVisible(false, immediate: true);
+            final message = result.error.trim().isNotEmpty
+                ? result.error.trim()
+                : 'Compact 执行失败';
+            _emitCompactFeedback(message, CompactFeedbackTone.error);
+            notifyListeners();
+          }
+        }
         break;
       case SessionCreatedEvent created:
         _connectionStage = SessionConnectionStage.ready;
@@ -3809,6 +4019,7 @@ class SessionController extends ChangeNotifier {
         _upsertSession(created.summary);
         requestSessionContext();
         requestPermissionRuleList();
+        requestContextWindowUsage();
         _finishSessionLoading(sessionId: created.summary.id);
         _flushDeferredFirstInputIfNeeded();
         break;
@@ -3867,6 +4078,7 @@ class SessionController extends ChangeNotifier {
             _isExternalNativeSession(resolvedHistorySummary);
         _executionActive = resolvedHistorySummary.executionActive;
         _sendCachedPushTokenIfPossible();
+        _contextWindowUsage = history.contextWindowUsage;
         _sessionContext = history.sessionContext;
         _skillCatalogMeta = history.skillCatalogMeta;
         _memoryCatalogMeta = history.memoryCatalogMeta;
@@ -3914,6 +4126,7 @@ class SessionController extends ChangeNotifier {
         _resetRuntimeProcessState();
         requestRuntimeProcessList();
         requestPermissionRuleList();
+        requestContextWindowUsage();
         if (history.currentDiff != null) {
           final current = _normalizeHistoryDiff(history.currentDiff!);
           _mergeRecentDiff(current);
@@ -3999,6 +4212,7 @@ class SessionController extends ChangeNotifier {
           _continueSameSessionEnabled = false;
           _continuedSameSessionId = '';
         }
+        requestContextWindowUsage();
         _syncObservedSessionPolling();
         break;
       case SessionResumeNoticeEvent notice:
@@ -4134,8 +4348,8 @@ class SessionController extends ChangeNotifier {
           _endUserSubmissionProtection();
         }
         _setAiStatusVisible(
-          status.visible,
-          label: status.label,
+          _isCompacting ? true : status.visible,
+          label: _isCompacting ? compactStatusLabel : status.label,
           phase: status.phase,
         );
         break;
@@ -4916,8 +5130,7 @@ class SessionController extends ChangeNotifier {
     }
     // 加载/auto-create 期间只丢弃不属于当前目标的 delta；用户主动 loadSession
     // 之后回流的匹配 delta 必须放行，否则增量内容永远不会落到 timeline。
-    if (_isLoadingSession &&
-        !_isHistoryEventForActiveTarget(delta.sessionId)) {
+    if (_isLoadingSession && !_isHistoryEventForActiveTarget(delta.sessionId)) {
       return;
     }
     _connectionStage = SessionConnectionStage.ready;
@@ -4937,6 +5150,7 @@ class SessionController extends ChangeNotifier {
       _upsertSession(resolvedSummary);
     }
     _sessionContext = delta.sessionContext;
+    _contextWindowUsage = delta.contextWindowUsage;
     _skillCatalogMeta = delta.skillCatalogMeta;
     _memoryCatalogMeta = delta.memoryCatalogMeta;
     _runtimePermissionMode = delta.resumeRuntimeMeta.permissionMode.trim();
@@ -4958,10 +5172,7 @@ class SessionController extends ChangeNotifier {
       _sessionDeltaKnown[delta.sessionId.trim()] = delta.latest;
     }
     for (final entry in delta.appendLogEntries) {
-      _appendTimelineItem(
-        _timelineFromHistory(entry, delta.resumeRuntimeMeta),
-        emitNotifications: false,
-      );
+      _appendHistoryTimelineEntry(entry, delta.resumeRuntimeMeta);
     }
     for (final diff in delta.upsertDiffs) {
       _mergeRecentDiff(diff);
@@ -5014,12 +5225,31 @@ class SessionController extends ChangeNotifier {
     RuntimeMeta resumeMeta,
   ) {
     _timeline.clear();
+    _isCompacting = false;
     for (final entry in entries) {
-      _appendTimelineItem(
-        _timelineFromHistory(entry, resumeMeta),
-        emitNotifications: false,
-      );
+      _appendHistoryTimelineEntry(entry, resumeMeta);
     }
+  }
+
+  void _appendHistoryTimelineEntry(
+    HistoryLogEntry entry,
+    RuntimeMeta resumeMeta,
+  ) {
+    final item = _timelineFromHistory(entry, resumeMeta);
+    if (item.kind == 'compaction') {
+      _upsertCompactionTimelineItem(
+        contextId: item.meta.contextId,
+        status: item.status,
+        trigger: item.trigger,
+        message: item.body,
+        timestamp: item.timestamp,
+        meta: item.meta,
+      );
+      final normalizedStatus = item.status.trim().toLowerCase();
+      _isCompacting = normalizedStatus == 'loading';
+      return;
+    }
+    _appendTimelineItem(item, emitNotifications: false);
   }
 
   TimelineItem _timelineFromHistory(
@@ -5036,6 +5266,8 @@ class SessionController extends ChangeNotifier {
       title: entry.label,
       body: restoredBody,
       stream: entry.stream,
+      status: entry.context?.status ?? '',
+      trigger: entry.context?.trigger ?? '',
       meta: _historyRuntimeMetaForEntry(entry, resumeMeta),
       context: entry.context,
       animateBody: false,
@@ -5123,6 +5355,9 @@ class SessionController extends ChangeNotifier {
   }
 
   String _restoredHistoryKind(HistoryLogEntry entry, String body) {
+    if (entry.kind == 'compaction') {
+      return 'compaction';
+    }
     if (entry.kind != 'terminal') {
       return entry.kind;
     }
@@ -5327,6 +5562,7 @@ class SessionController extends ChangeNotifier {
         body: _mergeTimelineBodies(previous.body, item.body),
         stream: previous.stream,
         status: item.status.isNotEmpty ? item.status : previous.status,
+        trigger: item.trigger.isNotEmpty ? item.trigger : previous.trigger,
         meta: item.meta,
         context: item.context ?? previous.context,
         animateBody: previous.animateBody || item.animateBody,
@@ -5366,6 +5602,9 @@ class SessionController extends ChangeNotifier {
   }
 
   bool _isDuplicateAssistantTimelineItem(TimelineItem item) {
+    if (item.kind == 'compaction') {
+      return false;
+    }
     if (item.kind != 'markdown' && item.kind != 'session') {
       return false;
     }
@@ -5411,6 +5650,9 @@ class SessionController extends ChangeNotifier {
   }
 
   bool _shouldMergeTimelineBodies(TimelineItem previous, TimelineItem item) {
+    if (previous.kind == 'compaction' || item.kind == 'compaction') {
+      return false;
+    }
     if (previous.stream != item.stream) {
       return false;
     }
@@ -5513,6 +5755,10 @@ class SessionController extends ChangeNotifier {
   }
 
   bool _shouldKeepTimelineItem(TimelineItem item) {
+    if (item.kind == 'compaction') {
+      final status = item.status.trim().toLowerCase();
+      return status == 'loading' || status == 'completed' || status == 'failed';
+    }
     if (item.body.trim().isEmpty && item.title.trim().isEmpty) {
       return false;
     }
@@ -7286,6 +7532,156 @@ class SessionController extends ChangeNotifier {
       body: _notificationPreview(body),
       createdAt: DateTime.now(),
     );
+  }
+
+  void _emitCompactFeedback(String message, CompactFeedbackTone tone) {
+    final normalized = message.trim();
+    if (normalized.isEmpty) {
+      return;
+    }
+    _compactFeedbackSignal = CompactFeedbackSignal(
+      id: ++_nextCompactFeedbackSignalId,
+      message: normalized,
+      tone: tone,
+      createdAt: DateTime.now(),
+    );
+  }
+
+  void _handleCompactionEvent(CompactionEvent event) {
+    final normalizedStatus = event.status.trim().toLowerCase();
+    final contextId = event.contextId.trim().isNotEmpty
+        ? event.contextId.trim()
+        : event.runtimeMeta.contextId.trim();
+    switch (normalizedStatus) {
+      case 'loading':
+        _isCompacting = true;
+        _setAiStatusVisible(true, label: compactStatusLabel);
+        _upsertCompactionTimelineItem(
+          contextId: contextId,
+          status: 'loading',
+          trigger: event.trigger,
+          message: event.message,
+          timestamp: event.timestamp,
+          meta: event.runtimeMeta,
+        );
+        break;
+      case 'completed':
+        _isCompacting = false;
+        _setAiStatusVisible(false, immediate: true);
+        _upsertCompactionTimelineItem(
+          contextId: contextId,
+          status: 'completed',
+          trigger: event.trigger,
+          message: '',
+          timestamp: event.timestamp,
+          meta: event.runtimeMeta,
+        );
+        break;
+      case 'failed':
+        _isCompacting = false;
+        _setAiStatusVisible(false, immediate: true);
+        final message = event.message.trim();
+        if (message.isNotEmpty) {
+          _emitCompactFeedback(message, CompactFeedbackTone.error);
+        }
+        _upsertCompactionTimelineItem(
+          contextId: contextId,
+          status: 'failed',
+          trigger: event.trigger,
+          message: message,
+          timestamp: event.timestamp,
+          meta: event.runtimeMeta,
+        );
+        break;
+      default:
+        return;
+    }
+  }
+
+  void _upsertCompactionTimelineItem({
+    required String contextId,
+    required String status,
+    required String trigger,
+    required String message,
+    required DateTime timestamp,
+    required RuntimeMeta meta,
+  }) {
+    final normalizedStatus = status.trim().toLowerCase();
+    final effectiveTrigger =
+        trigger.trim().isNotEmpty ? trigger.trim() : 'manual';
+    final effectiveContextId =
+        contextId.trim().isNotEmpty ? contextId.trim() : meta.contextId.trim();
+    final loadingIndex = _findLatestCompactionLoadingIndex(effectiveContextId);
+    if (normalizedStatus == 'loading' && loadingIndex != -1) {
+      _timeline[loadingIndex] = _timeline[loadingIndex].copyWith(
+        timestamp: timestamp,
+        status: 'loading',
+        trigger: effectiveTrigger,
+        body: '',
+        meta: _timeline[loadingIndex].meta.merge(
+              effectiveContextId.isNotEmpty
+                  ? meta.merge(RuntimeMeta(contextId: effectiveContextId))
+                  : meta,
+            ),
+      );
+      return;
+    }
+    if ((normalizedStatus == 'completed' || normalizedStatus == 'failed') &&
+        loadingIndex != -1) {
+      final previous = _timeline[loadingIndex];
+      _timeline[loadingIndex] = previous.copyWith(
+        timestamp: timestamp,
+        status: normalizedStatus,
+        trigger: previous.trigger.trim().isNotEmpty
+            ? previous.trigger
+            : effectiveTrigger,
+        body: normalizedStatus == 'failed' ? message.trim() : '',
+        meta: previous.meta.merge(
+          effectiveContextId.isNotEmpty
+              ? meta.merge(RuntimeMeta(contextId: effectiveContextId))
+              : meta,
+        ),
+      );
+      return;
+    }
+    _appendTimelineItem(
+      TimelineItem(
+        id: effectiveContextId.isNotEmpty
+            ? 'compaction-$effectiveContextId'
+            : 'compaction-${timestamp.microsecondsSinceEpoch}',
+        kind: 'compaction',
+        timestamp: timestamp,
+        body: normalizedStatus == 'failed' ? message.trim() : '',
+        status: normalizedStatus,
+        trigger: effectiveTrigger,
+        meta: effectiveContextId.isNotEmpty
+            ? meta.merge(RuntimeMeta(contextId: effectiveContextId))
+            : meta,
+      ),
+      emitNotifications: false,
+    );
+  }
+
+  int _findLatestCompactionLoadingIndex([String contextId = '']) {
+    final normalizedContextId = contextId.trim();
+    for (var i = _timeline.length - 1; i >= 0; i--) {
+      final item = _timeline[i];
+      if (item.kind != 'compaction') {
+        continue;
+      }
+      if (item.status.trim().toLowerCase() == 'loading') {
+        if (normalizedContextId.isNotEmpty &&
+            item.meta.contextId.trim().isNotEmpty &&
+            item.meta.contextId.trim() != normalizedContextId) {
+          continue;
+        }
+        return i;
+      }
+    }
+    if (normalizedContextId.isNotEmpty) {
+      return _findLatestCompactionLoadingIndex();
+    }
+    return -1;
   }
 
   String _notificationPreview(String text) {

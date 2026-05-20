@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -89,12 +90,10 @@ func ThreadIDFromMirror(sessionID string) string {
 }
 
 func ListNativeThreads(ctx context.Context, cwdFilter string) ([]NativeThread, error) {
-	home, err := os.UserHomeDir()
+	dbPath, historyPath, err := nativeCodexPaths()
 	if err != nil {
-		return nil, fmt.Errorf("resolve home dir failed: %w", err)
+		return nil, err
 	}
-	dbPath := filepath.Join(home, ".codex", "state_5.sqlite")
-	historyPath := filepath.Join(home, ".codex", "history.jsonl")
 	if _, err := os.Stat(dbPath); err != nil {
 		if os.IsNotExist(err) {
 			return []NativeThread{}, nil
@@ -114,34 +113,14 @@ func ListNativeThreads(ctx context.Context, cwdFilter string) ([]NativeThread, e
 		return nil, err
 	}
 
-	normalizedFilter := normalizePath(cwdFilter)
+	filterCandidates := candidateThreadCWDs(cwdFilter)
 	result := make([]NativeThread, 0, len(threads))
 	for _, thread := range threads {
-		if normalizedFilter != "" && normalizePath(thread.CWD) != normalizedFilter {
+		normalizedThreadCWD := normalizePath(thread.CWD)
+		if len(filterCandidates) > 0 && !pathCandidateMatch(normalizedThreadCWD, filterCandidates) {
 			continue
 		}
-		thread.MirrorSessionID = MirrorSessionID(thread.ThreadID)
-		if items, ok := prompts[thread.ThreadID]; ok {
-			thread.HistoryPrompts = items
-		}
-		if rollout, err := loadRollout(thread.RolloutPath); err == nil {
-			thread.LogEntries = rollout.LogEntries
-			thread.ControllerState = rollout.ControllerState
-			thread.ClaudeLifecycle = rollout.ClaudeLifecycle
-		}
-		if !isMeaningfulPromptText(thread.Title) {
-			thread.Title = latestMeaningfulPrompt(thread.HistoryPrompts)
-		}
-		if !isMeaningfulPromptText(thread.Title) {
-			thread.Title = latestMeaningfulNativeLogText(thread.LogEntries)
-		}
-		if !isMeaningfulPromptText(thread.Title) {
-			thread.Title = strings.TrimSpace(thread.FirstUserMessage)
-		}
-		if !isMeaningfulPromptText(thread.Title) {
-			thread.Title = "Codex 会话"
-		}
-		result = append(result, thread)
+		result = append(result, hydrateNativeThread(thread, prompts[thread.ThreadID]))
 	}
 	sort.Slice(result, func(i, j int) bool {
 		return result[i].UpdatedAt.After(result[j].UpdatedAt)
@@ -157,16 +136,28 @@ func FindNativeThread(ctx context.Context, sessionID string) (NativeThread, erro
 	if threadID == "" {
 		return NativeThread{}, fmt.Errorf("empty codex thread id")
 	}
-	threads, err := ListNativeThreads(ctx, "")
+	dbPath, historyPath, err := nativeCodexPaths()
 	if err != nil {
 		return NativeThread{}, err
 	}
-	for _, thread := range threads {
-		if thread.ThreadID == threadID {
-			return thread, nil
+	if _, err := os.Stat(dbPath); err != nil {
+		if os.IsNotExist(err) {
+			return NativeThread{}, fmt.Errorf("codex thread not found: %s", threadID)
 		}
+		return NativeThread{}, fmt.Errorf("stat codex sqlite failed: %w", err)
 	}
-	return NativeThread{}, fmt.Errorf("codex thread not found: %s", threadID)
+	thread, err := queryThreadByID(ctx, dbPath, threadID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return NativeThread{}, fmt.Errorf("codex thread not found: %s", threadID)
+		}
+		return NativeThread{}, err
+	}
+	prompts, err := loadHistoryForSession(historyPath, threadID)
+	if err != nil {
+		return NativeThread{}, err
+	}
+	return hydrateNativeThread(thread, prompts), nil
 }
 
 func MirrorRecord(thread NativeThread) data.SessionRecord {
@@ -250,6 +241,40 @@ func MirrorRecord(thread NativeThread) data.SessionRecord {
 	}
 }
 
+func nativeCodexPaths() (dbPath string, historyPath string, err error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", "", fmt.Errorf("resolve home dir failed: %w", err)
+	}
+	return filepath.Join(home, ".codex", "state_5.sqlite"),
+		filepath.Join(home, ".codex", "history.jsonl"),
+		nil
+}
+
+func hydrateNativeThread(thread NativeThread, prompts []NativePrompt) NativeThread {
+	thread.CWD = normalizePath(thread.CWD)
+	thread.MirrorSessionID = MirrorSessionID(thread.ThreadID)
+	thread.HistoryPrompts = append([]NativePrompt(nil), prompts...)
+	if rollout, err := loadRollout(thread.RolloutPath); err == nil {
+		thread.LogEntries = rollout.LogEntries
+		thread.ControllerState = rollout.ControllerState
+		thread.ClaudeLifecycle = rollout.ClaudeLifecycle
+	}
+	if !isMeaningfulPromptText(thread.Title) {
+		thread.Title = latestMeaningfulPrompt(thread.HistoryPrompts)
+	}
+	if !isMeaningfulPromptText(thread.Title) {
+		thread.Title = latestMeaningfulNativeLogText(thread.LogEntries)
+	}
+	if !isMeaningfulPromptText(thread.Title) {
+		thread.Title = strings.TrimSpace(thread.FirstUserMessage)
+	}
+	if !isMeaningfulPromptText(thread.Title) {
+		thread.Title = "Codex 会话"
+	}
+	return thread
+}
+
 func queryThreads(ctx context.Context, dbPath string) ([]NativeThread, error) {
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
@@ -314,6 +339,67 @@ func queryThreads(ctx context.Context, dbPath string) ([]NativeThread, error) {
 	return items, nil
 }
 
+func queryThreadByID(ctx context.Context, dbPath, threadID string) (NativeThread, error) {
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return NativeThread{}, fmt.Errorf("open codex sqlite failed: %w", err)
+	}
+	defer db.Close()
+
+	queryWithRollout := `select id, cwd, title, coalesce(model,''), coalesce(source,''), coalesce(model_provider,''), created_at, updated_at, coalesce(first_user_message,''), coalesce(rollout_path,'') from threads where archived = 0 and id = ? limit 1`
+	queryWithoutRollout := `select id, cwd, title, coalesce(model,''), coalesce(source,''), coalesce(model_provider,''), created_at, updated_at, coalesce(first_user_message,'') from threads where archived = 0 and id = ? limit 1`
+
+	var (
+		id, cwd, title, model, source, modelProvider string
+		createdAt, updatedAt                         int64
+		firstUserMessage, rolloutPath                string
+	)
+	err = db.QueryRowContext(ctx, queryWithRollout, threadID).Scan(
+		&id,
+		&cwd,
+		&title,
+		&model,
+		&source,
+		&modelProvider,
+		&createdAt,
+		&updatedAt,
+		&firstUserMessage,
+		&rolloutPath,
+	)
+	if err != nil && strings.Contains(err.Error(), "no such column: rollout_path") {
+		err = db.QueryRowContext(ctx, queryWithoutRollout, threadID).Scan(
+			&id,
+			&cwd,
+			&title,
+			&model,
+			&source,
+			&modelProvider,
+			&createdAt,
+			&updatedAt,
+			&firstUserMessage,
+		)
+		rolloutPath = ""
+	}
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return NativeThread{}, err
+		}
+		return NativeThread{}, fmt.Errorf("query codex thread failed: %w", err)
+	}
+	return NativeThread{
+		ThreadID:         id,
+		CWD:              cwd,
+		Title:            title,
+		Model:            model,
+		Source:           source,
+		ModelProvider:    modelProvider,
+		CreatedAt:        time.Unix(createdAt, 0).UTC(),
+		UpdatedAt:        time.Unix(updatedAt, 0).UTC(),
+		FirstUserMessage: firstUserMessage,
+		RolloutPath:      rolloutPath,
+	}, nil
+}
+
 func loadHistory(path string) (map[string][]NativePrompt, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -339,6 +425,44 @@ func loadHistory(path string) (map[string][]NativePrompt, error) {
 			continue
 		}
 		items[sessionID] = append(items[sessionID], NativePrompt{Text: text, Timestamp: time.Unix(line.TS, 0).UTC()})
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("scan codex history failed: %w", err)
+	}
+	return items, nil
+}
+
+func loadHistoryForSession(path, sessionID string) ([]NativePrompt, error) {
+	targetSessionID := strings.TrimSpace(sessionID)
+	if targetSessionID == "" {
+		return nil, nil
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []NativePrompt{}, nil
+		}
+		return nil, fmt.Errorf("open codex history failed: %w", err)
+	}
+	defer file.Close()
+
+	items := make([]NativePrompt, 0, 8)
+	scanner := bufio.NewScanner(file)
+	buf := make([]byte, 0, 64*1024)
+	scanner.Buffer(buf, 1024*1024)
+	for scanner.Scan() {
+		var line historyLine
+		if err := json.Unmarshal(scanner.Bytes(), &line); err != nil {
+			continue
+		}
+		if strings.TrimSpace(line.SessionID) != targetSessionID {
+			continue
+		}
+		text := strings.TrimSpace(line.Text)
+		if text == "" {
+			continue
+		}
+		items = append(items, NativePrompt{Text: text, Timestamp: time.Unix(line.TS, 0).UTC()})
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, fmt.Errorf("scan codex history failed: %w", err)
@@ -497,15 +621,68 @@ func normalizePath(value string) string {
 	if trimmed == "" {
 		return ""
 	}
+	trimmed = trimWindowsDevicePathPrefix(trimmed)
 	absPath, err := filepath.Abs(trimmed)
 	if err == nil {
 		trimmed = absPath
 	}
 	if resolved, err := filepath.EvalSymlinks(trimmed); err == nil && strings.TrimSpace(resolved) != "" {
-		trimmed = resolved
+		trimmed = trimWindowsDevicePathPrefix(resolved)
 	}
 	cleaned := filepath.Clean(trimmed)
 	return strings.TrimSuffix(cleaned, string(filepath.Separator))
+}
+
+func candidateThreadCWDs(raw string) []string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return nil
+	}
+	out := make([]string, 0, 5)
+	seen := map[string]struct{}{}
+	add := func(value string) {
+		normalized := normalizePath(value)
+		if normalized == "" {
+			return
+		}
+		if _, ok := seen[normalized]; ok {
+			return
+		}
+		seen[normalized] = struct{}{}
+		out = append(out, normalized)
+	}
+	add(trimmed)
+	add(trimWindowsDevicePathPrefix(trimmed))
+	if abs, err := filepath.Abs(trimWindowsDevicePathPrefix(trimmed)); err == nil {
+		add(abs)
+		if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+			add(resolved)
+		}
+	}
+	if resolved, err := filepath.EvalSymlinks(trimWindowsDevicePathPrefix(trimmed)); err == nil {
+		add(resolved)
+	}
+	return out
+}
+
+func pathCandidateMatch(value string, candidates []string) bool {
+	for _, candidate := range candidates {
+		if value == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func trimWindowsDevicePathPrefix(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if strings.HasPrefix(trimmed, `\\?\UNC\`) {
+		return `\\` + strings.TrimPrefix(trimmed, `\\?\UNC\`)
+	}
+	if strings.HasPrefix(trimmed, `\\?\`) {
+		return strings.TrimPrefix(trimmed, `\\?\`)
+	}
+	return trimmed
 }
 
 func latestMeaningfulPrompt(items []NativePrompt) string {

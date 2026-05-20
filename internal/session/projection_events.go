@@ -43,6 +43,13 @@ func ToProtocolSessionContext(ctx data.SessionContext) protocol.SessionContext {
 	}
 }
 
+func ToProtocolContextWindowUsage(usage data.ContextWindowUsage) protocol.ContextWindowUsage {
+	return protocol.NormalizeContextWindowUsage(protocol.ContextWindowUsage{
+		TokensUsed: usage.TokensUsed,
+		TokenLimit: usage.TokenLimit,
+	})
+}
+
 func ToProtocolCatalogMetadata(meta data.CatalogMetadata) protocol.CatalogMetadata {
 	lastSyncedAt := ""
 	if !meta.LastSyncedAt.IsZero() {
@@ -68,6 +75,7 @@ func HistoryContextFromSnapshot(ctx *data.SnapshotContext) *protocol.HistoryCont
 		Type:          ctx.Type,
 		Message:       ctx.Message,
 		Status:        ctx.Status,
+		Trigger:       ctx.Trigger,
 		Target:        ctx.Target,
 		TargetPath:    ctx.TargetPath,
 		Tool:          ctx.Tool,
@@ -293,6 +301,7 @@ func SessionHistoryEventFromRecord(record data.SessionRecord, runtimeAlive bool)
 		HistoryContextFromSnapshot(projection.LatestError),
 		projection.RawTerminalByStream,
 		executions,
+		ToProtocolContextWindowUsage(projection.ContextWindowUsage),
 		ToProtocolSessionContext(projection.SessionContext),
 		ToProtocolCatalogMetadata(projection.SkillCatalogMeta),
 		ToProtocolCatalogMetadata(projection.MemoryCatalogMeta),
@@ -383,6 +392,7 @@ func SessionDeltaEventFromRecord(record data.SessionRecord, known protocol.Sessi
 		HistoryContextFromSnapshot(projection.LatestError),
 		rawTerminalByStream,
 		executions,
+		ToProtocolContextWindowUsage(projection.ContextWindowUsage),
 		ToProtocolSessionContext(projection.SessionContext),
 		ToProtocolCatalogMetadata(projection.SkillCatalogMeta),
 		ToProtocolCatalogMetadata(projection.MemoryCatalogMeta),

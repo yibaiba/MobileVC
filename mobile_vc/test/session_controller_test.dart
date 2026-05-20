@@ -92,6 +92,31 @@ void main() {
   });
 
   group('SessionController action needed signal', () {
+    test('launch uri style config can replace stale saved cwd before connect',
+        () async {
+      SharedPreferences.setMockInitialValues({
+        'mobilevc.app_config':
+            '{"host":"10.0.0.2","port":"8001","token":"old-token","cwd":"C:\\\\Users\\\\29573\\\\Desktop\\\\fsdownload\\\\远程控制codex"}',
+      });
+
+      final fallback = AppConfig.fromJson(const {
+        'host': '10.0.0.2',
+        'port': '8001',
+        'token': 'old-token',
+        'cwd': r'C:\Users\29573\Desktop\fsdownload\远程控制codex',
+      });
+
+      final overridden = AppConfig.fromLaunchUri(
+        'http://10.136.78.122:8001/?token=123456&cwd=${Uri.encodeComponent(r'C:\Users\29573\Desktop\fsdownload\codexxm')}',
+        fallback: fallback!,
+      );
+
+      expect(overridden, isNotNull);
+      expect(overridden!.cwd, r'C:\Users\29573\Desktop\fsdownload\codexxm');
+      expect(overridden.token, '123456');
+      expect(overridden.host, '10.136.78.122');
+    });
+
     test('notification restore immediately loads target session when connected',
         () async {
       final service = _FakeMobileVcWsService();
@@ -1408,6 +1433,530 @@ void main() {
       expect(service.sentPayloads, hasLength(1));
       expect(service.sentPayloads[0]['action'], 'slash_command');
       expect(service.sentPayloads[0]['command'], '/claude');
+    });
+
+    test('slash 命令入口会自动补全前导斜杠', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.sentPayloads.clear();
+
+      controller.handleSlashCommandForTesting('compact');
+      expect(service.sentPayloads, hasLength(1));
+      expect(service.sentPayloads[0]['action'], 'slash_command');
+      expect(service.sentPayloads[0]['command'], '/compact');
+    });
+
+    test('slash 命令不会被 runtime meta.command 覆盖', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(
+        AgentStateEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-1',
+          runtimeMeta: const RuntimeMeta(
+            command: 'codex',
+            engine: 'codex',
+            claudeLifecycle: 'active',
+          ),
+          raw: const {'type': 'agent_state'},
+          state: 'IDLE',
+          message: 'ready',
+          command: 'codex',
+        ),
+      );
+      await _flushEvents();
+      service.sentPayloads.clear();
+
+      controller.handleSlashCommandForTesting('compact');
+
+      expect(service.sentPayloads, hasLength(1));
+      expect(service.sentPayloads[0]['action'], 'slash_command');
+      expect(service.sentPayloads[0]['command'], '/compact');
+    });
+
+    test('点击原生 compact 后立即显示 loading marker，不等后端事件', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.saveConfig(
+        const AppConfig(
+          cwd: '/workspace',
+          engine: 'codex',
+          permissionMode: 'default',
+        ),
+      );
+      await controller.connect();
+      service.emit(
+        SessionCreatedEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-1',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_created'},
+          summary: const SessionSummary(
+            id: 'session-1',
+            title: 'Test',
+            runtime: RuntimeMeta(engine: 'codex', command: 'codex'),
+          ),
+        ),
+      );
+      service.emit(
+        SessionHistoryEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-1',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_history'},
+          summary: const SessionSummary(id: 'session-1', title: 'Test'),
+          resumeRuntimeMeta:
+              const RuntimeMeta(engine: 'codex', command: 'codex'),
+        ),
+      );
+      await _flushEvents();
+      service.sentPayloads.clear();
+
+      controller.compactCurrentSession();
+
+      expect(service.sentPayloads, hasLength(1));
+      expect(service.sentPayloads.single['action'], 'compact');
+      expect(controller.isCompacting, isTrue);
+      expect(controller.aiStatusIndicatorVisible, isTrue);
+      expect(controller.aiStatusIndicatorLabel, '正在压缩上下文…');
+      final items = controller.timeline
+          .where((item) => item.kind == 'compaction')
+          .toList();
+      expect(items, hasLength(1));
+      expect(items.single.status, 'loading');
+      expect(items.single.trigger, 'manual');
+    });
+
+    test('codex compaction loading 到 completed 会原位更新同一 timeline item',
+        () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(
+        SessionCreatedEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-1',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_created'},
+          summary: const SessionSummary(
+            id: 'session-1',
+            title: 'Test',
+            runtime: RuntimeMeta(engine: 'codex', command: 'codex'),
+          ),
+        ),
+      );
+      service.emit(
+        SessionHistoryEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-1',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_history'},
+          summary: const SessionSummary(id: 'session-1', title: 'Test'),
+          resumeRuntimeMeta:
+              const RuntimeMeta(engine: 'codex', command: 'codex'),
+        ),
+      );
+      await _flushEvents();
+
+      service.emit(
+        CompactionEvent(
+          timestamp: _timestamp.add(const Duration(milliseconds: 10)),
+          sessionId: 'session-1',
+          runtimeMeta: const RuntimeMeta(
+            command: 'codex',
+            engine: 'codex',
+            source: 'compact',
+          ),
+          raw: const {'type': 'compaction'},
+          status: 'loading',
+          trigger: 'manual',
+        ),
+      );
+      await _flushEvents();
+
+      expect(controller.isCompacting, isTrue);
+      final loadingItems = controller.timeline
+          .where((item) => item.kind == 'compaction')
+          .toList();
+      expect(loadingItems, hasLength(1));
+      expect(loadingItems.single.status, 'loading');
+
+      service.emit(
+        CompactionEvent(
+          timestamp: _timestamp.add(const Duration(milliseconds: 30)),
+          sessionId: 'session-1',
+          runtimeMeta: const RuntimeMeta(
+            command: 'codex',
+            engine: 'codex',
+            source: 'compact',
+          ),
+          raw: const {'type': 'compaction'},
+          status: 'completed',
+          trigger: 'manual',
+        ),
+      );
+      await _flushEvents();
+
+      expect(controller.isCompacting, isFalse);
+      final items = controller.timeline
+          .where((item) => item.kind == 'compaction')
+          .toList();
+      expect(items, hasLength(1));
+      expect(items.single.status, 'completed');
+      expect(
+        controller.timeline.any(
+          (item) => item.kind == 'session' && item.body.contains('压缩完成'),
+        ),
+        isFalse,
+      );
+    });
+
+    test('stale WAIT_INPUT 不会结束 codex compaction', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(
+        CompactionEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-1',
+          runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+          raw: const {'type': 'compaction'},
+          status: 'loading',
+          trigger: 'manual',
+        ),
+      );
+      await _flushEvents();
+      expect(controller.isCompacting, isTrue);
+
+      service.emit(
+        AgentStateEvent(
+          timestamp: _timestamp.add(const Duration(milliseconds: 10)),
+          sessionId: 'session-1',
+          runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+          raw: const {'type': 'agent_state'},
+          state: 'WAIT_INPUT',
+          message: '等待输入',
+          awaitInput: true,
+          command: 'codex',
+        ),
+      );
+      await _flushEvents();
+
+      expect(controller.isCompacting, isTrue);
+      expect(
+        controller.timeline
+            .singleWhere((item) => item.kind == 'compaction')
+            .status,
+        'loading',
+      );
+    });
+
+    test('compact_result false 只结束按钮 loading 且不创建 completed marker', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(
+        CompactionEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-1',
+          runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+          raw: const {'type': 'compaction'},
+          status: 'loading',
+          trigger: 'manual',
+        ),
+      );
+      await _flushEvents();
+
+      service.emit(
+        CompactResultEvent(
+          timestamp: _timestamp.add(const Duration(milliseconds: 10)),
+          sessionId: 'session-1',
+          runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+          raw: const {'type': 'compact_result'},
+          accepted: false,
+          error: 'reject',
+        ),
+      );
+      await _flushEvents();
+
+      expect(controller.isCompacting, isFalse);
+      final items = controller.timeline
+          .where((item) => item.kind == 'compaction')
+          .toList();
+      expect(items, hasLength(1));
+      expect(items.single.status, 'loading');
+      expect(items.single.body, isEmpty);
+    });
+
+    test('compaction failed 会更新失败 marker 并发出错误反馈', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(
+        CompactionEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-1',
+          runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+          raw: const {'type': 'compaction'},
+          status: 'loading',
+          trigger: 'manual',
+        ),
+      );
+      await _flushEvents();
+
+      service.emit(
+        CompactionEvent(
+          timestamp: _timestamp.add(const Duration(milliseconds: 10)),
+          sessionId: 'session-1',
+          runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+          raw: const {'type': 'compaction'},
+          status: 'failed',
+          trigger: 'manual',
+          message: 'backend failed',
+        ),
+      );
+      await _flushEvents();
+
+      expect(controller.isCompacting, isFalse);
+      final item = controller.timeline
+          .singleWhere((entry) => entry.kind == 'compaction');
+      expect(item.status, 'failed');
+      expect(item.body, 'backend failed');
+      expect(controller.compactFeedbackSignal?.message, 'backend failed');
+    });
+
+    test('session_history 中 compaction 生命周期会折叠成单条 marker', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(
+        SessionHistoryEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-1',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_history'},
+          summary: const SessionSummary(id: 'session-1', title: 'Test'),
+          logEntries: const [
+            HistoryLogEntry(
+              kind: 'compaction',
+              timestamp: '2026-01-01T00:00:00Z',
+              context: HistoryContext(
+                id: 'cmp-1',
+                type: 'compaction',
+                status: 'loading',
+                trigger: 'manual',
+              ),
+            ),
+            HistoryLogEntry(
+              kind: 'compaction',
+              timestamp: '2026-01-01T00:00:01Z',
+              context: HistoryContext(
+                id: 'cmp-1',
+                type: 'compaction',
+                status: 'completed',
+                trigger: 'manual',
+              ),
+            ),
+          ],
+          resumeRuntimeMeta:
+              const RuntimeMeta(engine: 'codex', command: 'codex'),
+        ),
+      );
+      await _flushEvents();
+
+      final items = controller.timeline
+          .where((item) => item.kind == 'compaction')
+          .toList();
+      expect(items, hasLength(1));
+      expect(items.single.status, 'completed');
+      expect(controller.isCompacting, isFalse);
+    });
+
+    test('session_history 中残留 loading compaction 会恢复按钮 loading', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(
+        SessionHistoryEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-1',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_history'},
+          summary: const SessionSummary(id: 'session-1', title: 'Test'),
+          logEntries: const [
+            HistoryLogEntry(
+              kind: 'compaction',
+              timestamp: '2026-01-01T00:00:00Z',
+              context: HistoryContext(
+                id: 'cmp-loading',
+                type: 'compaction',
+                status: 'loading',
+                trigger: 'manual',
+              ),
+            ),
+          ],
+          resumeRuntimeMeta:
+              const RuntimeMeta(engine: 'codex', command: 'codex'),
+        ),
+      );
+      await _flushEvents();
+
+      expect(controller.isCompacting, isTrue);
+      final items = controller.timeline
+          .where((item) => item.kind == 'compaction')
+          .toList();
+      expect(items, hasLength(1));
+      expect(items.single.status, 'loading');
+    });
+
+    test('旧 compaction completed 不会结束当前新的 loading', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(
+        SessionHistoryEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-1',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_history'},
+          summary: const SessionSummary(id: 'session-1', title: 'Test'),
+          logEntries: const [
+            HistoryLogEntry(
+              kind: 'compaction',
+              timestamp: '2026-01-01T00:00:00Z',
+              context: HistoryContext(
+                id: 'cmp-old',
+                type: 'compaction',
+                status: 'completed',
+                trigger: 'manual',
+              ),
+            ),
+          ],
+          resumeRuntimeMeta:
+              const RuntimeMeta(engine: 'codex', command: 'codex'),
+        ),
+      );
+      await _flushEvents();
+
+      service.emit(
+        CompactionEvent(
+          timestamp: _timestamp.add(const Duration(milliseconds: 10)),
+          sessionId: 'session-1',
+          runtimeMeta: const RuntimeMeta(
+            command: 'codex',
+            engine: 'codex',
+            contextId: 'cmp-new',
+          ),
+          raw: const {'type': 'compaction', 'contextId': 'cmp-new'},
+          contextId: 'cmp-new',
+          status: 'loading',
+          trigger: 'manual',
+        ),
+      );
+      await _flushEvents();
+
+      expect(controller.isCompacting, isTrue);
+      final duringLoading = controller.timeline
+          .where((item) => item.kind == 'compaction')
+          .toList();
+      expect(duringLoading, hasLength(2));
+      expect(
+        duringLoading
+            .where((item) => item.meta.contextId == 'cmp-new')
+            .single
+            .status,
+        'loading',
+      );
+
+      service.emit(
+        CompactionEvent(
+          timestamp: _timestamp.add(const Duration(milliseconds: 20)),
+          sessionId: 'session-1',
+          runtimeMeta: const RuntimeMeta(
+            command: 'codex',
+            engine: 'codex',
+            contextId: 'cmp-new',
+          ),
+          raw: const {'type': 'compaction', 'contextId': 'cmp-new'},
+          contextId: 'cmp-new',
+          status: 'completed',
+          trigger: 'manual',
+        ),
+      );
+      await _flushEvents();
+
+      expect(controller.isCompacting, isFalse);
+      final items = controller.timeline
+          .where((item) => item.kind == 'compaction')
+          .toList();
+      expect(items, hasLength(2));
+      expect(
+        items.where((item) => item.meta.contextId == 'cmp-old').single.status,
+        'completed',
+      );
+      expect(
+        items.where((item) => item.meta.contextId == 'cmp-new').single.status,
+        'completed',
+      );
+    });
+
+    test('Claude 会话不暴露原生 compact 按钮能力', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(
+        AgentStateEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-1',
+          runtimeMeta: const RuntimeMeta(
+            command: 'claude',
+            engine: 'claude',
+          ),
+          raw: const {'type': 'agent_state'},
+          state: 'IDLE',
+          message: 'ready',
+          command: 'claude',
+        ),
+      );
+      await _flushEvents();
+
+      expect(controller.shouldShowCompactButton, isFalse);
+      expect(controller.canCompactCurrentSession, isFalse);
     });
 
     test('continueWithCurrentFile 在 Claude 会话中走后端 ai_turn continuation',
@@ -5069,7 +5618,7 @@ void main() {
       expect(prompt.options, hasLength(3));
     });
 
-    test('connect 时会补发 session_context_get 和 review_state_get', () async {
+    test('connect 时会补发 session_context_get、review_state_get 和 context_window_usage_get', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);
       await controller.initialize();
@@ -5091,6 +5640,7 @@ void main() {
           .toList();
       expect(actions, contains('session_context_get'));
       expect(actions, contains('review_state_get'));
+      expect(actions, contains('context_window_usage_get'));
     });
 
     test('review 决策后优先跳到同组下一个待审文件', () async {
@@ -7483,6 +8033,61 @@ void main() {
 
       expect(controller.aiStatusIndicatorVisible, isTrue);
       expect(controller.aiStatusIndicatorLabel, '正在读取 · README.md');
+    });
+
+    test('applies live context window usage updates', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionCreatedEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-usage',
+        runtimeMeta: const RuntimeMeta(),
+        raw: const {'type': 'session_created'},
+        summary: const SessionSummary(id: 'session-usage', title: 'Usage'),
+      ));
+      await _flushEvents();
+
+      service.emit(ContextWindowUsageEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 10)),
+        sessionId: 'session-usage',
+        runtimeMeta: const RuntimeMeta(engine: 'codex', command: 'codex'),
+        raw: const {'type': 'context_window_usage'},
+        usage: const ContextWindowUsage(tokensUsed: 45000, tokenLimit: 200000),
+      ));
+      await _flushEvents();
+
+      expect(controller.contextWindowUsage.tokensUsed, 45000);
+      expect(controller.contextWindowUsage.tokenLimit, 200000);
+      expect(controller.contextWindowUsage.percentUsed, 23);
+    });
+
+    test('restores context window usage from session history', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-history-usage',
+        runtimeMeta: const RuntimeMeta(),
+        raw: const {'type': 'session_history'},
+        summary:
+            const SessionSummary(id: 'session-history-usage', title: 'Usage'),
+        contextWindowUsage:
+            const ContextWindowUsage(tokensUsed: 120000, tokenLimit: 200000),
+        resumeRuntimeMeta: const RuntimeMeta(engine: 'codex', command: 'codex'),
+      ));
+      await _flushEvents();
+
+      expect(controller.contextWindowUsage.tokensUsed, 120000);
+      expect(controller.contextWindowUsage.tokenLimit, 200000);
+      expect(controller.contextWindowUsage.tokensRemaining, 80000);
     });
   });
 

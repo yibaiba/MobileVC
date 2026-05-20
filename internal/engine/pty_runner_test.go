@@ -1289,6 +1289,61 @@ func TestPtyRunnerResumeCommandAddsPermissionMode(t *testing.T) {
 	}
 }
 
+func TestCodexContextWindowUsageParsesCamelCasePayload(t *testing.T) {
+	usage, ok := codexContextWindowUsage(map[string]any{
+		"modelContextWindow": 200000,
+		"last": map[string]any{
+			"totalTokens": 50000,
+		},
+	})
+	if !ok {
+		t.Fatal("expected usage to parse")
+	}
+	if usage.TokenLimit != 200000 || usage.TokensUsed != 50000 {
+		t.Fatalf("unexpected usage: %+v", usage)
+	}
+}
+
+func TestCodexContextWindowUsageParsesSnakeCasePayload(t *testing.T) {
+	usage, ok := codexContextWindowUsage(map[string]any{
+		"model_context_window": 128000,
+		"total": map[string]any{
+			"total_tokens": 64000,
+		},
+	})
+	if !ok {
+		t.Fatal("expected usage to parse")
+	}
+	if usage.TokenLimit != 128000 || usage.TokensUsed != 64000 {
+		t.Fatalf("unexpected usage: %+v", usage)
+	}
+}
+
+func TestClaudeUsageHelpers(t *testing.T) {
+	maxTokens := claudeContextWindowMaxTokens(json.RawMessage(`{
+		"primary": {"contextWindow": 200000},
+		"fallback": {"contextWindow": 100000}
+	}`))
+	if maxTokens != 200000 {
+		t.Fatalf("unexpected max tokens: %d", maxTokens)
+	}
+
+	totalTokens := claudeUsageTotalTokens(json.RawMessage(`{"total_tokens":12345}`))
+	if totalTokens != 12345 {
+		t.Fatalf("unexpected total tokens: %d", totalTokens)
+	}
+
+	derived := claudeDerivedResultUsage(json.RawMessage(`{
+		"input_tokens":1000,
+		"cache_creation_input_tokens":200,
+		"cache_read_input_tokens":300,
+		"output_tokens":400
+	}`))
+	if derived != 1900 {
+		t.Fatalf("unexpected derived usage: %d", derived)
+	}
+}
+
 func TestNewClaudeStreamCommandPreservesResumeAndPermissionMode(t *testing.T) {
 	cmd := newClaudeStreamCommand(context.Background(), "claude --resume resume-xyz", "resume-xyz", "auto")
 	joined := strings.Join(cmd.Args, " ")
@@ -1432,6 +1487,49 @@ func TestExtractCodexInitialPromptStripsConfigFlags(t *testing.T) {
 	}
 }
 
+func TestCodexRunUsesInitialInputAsInitialPromptWhenCommandHasNoInlinePrompt(t *testing.T) {
+	req := ExecRequest{
+		SessionID:      "s-codex-initial-input",
+		Command:        "codex -m gpt-5.5",
+		Mode:           ModePTY,
+		PermissionMode: "default",
+		InitialInput:   "hello from initial input\n",
+	}
+
+	if got := extractCodexInitialPrompt(req.Command); got != "" {
+		t.Fatalf("expected no inline codex initial prompt, got %q", got)
+	}
+
+	initialPrompt := extractCodexInitialPrompt(req.Command)
+	if strings.TrimSpace(initialPrompt) == "" && strings.TrimSpace(req.InitialInput) != "" {
+		initialPrompt = strings.TrimSpace(req.InitialInput)
+	}
+
+	if initialPrompt != "hello from initial input" {
+		t.Fatalf("expected initial input fallback to become initial prompt, got %q", initialPrompt)
+	}
+}
+
+func TestCodexResumeCommandStartsImmediatelyWithoutLazyPrompt(t *testing.T) {
+	req := ExecRequest{
+		SessionID: "s-codex-resume",
+		Command:   "codex resume thread-123",
+		Mode:      ModePTY,
+		RuntimeMeta: protocol.RuntimeMeta{
+			Engine:          "codex",
+			ResumeSessionID: "thread-123",
+		},
+	}
+
+	initialPrompt := extractCodexInitialPrompt(req.Command)
+	if initialPrompt != "" {
+		t.Fatalf("expected no inline prompt for codex resume command, got %q", initialPrompt)
+	}
+	if strings.TrimSpace(extractResumeArg(req.Command)) == "" {
+		t.Fatalf("expected codex resume command to carry a resume id")
+	}
+}
+
 func TestExtractCodexReasoningEffortFlagSupportsConfigOverride(t *testing.T) {
 	got := extractCodexReasoningEffortFlag(
 		`codex -m gpt-5.4 --config model_reasoning_effort="xhigh"`,
@@ -1503,6 +1601,180 @@ func TestCodexAppSessionTurnStartPassesReasoningEffort(t *testing.T) {
 	}
 	if !strings.Contains(output, `"effort":"xhigh"`) {
 		t.Fatalf("expected reasoning effort override in turn/start payload, got %q", output)
+	}
+}
+
+func TestCodexAppSessionCompactUsesThreadCompactStart(t *testing.T) {
+	buf := &nopWriteCloser{}
+	var compactionEvents []protocol.CompactionEvent
+	app := &codexAppSession{
+		runner: NewPtyRunner(),
+		req: ExecRequest{
+			Command: "codex -m gpt-5.4",
+		},
+		stdin:     buf,
+		sessionID: "s-compact",
+		sink: func(event any) {
+			if compaction, ok := event.(protocol.CompactionEvent); ok {
+				compactionEvents = append(compactionEvents, compaction)
+			}
+		},
+	}
+	app.setThreadID("thread-compact-1")
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- app.Compact(context.Background())
+	}()
+
+	resolveNextPendingRPC(t, app, map[string]any{
+		"turn": map[string]any{
+			"id": "turn-compact-1",
+		},
+	})
+
+	if err := <-errCh; err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, `"method":"thread/compact/start"`) {
+		t.Fatalf("expected thread/compact/start rpc call, got %q", output)
+	}
+	if !strings.Contains(output, `"threadId":"thread-compact-1"`) {
+		t.Fatalf("expected thread id in compact payload, got %q", output)
+	}
+	if got := app.activeTurn(); got != "turn-compact-1" {
+		t.Fatalf("expected active turn to update, got %q", got)
+	}
+	if len(compactionEvents) != 1 {
+		t.Fatalf("expected loading compaction event, got %#v", compactionEvents)
+	}
+	if compactionEvents[0].Status != "loading" || compactionEvents[0].Trigger != "manual" {
+		t.Fatalf("unexpected compaction loading event: %#v", compactionEvents[0])
+	}
+	if compactionEvents[0].ContextID == "" {
+		t.Fatalf("expected stable compaction context id at start, got %#v", compactionEvents[0])
+	}
+}
+
+func TestCodexAppSessionCompactionItemCompletionEmitsCompletedEvent(t *testing.T) {
+	var compactionEvents []protocol.CompactionEvent
+	app := &codexAppSession{
+		runner:    NewPtyRunner(),
+		sessionID: "s-compaction-complete",
+		sink: func(event any) {
+			if compaction, ok := event.(protocol.CompactionEvent); ok {
+				compactionEvents = append(compactionEvents, compaction)
+			}
+		},
+	}
+	app.setCompactionTurnID("turn-compact-1")
+	app.setCompactionID("cmp-1")
+
+	params, err := json.Marshal(map[string]any{
+		"threadId": "thread-123",
+		"turnId":   "turn-compact-1",
+		"item": map[string]any{
+			"type": "contextCompaction",
+			"id":   "item-compact-1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal params: %v", err)
+	}
+
+	app.handleItemEvent(params, "done")
+
+	if len(compactionEvents) != 1 {
+		t.Fatalf("expected one completed compaction event, got %#v", compactionEvents)
+	}
+	if compactionEvents[0].Status != "completed" || compactionEvents[0].Trigger != "manual" {
+		t.Fatalf("unexpected compaction completed event: %#v", compactionEvents[0])
+	}
+	if compactionEvents[0].ContextID != "cmp-1" {
+		t.Fatalf("expected completed event to retain compaction lifecycle id, got %#v", compactionEvents[0])
+	}
+}
+
+func TestCodexAppSessionCompactionTurnErrorEmitsFailedEvent(t *testing.T) {
+	var compactionEvents []protocol.CompactionEvent
+	app := &codexAppSession{
+		runner:    NewPtyRunner(),
+		sessionID: "s-compaction-failed",
+		sink: func(event any) {
+			if compaction, ok := event.(protocol.CompactionEvent); ok {
+				compactionEvents = append(compactionEvents, compaction)
+			}
+		},
+	}
+	app.setCompactionTurnID("turn-compact-1")
+	app.setCompactionID("cmp-err")
+
+	params, err := json.Marshal(map[string]any{
+		"threadId": "thread-123",
+		"turn": map[string]any{
+			"id": "turn-compact-1",
+			"error": map[string]any{
+				"message": "compaction exploded",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal params: %v", err)
+	}
+
+	app.handleTurnCompleted(params)
+
+	if len(compactionEvents) != 1 {
+		t.Fatalf("expected one failed compaction event, got %#v", compactionEvents)
+	}
+	if compactionEvents[0].Status != "failed" {
+		t.Fatalf("unexpected compaction failed event: %#v", compactionEvents[0])
+	}
+	if compactionEvents[0].Message != "compaction exploded" {
+		t.Fatalf("unexpected compaction error message: %#v", compactionEvents[0])
+	}
+	if compactionEvents[0].ContextID != "cmp-err" {
+		t.Fatalf("expected failed event to retain compaction lifecycle id, got %#v", compactionEvents[0])
+	}
+}
+
+func TestCodexAppSessionCompactionLoadingIsNotDuplicatedByItemStarted(t *testing.T) {
+	var compactionEvents []protocol.CompactionEvent
+	app := &codexAppSession{
+		runner:    NewPtyRunner(),
+		sessionID: "s-compaction-loading-dedup",
+		sink: func(event any) {
+			if compaction, ok := event.(protocol.CompactionEvent); ok {
+				compactionEvents = append(compactionEvents, compaction)
+			}
+		},
+	}
+	app.setThreadID("thread-compact-1")
+	app.resetCompactionLifecycle()
+	app.setCompactionID("cmp-load")
+	app.emitCompactionEvent("loading", "manual", "")
+
+	params, err := json.Marshal(map[string]any{
+		"threadId": "thread-123",
+		"turnId":   "turn-compact-1",
+		"item": map[string]any{
+			"type": "contextCompaction",
+			"id":   "item-compact-1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal params: %v", err)
+	}
+
+	app.handleItemEvent(params, "running")
+
+	if len(compactionEvents) != 1 {
+		t.Fatalf("expected one loading compaction event, got %#v", compactionEvents)
+	}
+	if compactionEvents[0].ContextID != "cmp-load" {
+		t.Fatalf("expected deduped loading event to retain original lifecycle id, got %#v", compactionEvents[0])
 	}
 }
 

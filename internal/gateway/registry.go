@@ -529,6 +529,8 @@ func eventCursorFromEvent(event any) int64 {
 		return e.EventCursor
 	case protocol.ErrorEvent:
 		return e.EventCursor
+	case protocol.ContextWindowUsageEvent:
+		return e.EventCursor
 	case protocol.InteractionRequestEvent:
 		return e.EventCursor
 	case protocol.PromptRequestEvent:

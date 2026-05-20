@@ -175,4 +175,30 @@ void main() {
 
     expect(find.text('执行中'), findsNothing);
   });
+
+  testWidgets('compaction timeline item is visible alongside ai indicator',
+      (tester) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: ChatTimeline(
+            items: [
+              TimelineItem(
+                id: 'compaction-1',
+                kind: 'compaction',
+                timestamp: DateTime(2026, 1, 1),
+                status: 'loading',
+                trigger: 'manual',
+              ),
+            ],
+            isAiRunning: true,
+            aiStatusLabel: '正在压缩上下文…',
+          ),
+        ),
+      ),
+    );
+
+    expect(find.text('压缩中'), findsOneWidget);
+    expect(find.text('正在压缩上下文…'), findsOneWidget);
+  });
 }
