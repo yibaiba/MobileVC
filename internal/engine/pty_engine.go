@@ -41,36 +41,36 @@ const (
 )
 
 type PtyRunner struct {
-	mu                      sync.Mutex
-	runCtx                  context.Context
-	writer                  io.WriteCloser
-	closer                  io.Closer
-	cmd                     *exec.Cmd
-	closed                  bool
-	suppressExitError       bool
-	lazyStart               bool
-	interactive             bool
-	awaitingReadyPrompt     bool
-	processDone             chan struct{}
-	processErr              error
-	pendingReq              ExecRequest
-	pendingCWD              string
-	currentDir              string
-	sink                    EventSink
-	claudeSessionID         string
-	codexSession            *codexAppSession
-	permissionMode          string
+	mu                          sync.Mutex
+	runCtx                      context.Context
+	writer                      io.WriteCloser
+	closer                      io.Closer
+	cmd                         *exec.Cmd
+	closed                      bool
+	suppressExitError           bool
+	lazyStart                   bool
+	interactive                 bool
+	awaitingReadyPrompt         bool
+	processDone                 chan struct{}
+	processErr                  error
+	pendingReq                  ExecRequest
+	pendingCWD                  string
+	currentDir                  string
+	sink                        EventSink
+	claudeSessionID             string
+	codexSession                *codexAppSession
+	permissionMode              string
 	pendingControlRequestID     string
 	pendingControlRequestIDPrev string
 	pendingControlInput         json.RawMessage
 	pendingControlInputPrev     json.RawMessage
 	pendingPromptOptions        []string
-	lastToolName            string
-	lastToolTarget          string
-	fileSnapshots           map[string]fileSnapshot
-	catalogAuthoringBuffer  strings.Builder
-	lastAssistantTextKey    string
-	runGeneration           uint64
+	lastToolName                string
+	lastToolTarget              string
+	fileSnapshots               map[string]fileSnapshot
+	catalogAuthoringBuffer      strings.Builder
+	lastAssistantTextKey        string
+	runGeneration               uint64
 	// stall watchdog 状态：lastEngineOutputAt 由 markOutputSeen 在每次读到字节/行后更新；
 	// stallWatchdogCancel 用于在 runner 关闭时停止后台巡检 goroutine。
 	lastEngineOutputAt  time.Time
@@ -82,7 +82,11 @@ type PtyRunner struct {
 	toolUsePending bool
 	// streamFirstLineSeen 用于在 claude stream 启动期 emit "engine_starting" phase，
 	// 在收到首条 raw line 时清掉，避免 resume 启动 + 首字延迟期间前端无反馈。
-	streamFirstLineSeen bool
+	streamFirstLineSeen         bool
+	lastContextWindowUsedTokens int
+	lastContextWindowMaxTokens  int
+	hasContextWindowUsedTokens  bool
+	hasContextWindowMaxTokens   bool
 }
 
 type fileSnapshot struct {
@@ -133,6 +137,38 @@ func NewPtyRunner() *PtyRunner {
 	return &PtyRunner{}
 }
 
+func (r *PtyRunner) ContextWindowUsage(ctx context.Context) (protocol.ContextWindowUsage, bool, error) {
+	r.mu.Lock()
+	codexSession := r.codexSession
+	cachedUsed := r.lastContextWindowUsedTokens
+	cachedMax := r.lastContextWindowMaxTokens
+	hasUsed := r.hasContextWindowUsedTokens
+	hasMax := r.hasContextWindowMaxTokens
+	r.mu.Unlock()
+
+	if codexSession != nil {
+		if usage, ok, err := codexSession.ContextWindowUsage(ctx); err != nil {
+			return protocol.ContextWindowUsage{}, false, err
+		} else if ok {
+			r.mu.Lock()
+			r.lastContextWindowUsedTokens = usage.TokensUsed
+			r.lastContextWindowMaxTokens = usage.TokenLimit
+			r.hasContextWindowUsedTokens = true
+			r.hasContextWindowMaxTokens = true
+			r.mu.Unlock()
+			return usage, true, nil
+		}
+	}
+
+	if hasMax && hasUsed && cachedMax > 0 {
+		return protocol.NormalizeContextWindowUsage(protocol.ContextWindowUsage{
+			TokensUsed: cachedUsed,
+			TokenLimit: cachedMax,
+		}), true, nil
+	}
+	return protocol.ContextWindowUsage{}, false, nil
+}
+
 func (r *PtyRunner) Run(ctx context.Context, req ExecRequest, sink EventSink) error {
 	if req.SessionID == "" {
 		return errors.New("session id is required")
@@ -161,6 +197,9 @@ func (r *PtyRunner) Run(ctx context.Context, req ExecRequest, sink EventSink) er
 
 	if shouldUseCodexAppServer(req.Command) {
 		initialPrompt := extractCodexInitialPrompt(req.Command)
+		if strings.TrimSpace(initialPrompt) == "" && strings.TrimSpace(req.InitialInput) != "" {
+			initialPrompt = strings.TrimSpace(req.InitialInput)
+		}
 		if initialPrompt != "" {
 			generation := r.nextRunGeneration()
 			r.mu.Lock()
@@ -179,6 +218,26 @@ func (r *PtyRunner) Run(ctx context.Context, req ExecRequest, sink EventSink) er
 			r.lazyStart = false
 			r.mu.Unlock()
 			return r.runCodexAppServer(ctx, req, cwd, sink, initialPrompt)
+		}
+		if strings.TrimSpace(extractResumeArg(req.Command)) != "" ||
+			strings.TrimSpace(req.RuntimeMeta.ResumeSessionID) != "" {
+			generation := r.nextRunGeneration()
+			r.mu.Lock()
+			r.runCtx = ctx
+			r.permissionMode = req.PermissionMode
+			r.interactive = false
+			r.runGeneration = generation
+			r.pendingReq = req
+			r.lastAssistantTextKey = ""
+			r.pendingCWD = cwd
+			r.currentDir = cwd
+			r.sink = sink
+			r.closed = false
+			r.processDone = make(chan struct{})
+			r.processErr = nil
+			r.lazyStart = false
+			r.mu.Unlock()
+			return r.runCodexAppServer(ctx, req, cwd, sink, "")
 		}
 		generation := r.nextRunGeneration()
 		r.mu.Lock()
@@ -516,6 +575,27 @@ func (r *PtyRunner) CanAcceptInteractiveInput() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.interactive && r.writer != nil && !r.closed
+}
+
+func (r *PtyRunner) HasActiveTurn() bool {
+	r.mu.Lock()
+	session := r.codexSession
+	r.mu.Unlock()
+	if session == nil {
+		return false
+	}
+	return session.HasActiveTurn()
+}
+
+func (r *PtyRunner) Compact(ctx context.Context) error {
+	r.mu.Lock()
+	session := r.codexSession
+	closed := r.closed
+	r.mu.Unlock()
+	if session == nil || closed {
+		return errors.New("no active codex session")
+	}
+	return session.Compact(ctx)
 }
 
 func (r *PtyRunner) waitForInteractiveReady(ctx context.Context) error {
@@ -1979,6 +2059,8 @@ type claudeStreamEnvelope struct {
 	DurationMs    int64           `json:"duration_ms,omitempty"`
 	NumTurns      int             `json:"num_turns,omitempty"`
 	TotalCost     float64         `json:"total_cost_usd,omitempty"`
+	Usage         json.RawMessage `json:"usage,omitempty"`
+	ModelUsage    json.RawMessage `json:"modelUsage,omitempty"`
 	ToolUseResult json.RawMessage `json:"tool_use_result,omitempty"`
 	Request       struct {
 		Subtype  string          `json:"subtype,omitempty"`
@@ -2142,6 +2224,7 @@ func (r *PtyRunner) readClaudeStreamJSON(ctx context.Context, reader io.Reader, 
 				sendEvent(sink, protocol.ApplyRuntimeMeta(protocol.NewSessionStateEvent(sessionID, "active", "AI 会话已续接"), protocol.RuntimeMeta{ResumeSessionID: envelope.SessionID}))
 			}
 		}
+		r.emitClaudeContextWindowUsage(sessionID, envelope, sink)
 		switch envelope.Type {
 		case "control_request":
 			requestID := strings.TrimSpace(envelope.RequestID)
@@ -2365,6 +2448,123 @@ func shouldEmitClaudeReadyPrompt(envelope claudeStreamEnvelope) bool {
 		return false
 	}
 	return true
+}
+
+func (r *PtyRunner) emitClaudeContextWindowUsage(sessionID string, envelope claudeStreamEnvelope, sink EventSink) {
+	maxTokens := claudeContextWindowMaxTokens(envelope.ModelUsage)
+	if maxTokens > 0 {
+		r.mu.Lock()
+		r.lastContextWindowMaxTokens = maxTokens
+		r.hasContextWindowMaxTokens = true
+		r.mu.Unlock()
+	}
+
+	usedTokens := -1
+	if strings.EqualFold(strings.TrimSpace(envelope.Subtype), "task_progress") {
+		usedTokens = claudeUsageTotalTokens(envelope.Usage)
+		if usedTokens >= 0 {
+			r.mu.Lock()
+			r.lastContextWindowUsedTokens = usedTokens
+			r.hasContextWindowUsedTokens = true
+			r.mu.Unlock()
+		}
+	}
+
+	r.mu.Lock()
+	cachedUsed := r.lastContextWindowUsedTokens
+	cachedMax := r.lastContextWindowMaxTokens
+	hasUsed := r.hasContextWindowUsedTokens
+	hasMax := r.hasContextWindowMaxTokens
+	r.mu.Unlock()
+
+	if !hasMax || cachedMax <= 0 {
+		return
+	}
+	if !hasUsed {
+		if strings.EqualFold(strings.TrimSpace(envelope.Type), "result") {
+			cachedUsed = claudeDerivedResultUsage(envelope.Usage)
+		}
+		if cachedUsed < 0 {
+			return
+		}
+	}
+	sendEvent(sink, protocol.ApplyRuntimeMeta(
+		protocol.NewContextWindowUsageEvent(sessionID, protocol.ContextWindowUsage{
+			TokensUsed: cachedUsed,
+			TokenLimit: cachedMax,
+		}),
+		protocol.RuntimeMeta{
+			ResumeSessionID: envelope.SessionID,
+			Engine:          "claude",
+			Source:          "claude/usage",
+		},
+	))
+}
+
+func claudeContextWindowMaxTokens(raw json.RawMessage) int {
+	if len(raw) == 0 {
+		return 0
+	}
+	var root map[string]any
+	if err := json.Unmarshal(raw, &root); err != nil {
+		return 0
+	}
+	best := 0
+	for _, value := range root {
+		record, ok := value.(map[string]any)
+		if !ok {
+			continue
+		}
+		contextWindow := firstPositiveInt(record["contextWindow"], record["context_window"])
+		if contextWindow > best {
+			best = contextWindow
+		}
+	}
+	return best
+}
+
+func claudeUsageTotalTokens(raw json.RawMessage) int {
+	if len(raw) == 0 {
+		return -1
+	}
+	var usage map[string]any
+	if err := json.Unmarshal(raw, &usage); err != nil {
+		return -1
+	}
+	return firstNonNegativeInt(usage["total_tokens"], usage["totalTokens"])
+}
+
+func claudeDerivedResultUsage(raw json.RawMessage) int {
+	if len(raw) == 0 {
+		return -1
+	}
+	var usage map[string]any
+	if err := json.Unmarshal(raw, &usage); err != nil {
+		return -1
+	}
+	inputTokens := firstNonNegativeInt(usage["input_tokens"], usage["inputTokens"])
+	outputTokens := firstNonNegativeInt(usage["output_tokens"], usage["outputTokens"])
+	cacheCreation := firstNonNegativeInt(
+		usage["cache_creation_input_tokens"],
+		usage["cacheCreationInputTokens"],
+	)
+	cacheRead := firstNonNegativeInt(
+		usage["cache_read_input_tokens"],
+		usage["cacheReadInputTokens"],
+	)
+	if inputTokens < 0 && outputTokens < 0 && cacheCreation < 0 && cacheRead < 0 {
+		return -1
+	}
+	total := 0
+	for _, value := range []int{inputTokens, outputTokens, cacheCreation, cacheRead} {
+		if value > 0 {
+			total += value
+		}
+	}
+	if total <= 0 {
+		return -1
+	}
+	return total
 }
 
 func shouldSuppressClaudeRawLine(line string) bool {

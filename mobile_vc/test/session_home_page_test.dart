@@ -140,6 +140,47 @@ void main() {
 
     expect(controller.configuredAiModel, 'opusplan');
   });
+
+  testWidgets('主界面底部常驻显示上下文圆形入口', (tester) async {
+    final service = _FakeMobileVcWsService();
+    final controller = SessionController(service: service);
+    await controller.initialize();
+    addTearDown(controller.disposeController);
+
+    await controller.saveConfig(
+      const AppConfig(
+        cwd: '/workspace',
+        engine: 'codex',
+        permissionMode: 'default',
+      ),
+    );
+    await controller.connect();
+
+    service.emit(
+      SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-1',
+        runtimeMeta: const RuntimeMeta(engine: 'codex'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-1', title: '会话'),
+        contextWindowUsage: const ContextWindowUsage(
+          tokensUsed: 120000,
+          tokenLimit: 200000,
+        ),
+        runtimeAlive: true,
+      ),
+    );
+    await _flushEvents();
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SessionHomePage(controller: controller),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.byKey(const ValueKey('context-window-button')), findsOneWidget);
+  });
 }
 
 final _timestamp = DateTime(2026, 1, 1);

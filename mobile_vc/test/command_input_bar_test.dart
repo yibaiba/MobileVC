@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:mobile_vc/features/chat/command_input_bar.dart';
+import 'package:mobile_vc/data/models/session_models.dart';
 
 void main() {
   group('CommandInputBar', () {
@@ -72,10 +73,8 @@ void main() {
         ),
       );
 
-      expect(
-          find.textContaining('Claude ·', findRichText: true), findsOneWidget);
       final field = tester.widget<TextField>(find.byType(TextField));
-      expect(field.decoration?.hintText, '继续回复 Claude');
+      expect(field.decoration?.hintText, '回复 Claude');
     });
 
     testWidgets('等待输入时即使 canStop 为 true 也显示发送按钮', (tester) async {
@@ -113,25 +112,21 @@ void main() {
         ),
       );
 
-      expect(
-          find.textContaining('Codex ·', findRichText: true), findsOneWidget);
       final field = tester.widget<TextField>(find.byType(TextField));
-      expect(field.decoration?.hintText, '继续回复 Codex');
+      expect(field.decoration?.hintText, '回复 Codex');
     });
 
     testWidgets('shell 模式显示 Shell 状态与 hint', (tester) async {
       await tester.pumpWidget(
         _buildTestApp(
-          isBusy: true,
+          isBusy: false,
           showClaudeMode: false,
           currentEngine: 'shell',
         ),
       );
 
-      expect(
-          find.textContaining('Shell ·', findRichText: true), findsOneWidget);
       final field = tester.widget<TextField>(find.byType(TextField));
-      expect(field.decoration?.hintText, '当前 shell 会话仍在运行');
+      expect(field.decoration?.hintText, '输入命令');
     });
 
     testWidgets('busy 且非等待输入时发送按钮切为停止按钮', (tester) async {
@@ -167,6 +162,89 @@ void main() {
       expect(field.decoration?.hintText, '会话切换中...');
       expect(button.onPressed, isNull);
     });
+
+    testWidgets('支持 compact 时显示压缩按钮并触发回调', (tester) async {
+      var compacted = false;
+      await tester.pumpWidget(
+        _buildTestApp(
+          canCompact: true,
+          onCompact: () => compacted = true,
+        ),
+      );
+
+      expect(find.text('压缩'), findsOneWidget);
+
+      await tester.tap(find.text('压缩'));
+      await tester.pump();
+
+      expect(compacted, isTrue);
+    });
+
+    testWidgets('compact 进行中时显示压缩中状态并禁用点击', (tester) async {
+      var compacted = false;
+      await tester.pumpWidget(
+        _buildTestApp(
+          canCompact: false,
+          isCompacting: true,
+          compactStatusLabel: '正在压缩上下文…',
+          onCompact: () => compacted = true,
+        ),
+      );
+
+      expect(find.text('压缩中'), findsOneWidget);
+      expect(find.byType(CircularProgressIndicator), findsWidgets);
+
+      await tester.tap(find.text('压缩中'));
+      await tester.pump();
+
+      expect(compacted, isFalse);
+    });
+
+    testWidgets('支持 compact 时按钮顺序为压缩在前 日志在最后', (tester) async {
+      await tester.pumpWidget(
+        _buildTestApp(
+          canCompact: true,
+        ),
+      );
+
+      final compactX = tester.getCenter(find.text('压缩')).dx;
+      final skillX = tester.getCenter(find.text('Skill')).dx;
+      final logsX = tester.getCenter(find.text('日志')).dx;
+      final memoryX = tester.getCenter(find.text('Memory')).dx;
+
+      expect(compactX, lessThan(skillX));
+      expect(logsX, greaterThan(memoryX));
+    });
+
+    testWidgets('不支持 compact 时不显示压缩按钮', (tester) async {
+      await tester.pumpWidget(
+        _buildTestApp(
+          canCompact: false,
+        ),
+      );
+
+      expect(find.text('压缩'), findsNothing);
+    });
+
+    testWidgets('始终显示上下文圆形入口并支持点击', (tester) async {
+      var opened = false;
+      await tester.pumpWidget(
+        _buildTestApp(
+          contextWindowUsage: const ContextWindowUsage(
+            tokensUsed: 120000,
+            tokenLimit: 200000,
+          ),
+          onOpenContextWindowUsage: () => opened = true,
+        ),
+      );
+
+      expect(find.byKey(const ValueKey('context-window-button')), findsOneWidget);
+
+      await tester.tap(find.byKey(const ValueKey('context-window-button')));
+      await tester.pump();
+
+      expect(opened, isTrue);
+    });
   });
 }
 
@@ -176,11 +254,17 @@ Widget _buildTestApp({
   bool awaitInput = false,
   bool isBusy = false,
   bool canStop = false,
+  bool canCompact = false,
+  bool isCompacting = false,
+  String compactStatusLabel = '',
+  ContextWindowUsage contextWindowUsage = const ContextWindowUsage(),
   bool showClaudeMode = true,
   String currentEngine = 'claude',
   bool isSessionLoading = false,
   ValueChanged<String>? onSubmit,
   VoidCallback? onStop,
+  VoidCallback? onCompact,
+  VoidCallback? onOpenContextWindowUsage,
 }) {
   return MaterialApp(
     home: Scaffold(
@@ -188,6 +272,11 @@ Widget _buildTestApp({
         awaitInput: awaitInput,
         isBusy: isBusy,
         canStop: canStop,
+        canCompact: canCompact,
+        isCompacting: isCompacting,
+        compactStatusLabel: compactStatusLabel,
+        contextWindowUsage: contextWindowUsage,
+        onOpenContextWindowUsage: onOpenContextWindowUsage ?? () {},
         hasPendingReview: false,
         fastMode: false,
         permissionMode: 'default',
@@ -195,6 +284,7 @@ Widget _buildTestApp({
         shouldShowReviewChoices: shouldShowReviewChoices,
         onSubmit: onSubmit ?? (_) {},
         onStop: onStop ?? () {},
+        onCompact: onCompact ?? () {},
         onOpenSessions: () {},
         onOpenRuntimeInfo: () {},
         onOpenLogs: () {},

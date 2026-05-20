@@ -16,8 +16,12 @@ import (
 type permissionStubRunner struct {
 	mu                sync.Mutex
 	interactive       bool
+	activeTurn        bool
 	hasPending        bool
 	currentRequestID  string
+	contextUsage      protocol.ContextWindowUsage
+	contextUsageOK    bool
+	contextUsageErr   error
 	writeErr          error
 	writeDecisions    []string
 	permissionMode    string
@@ -61,6 +65,7 @@ func (r *permissionStubRunner) Close() error {
 }
 
 func (r *permissionStubRunner) CanAcceptInteractiveInput() bool { return r.interactive }
+func (r *permissionStubRunner) HasActiveTurn() bool             { return r.activeTurn }
 func (r *permissionStubRunner) ClaudeSessionID() string         { return "" }
 
 func (r *permissionStubRunner) WritePermissionResponse(ctx context.Context, decision string) error {
@@ -84,6 +89,15 @@ func (r *permissionStubRunner) CurrentPermissionRequestID() string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.currentRequestID
+}
+
+func (r *permissionStubRunner) ContextWindowUsage(ctx context.Context) (protocol.ContextWindowUsage, bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.contextUsageErr != nil {
+		return protocol.ContextWindowUsage{}, false, r.contextUsageErr
+	}
+	return r.contextUsage, r.contextUsageOK, nil
 }
 
 func (r *permissionStubRunner) SetPermissionMode(mode string) {
@@ -394,6 +408,28 @@ func TestService_CurrentPermissionRequestID_WithActive(t *testing.T) {
 	// 正确 sessionID
 	if got := svc.CurrentPermissionRequestID("active-session"); got != "perm-77" {
 		t.Errorf("expected perm-77 for active session, got %q", got)
+	}
+}
+
+func TestService_CurrentContextWindowUsage_WithActive(t *testing.T) {
+	runner := newPermissionStubRunner()
+	runner.contextUsage = protocol.ContextWindowUsage{
+		TokensUsed: 42000,
+		TokenLimit: 200000,
+	}
+	runner.contextUsageOK = true
+	svc := makeServiceWithPermissionRunner(t, runner)
+	startPermissionRunner(t, svc, "active-session", runner)
+
+	got, ok, err := svc.CurrentContextWindowUsage(context.Background(), "active-session")
+	if err != nil {
+		t.Fatalf("CurrentContextWindowUsage returned err: %v", err)
+	}
+	if !ok {
+		t.Fatal("CurrentContextWindowUsage returned ok=false, want true")
+	}
+	if got.TokensUsed != 42000 || got.TokenLimit != 200000 {
+		t.Fatalf("unexpected usage: %+v", got)
 	}
 }
 

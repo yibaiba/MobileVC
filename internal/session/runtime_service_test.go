@@ -458,3 +458,67 @@ func TestBuildDetachedResumeRequestForCodexDoesNotAppendClaudeFlags(t *testing.T
 		t.Fatalf("did not expect claude stream flags on codex command, got %q", req.Command)
 	}
 }
+
+func TestCompactRestartsDetachedCodexResumeSession(t *testing.T) {
+	resumed := newResumeStubRunner("resume-codex-123", true)
+	svc := NewService("s1", Dependencies{
+		NewExecRunner: func() engine.Runner { return newResumeStubRunner("", true) },
+		NewPtyRunner:  func() engine.Runner { return resumed },
+	})
+	svc.manager.updateResumeSessionID("resume-codex-123")
+	svc.manager.updateMeta(func(m *protocol.RuntimeMeta) {
+		m.Command = "codex -m gpt-5"
+		m.Engine = "codex"
+		m.CWD = "/tmp"
+		m.PermissionMode = "default"
+		m.ResumeSessionID = "resume-codex-123"
+	})
+
+	err := svc.Compact(context.Background(), "s1", func(any) {})
+	if !errors.Is(err, engine.ErrInputNotSupported) {
+		t.Fatalf("expected detached codex resume runner to restart into compact path and fail on missing compactor, got %v", err)
+	}
+
+	waitSignal(t, resumed.started, "detached codex compact resume runner start")
+	lower := strings.ToLower(strings.TrimSpace(resumed.lastReq.Command))
+	if !strings.HasPrefix(lower, "codex resume resume-codex-123") {
+		t.Fatalf("expected codex resume command before compact, got %q", resumed.lastReq.Command)
+	}
+}
+
+func TestCompactWaitsForDetachedCodexResumeRunnerToBecomeInteractive(t *testing.T) {
+	resumed := newResumeStubRunner("resume-codex-wait", false)
+	resumed.runFn = func(ctx context.Context, req engine.ExecRequest, sink engine.EventSink) error {
+		select {
+		case resumed.started <- struct{}{}:
+		default:
+		}
+		time.AfterFunc(120*time.Millisecond, func() {
+			resumed.interactive = true
+		})
+		<-ctx.Done()
+		return nil
+	}
+
+	svc := NewService("s1", Dependencies{
+		NewExecRunner: func() engine.Runner { return newResumeStubRunner("", true) },
+		NewPtyRunner:  func() engine.Runner { return resumed },
+	})
+	svc.manager.updateResumeSessionID("resume-codex-wait")
+	svc.manager.updateMeta(func(m *protocol.RuntimeMeta) {
+		m.Command = "codex -m gpt-5"
+		m.Engine = "codex"
+		m.CWD = "/tmp"
+		m.PermissionMode = "default"
+		m.ResumeSessionID = "resume-codex-wait"
+	})
+
+	start := time.Now()
+	err := svc.Compact(context.Background(), "s1", func(any) {})
+	if !errors.Is(err, engine.ErrInputNotSupported) {
+		t.Fatalf("expected detached codex resume runner to reach compactor check after interactive wait, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed < 100*time.Millisecond {
+		t.Fatalf("expected compact to wait for interactive resume readiness, elapsed=%v", elapsed)
+	}
+}

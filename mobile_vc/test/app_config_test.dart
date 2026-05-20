@@ -308,5 +308,25 @@ void main() {
       expect(config.modelForEngine('codex'), 'gpt-5.4');
       expect(config.reasoningEffortForEngine('codex'), 'xhigh');
     });
+
+    test('launch uri overrides saved cwd token host and port', () {
+      const fallback = AppConfig(
+        host: '10.0.0.2',
+        port: '8001',
+        token: 'old-token',
+        cwd: r'C:\Users\29573\Desktop\fsdownload\远程控制codex',
+      );
+
+      final next = AppConfig.fromLaunchUri(
+        'http://10.136.78.122:8001/?token=123456&cwd=${Uri.encodeComponent(r'C:\Users\29573\Desktop\fsdownload\codexxm')}',
+        fallback: fallback,
+      );
+
+      expect(next, isNotNull);
+      expect(next!.host, '10.136.78.122');
+      expect(next.port, '8001');
+      expect(next.token, '123456');
+      expect(next.cwd, r'C:\Users\29573\Desktop\fsdownload\codexxm');
+    });
   });
 }

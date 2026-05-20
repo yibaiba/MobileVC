@@ -225,6 +225,31 @@ func ApplyEventToProjection(snapshot data.ProjectionSnapshot, event any) (data.P
 		snapshot.LatestError = ctx
 		snapshot.LogEntries = append(snapshot.LogEntries, data.SnapshotLogEntry{Kind: "error", Context: ctx})
 		return snapshot, true
+	case protocol.CompactionEvent:
+		ctx := &data.SnapshotContext{
+			ID:        firstNonEmptyString(e.ContextID, fmt.Sprintf("compaction:%s", e.Timestamp.Format(time.RFC3339Nano))),
+			Type:      "compaction",
+			Message:   e.Message,
+			Status:    e.Status,
+			Trigger:   e.Trigger,
+			Command:   firstNonEmptyString(e.RuntimeMeta.Command, snapshot.Runtime.Command, snapshot.Controller.CurrentCommand),
+			Timestamp: e.Timestamp.Format(time.RFC3339),
+			Title:     "Context compaction",
+			Source:    e.Source,
+		}
+		snapshot.LogEntries = append(snapshot.LogEntries, data.SnapshotLogEntry{
+			Kind:      "compaction",
+			Message:   e.Message,
+			Timestamp: e.Timestamp.Format(time.RFC3339),
+			Context:   ctx,
+		})
+		return snapshot, true
+	case protocol.ContextWindowUsageEvent:
+		snapshot.ContextWindowUsage = data.ContextWindowUsage{
+			TokensUsed: e.Usage.TokensUsed,
+			TokenLimit: e.Usage.TokenLimit,
+		}
+		return snapshot, true
 	case protocol.StepUpdateEvent:
 		ctx := &data.SnapshotContext{ID: firstNonEmptyString(e.ContextID, fmt.Sprintf("step:%s", e.Timestamp.Format(time.RFC3339Nano))), Type: "step", Message: e.Message, Status: e.Status, Target: e.Target, TargetPath: firstNonEmptyString(e.TargetPath, e.Target), Tool: e.Tool, Command: e.Command, Timestamp: e.Timestamp.Format(time.RFC3339), Title: firstNonEmptyString(e.ContextTitle, e.Message, "当前步骤")}
 		if !isTerminalStepStatus(e.Status) && !isTerminalStepMessage(e.Message) {

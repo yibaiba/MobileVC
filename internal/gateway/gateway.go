@@ -272,7 +272,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	activeRuntimeRecord := func(sessionID string) bool {
 		trimmedSessionID := strings.TrimSpace(sessionID)
-		if trimmedSessionID == "" || claudesync.IsMirrorSessionID(trimmedSessionID) || codexsync.IsMirrorSessionID(trimmedSessionID) {
+		if trimmedSessionID == "" || claudesync.IsMirrorSessionID(trimmedSessionID) {
 			return false
 		}
 		entry := h.runtimeSessions.Get(trimmedSessionID)
@@ -280,7 +280,25 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return false
 		}
 		snapshot := entry.service.RuntimeSnapshot()
-		return snapshot.Running && strings.TrimSpace(snapshot.ActiveSession) == trimmedSessionID
+		if snapshot.Running && strings.TrimSpace(snapshot.ActiveSession) == trimmedSessionID {
+			return true
+		}
+		if codexsync.IsMirrorSessionID(trimmedSessionID) {
+			resumeSessionID := strings.TrimSpace(codexsync.ThreadIDFromMirror(trimmedSessionID))
+			if resumeSessionID == "" {
+				return false
+			}
+			candidates := []string{
+				snapshot.ResumeSessionID,
+				snapshot.ActiveMeta.ResumeSessionID,
+			}
+			for _, candidate := range candidates {
+				if strings.TrimSpace(candidate) == resumeSessionID {
+					return true
+				}
+			}
+		}
+		return false
 	}
 
 	loadSessionRecordForRequest := func(requestedSessionID string) (data.SessionRecord, error) {
@@ -320,6 +338,25 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	emit := func(event any) {
 		session.Enqueue(ctx, writeCh, event)
+	}
+	emitContextWindowUsageIfAvailable := func(sessionID string, service *session.Service) {
+		if service == nil {
+			return
+		}
+		ctxUsage, cancelUsage := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancelUsage()
+		usage, ok, err := service.CurrentContextWindowUsage(ctxUsage, sessionID)
+		if err != nil {
+			logx.Warn("ws", "load context window usage failed: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, sessionID, remoteAddr, err)
+			return
+		}
+		if !ok || usage.TokenLimit <= 0 {
+			return
+		}
+		emit(protocol.ApplyRuntimeMeta(
+			protocol.NewContextWindowUsageEvent(sessionID, usage),
+			service.RuntimeSnapshot().ActiveMeta,
+		))
 	}
 	ackClientAction := func(sessionID, action string, client protocol.ClientEvent) bool {
 		clientActionID := strings.TrimSpace(client.ClientActionID)
@@ -794,7 +831,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// Merge any new events from Claude CLI JSONL (if this session was continued in CLI).
 			// Switch runtime first so merge sees the correct ActiveSession.
 			switchRuntimeSession(record.Summary.ID)
-			if !activeRuntimeLoad {
+			if !activeRuntimeLoad && !codexsync.IsMirrorSessionID(record.Summary.ID) {
 				record = mergeClaudeJSONLToRecord(ctx, h.SessionStore, record, runtimeSvc)
 			}
 			augmentedProjection := session.NormalizeProjectionSnapshot(record.Projection)
@@ -808,8 +845,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			record.Summary.Runtime = record.Projection.Runtime
+			runtimeSvc.SyncRuntimeMeta(protocol.RuntimeMeta{
+				Command:         record.Projection.Runtime.Command,
+				Engine:          record.Projection.Runtime.Engine,
+				CWD:             record.Projection.Runtime.CWD,
+				PermissionMode:  record.Projection.Runtime.PermissionMode,
+				ResumeSessionID: record.Projection.Runtime.ResumeSessionID,
+				ClaudeLifecycle: record.Projection.Runtime.ClaudeLifecycle,
+			})
 			loadRuntimeAlive := sessionRecordRuntimeAlive(record, runtimeSvc)
 			emit(session.SessionHistoryEventFromRecord(record, loadRuntimeAlive))
+			emitContextWindowUsageIfAvailable(record.Summary.ID, runtimeSvc)
 			emitReviewStateFromProjection(emit, selectedSessionID, record.Projection)
 			if restored := restoredAgentStateEventFromRecord(record, loadRuntimeAlive); restored != nil {
 				emit(*restored)
@@ -900,7 +946,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// Re-bind PTY runner output sink to new connection after reconnect.
 			resumeEmitAndPersist := emitAndPersistFor(selectedSessionID)
 			runtimeSvc.SetSink(sessionRuntime.EnsureBufferedSinkWithProcessor(resumeEmitAndPersist))
-			record = mergeClaudeJSONLToRecord(ctx, h.SessionStore, record, runtimeSvc)
+			if !codexsync.IsMirrorSessionID(record.Summary.ID) {
+				record = mergeClaudeJSONLToRecord(ctx, h.SessionStore, record, runtimeSvc)
+			}
 			augmentedProjection := session.NormalizeProjectionSnapshot(record.Projection)
 			runtimeProjection := buildProjectionSnapshotForService(record.Summary.ID, runtimeSvc)
 			projection := runtimeProjection
@@ -911,6 +959,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			record.Projection = projection
 			record.Summary.Runtime = projection.Runtime
+			runtimeSvc.SyncRuntimeMeta(protocol.RuntimeMeta{
+				Command:         projection.Runtime.Command,
+				Engine:          projection.Runtime.Engine,
+				CWD:             projection.Runtime.CWD,
+				PermissionMode:  projection.Runtime.PermissionMode,
+				ResumeSessionID: projection.Runtime.ResumeSessionID,
+				ClaudeLifecycle: projection.Runtime.ClaudeLifecycle,
+			})
 			runtimeAlive := sessionRecordRuntimeAlive(record, runtimeSvc)
 			if runtimeAlive && session.ShouldEmitResumeRecoveryStateEvent(runtimeSvc, projection, req.LastKnownRuntimeState) {
 				recovery := session.BuildResumeRecoveryStateEvent(record.Summary.ID, runtimeSvc, projection, req.LastKnownRuntimeState)
@@ -920,6 +976,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			emit(session.SessionHistoryEventFromRecord(record, runtimeAlive))
+			emitContextWindowUsageIfAvailable(record.Summary.ID, runtimeSvc)
 			logx.Info("ws", "session history emitted: sessionID=%s runtimeAlive=%v ownership=%s", record.Summary.ID, runtimeAlive, record.Summary.Ownership)
 			emitReviewStateFromProjection(emit, selectedSessionID, record.Projection)
 			restoredState := ""
@@ -1998,6 +2055,19 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			emit(result)
+		case "context_window_usage_get":
+			var usageReq protocol.ContextWindowUsageRequestEvent
+			if err := json.Unmarshal(payload, &usageReq); err != nil {
+				logx.Warn("ws", "invalid context_window_usage_get request: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
+				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid context_window_usage_get request: %v", err), ""))
+				continue
+			}
+			targetSessionID := strings.TrimSpace(usageReq.SessionID)
+			if targetSessionID == "" {
+				targetSessionID = strings.TrimSpace(selectedSessionID)
+			}
+			_, targetService := runtimeForSession(targetSessionID)
+			emitContextWindowUsageIfAvailable(targetSessionID, targetService)
 		case "runtime_process_list":
 			rootPID, items, err := runtimeSvc.ActiveProcessTree(ctx)
 			if err != nil {
@@ -2218,6 +2288,25 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid slash_command request: %v", err), ""))
 				continue
 			}
+			logx.Info(
+				"ws",
+				"incoming slash_command: connectionID=%s sessionID=%s remoteAddr=%s command=%q engine=%q runtimeCommand=%q clientActionID=%s",
+				connectionID,
+				selectedSessionID,
+				remoteAddr,
+				slashReq.Command,
+				slashReq.Engine,
+				slashReq.Command,
+				slashReq.ClientActionID,
+			)
+			sessionIDForAck := strings.TrimSpace(firstNonEmptyString(slashReq.SessionID, selectedSessionID))
+			if sessionIDForAck == "" {
+				sessionIDForAck = selectedSessionID
+			}
+			if !ackClientAction(sessionIDForAck, "slash_command", slashReq.ClientEvent) {
+				logx.Info("ws", "duplicate client action ignored: connectionID=%s sessionID=%s remoteAddr=%s action=slash_command clientActionID=%s", connectionID, sessionIDForAck, remoteAddr, slashReq.ClientActionID)
+				continue
+			}
 			parsedSlash, err := parseSlashCommand(slashReq.Command)
 			if err != nil {
 				emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
@@ -2251,16 +2340,46 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if sessionID != strings.TrimSpace(selectedSessionID) {
 				switchRuntimeSession(sessionID)
 			}
-			if !ackClientAction(sessionID, "slash_command", slashReq.ClientEvent) {
-				logx.Info("ws", "duplicate client action ignored: connectionID=%s sessionID=%s remoteAddr=%s action=slash_command clientActionID=%s", connectionID, sessionID, remoteAddr, slashReq.ClientActionID)
-				continue
-			}
 			service := runtimeSvc
 			emitAndPersist := emitAndPersistFor(sessionID)
 			if err := handleSlashCommand(ctx, sessionID, slashReq, sessionContext, service, h.SkillLauncher, emitAndPersist); err != nil {
 				logx.Error("ws", "handle slash command failed: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, sessionID, remoteAddr, err)
 				emit(protocol.NewErrorEvent(sessionID, err.Error(), ""))
 			}
+		case "compact":
+			var compactReq protocol.CompactRequestEvent
+			if err := json.Unmarshal(payload, &compactReq); err != nil {
+				logx.Warn("ws", "invalid compact request: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
+				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid compact request: %v", err), ""))
+				continue
+			}
+			sessionIDForAck := strings.TrimSpace(firstNonEmptyString(compactReq.SessionID, selectedSessionID))
+			if sessionIDForAck == "" {
+				sessionIDForAck = selectedSessionID
+			}
+			if !ackClientAction(sessionIDForAck, "compact", compactReq.ClientEvent) {
+				logx.Info("ws", "duplicate client action ignored: connectionID=%s sessionID=%s remoteAddr=%s action=compact clientActionID=%s", connectionID, sessionIDForAck, remoteAddr, compactReq.ClientActionID)
+				continue
+			}
+			targetSessionID := strings.TrimSpace(firstNonEmptyString(compactReq.SessionID, selectedSessionID))
+			if targetSessionID == "" {
+				emit(protocol.NewCompactResultEvent(selectedSessionID, false, "请先创建或加载会话后再执行 Compact"))
+				continue
+			}
+			if targetSessionID != strings.TrimSpace(selectedSessionID) {
+				switchRuntimeSession(targetSessionID)
+			}
+			emitAndPersist := emitAndPersistFor(targetSessionID)
+			sessionRuntime, service := runtimeForSession(targetSessionID)
+			if sessionRuntime != nil {
+				service.SetSink(sessionRuntime.EnsureBufferedSinkWithProcessor(emitAndPersist))
+			}
+			if err := service.Compact(ctx, targetSessionID, emitAndPersist); err != nil {
+				logx.Error("ws", "handle compact failed: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, targetSessionID, remoteAddr, err)
+				emit(protocol.NewCompactResultEvent(targetSessionID, false, err.Error()))
+				continue
+			}
+			emit(protocol.NewCompactResultEvent(targetSessionID, true, ""))
 		case "fs_list":
 			var fsListReq protocol.FSListRequestEvent
 			if err := json.Unmarshal(payload, &fsListReq); err != nil {
@@ -3532,14 +3651,26 @@ func normalizeSessionCWD(raw string) string {
 	if trimmed == "" {
 		return ""
 	}
+	trimmed = trimWindowsDevicePathPrefix(trimmed)
 	absPath, err := filepath.Abs(trimmed)
 	if err == nil {
 		trimmed = absPath
 	}
 	if resolved, err := filepath.EvalSymlinks(trimmed); err == nil && strings.TrimSpace(resolved) != "" {
-		trimmed = resolved
+		trimmed = trimWindowsDevicePathPrefix(resolved)
 	}
 	return filepath.Clean(trimmed)
+}
+
+func trimWindowsDevicePathPrefix(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if strings.HasPrefix(trimmed, `\\?\UNC\`) {
+		return `\\` + strings.TrimPrefix(trimmed, `\\?\UNC\`)
+	}
+	if strings.HasPrefix(trimmed, `\\?\`) {
+		return strings.TrimPrefix(trimmed, `\\?\`)
+	}
+	return trimmed
 }
 
 func filterStoreSessionsByCWD(items []data.SessionSummary, filterCWD string) []data.SessionSummary {
@@ -3974,8 +4105,11 @@ func mergeCodexMirrorProjection(fresh data.ProjectionSnapshot, existing data.Pro
 	fresh.LogEntries = mergeSnapshotLogEntries(fresh.LogEntries, existing.LogEntries)
 	fresh.RawTerminalByStream = mergeRawTerminalByStream(fresh.RawTerminalByStream, existing.RawTerminalByStream)
 	fresh.TerminalExecutions = mergeTerminalExecutions(fresh.TerminalExecutions, existing.TerminalExecutions)
-	fresh.Controller = session.MergeControllerSnapshot(fresh.Controller, existing.Controller)
-	fresh.Runtime = session.MergeStoreSessionRuntime(fresh.Runtime, existing.Runtime)
+	fresh.Controller = mergeCodexMirrorController(fresh.Controller, existing.Controller)
+	fresh.Runtime = mergeCodexMirrorRuntime(fresh.Runtime, existing.Runtime)
+	if fresh.ContextWindowUsage.TokenLimit <= 0 {
+		fresh.ContextWindowUsage = existing.ContextWindowUsage
+	}
 	if fresh.Runtime.Source == "" {
 		fresh.Runtime.Source = "codex-native"
 	}
@@ -4008,6 +4142,49 @@ func mergeCodexMirrorProjection(fresh data.ProjectionSnapshot, existing data.Pro
 	fresh.MemoryCatalogMeta = existing.MemoryCatalogMeta
 
 	return session.NormalizeProjectionSnapshot(fresh)
+}
+
+func mergeCodexMirrorRuntime(fresh data.SessionRuntime, existing data.SessionRuntime) data.SessionRuntime {
+	merged := session.MergeStoreSessionRuntime(fresh, existing)
+	if !strings.EqualFold(strings.TrimSpace(merged.Engine), "codex") {
+		merged.Engine = firstNonEmptyString(fresh.Engine, "codex")
+	}
+	if !isCodexMirrorRuntimeCommand(merged.Command) {
+		merged.Command = firstNonEmptyString(fresh.Command, "codex")
+	}
+	if strings.TrimSpace(merged.ResumeSessionID) != strings.TrimSpace(fresh.ResumeSessionID) {
+		merged.ResumeSessionID = fresh.ResumeSessionID
+	}
+	merged.Source = firstNonEmptyString(fresh.Source, merged.Source, "codex-native")
+	return merged
+}
+
+func mergeCodexMirrorController(fresh session.ControllerSnapshot, existing session.ControllerSnapshot) session.ControllerSnapshot {
+	merged := session.MergeControllerSnapshot(fresh, existing)
+	merged.ResumeSession = firstNonEmptyString(fresh.ResumeSession, merged.ResumeSession)
+	merged.CurrentCommand = firstNonEmptyString(fresh.CurrentCommand, merged.CurrentCommand)
+	merged.ActiveMeta = protocol.MergeRuntimeMeta(merged.ActiveMeta, protocol.RuntimeMeta{
+		ResumeSessionID: fresh.ActiveMeta.ResumeSessionID,
+		Command:         fresh.ActiveMeta.Command,
+		Engine:          fresh.ActiveMeta.Engine,
+		CWD:             fresh.ActiveMeta.CWD,
+		Source:          firstNonEmptyString(fresh.ActiveMeta.Source, "codex-native"),
+	})
+	if !strings.EqualFold(strings.TrimSpace(merged.ActiveMeta.Engine), "codex") {
+		merged.ActiveMeta.Engine = firstNonEmptyString(fresh.ActiveMeta.Engine, "codex")
+	}
+	if !isCodexMirrorRuntimeCommand(merged.ActiveMeta.Command) {
+		merged.ActiveMeta.Command = firstNonEmptyString(fresh.ActiveMeta.Command, "codex")
+	}
+	if strings.TrimSpace(merged.ActiveMeta.ResumeSessionID) != strings.TrimSpace(fresh.ActiveMeta.ResumeSessionID) {
+		merged.ActiveMeta.ResumeSessionID = fresh.ActiveMeta.ResumeSessionID
+	}
+	return merged
+}
+
+func isCodexMirrorRuntimeCommand(command string) bool {
+	trimmed := strings.ToLower(strings.TrimSpace(command))
+	return trimmed == "codex" || strings.HasPrefix(trimmed, "codex ")
 }
 
 func mergeSnapshotLogEntries(base []data.SnapshotLogEntry, overlay []data.SnapshotLogEntry) []data.SnapshotLogEntry {

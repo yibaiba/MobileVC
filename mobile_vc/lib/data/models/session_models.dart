@@ -99,6 +99,7 @@ class HistoryContext {
     this.type = '',
     this.message = '',
     this.status = '',
+    this.trigger = '',
     this.target = '',
     this.targetPath = '',
     this.tool = '',
@@ -124,6 +125,7 @@ class HistoryContext {
   final String type;
   final String message;
   final String status;
+  final String trigger;
   final String target;
   final String targetPath;
   final String tool;
@@ -156,6 +158,7 @@ class HistoryContext {
       type: read('type'),
       message: read('message'),
       status: read('status'),
+      trigger: read('trigger'),
       target: read('target'),
       targetPath: read('targetPath'),
       tool: read('tool'),
@@ -739,6 +742,76 @@ class SessionContext {
           .toList(),
     );
   }
+}
+
+class ContextWindowUsage {
+  const ContextWindowUsage({
+    this.tokensUsed = 0,
+    this.tokenLimit = 0,
+  });
+
+  final int tokensUsed;
+  final int tokenLimit;
+
+  bool get isAvailable => tokenLimit > 0;
+
+  int get tokensRemaining =>
+      tokenLimit <= 0 ? 0 : (tokenLimit - tokensUsed).clamp(0, tokenLimit);
+
+  double get fractionUsed {
+    if (tokenLimit <= 0) {
+      return 0;
+    }
+    final value = tokensUsed / tokenLimit;
+    if (value.isNaN || value.isInfinite) {
+      return 0;
+    }
+    return value.clamp(0, 1).toDouble();
+  }
+
+  int get percentUsed => (fractionUsed * 100).round().clamp(0, 100);
+
+  ContextWindowUsage copyWith({
+    int? tokensUsed,
+    int? tokenLimit,
+  }) {
+    return ContextWindowUsage(
+      tokensUsed: tokensUsed ?? this.tokensUsed,
+      tokenLimit: tokenLimit ?? this.tokenLimit,
+    );
+  }
+
+  factory ContextWindowUsage.fromJson(Map<String, dynamic> json) {
+    final tokensUsed = (json['tokensUsed'] as num?)?.toInt() ??
+        int.tryParse((json['tokensUsed'] ?? '').toString()) ??
+        0;
+    final tokenLimit = (json['tokenLimit'] as num?)?.toInt() ??
+        int.tryParse((json['tokenLimit'] ?? '').toString()) ??
+        0;
+    if (tokenLimit <= 0) {
+      return const ContextWindowUsage();
+    }
+    return ContextWindowUsage(
+      tokensUsed: tokensUsed.clamp(0, tokenLimit),
+      tokenLimit: tokenLimit,
+    );
+  }
+}
+
+String formatTokenCountCompact(int value) {
+  if (value >= 1000000) {
+    final scaled = value / 1000000;
+    return scaled % 1 == 0
+        ? '${scaled.toStringAsFixed(0)}M'
+        : '${scaled.toStringAsFixed(1)}M';
+  }
+  if (value >= 1000) {
+    final scaled = value / 1000;
+    return scaled % 1 == 0
+        ? '${scaled.toStringAsFixed(0)}K'
+        : '${scaled.toStringAsFixed(1)}K';
+  }
+  return value.toString();
 }
 
 class RuntimeInfoItem {

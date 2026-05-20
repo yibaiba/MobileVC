@@ -23,6 +23,7 @@ import '../../features/runtime_info/runtime_info_sheet.dart';
 import '../../features/skills/skill_management_sheet.dart';
 import '../../features/status/status_detail_sheet.dart';
 import '../../features/status/terminal_log_sheet.dart';
+import 'context_window_usage_sheet.dart';
 import 'claude_model_utils.dart';
 import 'connection_scan_sheet.dart';
 import 'session_controller.dart';
@@ -46,8 +47,62 @@ class SessionHomePage extends StatefulWidget {
 
 class _SessionHomePageState extends State<SessionHomePage> {
   final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
+  int _lastCompactFeedbackId = 0;
 
   SessionController get controller => widget.controller;
+
+  @override
+  void initState() {
+    super.initState();
+    controller.addListener(_handleControllerSignals);
+  }
+
+  @override
+  void dispose() {
+    controller.removeListener(_handleControllerSignals);
+    super.dispose();
+  }
+
+  @override
+  void didUpdateWidget(covariant SessionHomePage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.controller == widget.controller) {
+      return;
+    }
+    oldWidget.controller.removeListener(_handleControllerSignals);
+    widget.controller.addListener(_handleControllerSignals);
+    _lastCompactFeedbackId = 0;
+  }
+
+  void _handleControllerSignals() {
+    final signal = controller.compactFeedbackSignal;
+    if (!mounted || signal == null || signal.id == _lastCompactFeedbackId) {
+      return;
+    }
+    _lastCompactFeedbackId = signal.id;
+    final messenger = ScaffoldMessenger.of(context);
+    final scheme = Theme.of(context).colorScheme;
+    final isSuccess = signal.tone == CompactFeedbackTone.success;
+    messenger
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          content: Row(
+            children: [
+              Icon(
+                isSuccess ? Icons.check_circle_rounded : Icons.error_rounded,
+                size: 18,
+                color: Colors.white,
+              ),
+              const SizedBox(width: 10),
+              Expanded(child: Text(signal.message)),
+            ],
+          ),
+          backgroundColor: isSuccess ? const Color(0xFF0F766E) : scheme.error,
+          duration: Duration(milliseconds: isSuccess ? 1600 : 3200),
+        ),
+      );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -219,6 +274,11 @@ class _SessionHomePageState extends State<SessionHomePage> {
         awaitInput: controller.awaitInput,
         isBusy: controller.isSessionBusy,
         canStop: controller.canStopCurrentRun,
+        canCompact: controller.shouldShowCompactButton,
+        isCompacting: controller.isCompacting,
+        compactStatusLabel: controller.compactStatusLabel,
+        contextWindowUsage: controller.contextWindowUsage,
+        onOpenContextWindowUsage: () => _openContextWindowUsage(context),
         hasPendingReview: controller.hasPendingReview,
         fastMode: controller.fastMode,
         permissionMode: controller.displayPermissionMode,
@@ -227,6 +287,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
         shouldShowPlanChoices: controller.shouldShowPlanChoices,
         onSubmit: controller.sendInputText,
         onStop: controller.stopCurrentRun,
+        onCompact: controller.compactCurrentSession,
         onOpenSessions: () => _openSessions(context),
         onOpenRuntimeInfo: () => _openRuntimeInfo(context),
         onOpenLogs: () => _openLogs(context),
@@ -243,6 +304,28 @@ class _SessionHomePageState extends State<SessionHomePage> {
         canSendToContinuedSameSession: controller.canSendToContinuedSameSession,
         isExternallyLocked: controller.isSessionReadOnly,
         externalLockedHint: controller.sessionReadOnlyHint,
+      ),
+    );
+  }
+
+  Future<void> _openContextWindowUsage(BuildContext context) async {
+    await showModalBottomSheet<void>(
+      context: context,
+      useSafeArea: true,
+      showDragHandle: true,
+      isScrollControlled: true,
+      builder: (context) => ListenableBuilder(
+        listenable: controller,
+        builder: (context, _) {
+          final engine = controller.commandBarEngine.trim();
+          final engineLabel = engine.isEmpty
+              ? 'AI'
+              : '${engine[0].toUpperCase()}${engine.substring(1)}';
+          return ContextWindowUsageSheet(
+            usage: controller.contextWindowUsage,
+            engineLabel: engineLabel,
+          );
+        },
       ),
     );
   }

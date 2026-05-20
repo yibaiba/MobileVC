@@ -73,6 +73,10 @@ type codexAppSession struct {
 	assistantEmitted  string
 	pendingApproval   *codexPendingApproval
 	readyPromptSeq    uint64
+	compactionID      string
+	compactionTurnID  string
+	compactionStatus  string
+	compactionEventID string
 }
 
 type codexPendingApproval struct {
@@ -143,6 +147,12 @@ type codexItemNotification struct {
 	ThreadID string         `json:"threadId"`
 	TurnID   string         `json:"turnId"`
 	Item     map[string]any `json:"item"`
+}
+
+type codexTokenUsageNotification struct {
+	ThreadID   string `json:"threadId"`
+	TurnID     string `json:"turnId"`
+	TokenUsage any    `json:"tokenUsage"`
 }
 
 type codexCommandApprovalRequest struct {
@@ -338,6 +348,55 @@ func (s *codexAppSession) SendUserInput(ctx context.Context, data []byte) error 
 	return nil
 }
 
+func (s *codexAppSession) Compact(ctx context.Context) error {
+	threadID := strings.TrimSpace(s.threadIDValue())
+	if threadID == "" {
+		return errors.New("codex thread is not ready")
+	}
+	if strings.TrimSpace(s.activeTurn()) != "" {
+		return errors.New("a foreground turn is already active")
+	}
+	s.resetCompactionLifecycle()
+	s.setCompactionID(fmt.Sprintf("compaction:%d", time.Now().UTC().UnixNano()))
+	s.emitCompactionEvent("loading", "manual", "")
+	var resp codexTurnStartResponse
+	if err := s.call(ctx, "thread/compact/start", map[string]any{
+		"threadId": threadID,
+	}, &resp); err != nil {
+		s.emitCompactionEvent("failed", "manual", err.Error())
+		return err
+	}
+	if strings.TrimSpace(resp.Turn.ID) != "" {
+		s.setActiveTurnID(resp.Turn.ID)
+		s.setCompactionTurnID(resp.Turn.ID)
+	}
+	return nil
+}
+
+func (s *codexAppSession) ContextWindowUsage(ctx context.Context) (protocol.ContextWindowUsage, bool, error) {
+	threadID := strings.TrimSpace(s.threadIDValue())
+	if threadID == "" {
+		return protocol.ContextWindowUsage{}, false, nil
+	}
+
+	var result map[string]any
+	if err := s.call(ctx, "thread/contextWindow/read", map[string]any{
+		"threadId": threadID,
+	}, &result); err != nil {
+		return protocol.ContextWindowUsage{}, false, err
+	}
+
+	raw, ok := result["usage"]
+	if !ok {
+		return protocol.ContextWindowUsage{}, false, nil
+	}
+	usage, parsed := codexContextWindowUsage(raw)
+	if !parsed {
+		return protocol.ContextWindowUsage{}, false, nil
+	}
+	return usage, true, nil
+}
+
 func (s *codexAppSession) WritePermissionResponse(ctx context.Context, decision string) error {
 	decision = strings.TrimSpace(strings.ToLower(decision))
 	pending := s.pendingApprovalSnapshot()
@@ -492,6 +551,11 @@ func (s *codexAppSession) handleNotification(message codexRPCMessage) {
 		s.handleItemEvent(message.Params, "done")
 	case "rawResponseItem/completed":
 		s.handleRawResponseItemCompleted(message.Params)
+	case "thread/tokenUsage/updated":
+		var payload codexTokenUsageNotification
+		if err := json.Unmarshal(message.Params, &payload); err == nil {
+			s.handleTokenUsageUpdated(payload.TokenUsage)
+		}
 	case "turn/diff/updated":
 		var payload codexTurnDiffNotification
 		if err := json.Unmarshal(message.Params, &payload); err == nil {
@@ -505,6 +569,11 @@ func (s *codexAppSession) handleNotification(message codexRPCMessage) {
 					protocol.NewLogEvent(s.sessionID, strings.TrimSpace(payload.Error.Message), "stderr"),
 					s.runtimeMeta("active"),
 				))
+				return
+			}
+			if s.isCompactionTurn(payload.TurnID) {
+				s.emitCompactionEvent("failed", "manual", strings.TrimSpace(payload.Error.Message))
+				s.clearCompactionTurnID(payload.TurnID)
 				return
 			}
 			sendEvent(s.sink, protocol.ApplyRuntimeMeta(
@@ -580,10 +649,21 @@ func (s *codexAppSession) handleTurnCompleted(raw json.RawMessage) {
 	}
 	s.clearActiveTurnID(payload.Turn.ID)
 	if payload.Turn.Error != nil && strings.TrimSpace(payload.Turn.Error.Message) != "" {
-		sendEvent(s.sink, protocol.ApplyRuntimeMeta(
-			protocol.NewErrorEvent(s.sessionID, strings.TrimSpace(payload.Turn.Error.Message), strings.TrimSpace(payload.Turn.Error.AdditionalDetails)),
-			s.runtimeMeta("active"),
-		))
+		if s.isCompactionTurn(payload.Turn.ID) {
+			s.ensureCompactionID(payload.Turn.ID)
+			s.emitCompactionEvent("failed", "manual", strings.TrimSpace(payload.Turn.Error.Message))
+			s.clearCompactionTurnID(payload.Turn.ID)
+		} else {
+			sendEvent(s.sink, protocol.ApplyRuntimeMeta(
+				protocol.NewErrorEvent(s.sessionID, strings.TrimSpace(payload.Turn.Error.Message), strings.TrimSpace(payload.Turn.Error.AdditionalDetails)),
+				s.runtimeMeta("active"),
+			))
+		}
+	}
+	if s.isCompactionTurn(payload.Turn.ID) {
+		s.ensureCompactionID(payload.Turn.ID)
+		s.emitCompactionEvent("completed", "manual", "")
+		s.clearCompactionTurnID(payload.Turn.ID)
 	}
 	s.emitReadyPromptAfterReply()
 }
@@ -596,6 +676,12 @@ func (s *codexAppSession) handleItemEvent(raw json.RawMessage, status string) {
 	itemType := strings.TrimSpace(asString(payload.Item["type"]))
 	if itemType == "" {
 		return
+	}
+	if itemType == "contextCompaction" {
+		s.handleCompactionItem(payload, status)
+		if status == "done" {
+			return
+		}
 	}
 	if status == "done" && itemType == "agentMessage" {
 		if text := codexItemText(payload.Item); text != "" {
@@ -620,6 +706,37 @@ func (s *codexAppSession) handleItemEvent(raw json.RawMessage, status string) {
 	))
 }
 
+func (s *codexAppSession) handleCompactionItem(payload codexItemNotification, status string) {
+	trigger := "manual"
+	s.ensureCompactionID(payload.TurnID)
+	if status == "running" {
+		if payload.TurnID != "" {
+			s.setCompactionTurnID(payload.TurnID)
+		}
+		s.emitCompactionEvent("loading", trigger, "")
+		return
+	}
+	if status != "done" {
+		return
+	}
+	message := strings.TrimSpace(firstNonEmptyString(
+		asString(payload.Item["message"]),
+		codexItemText(payload.Item),
+	))
+	statusValue := strings.TrimSpace(strings.ToLower(asString(payload.Item["status"])))
+	if statusValue == "failed" {
+		s.emitCompactionEvent("failed", trigger, message)
+		if payload.TurnID != "" {
+			s.clearCompactionTurnID(payload.TurnID)
+		}
+		return
+	}
+	s.emitCompactionEvent("completed", trigger, "")
+	if payload.TurnID != "" {
+		s.clearCompactionTurnID(payload.TurnID)
+	}
+}
+
 func (s *codexAppSession) handleRawResponseItemCompleted(raw json.RawMessage) {
 	var payload codexItemNotification
 	if err := json.Unmarshal(raw, &payload); err != nil {
@@ -630,6 +747,18 @@ func (s *codexAppSession) handleRawResponseItemCompleted(raw json.RawMessage) {
 		return
 	}
 	s.emitAssistantCompletedText(text)
+}
+
+func (s *codexAppSession) handleTokenUsageUpdated(raw any) {
+	usage, ok := codexContextWindowUsage(raw)
+	if !ok {
+		return
+	}
+	meta := s.runtimeMeta("active")
+	sendEvent(s.sink, protocol.ApplyRuntimeMeta(
+		protocol.NewContextWindowUsageEvent(s.sessionID, usage),
+		meta,
+	))
 }
 
 func (s *codexAppSession) emitAssistantChunk(text string) {
@@ -656,6 +785,90 @@ func (s *codexAppSession) emitAssistantChunk(text string) {
 		protocol.NewLogEvent(s.sessionID, text, "stdout"),
 		meta,
 	))
+}
+
+func codexContextWindowUsage(raw any) (protocol.ContextWindowUsage, bool) {
+	record, ok := raw.(map[string]any)
+	if !ok || len(record) == 0 {
+		return protocol.ContextWindowUsage{}, false
+	}
+	last := asMap(record["last"])
+	total := asMap(record["total"])
+	contextWindow := firstPositiveInt(
+		record["model_context_window"],
+		record["modelContextWindow"],
+		record["context_window"],
+		record["contextWindow"],
+		total["modelContextWindow"],
+		total["model_context_window"],
+		last["modelContextWindow"],
+		last["model_context_window"],
+	)
+	if contextWindow <= 0 {
+		return protocol.ContextWindowUsage{}, false
+	}
+	usedTokens := firstNonNegativeInt(
+		last["total_tokens"],
+		last["totalTokens"],
+		total["total_tokens"],
+		total["totalTokens"],
+		record["total_tokens"],
+		record["totalTokens"],
+	)
+	if usedTokens < 0 {
+		return protocol.ContextWindowUsage{}, false
+	}
+	return protocol.NormalizeContextWindowUsage(protocol.ContextWindowUsage{
+		TokensUsed: usedTokens,
+		TokenLimit: contextWindow,
+	}), true
+}
+
+func asMap(value any) map[string]any {
+	if result, ok := value.(map[string]any); ok {
+		return result
+	}
+	return map[string]any{}
+}
+
+func firstPositiveInt(values ...any) int {
+	for _, value := range values {
+		number := intValue(value)
+		if number > 0 {
+			return number
+		}
+	}
+	return 0
+}
+
+func firstNonNegativeInt(values ...any) int {
+	for _, value := range values {
+		number := intValue(value)
+		if number >= 0 {
+			return number
+		}
+	}
+	return -1
+}
+
+func intValue(value any) int {
+	switch v := value.(type) {
+	case int:
+		return v
+	case int64:
+		return int(v)
+	case float64:
+		return int(v)
+	case json.Number:
+		if parsed, err := v.Int64(); err == nil {
+			return int(parsed)
+		}
+	case string:
+		if parsed, err := json.Number(strings.TrimSpace(v)).Int64(); err == nil {
+			return int(parsed)
+		}
+	}
+	return -1
 }
 
 func (s *codexAppSession) emitAssistantCompletedText(text string) {
@@ -939,6 +1152,105 @@ func (s *codexAppSession) activeTurn() string {
 	return s.activeTurnID
 }
 
+func (s *codexAppSession) emitCompactionEvent(status, trigger, message string) {
+	status = strings.TrimSpace(strings.ToLower(status))
+	if status == "" {
+		return
+	}
+	trigger = strings.TrimSpace(trigger)
+	message = strings.TrimSpace(message)
+	s.mu.Lock()
+	currentStatus := strings.TrimSpace(strings.ToLower(s.compactionStatus))
+	contextID := strings.TrimSpace(s.compactionID)
+	currentEventID := strings.TrimSpace(s.compactionEventID)
+	if currentStatus == status && currentEventID == contextID {
+		s.mu.Unlock()
+		return
+	}
+	if (currentStatus == "completed" || currentStatus == "failed") &&
+		(status == "completed" || status == "failed") {
+		s.mu.Unlock()
+		return
+	}
+	s.compactionStatus = status
+	s.compactionEventID = contextID
+	s.mu.Unlock()
+	meta := s.runtimeMeta("active")
+	meta.Source = "compact"
+	meta.Target = "compact"
+	meta.TargetType = "compact"
+	meta.TargetText = trigger
+	if contextID != "" {
+		meta.ContextID = contextID
+		meta.ContextTitle = "Context compaction"
+	}
+	if status == "completed" || status == "failed" {
+		meta.ClaudeLifecycle = "waiting_input"
+	}
+	sendEvent(s.sink, protocol.ApplyRuntimeMeta(
+		protocol.NewCompactionEvent(s.sessionID, contextID, status, trigger, message),
+		meta,
+	))
+}
+
+func (s *codexAppSession) setCompactionID(compactionID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.compactionID = strings.TrimSpace(compactionID)
+}
+
+func (s *codexAppSession) ensureCompactionID(fallback string) {
+	fallback = strings.TrimSpace(fallback)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if strings.TrimSpace(s.compactionID) != "" {
+		return
+	}
+	if fallback != "" {
+		s.compactionID = fallback
+		return
+	}
+	s.compactionID = fmt.Sprintf("compaction:%d", time.Now().UTC().UnixNano())
+}
+
+func (s *codexAppSession) setCompactionTurnID(turnID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.compactionTurnID = strings.TrimSpace(turnID)
+}
+
+func (s *codexAppSession) clearCompactionTurnID(turnID string) {
+	normalized := strings.TrimSpace(turnID)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if normalized == "" || normalized == strings.TrimSpace(s.compactionTurnID) {
+		s.compactionTurnID = ""
+	}
+}
+
+func (s *codexAppSession) resetCompactionLifecycle() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.compactionID = ""
+	s.compactionTurnID = ""
+	s.compactionStatus = ""
+	s.compactionEventID = ""
+}
+
+func (s *codexAppSession) isCompactionTurn(turnID string) bool {
+	normalized := strings.TrimSpace(turnID)
+	if normalized == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return strings.TrimSpace(s.compactionTurnID) == normalized
+}
+
+func (s *codexAppSession) HasActiveTurn() bool {
+	return strings.TrimSpace(s.activeTurn()) != ""
+}
+
 func (s *codexAppSession) threadAndTurn() (string, string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -999,9 +1311,10 @@ func (s *codexAppSession) appendAssistantDelta(delta string) []string {
 		return nil
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.assistantBuffer.WriteString(delta)
-	return nil
+	emitted := codexDrainAssistantChunks(&s.assistantBuffer, false)
+	s.mu.Unlock()
+	return emitted
 }
 
 func (s *codexAppSession) flushAssistantDelta() []string {

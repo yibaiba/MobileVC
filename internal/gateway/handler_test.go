@@ -5171,6 +5171,23 @@ func TestHandlerSlashCommandExecMappings(t *testing.T) {
 	}
 }
 
+func TestHandlerCompactActionRequiresLoadedSession(t *testing.T) {
+	h := newTestHandler()
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+
+	if err := conn.WriteJSON(protocol.CompactRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "compact"},
+	}); err != nil {
+		t.Fatalf("write compact request: %v", err)
+	}
+
+	event := readUntilType(t, conn, protocol.EventTypeCompactResult)
+	if event["accepted"] != false {
+		t.Fatalf("expected compact rejection, got %#v", event)
+	}
+}
+
 func TestHandlerSessionDeleteRemovesHistorySessionFromList(t *testing.T) {
 	h := newTestHandler()
 	tempStore, err := data.NewFileStore(t.TempDir())
@@ -5239,6 +5256,9 @@ func TestHandlerInitialSessionListDoesNotMergeNativeCodexSessions(t *testing.T) 
 		t.Fatalf("mkdir project dir: %v", err)
 	}
 	t.Setenv("HOME", homeDir)
+	t.Setenv("USERPROFILE", homeDir)
+	t.Setenv("HOMEDRIVE", "")
+	t.Setenv("HOMEPATH", "")
 	threadID := seedNativeCodexSessionFixture(t, homeDir, projectDir)
 
 	h := newTestHandler()
@@ -5275,6 +5295,9 @@ func TestHandlerSessionListMergesNativeCodexSessionsByCWD(t *testing.T) {
 		t.Fatalf("mkdir other dir: %v", err)
 	}
 	t.Setenv("HOME", homeDir)
+	t.Setenv("USERPROFILE", homeDir)
+	t.Setenv("HOMEDRIVE", "")
+	t.Setenv("HOMEPATH", "")
 	threadID := seedNativeCodexSessionFixture(t, homeDir, projectDir)
 
 	h := newTestHandler()
@@ -5369,6 +5392,54 @@ func TestHandlerSessionListMergesNativeCodexSessionsByCWD(t *testing.T) {
 	}
 }
 
+func TestHandlerSessionListMergesNativeCodexSessionsByWindowsDeviceCWD(t *testing.T) {
+	homeDir := t.TempDir()
+	projectDir := filepath.Join(homeDir, "workspace", "MobileVC")
+	if err := os.MkdirAll(projectDir, 0o755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
+	}
+	t.Setenv("HOME", homeDir)
+	t.Setenv("USERPROFILE", homeDir)
+	t.Setenv("HOMEDRIVE", "")
+	t.Setenv("HOMEPATH", "")
+	threadID := seedNativeCodexSessionFixture(t, homeDir, `\\?\`+projectDir)
+
+	h := newTestHandler()
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	h.SessionStore = tempStore
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+	_ = readUntilType(t, conn, protocol.EventTypeSessionListResult)
+
+	if err := conn.WriteJSON(protocol.SessionListRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_list"},
+		CWD:         projectDir,
+	}); err != nil {
+		t.Fatalf("write session list request: %v", err)
+	}
+
+	listEvent := readUntilType(t, conn, protocol.EventTypeSessionListResult)
+	items, ok := listEvent["items"].([]any)
+	if !ok {
+		t.Fatalf("expected session list items, got %#v", listEvent)
+	}
+
+	for _, raw := range items {
+		item, _ := raw.(map[string]any)
+		if item["id"] == "codex-thread:"+threadID {
+			runtime, _ := item["runtime"].(map[string]any)
+			if normalizeSessionCWD(fmt.Sprint(runtime["cwd"])) != normalizeSessionCWD(projectDir) {
+				t.Fatalf("expected normalized runtime cwd %q, got %#v", normalizeSessionCWD(projectDir), runtime)
+			}
+			return
+		}
+	}
+	t.Fatalf("expected native Codex session in filtered list, got %#v", items)
+}
+
 func TestHandlerSessionListHidesNativeCodexMirrorWhenTrackedByMobileVC(t *testing.T) {
 	homeDir := t.TempDir()
 	projectDir := filepath.Join(homeDir, "workspace", "MobileVC")
@@ -5376,6 +5447,9 @@ func TestHandlerSessionListHidesNativeCodexMirrorWhenTrackedByMobileVC(t *testin
 		t.Fatalf("mkdir project dir: %v", err)
 	}
 	t.Setenv("HOME", homeDir)
+	t.Setenv("USERPROFILE", homeDir)
+	t.Setenv("HOMEDRIVE", "")
+	t.Setenv("HOMEPATH", "")
 	threadID := seedNativeCodexSessionFixture(t, homeDir, projectDir)
 
 	h := newTestHandler()
@@ -5601,6 +5675,9 @@ func TestHandlerSessionLoadMirrorsNativeCodexSession(t *testing.T) {
 		t.Fatalf("mkdir project dir: %v", err)
 	}
 	t.Setenv("HOME", homeDir)
+	t.Setenv("USERPROFILE", homeDir)
+	t.Setenv("HOMEDRIVE", "")
+	t.Setenv("HOMEPATH", "")
 	threadID := seedNativeCodexSessionFixture(t, homeDir, projectDir)
 
 	h := newTestHandler()
@@ -5681,6 +5758,9 @@ func TestHandlerSessionLoadPreservesCachedCodexMirrorRuntimeState(t *testing.T) 
 		t.Fatalf("mkdir project dir: %v", err)
 	}
 	t.Setenv("HOME", homeDir)
+	t.Setenv("USERPROFILE", homeDir)
+	t.Setenv("HOMEDRIVE", "")
+	t.Setenv("HOMEPATH", "")
 	threadID := seedNativeCodexSessionFixture(t, homeDir, projectDir)
 
 	h := newTestHandler()
@@ -5783,6 +5863,221 @@ func TestHandlerSessionLoadPreservesCachedCodexMirrorRuntimeState(t *testing.T) 
 	}
 }
 
+func TestHandlerCompactRestartsLoadedCodexMirrorSession(t *testing.T) {
+	homeDir := t.TempDir()
+	projectDir := filepath.Join(homeDir, "workspace", "MobileVC")
+	if err := os.MkdirAll(projectDir, 0o755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
+	}
+	t.Setenv("HOME", homeDir)
+	t.Setenv("USERPROFILE", homeDir)
+	t.Setenv("HOMEDRIVE", "")
+	t.Setenv("HOMEPATH", "")
+	threadID := seedNativeCodexSessionFixture(t, homeDir, projectDir)
+
+	h := newTestHandler()
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	h.SessionStore = tempStore
+
+	resumed := newInteractiveHoldingStubRunner()
+	h.NewPtyRunner = func() engine.Runner { return resumed }
+
+	thread, err := codexsync.FindNativeThread(context.Background(), threadID)
+	if err != nil {
+		t.Fatalf("find native thread: %v", err)
+	}
+	record := codexsync.MirrorRecord(thread)
+	if _, err := h.SessionStore.UpsertSession(context.Background(), record); err != nil {
+		t.Fatalf("upsert mirror session: %v", err)
+	}
+	if _, err := h.SessionStore.SaveProjection(context.Background(), record.Summary.ID, data.ProjectionSnapshot{
+		RawTerminalByStream: map[string]string{"stdout": "", "stderr": ""},
+		LogEntries:          record.Projection.LogEntries,
+		Runtime: data.SessionRuntime{
+			ResumeSessionID: threadID,
+			Command:         "codex resume " + threadID,
+			Engine:          "codex",
+			CWD:             projectDir,
+			PermissionMode:  "default",
+			ClaudeLifecycle: "resumable",
+			Source:          "codex-native",
+		},
+		Controller: session.ControllerSnapshot{
+			SessionID:       record.Summary.ID,
+			State:           session.ControllerStateIdle,
+			CurrentCommand:  "codex resume " + threadID,
+			ResumeSession:   threadID,
+			ClaudeLifecycle: "resumable",
+			ActiveMeta: protocol.RuntimeMeta{
+				ResumeSessionID: threadID,
+				Command:         "codex resume " + threadID,
+				Engine:          "codex",
+				CWD:             projectDir,
+				PermissionMode:  "default",
+				ClaudeLifecycle: "resumable",
+			},
+		},
+	}); err != nil {
+		t.Fatalf("save mirror projection: %v", err)
+	}
+
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+
+	mirrorID := "codex-thread:" + threadID
+	if err := conn.WriteJSON(protocol.SessionLoadRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_load"},
+		SessionID:   mirrorID,
+		CWD:         projectDir,
+	}); err != nil {
+		t.Fatalf("write session load request: %v", err)
+	}
+	_ = readUntilSessionHistory(t, conn)
+	_ = readUntilType(t, conn, protocol.EventTypeReviewState)
+	_ = readUntilType(t, conn, protocol.EventTypeAgentState)
+
+	if err := conn.WriteJSON(protocol.CompactRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "compact", SessionID: mirrorID},
+	}); err != nil {
+		t.Fatalf("write compact request: %v", err)
+	}
+
+	compact := readUntilType(t, conn, protocol.EventTypeCompactResult)
+	if compact["accepted"] != false {
+		t.Fatalf("expected compact to fail against stub runner lacking compactor, got %#v", compact)
+	}
+	if msg, _ := compact["error"].(string); !strings.Contains(msg, "input not supported") {
+		t.Fatalf("expected compactor-not-supported error after resume restart, got %#v", compact)
+	}
+
+	resumed.WaitStarted(t)
+	if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(resumed.lastReq.Command)), "codex resume "+strings.ToLower(threadID)) {
+		t.Fatalf("expected codex resume command on compact restore, got %q", resumed.lastReq.Command)
+	}
+}
+
+func TestHandlerCompactLoadedCodexMirrorIgnoresStaleClaudeRuntimeCache(t *testing.T) {
+	homeDir := t.TempDir()
+	projectDir := filepath.Join(homeDir, "workspace", "MobileVC")
+	if err := os.MkdirAll(projectDir, 0o755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
+	}
+	t.Setenv("HOME", homeDir)
+	t.Setenv("USERPROFILE", homeDir)
+	t.Setenv("HOMEDRIVE", "")
+	t.Setenv("HOMEPATH", "")
+	threadID := seedNativeCodexSessionFixture(t, homeDir, projectDir)
+
+	h := newTestHandler()
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	h.SessionStore = tempStore
+
+	resumed := newInteractiveHoldingStubRunner()
+	h.NewPtyRunner = func() engine.Runner { return resumed }
+
+	thread, err := codexsync.FindNativeThread(context.Background(), threadID)
+	if err != nil {
+		t.Fatalf("find native thread: %v", err)
+	}
+	record := codexsync.MirrorRecord(thread)
+	if _, err := h.SessionStore.UpsertSession(context.Background(), record); err != nil {
+		t.Fatalf("upsert mirror session: %v", err)
+	}
+	staleResumeID := "29fbef9d-63a2-4d04-bb84-f574b3ac6c26"
+	staleCommand := "claude --resume " + staleResumeID + " --print --verbose --output-format stream-json --input-format stream-json --permission-prompt-tool stdio"
+	if _, err := h.SessionStore.SaveProjection(context.Background(), record.Summary.ID, data.ProjectionSnapshot{
+		RawTerminalByStream: map[string]string{"stdout": "stale output", "stderr": ""},
+		LogEntries: append(record.Projection.LogEntries, data.SnapshotLogEntry{
+			Kind:      "markdown",
+			Message:   "Cached note from stale runtime",
+			Timestamp: "2026-04-04T02:05:00Z",
+		}),
+		Runtime: data.SessionRuntime{
+			ResumeSessionID: staleResumeID,
+			Command:         staleCommand,
+			Engine:          "codex",
+			CWD:             projectDir,
+			PermissionMode:  "auto",
+			ClaudeLifecycle: "waiting_input",
+			Source:          "mobilevc",
+		},
+		Controller: session.ControllerSnapshot{
+			SessionID:       record.Summary.ID,
+			State:           session.ControllerStateWaitInput,
+			CurrentCommand:  staleCommand,
+			ResumeSession:   staleResumeID,
+			ClaudeLifecycle: "waiting_input",
+			ActiveMeta: protocol.RuntimeMeta{
+				ResumeSessionID: staleResumeID,
+				Command:         staleCommand,
+				Engine:          "codex",
+				Model:           "sonnet",
+				CWD:             projectDir,
+				PermissionMode:  "auto",
+				ClaudeLifecycle: "waiting_input",
+			},
+		},
+		CurrentStep: &data.SnapshotContext{
+			ID:      "step-stale",
+			Type:    "step",
+			Message: "等待输入",
+			Status:  "WAIT_INPUT",
+			Title:   "等待输入",
+		},
+	}); err != nil {
+		t.Fatalf("save stale mirror projection: %v", err)
+	}
+
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+
+	mirrorID := "codex-thread:" + threadID
+	if err := conn.WriteJSON(protocol.SessionLoadRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_load"},
+		SessionID:   mirrorID,
+		CWD:         projectDir,
+	}); err != nil {
+		t.Fatalf("write session load request: %v", err)
+	}
+	history := readUntilSessionHistory(t, conn)
+	resumeMeta, _ := history["resumeRuntimeMeta"].(map[string]any)
+	if got := fmt.Sprint(resumeMeta["resumeSessionId"]); got != threadID {
+		t.Fatalf("expected native codex thread resume id, got %#v", resumeMeta)
+	}
+	if got := strings.ToLower(strings.TrimSpace(fmt.Sprint(resumeMeta["command"]))); !strings.HasPrefix(got, "codex") {
+		t.Fatalf("expected native codex command after stale cache sanitize, got %#v", resumeMeta)
+	}
+	_ = readUntilType(t, conn, protocol.EventTypeReviewState)
+	_ = readUntilType(t, conn, protocol.EventTypeAgentState)
+
+	if err := conn.WriteJSON(protocol.CompactRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "compact", SessionID: mirrorID},
+	}); err != nil {
+		t.Fatalf("write compact request: %v", err)
+	}
+
+	compact := readUntilType(t, conn, protocol.EventTypeCompactResult)
+	if compact["accepted"] != false {
+		t.Fatalf("expected compact to fail against stub runner lacking compactor, got %#v", compact)
+	}
+	if msg, _ := compact["error"].(string); !strings.Contains(msg, "input not supported") {
+		t.Fatalf("expected compactor-not-supported error after codex resume restart, got %#v", compact)
+	}
+
+	resumed.WaitStarted(t)
+	lower := strings.ToLower(strings.TrimSpace(resumed.lastReq.Command))
+	if !strings.HasPrefix(lower, "codex resume "+strings.ToLower(threadID)) {
+		t.Fatalf("expected stale claude cache to be ignored in compact restore, got %q", resumed.lastReq.Command)
+	}
+}
+
+
 func TestHandlerSessionDeleteRejectsNativeCodexMirror(t *testing.T) {
 	homeDir := t.TempDir()
 	projectDir := filepath.Join(homeDir, "workspace", "MobileVC")
@@ -5790,6 +6085,9 @@ func TestHandlerSessionDeleteRejectsNativeCodexMirror(t *testing.T) {
 		t.Fatalf("mkdir project dir: %v", err)
 	}
 	t.Setenv("HOME", homeDir)
+	t.Setenv("USERPROFILE", homeDir)
+	t.Setenv("HOMEDRIVE", "")
+	t.Setenv("HOMEPATH", "")
 	threadID := seedNativeCodexSessionFixture(t, homeDir, projectDir)
 
 	h := newTestHandler()

@@ -45,6 +45,12 @@ func deriveClaudeLifecycleLocked(activeRunner engine.Runner, meta protocol.Runti
 		}
 		return "inactive"
 	}
+	if hasRunnerActiveTurn(activeRunner) {
+		if trimmedResume != "" {
+			return "active"
+		}
+		return "starting"
+	}
 	if provider, ok := activeRunner.(engine.InteractiveStateProvider); ok && provider.CanAcceptInteractiveInput() {
 		return "waiting_input"
 	}
@@ -52,6 +58,14 @@ func deriveClaudeLifecycleLocked(activeRunner engine.Runner, meta protocol.Runti
 		return "active"
 	}
 	return "starting"
+}
+
+func hasRunnerActiveTurn(activeRunner engine.Runner) bool {
+	if activeRunner == nil {
+		return false
+	}
+	provider, ok := activeRunner.(engine.TurnStateProvider)
+	return ok && provider.HasActiveTurn()
 }
 
 type manager struct {
@@ -176,6 +190,7 @@ func (m *manager) snapshot() Snapshot {
 	if provider, ok := m.activeRunner.(engine.InteractiveStateProvider); ok && m.activeRunner != nil {
 		canAcceptInteractiveInput = provider.CanAcceptInteractiveInput()
 	}
+	hasActiveTurn := hasRunnerActiveTurn(m.activeRunner)
 	meta := m.activeMeta
 	if strings.TrimSpace(meta.ResumeSessionID) == "" {
 		meta.ResumeSessionID = m.resumeSessionID
@@ -186,6 +201,7 @@ func (m *manager) snapshot() Snapshot {
 	return Snapshot{
 		Running:                   m.activeRunner != nil,
 		CanAcceptInteractiveInput: canAcceptInteractiveInput,
+		HasActiveTurn:             hasActiveTurn,
 		ActiveMeta:                meta,
 		ActiveSession:             m.activeSession,
 		ResumeSessionID:           m.resumeSessionID,
@@ -262,6 +278,65 @@ func (s *Service) StopActive(sessionID string, emit func(any)) error {
 	return nil
 }
 
+func (s *Service) Compact(ctx context.Context, sessionID string, emit func(any)) error {
+	currentRunner, activeMeta, currentSessionID := s.manager.current()
+	if currentRunner == nil || currentSessionID == "" {
+		restartReq, err := s.buildDetachedResumeRequest(ExecuteRequest{
+			Command:        firstNonEmptyRuntimeValue(activeMeta.Command, s.manager.snapshot().ActiveMeta.Command),
+			CWD:            firstNonEmptyRuntimeValue(activeMeta.CWD, s.manager.snapshot().ActiveMeta.CWD),
+			Mode:           engine.ModePTY,
+			PermissionMode: firstNonEmptyRuntimeValue(activeMeta.PermissionMode, s.manager.snapshot().ActiveMeta.PermissionMode),
+			RuntimeMeta: protocol.RuntimeMeta{
+				Command:        firstNonEmptyRuntimeValue(activeMeta.Command, s.manager.snapshot().ActiveMeta.Command),
+				Engine:         firstNonEmptyRuntimeValue(activeMeta.Engine, s.manager.snapshot().ActiveMeta.Engine),
+				CWD:            firstNonEmptyRuntimeValue(activeMeta.CWD, s.manager.snapshot().ActiveMeta.CWD),
+				PermissionMode: firstNonEmptyRuntimeValue(activeMeta.PermissionMode, s.manager.snapshot().ActiveMeta.PermissionMode),
+				ResumeSessionID: firstNonEmptyRuntimeValue(
+					activeMeta.ResumeSessionID,
+					s.manager.snapshot().ActiveMeta.ResumeSessionID,
+					s.manager.snapshot().ResumeSessionID,
+				),
+			},
+		}, firstNonEmptyRuntimeValue(activeMeta.PermissionMode, s.manager.snapshot().ActiveMeta.PermissionMode))
+		if err != nil {
+			return ErrNoActiveRunner
+		}
+		if err := s.Execute(ctx, sessionID, restartReq, emit); err != nil {
+			return err
+		}
+		if err := s.waitForInteractive(ctx); err != nil {
+			return err
+		}
+		currentRunner, activeMeta, currentSessionID = s.manager.current()
+		if currentRunner == nil || currentSessionID == "" {
+			return ErrNoActiveRunner
+		}
+	}
+	compactor, ok := currentRunner.(engine.ContextCompactor)
+	if !ok {
+		return engine.ErrInputNotSupported
+	}
+	if err := compactor.Compact(ctx); err != nil {
+		if errors.Is(err, ErrNoActiveRunner) || strings.Contains(strings.ToLower(err.Error()), "no active codex session") {
+			return ErrNoActiveRunner
+		}
+		return err
+	}
+	effectiveMeta := activeMeta
+	effectiveMeta.Source = "compact"
+	effectiveMeta.Target = "compact"
+	effectiveMeta.TargetType = "compact"
+	effectiveMeta.TargetText = "compact"
+	effectiveMeta.ClaudeLifecycle = "active"
+	s.manager.updateMeta(func(m *protocol.RuntimeMeta) {
+		*m = effectiveMeta
+	})
+	for _, event := range s.controller.OnInputSent(effectiveMeta) {
+		emit(event)
+	}
+	return nil
+}
+
 func (s *Service) closeActiveAndWait() {
 	s.manager.closeActive()
 	s.execWG.Wait()
@@ -326,10 +401,17 @@ func (s *Service) Execute(ctx context.Context, sessionID string, req ExecuteRequ
 					s.manager.updateResumeSessionID(resumeSessionID)
 				}
 			}
-			mappedMeta := s.manager.snapshot().ActiveMeta
+			mappedMeta := protocol.MergeRuntimeMeta(s.manager.snapshot().ActiveMeta, incomingMeta)
 			switch event.(type) {
 			case protocol.PromptRequestEvent:
 				mappedMeta.ClaudeLifecycle = "waiting_input"
+			case protocol.CompactionEvent:
+				switch strings.TrimSpace(strings.ToLower(event.(protocol.CompactionEvent).Status)) {
+				case "loading":
+					mappedMeta.ClaudeLifecycle = "active"
+				case "completed", "failed":
+					mappedMeta.ClaudeLifecycle = "waiting_input"
+				}
 			case protocol.StepUpdateEvent, protocol.FileDiffEvent:
 				if runnerIsClaudeSession(selected, preparedReq.Command, mappedMeta.Command, preparedReq.RuntimeMeta.Command) {
 					mappedMeta.ClaudeLifecycle = "active"
@@ -565,6 +647,21 @@ func (s *Service) CurrentRunner() engine.Runner {
 	return s.manager.currentRunner()
 }
 
+func (s *Service) CurrentContextWindowUsage(ctx context.Context, sessionID string) (protocol.ContextWindowUsage, bool, error) {
+	currentRunner, _, currentSessionID := s.manager.current()
+	if currentRunner == nil || currentSessionID == "" {
+		return protocol.ContextWindowUsage{}, false, nil
+	}
+	if targetSessionID := strings.TrimSpace(sessionID); targetSessionID != "" && targetSessionID != currentSessionID {
+		return protocol.ContextWindowUsage{}, false, nil
+	}
+	provider, ok := currentRunner.(engine.ContextWindowUsageProvider)
+	if !ok {
+		return protocol.ContextWindowUsage{}, false, nil
+	}
+	return provider.ContextWindowUsage(ctx)
+}
+
 func (s *Service) CanResumeAISession(req ExecuteRequest) bool {
 	currentRunner, activeMeta, currentSessionID := s.manager.current()
 	if req.Mode != engine.ModePTY {
@@ -602,6 +699,18 @@ func (s *Service) UpdatePermissionMode(mode string) {
 	}
 	if pr, ok := r.(interface{ SetPermissionMode(string) }); ok {
 		pr.SetPermissionMode(trimmed)
+	}
+}
+
+func (s *Service) SyncRuntimeMeta(meta protocol.RuntimeMeta) {
+	s.manager.updateMeta(func(m *protocol.RuntimeMeta) {
+		*m = protocol.MergeRuntimeMeta(*m, meta)
+	})
+	if resumeSessionID := strings.TrimSpace(meta.ResumeSessionID); resumeSessionID != "" {
+		s.manager.updateResumeSessionID(resumeSessionID)
+	}
+	if strings.TrimSpace(meta.PermissionMode) != "" {
+		s.controller.UpdatePermissionMode(meta.PermissionMode)
 	}
 }
 

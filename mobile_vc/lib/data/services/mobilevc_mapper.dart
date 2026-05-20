@@ -11,6 +11,12 @@ class MobileVcMapper {
         return PongEvent.fromJson(json);
       case 'client_action_ack':
         return ClientActionAckEvent.fromJson(json);
+      case 'compact_result':
+        return CompactResultEvent.fromJson(json);
+      case 'compaction':
+        return CompactionEvent.fromJson(json);
+      case 'context_window_usage':
+        return ContextWindowUsageEvent.fromJson(json);
       case 'log':
         return LogEvent.fromJson(json);
       case 'progress':

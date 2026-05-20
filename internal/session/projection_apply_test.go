@@ -152,6 +152,26 @@ func TestNormalizeAssistantReplyForDedupe(t *testing.T) {
 	}
 }
 
+func TestApplyEventToProjection_ContextWindowUsageEvent(t *testing.T) {
+	snapshot, applied := ApplyEventToProjection(
+		data.ProjectionSnapshot{},
+		protocol.ContextWindowUsageEvent{
+			Event: protocol.Event{SessionID: "s1"},
+			Usage: protocol.ContextWindowUsage{
+				TokensUsed: 420,
+				TokenLimit: 2000,
+			},
+		},
+	)
+	if !applied {
+		t.Fatal("expected usage event to apply")
+	}
+	if snapshot.ContextWindowUsage.TokensUsed != 420 ||
+		snapshot.ContextWindowUsage.TokenLimit != 2000 {
+		t.Fatalf("unexpected stored usage: %+v", snapshot.ContextWindowUsage)
+	}
+}
+
 func TestAppendExecutionStream(t *testing.T) {
 	t.Run("nil item is no-op", func(t *testing.T) {
 		appendExecutionStream(nil, "stdout", "x") // 不能 panic
