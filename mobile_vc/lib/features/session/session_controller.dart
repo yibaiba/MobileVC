@@ -6,6 +6,7 @@ import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../core/config/app_config.dart';
+import '../../core/config/app_connection_environment.dart';
 import '../../data/models/events.dart';
 import '../../data/models/runtime_meta.dart';
 import '../../data/models/session_models.dart';
@@ -189,6 +190,7 @@ class SessionController extends ChangeNotifier {
       : _service = service ?? MobileVcWsService();
 
   static const _prefsKey = 'mobilevc.app_config';
+  static const _connectionIntentPrefsKey = 'mobilevc.connection_intent';
   static const int _maxForegroundReconnectAttempts = 4;
   static const Duration _connectionHealthInterval = Duration(seconds: 10);
   static const Duration _connectionSilenceTimeout = Duration(seconds: 45);
@@ -394,6 +396,7 @@ class SessionController extends ChangeNotifier {
       );
   bool get connecting => _connecting;
   bool get connected => _connected;
+  bool get autoReconnectEnabled => _autoReconnectEnabled;
   bool get reconnecting =>
       _connectionStage == SessionConnectionStage.reconnecting ||
       _connectionStage == SessionConnectionStage.backgroundSuspended;
@@ -1215,6 +1218,7 @@ class SessionController extends ChangeNotifier {
     }
     _subscription = _service.events.listen(_handleEvent);
     _startConnectionHealthMonitor();
+    unawaited(_restoreConnectionIntent());
     _syncDerivedState();
     notifyListeners();
     _pushDebug('initialize end');
@@ -1272,6 +1276,31 @@ class SessionController extends ChangeNotifier {
         label: '[session] prefs restore stack',
       );
       await prefs.remove(_prefsKey);
+    }
+  }
+
+  Future<void> _restoreConnectionIntent() async {
+    final prefs = await SharedPreferences.getInstance();
+    if (prefs.getBool(_connectionIntentPrefsKey) != true) {
+      return;
+    }
+    _autoReconnectEnabled = true;
+    _scheduleReconnect(immediate: true);
+  }
+
+  Future<void> _saveConnectionIntent(bool enabled) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool(_connectionIntentPrefsKey, enabled);
+    } catch (error, stack) {
+      _pushDebug(
+        'save connection intent failed',
+        'key=$_connectionIntentPrefsKey errorType=${error.runtimeType}',
+      );
+      debugPrintStack(
+        stackTrace: stack,
+        label: '[session] save connection intent stack',
+      );
     }
   }
 
@@ -1763,7 +1792,12 @@ class SessionController extends ChangeNotifier {
     _syncDerivedState();
     notifyListeners();
     try {
-      await _service.connect(_config.wsUrl);
+      await _service.connect(
+        _config.wsUrlFor(
+          secureTransport: defaultSecureBackendTransport ? true : null,
+        ),
+      );
+      unawaited(_saveConnectionIntent(true));
       _connected = true;
       _reconnectAttempt = 0;
       _connectionStage = SessionConnectionStage.connected;
@@ -1836,6 +1870,7 @@ class SessionController extends ChangeNotifier {
 
   Future<void> disconnect() async {
     _autoReconnectEnabled = false;
+    unawaited(_saveConnectionIntent(false));
     _reconnectAttempt = 0;
     _cancelReconnectTimer();
     _stopObservedSessionSync();
