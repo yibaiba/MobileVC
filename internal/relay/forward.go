@@ -13,8 +13,11 @@ import (
 
 func (s *Server) forwardLoop(peer *peerConn, sessionID string, direction string) {
 	for {
-		raw, err := peer.ReadRawFrame()
+		raw, err := peer.ReadRawFrame(s.maxPostAuthFrameBytes())
 		if err != nil {
+			if errors.Is(err, errFrameTooLarge) {
+				writeError(peer, CodeFrameTooLarge)
+			}
 			return
 		}
 		if err := s.dispatchPostAuthFrame(peer, sessionID, direction, raw); err != nil {
@@ -24,6 +27,14 @@ func (s *Server) forwardLoop(peer *peerConn, sessionID string, direction string)
 			return
 		}
 	}
+}
+
+func (s *Server) maxPostAuthFrameBytes() int64 {
+	payloadLimit := int64(s.cfg.MaxPayloadBytes) * 2
+	if payloadLimit < s.cfg.MaxControlFrameBytes {
+		return s.cfg.MaxControlFrameBytes
+	}
+	return payloadLimit
 }
 
 func (s *Server) dispatchPostAuthFrame(peer *peerConn, sessionID string, direction string, raw []byte) error {
@@ -57,10 +68,6 @@ func isE2EEHandshakeFrameType(frameType string) bool {
 }
 
 func (s *Server) forwardE2EEHandshakeFrame(peer *peerConn, sessionID string, direction string, frameType string, raw []byte) error {
-	if int64(len(raw)) > s.cfg.MaxControlFrameBytes {
-		writeError(peer, CodeFrameTooLarge)
-		return errors.New("e2ee handshake control frame too large")
-	}
 	frame, err := decodeE2EEHandshakeFrame(frameType, raw)
 	if err != nil {
 		writeError(peer, CodeE2EEHandshakeFailed)

@@ -110,7 +110,7 @@ Questions to answer:
 - E2EE forward missing `streamId` or `handshakeId` -> `relay.error` with `protocol_error`.
 - Forward with missing or mismatched `clientId` -> `relay.error` with `protocol_error`.
 - E2EE handshake control frame with wrong role/direction/session/client ID -> `relay.error` with `protocol_error`.
-- E2EE handshake control frame larger than `MaxControlFrameBytes` -> `relay.error` with `frame_too_large`.
+- Post-auth raw websocket frames must be size-bounded while reading, before JSON decode. Frames above the post-auth raw frame limit -> `relay.error` with `frame_too_large`; decoded relay payloads above `MaxPayloadBytes` still -> `payload_too_large`.
 - First agent-to-client forward with an empty `clientId` after successful client pairing -> relay fills the current active `clientId`; wrong non-empty `clientId` still -> `protocol_error`.
 - Missing `client.attached` before the relay websocket closes -> local relay client write returns the underlying read/close error.
 - Per-IP or role capacity exceeded before upgrade -> HTTP 429.

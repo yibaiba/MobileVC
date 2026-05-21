@@ -14,6 +14,8 @@ import (
 	"mobilevc/internal/logx"
 )
 
+var errFrameTooLarge = errors.New("frame too large")
+
 func (s *Server) handleAgent(w http.ResponseWriter, r *http.Request) {
 	remote := s.clientIP(r)
 	if err := s.acquireConn(roleAgent, remote); err != nil {
@@ -140,7 +142,7 @@ func readLimitedFrame(reader io.Reader, limit int64) ([]byte, error) {
 		return nil, err
 	}
 	if int64(len(raw)) > limit {
-		return nil, errors.New("control frame too large")
+		return nil, errFrameTooLarge
 	}
 	return raw, nil
 }

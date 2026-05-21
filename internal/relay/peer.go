@@ -2,7 +2,6 @@ package relay
 
 import (
 	"errors"
-	"io"
 	"sync"
 	"time"
 
@@ -44,12 +43,12 @@ func (p *peerConn) ReadJSON(v any) error {
 	return p.conn.ReadJSON(v)
 }
 
-func (p *peerConn) ReadRawFrame() ([]byte, error) {
+func (p *peerConn) ReadRawFrame(limit int64) ([]byte, error) {
 	_, reader, err := p.conn.NextReader()
 	if err != nil {
 		return nil, err
 	}
-	return io.ReadAll(reader)
+	return readLimitedFrame(reader, limit)
 }
 
 func (p *peerConn) Enqueue(v any) error {

@@ -432,6 +432,39 @@ func TestRelayRejectsOversizedDecodedPayload(t *testing.T) {
 	}
 }
 
+func TestRelayRejectsOversizedPostAuthFrameBeforeDecode(t *testing.T) {
+	server := newLimitedTestRelayServer(t, Config{MaxPayloadBytes: 32})
+	defer server.Close()
+
+	sessionID := "rs_large_frame"
+	secret := "pair-secret-128-bit-minimum"
+	agent := dialRelay(t, server.URL, "/relay/agent")
+	defer agent.Close()
+	registerAgent(t, agent, sessionID, secret, "reconnect-secret", time.Now().Add(time.Minute))
+	client := dialRelay(t, server.URL, "/relay/client")
+	defer client.Close()
+	clientID := pairClient(t, client, sessionID, secret)
+	readAttached(t, agent, clientID)
+
+	oversized := map[string]any{
+		"type":      TypeRelayForward,
+		"version":   Version,
+		"sessionId": sessionID,
+		"clientId":  clientID,
+		"padding":   strings.Repeat("x", 20*1024),
+	}
+	if err := client.WriteJSON(oversized); err != nil {
+		t.Fatalf("send oversized frame: %v", err)
+	}
+	var errFrame ErrorFrame
+	if err := client.ReadJSON(&errFrame); err != nil {
+		t.Fatalf("read oversized frame error: %v", err)
+	}
+	if errFrame.Code != CodeFrameTooLarge {
+		t.Fatalf("unexpected error frame: %#v", errFrame)
+	}
+}
+
 func TestRelayAcceptsPaddedBase64URLPayload(t *testing.T) {
 	server := newTestRelayServer(t)
 	defer server.Close()
