@@ -53,7 +53,7 @@ func main() {
 	startRelayClient(cfg, wsHandler)
 	ttsHandler := initTTSHandler(cfg)
 	mux := buildMux(cfg, wsHandler, ttsHandler)
-	startHTTPServer(addr, mux, startedAt)
+	startHTTPServer(addr, summary, mux, startedAt)
 }
 
 func bootstrap(overrides config.Overrides) (config.Config, *data.FileStore) {
@@ -219,7 +219,7 @@ func buildMux(cfg config.Config, wsHandler *gateway.Handler, ttsHandler *tts.HTT
 	return mux
 }
 
-func startHTTPServer(addr string, mux *http.ServeMux, startedAt time.Time) {
+func startHTTPServer(addr string, summary config.Summary, mux *http.ServeMux, startedAt time.Time) {
 	server := &http.Server{
 		Addr:    addr,
 		Handler: mux,
@@ -231,11 +231,12 @@ func startHTTPServer(addr string, mux *http.ServeMux, startedAt time.Time) {
 		logx.Error("bootstrap", "HTTP listen failed: %v", err)
 		panic(fmt.Errorf("listen tcp %s: %w", addr, err))
 	}
-	logx.Info("bootstrap", "Ready: addr=%s health=http://localhost%s/healthz version=http://localhost%s/version ws=ws://localhost%s/ws?token=<redacted> startup=%s",
+	logx.Info("bootstrap", "Ready: addr=%s exposureMode=%s health=%s version=%s ws=%s startup=%s",
 		addr,
-		addr,
-		addr,
-		addr,
+		summary.ExposureMode,
+		summary.HealthURL,
+		summary.VersionURL,
+		summary.WebSocketURL,
 		time.Since(startedAt).Round(time.Millisecond),
 	)
 

@@ -86,6 +86,9 @@ type Summary struct {
 	RelayURL               string
 	ExposureMode           string
 	ListenAddress          string
+	HealthURL              string
+	VersionURL             string
+	WebSocketURL           string
 }
 
 func Load() (Config, error) {
@@ -158,6 +161,25 @@ func (c Config) ListenAddress() string {
 	return net.JoinHostPort(host, c.Port)
 }
 
+func (c Config) LocalEndpointHostPort() string {
+	if c.Network.ExposureMode == ExposureModeRelayOnly {
+		return c.ListenAddress()
+	}
+	return net.JoinHostPort("localhost", c.Port)
+}
+
+func (c Config) HealthURL() string {
+	return "http://" + c.LocalEndpointHostPort() + "/healthz"
+}
+
+func (c Config) VersionURL() string {
+	return "http://" + c.LocalEndpointHostPort() + "/version"
+}
+
+func (c Config) WebSocketURL() string {
+	return "ws://" + c.LocalEndpointHostPort() + "/ws?token=<redacted>"
+}
+
 func (c Config) Summary() Summary {
 	return Summary{
 		Port:                   c.Port,
@@ -180,5 +202,8 @@ func (c Config) Summary() Summary {
 		RelayURL:               c.Relay.URL,
 		ExposureMode:           c.Network.ExposureMode,
 		ListenAddress:          c.ListenAddress(),
+		HealthURL:              c.HealthURL(),
+		VersionURL:             c.VersionURL(),
+		WebSocketURL:           c.WebSocketURL(),
 	}
 }

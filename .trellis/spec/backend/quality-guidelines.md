@@ -40,6 +40,8 @@ Questions to answer:
 - Relay server command: `go run ./cmd/relay`
 - Relay endpoints: `GET /relay/agent`, `GET /relay/client`, `GET /healthz`, `GET /version`
 - Local backend env: `RELAY_MODE=true`, `RELAY_URL=<ws-or-wss-url>`, `RELAY_PAIRING_EVENT_PATH=<owner-only-json-path>`
+- Local backend exposure env/flag: `NETWORK_EXPOSURE_MODE=lan|relay-only`, `--network-exposure-mode lan|relay-only`
+- Local backend URL helpers: `Config.ListenAddress()`, `Config.HealthURL()`, `Config.VersionURL()`, `Config.WebSocketURL()`
 - Relay client entry: `relayclient.Run(ctx, cfg, gatewayHandler, relayclient.EmitPairingFile)`
 - Relay capacity env: `RELAY_MAX_AGENT_CONNS`, `RELAY_MAX_CLIENT_CONNS`, `RELAY_MAX_CONNS_PER_IP`, `RELAY_FORWARD_QUEUE_SIZE`
 - Relay liveness env: `RELAY_PING_INTERVAL`, `RELAY_PONG_TIMEOUT`, `RELAY_AGENT_GRACE_PERIOD`
@@ -55,6 +57,7 @@ Questions to answer:
 - `agent.register` sends only secret hashes; plaintext pairing secret is local-only and written through `RELAY_PAIRING_EVENT_PATH`.
 - `client.pair` is the only place a client sends the one-time pairing secret.
 - Direct backend `AUTH_TOKEN` must not appear in relay control frames, relay envelopes, relay QR URIs, relay logs, or relay event files.
+- Local backend listen address and startup URLs must be derived from `Network.ExposureMode`: LAN mode listens on `:<port>` and logs local test URLs using `localhost:<port>`; relay-only mode listens on `127.0.0.1:<port>` and logs loopback URLs using `127.0.0.1:<port>`.
 - Relay traffic enters the gateway through `gateway.ClientConn`; do not fake `http.Request` or gorilla request state.
 - Relay writes must be serialized per websocket connection; authentication responses, `relay.error`, ping frames, and queued forwards share the same write lock.
 - Relay must not write authentication or pairing responses while holding the global relay session mutex. Mutate shared session state under the mutex, release it, then write to the websocket with a write deadline.
@@ -72,6 +75,7 @@ Questions to answer:
 - `http://` or `https://` relay URL -> config error.
 - Public `ws://` relay URL -> config error; only loopback/LAN development hosts may use `ws://`.
 - Missing `RELAY_PAIRING_EVENT_PATH` in relay mode -> config error.
+- Invalid `NETWORK_EXPOSURE_MODE` -> config error.
 - Invalid relay duration / integer / byte env value -> config error; do not silently fall back to defaults.
 - Invalid relay boolean env value -> config error; do not silently fall back to defaults.
 - `RELAY_REQUIRE_E2EE=true` together with `RELAY_PLAINTEXT_TEST_MODE=true` -> config error.
@@ -90,6 +94,7 @@ Questions to answer:
 #### 5. Good/Base/Bad Cases
 - Good: backend writes pairing data to an owner-only temp file, launcher reads and deletes it, logs show only redacted URI.
 - Good: public relay starts with E2EE required and rejects plaintext before forwarding payloads.
+- Good: relay-only backend logs `health=http://127.0.0.1:<port>/healthz` and `ws=ws://127.0.0.1:<port>/ws?token=<redacted>`; it must not concatenate `localhost` with a full host:port listen address.
 - Good: local test relay uses explicit `--require-e2ee=false --plaintext-test-mode=true` and UI/logs label it as test-only.
 - Good: relay behind a trusted reverse proxy enforces caps by forwarded client IP, while direct internet clients cannot spoof forwarded headers.
 - Base: direct `/ws?token=...` path still performs token and origin checks.
@@ -99,6 +104,7 @@ Questions to answer:
 
 #### 6. Tests Required
 - Relay pairing, one-time secret consumption, URL validation, oversized payload, and opaque unknown business payload forwarding.
+- Network exposure tests must cover listen address plus generated health/version/websocket URLs for LAN and relay-only modes.
 - Relay plaintext rejection, plaintext test-mode allowance, E2EE metadata validation, unsupported encryption rejection, config env parsing, and CLI flag parsing.
 - Relay per-IP caps, trusted forwarded IP positive/negative cases, ping writer shutdown, mismatched `clientId`, duplicate session register rejection, and reconnect within grace.
 - Relay agent-disconnect grace expiry must remove orphan sessions and close paired clients.

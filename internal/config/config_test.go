@@ -77,14 +77,36 @@ func preserveEnv(t *testing.T, key string) {
 
 func TestLoadNetworkExposureMode(t *testing.T) {
 	tests := []struct {
-		name     string
-		raw      string
-		wantMode string
-		wantAddr string
+		name       string
+		raw        string
+		wantMode   string
+		wantAddr   string
+		wantHealth string
+		wantWS     string
 	}{
-		{name: "default lan", wantMode: ExposureModeLAN, wantAddr: ":8001"},
-		{name: "lan alias", raw: "lan-enabled", wantMode: ExposureModeLAN, wantAddr: ":8001"},
-		{name: "relay only", raw: "relay-only", wantMode: ExposureModeRelayOnly, wantAddr: "127.0.0.1:8001"},
+		{
+			name:       "default lan",
+			wantMode:   ExposureModeLAN,
+			wantAddr:   ":8001",
+			wantHealth: "http://localhost:8001/healthz",
+			wantWS:     "ws://localhost:8001/ws?token=<redacted>",
+		},
+		{
+			name:       "lan alias",
+			raw:        "lan-enabled",
+			wantMode:   ExposureModeLAN,
+			wantAddr:   ":8001",
+			wantHealth: "http://localhost:8001/healthz",
+			wantWS:     "ws://localhost:8001/ws?token=<redacted>",
+		},
+		{
+			name:       "relay only",
+			raw:        "relay-only",
+			wantMode:   ExposureModeRelayOnly,
+			wantAddr:   "127.0.0.1:8001",
+			wantHealth: "http://127.0.0.1:8001/healthz",
+			wantWS:     "ws://127.0.0.1:8001/ws?token=<redacted>",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -102,6 +124,12 @@ func TestLoadNetworkExposureMode(t *testing.T) {
 			}
 			if cfg.ListenAddress() != tt.wantAddr {
 				t.Fatalf("listen address: got %q want %q", cfg.ListenAddress(), tt.wantAddr)
+			}
+			if cfg.HealthURL() != tt.wantHealth {
+				t.Fatalf("health url: got %q want %q", cfg.HealthURL(), tt.wantHealth)
+			}
+			if cfg.WebSocketURL() != tt.wantWS {
+				t.Fatalf("websocket url: got %q want %q", cfg.WebSocketURL(), tt.wantWS)
 			}
 		})
 	}
@@ -141,6 +169,7 @@ func TestLoadWithOverridesUsesCLIValues(t *testing.T) {
 		cfg.AuthToken != "cli-token" ||
 		cfg.Network.ExposureMode != ExposureModeRelayOnly ||
 		cfg.ListenAddress() != "127.0.0.1:9001" ||
+		cfg.HealthURL() != "http://127.0.0.1:9001/healthz" ||
 		!cfg.Relay.Enabled ||
 		cfg.Relay.URL != "wss://relay.example.test" ||
 		cfg.Relay.PairingEventPath != "/tmp/mobilevc-pairing.json" {
