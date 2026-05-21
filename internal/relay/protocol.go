@@ -19,6 +19,7 @@ const (
 	DirectionAgentToClient = "agent_to_client"
 	ContentTypeMobileVC    = "mobilevc.ws.v1"
 	EncryptionNone         = "none"
+	EncryptionE2EEV1       = "p256-ecdsa+p256-ecdh+hkdf-sha256+aes-256-gcm"
 	PayloadBase64URL       = "base64url"
 )
 
@@ -105,6 +106,9 @@ type ForwardEnvelope struct {
 	Encryption      string `json:"encryption"`
 	PayloadEncoding string `json:"payloadEncoding"`
 	Payload         string `json:"payload"`
+	StreamID        uint64 `json:"streamId,omitempty"`
+	Counter         uint64 `json:"counter,omitempty"`
+	HandshakeID     string `json:"handshakeId,omitempty"`
 }
 
 type ErrorFrame struct {
