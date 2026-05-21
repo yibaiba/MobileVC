@@ -50,12 +50,13 @@ func main() {
 
 	logConfigSummary(summary, cfg.AuthToken)
 	pushService := initPushService()
-	wsHandler, err := initWebSocketHandler(cfg, sessionStore, pushService)
+	trustStore, err := relayDeviceTrustStore(cfg)
 	if err != nil {
-		logx.Error("bootstrap", "initialize websocket handler failed: %v", err)
+		logx.Error("bootstrap", "initialize relay device trust failed: %v", err)
 		panic(err)
 	}
-	if err := startRelayClient(cfg, wsHandler); err != nil {
+	wsHandler := initWebSocketHandler(cfg, sessionStore, pushService, trustStore)
+	if err := startRelayClient(cfg, wsHandler, trustStore); err != nil {
 		logx.Error("relay", "start relay client failed: %v", err)
 		panic(err)
 	}
@@ -144,22 +145,21 @@ func initPushService() push.Service {
 	return pushService
 }
 
-func initWebSocketHandler(cfg config.Config, sessionStore *data.FileStore, pushService push.Service) (*gateway.Handler, error) {
+func initWebSocketHandler(cfg config.Config, sessionStore *data.FileStore, pushService push.Service, trustStore *e2ee.DeviceTrustStore) *gateway.Handler {
 	logx.Info("bootstrap", "Preparing websocket handler")
 	wsHandler := gateway.NewHandler(cfg.AuthToken, sessionStore)
 	wsHandler.PushService = pushService
 	if cfg.Relay.Enabled {
-		trustStore, err := relayDeviceTrustStore()
-		if err != nil {
-			return nil, err
-		}
 		wsHandler.DeviceTrust = trustStore
 	}
 	logx.Info("bootstrap", "WebSocket handler ready")
-	return wsHandler, nil
+	return wsHandler
 }
 
-func relayDeviceTrustStore() (*e2ee.DeviceTrustStore, error) {
+func relayDeviceTrustStore(cfg config.Config) (*e2ee.DeviceTrustStore, error) {
+	if !cfg.Relay.Enabled {
+		return nil, nil
+	}
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		return nil, fmt.Errorf("resolve relay device trust home: %w", err)
@@ -167,11 +167,11 @@ func relayDeviceTrustStore() (*e2ee.DeviceTrustStore, error) {
 	return e2ee.LoadOrCreateDeviceTrustStore(e2ee.DefaultDeviceTrustPath(homeDir))
 }
 
-func startRelayClient(cfg config.Config, wsHandler *gateway.Handler) error {
+func startRelayClient(cfg config.Config, wsHandler *gateway.Handler, trustStore *e2ee.DeviceTrustStore) error {
 	if !cfg.Relay.Enabled {
 		return nil
 	}
-	relayCfg, err := relayConfig(cfg)
+	relayCfg, err := relayConfig(cfg, trustStore)
 	if err != nil {
 		return err
 	}
@@ -184,7 +184,7 @@ func startRelayClient(cfg config.Config, wsHandler *gateway.Handler) error {
 	return nil
 }
 
-func relayConfig(cfg config.Config) (relayclient.Config, error) {
+func relayConfig(cfg config.Config, trustStore *e2ee.DeviceTrustStore) (relayclient.Config, error) {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		return relayclient.Config{}, fmt.Errorf("resolve relay node identity home: %w", err)
@@ -198,8 +198,10 @@ func relayConfig(cfg config.Config) (relayclient.Config, error) {
 		PairingTTL:         cfg.Relay.PairingTTL,
 		AgentGracePeriod:   cfg.Relay.AgentGracePeriod,
 		PairingEventPath:   cfg.Relay.PairingEventPath,
+		Capabilities:       e2ee.ProductionCapabilities(),
 		NodeFingerprintHex: fmt.Sprintf("%x", identity.Fingerprint),
 		NodeIdentity:       identity,
+		DeviceTrust:        trustStore,
 	}, nil
 }
 

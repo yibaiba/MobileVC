@@ -128,6 +128,130 @@ Future<void> _servePairingE2eeRelay(
   }
 }
 
+Future<void> _serveReconnectE2eeRelay({
+  required WebSocket socket,
+  required RelayE2eeEphemeralKeyPair nodeIdentity,
+  required Map<String, dynamic> trustedDevice,
+  List<Map<String, dynamic>>? observedForwards,
+  List<Map<String, dynamic>>? observedPlaintexts,
+  List<Map<String, dynamic>>? observedControls,
+  String resultErrorCode = '',
+}) async {
+  final capabilities = RelayE2eeCapabilitySet.production();
+  RelayMobileVcStreamCodec? codec;
+  RelayE2eeHandshakeInput? handshakeInput;
+  RelayE2eeEphemeralKeyPair? nodeEphemeralKey;
+  Uint8List? nodeSignature;
+  await for (final raw in socket) {
+    final frame = jsonDecode(raw as String) as Map<String, dynamic>;
+    observedControls?.add(Map<String, dynamic>.from(frame));
+    switch ((frame['type'] ?? '').toString()) {
+      case 'client.reconnect':
+        socket.add(jsonEncode(const <String, dynamic>{
+          'type': 'client.paired',
+          'version': 1,
+          'sessionId': 'rs_test',
+          'clientId': 'rc_test',
+        }));
+      case relayFrameClientE2eeHello:
+        final hello = RelayE2eeClientHelloFrame.fromJson(frame);
+        expect(hello.kind, relayE2eeHandshakeKindReconnect);
+        expect(hello.deviceId, trustedDevice['deviceId']);
+        final nodeEphemeral = await RelayE2eeHandshake.newEphemeralKeyPair();
+        nodeEphemeralKey = nodeEphemeral;
+        final input = capabilities.applyToHandshake(
+          RelayE2eeHandshakeInput(
+            kind: relayE2eeHandshakeKindReconnect,
+            sessionId: hello.sessionId,
+            clientId: hello.clientId,
+            handshakeId: hello.handshakeId,
+            relayProtocolVersion: 0,
+            e2eeProtocolVersion: 0,
+            tunnelProtocolVersion: 0,
+            cryptoSuite: '',
+            clientEphemeralPublicKey: hello.clientEphemeralPublicKey,
+            nodeEphemeralPublicKey: nodeEphemeral.publicKey,
+            nodeIdentityPublicKey: nodeIdentity.publicKey,
+            deviceIdentityPublicKey: hello.deviceIdentityPublicKey,
+            requiresE2EE: false,
+            plaintextTestMode: false,
+            supportsMultiplexStreams: false,
+            supportsFileDownload: false,
+            supportsDeviceManagement: false,
+          ),
+        );
+        handshakeInput = input;
+        final transcript = RelayE2eeHandshake.transcript(input);
+        final signature = await RelayDeviceIdentityStore.signWithPrivateScalar(
+          privateScalar: nodeIdentity.privateScalar,
+          transcript: transcript,
+        );
+        nodeSignature = signature;
+        socket.add(jsonEncode(RelayE2eeAgentHelloFrame(
+          sessionId: hello.sessionId,
+          clientId: hello.clientId,
+          handshakeId: hello.handshakeId,
+          capabilities: capabilities,
+          nodeEphemeralPublicKey: nodeEphemeral.publicKey,
+          nodeIdentityPublicKey: nodeIdentity.publicKey,
+          nodeSignature: signature,
+        ).toJson()));
+      case relayFrameClientE2eeProof:
+        final proof = RelayE2eeClientProofFrame.fromJson(frame);
+        final input = handshakeInput;
+        final nodeEphemeral = nodeEphemeralKey;
+        final signature = nodeSignature;
+        if (input == null || nodeEphemeral == null || signature == null) {
+          throw StateError('test reconnect handshake input missing');
+        }
+        if (resultErrorCode.isEmpty) {
+          await RelayE2eeHandshake.validateReconnectHandshake(
+            input: input,
+            deviceCredential: trustedDevice['deviceCredential'] as String,
+            deviceProof: Uint8List.fromList(proof.deviceProof),
+            nodeSignature: signature,
+            deviceSignature: Uint8List.fromList(proof.deviceSignature),
+          );
+          codec = RelayMobileVcStreamCodec.agent(
+            sessionId: proof.sessionId,
+            clientId: proof.clientId,
+            handshakeId: proof.handshakeId,
+            keys: await RelayE2eeHandshake.deriveTrafficKeys(
+              privateScalar: nodeEphemeral.privateScalar,
+              remotePublicKey:
+                  Uint8List.fromList(input.clientEphemeralPublicKey),
+              input: input,
+            ),
+          );
+        }
+        socket.add(jsonEncode(RelayE2eeAgentResultFrame(
+          sessionId: proof.sessionId,
+          clientId: proof.clientId,
+          handshakeId: proof.handshakeId,
+          ok: resultErrorCode.isEmpty,
+          errorCode: resultErrorCode,
+        ).toJson()));
+      case relayForwardType:
+        observedForwards?.add(Map<String, dynamic>.from(frame));
+        final relayCodec = codec;
+        if (relayCodec == null) {
+          throw StateError('test reconnect e2ee codec missing');
+        }
+        final decoded = await relayCodec.decodeJson(frame);
+        observedPlaintexts?.add(Map<String, dynamic>.from(decoded));
+        if (decoded['type'] == 'ping') {
+          socket.add(jsonEncode(await relayCodec.encodeJson(
+            messageId: 'msg_reconnect_ack',
+            payload: const <String, dynamic>{
+              'type': 'pong',
+              'sessionId': 'session-reconnect',
+            },
+          )));
+        }
+    }
+  }
+}
+
 MobileVcWsService _testRelayService({int seed = 101}) {
   final store = _MemoryRelaySecureStore();
   return MobileVcWsService(
@@ -165,6 +289,20 @@ String _testHex(Uint8List bytes) {
     buffer.write(byte.toRadixString(16).padLeft(2, '0'));
   }
   return buffer.toString();
+}
+
+Future<Map<String, dynamic>> _waitForRelayDeviceRegistration(
+  List<Map<String, dynamic>> observed,
+) async {
+  for (var i = 0; i < 100; i++) {
+    final matches =
+        observed.where((event) => event['action'] == 'relay_device_register');
+    if (matches.isNotEmpty) {
+      return matches.single;
+    }
+    await Future<void>.delayed(const Duration(milliseconds: 10));
+  }
+  throw StateError('relay device registration was not observed');
 }
 
 ActionNeededSignal _expectSignal(
@@ -312,24 +450,193 @@ void main() {
       );
     });
 
-    test('production E2EE relay reconnect is blocked until rekey is wired',
-        () async {
-      final service = MobileVcWsService();
+    test('production E2EE relay reconnect performs device rekey', () async {
+      final nodeIdentity = await RelayE2eeHandshake.newEphemeralKeyPair();
+      final nodeFingerprint = await RelayE2eeCrypto.fingerprint(
+        nodeIdentity.publicKey,
+      );
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(server.close);
+      final observedPairingPlaintexts = <Map<String, dynamic>>[];
+      server.transform(WebSocketTransformer()).listen((socket) {
+        _servePairingE2eeRelay(
+          socket,
+          nodeIdentity,
+          null,
+          observedPairingPlaintexts,
+        );
+      });
+      final service = _testRelayService();
       addTearDown(service.dispose);
+      final relayUrl = 'ws://127.0.0.1:${server.port}';
+
+      await service.connectRelay(
+        relayUrl: relayUrl,
+        sessionId: 'rs_test',
+        pairingSecret: 'pair-secret-128-bit-minimum',
+        nodeFingerprintHex: _testHex(nodeFingerprint),
+        relayCapabilities: RelayE2eeCapabilitySet.production(),
+      );
+      final relaySession = service.takeRelaySession();
+      expect(relaySession, isNotNull);
+      final trustedDevice =
+          await _waitForRelayDeviceRegistration(observedPairingPlaintexts);
+      await service.disconnect();
+
+      final reconnectServer =
+          await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(reconnectServer.close);
+      final observedControls = <Map<String, dynamic>>[];
+      final observedForwards = <Map<String, dynamic>>[];
+      final observedPlaintexts = <Map<String, dynamic>>[];
+      reconnectServer.transform(WebSocketTransformer()).listen((socket) {
+        _serveReconnectE2eeRelay(
+          socket: socket,
+          nodeIdentity: nodeIdentity,
+          trustedDevice: trustedDevice,
+          observedControls: observedControls,
+          observedForwards: observedForwards,
+          observedPlaintexts: observedPlaintexts,
+        );
+      });
+      final events = <AppEvent>[];
+      final subscription = service.events.listen(events.add);
+      addTearDown(subscription.cancel);
+
+      await service.connectRelay(
+        relayUrl: 'ws://127.0.0.1:${reconnectServer.port}',
+        sessionId: 'rs_test',
+        clientId: relaySession!.clientId,
+        clientReconnectSecret: relaySession.clientReconnectSecret,
+        nodeFingerprintHex: _testHex(nodeFingerprint),
+        relayCapabilities: RelayE2eeCapabilitySet.production(),
+      );
+
+      expect(service.hasRelayE2eeHandshake, isTrue);
+      expect(service.send(const <String, dynamic>{'type': 'ping'}), isTrue);
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+
+      final deviceCredential = trustedDevice['deviceCredential'] as String;
+      expect(
+        observedControls
+            .any((frame) => frame.toString().contains(deviceCredential)),
+        isFalse,
+      );
+      expect(observedForwards, hasLength(1));
+      expect(observedForwards.single['encryption'], relayE2eeSuite);
+      expect(observedForwards.single['payload'].toString(),
+          isNot(contains('ping')));
+      expect(observedPlaintexts.single['type'], 'ping');
+      expect(
+          events.whereType<PongEvent>().single.sessionId, 'session-reconnect');
+      expect(events.whereType<ErrorEvent>(), isEmpty);
+    });
+
+    test('production E2EE relay reconnect surfaces device rejection', () async {
+      final nodeIdentity = await RelayE2eeHandshake.newEphemeralKeyPair();
+      final nodeFingerprint = await RelayE2eeCrypto.fingerprint(
+        nodeIdentity.publicKey,
+      );
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(server.close);
+      final observedPairingPlaintexts = <Map<String, dynamic>>[];
+      server.transform(WebSocketTransformer()).listen((socket) {
+        _servePairingE2eeRelay(
+          socket,
+          nodeIdentity,
+          null,
+          observedPairingPlaintexts,
+        );
+      });
+      final service = _testRelayService();
+      addTearDown(service.dispose);
+
+      await service.connectRelay(
+        relayUrl: 'ws://127.0.0.1:${server.port}',
+        sessionId: 'rs_test',
+        pairingSecret: 'pair-secret-128-bit-minimum',
+        nodeFingerprintHex: _testHex(nodeFingerprint),
+        relayCapabilities: RelayE2eeCapabilitySet.production(),
+      );
+      final relaySession = service.takeRelaySession();
+      final trustedDevice =
+          await _waitForRelayDeviceRegistration(observedPairingPlaintexts);
+      await service.disconnect();
+
+      final reconnectServer =
+          await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(reconnectServer.close);
+      reconnectServer.transform(WebSocketTransformer()).listen((socket) {
+        _serveReconnectE2eeRelay(
+          socket: socket,
+          nodeIdentity: nodeIdentity,
+          trustedDevice: trustedDevice,
+          resultErrorCode: 'device_revoked',
+        );
+      });
 
       expect(
         service.connectRelay(
-          relayUrl: 'ws://127.0.0.1:1',
+          relayUrl: 'ws://127.0.0.1:${reconnectServer.port}',
           sessionId: 'rs_test',
-          clientId: 'rc_test',
-          clientReconnectSecret: 'reconnect_secret',
+          clientId: relaySession!.clientId,
+          clientReconnectSecret: relaySession.clientReconnectSecret,
+          nodeFingerprintHex: _testHex(nodeFingerprint),
           relayCapabilities: RelayE2eeCapabilitySet.production(),
         ),
         throwsA(
           isA<RelayPairingException>().having(
             (error) => error.code,
             'code',
-            'e2ee_unsupported_version',
+            'device_revoked',
+          ),
+        ),
+      );
+    });
+
+    test('production E2EE relay rejects forward before handshake completes',
+        () async {
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(server.close);
+      server.transform(WebSocketTransformer()).listen((socket) {
+        socket.listen((_) {
+          socket.add(jsonEncode(const <String, dynamic>{
+            'type': 'client.paired',
+            'version': 1,
+            'sessionId': 'rs_test',
+            'clientId': 'rc_test',
+            'clientReconnectSecret': 'reconnect_secret',
+          }));
+          socket.add(jsonEncode(<String, dynamic>{
+            'type': 'relay.forward',
+            'version': 1,
+            'sessionId': 'rs_test',
+            'clientId': 'rc_test',
+            'direction': 'agent_to_client',
+            'messageId': 'msg_plain',
+            'contentType': 'mobilevc.ws.v1',
+            'encryption': 'none',
+            'payloadEncoding': 'base64url',
+            'payload': base64UrlEncode(utf8.encode('{"type":"pong"}')),
+          }));
+        });
+      });
+      final service = _testRelayService();
+      addTearDown(service.dispose);
+
+      expect(
+        service.connectRelay(
+          relayUrl: 'ws://127.0.0.1:${server.port}',
+          sessionId: 'rs_test',
+          pairingSecret: 'pair-secret-128-bit-minimum',
+          nodeFingerprintHex: '0' * 64,
+          relayCapabilities: RelayE2eeCapabilitySet.production(),
+        ),
+        throwsA(
+          isA<RelayPairingException>().having(
+            (error) => error.code,
+            'code',
+            'e2ee_decrypt_failed',
           ),
         ),
       );
@@ -399,8 +706,8 @@ void main() {
       expect(observedForwards, hasLength(greaterThanOrEqualTo(2)));
       expect(observedForwards[0]['encryption'], relayE2eeSuite);
       expect(observedForwards[1]['encryption'], relayE2eeSuite);
-      expect(observedForwards[1]['payload'].toString(),
-          isNot(contains('ping')));
+      expect(
+          observedForwards[1]['payload'].toString(), isNot(contains('ping')));
       expect(
         observedPlaintexts.first['action'],
         'relay_device_register',

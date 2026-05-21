@@ -110,6 +110,18 @@ func DeviceCredentialMatches(hash string, credential string) bool {
 	return subtle.ConstantTimeCompare([]byte(hash), []byte(actual)) == 1
 }
 
+func DeviceProofMatchesCredentialHash(hash string, transcript []byte, expected []byte) bool {
+	secretHash, err := base64.RawURLEncoding.DecodeString(hash)
+	if err != nil {
+		return false
+	}
+	actual, err := proofFromSecretHash(ProofPurposeDevice, secretHash, transcript)
+	if err != nil {
+		return false
+	}
+	return len(actual) == len(expected) && subtle.ConstantTimeCompare(actual, expected) == 1
+}
+
 func (s *DeviceTrustStore) RegisterDevice(reg DeviceRegistration) (TrustedDevice, error) {
 	if s == nil {
 		return TrustedDevice{}, errors.New("device trust store is required")
@@ -181,6 +193,29 @@ func (s *DeviceTrustStore) VerifyDeviceCredential(deviceID string, credential st
 	return encoded.toTrusted()
 }
 
+func (s *DeviceTrustStore) VerifyDeviceProof(deviceID string, publicKey []byte, transcript []byte, deviceProof []byte, deviceSignature []byte) (TrustedDevice, error) {
+	if s == nil {
+		return TrustedDevice{}, errors.New("device trust store is required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	device, err := s.trustedDeviceLocked(deviceID)
+	if err != nil {
+		return TrustedDevice{}, err
+	}
+	if subtle.ConstantTimeCompare(device.PublicKey, publicKey) != 1 {
+		return TrustedDevice{}, errors.New("device_unknown")
+	}
+	verified, err := VerifyNodeSignature(device.PublicKey, transcript, deviceSignature)
+	if err != nil {
+		return TrustedDevice{}, errors.New("device_unknown")
+	}
+	if !verified || !DeviceProofMatchesCredentialHash(device.CredentialHash, transcript, deviceProof) {
+		return TrustedDevice{}, errors.New("device_unknown")
+	}
+	return device, nil
+}
+
 func (s *DeviceTrustStore) MarkDeviceSeen(deviceID string, sessionID string, now time.Time) (TrustedDevice, string, error) {
 	if s == nil {
 		return TrustedDevice{}, "", errors.New("device trust store is required")
@@ -206,6 +241,17 @@ func (s *DeviceTrustStore) MarkDeviceSeen(deviceID string, sessionID string, now
 	}
 	device, err := encoded.toTrusted()
 	return device, previous, err
+}
+
+func (s *DeviceTrustStore) trustedDeviceLocked(deviceID string) (TrustedDevice, error) {
+	encoded, ok := s.file.Devices[strings.TrimSpace(deviceID)]
+	if !ok {
+		return TrustedDevice{}, errors.New("device_unknown")
+	}
+	if strings.TrimSpace(encoded.RevokedAt) != "" {
+		return TrustedDevice{}, errors.New("device_revoked")
+	}
+	return encoded.toTrusted()
 }
 
 func (s *DeviceTrustStore) RevokeDevice(deviceID string, now time.Time) (TrustedDevice, error) {

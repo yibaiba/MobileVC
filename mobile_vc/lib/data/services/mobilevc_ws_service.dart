@@ -109,10 +109,7 @@ class MobileVcWsService {
     var activeRelayReconnectSecret = initialRelayReconnectSecret;
     final pairedCompleter =
         relaySessionId.isNotEmpty ? Completer<void>() : null;
-    final e2eeCompleter = _requiresPairingE2EE(
-      relayPairingSecret: relayPairingSecret,
-      capabilities: relayCapabilities,
-    )
+    final e2eeCompleter = _requiresRelayE2EE(capabilities: relayCapabilities)
         ? Completer<void>()
         : null;
     _RelayE2eeHandshakeState? e2eeState;
@@ -156,12 +153,13 @@ class MobileVcWsService {
     }
 
     void completeRelayConnectError(Object error) {
+      if (e2eeCompleter != null && !e2eeCompleter.isCompleted) {
+        e2eeCompleter.completeError(error);
+        return;
+      }
       final completer = pairedCompleter;
       if (completer != null && !completer.isCompleted) {
         completer.completeError(error);
-      }
-      if (e2eeCompleter != null && !e2eeCompleter.isCompleted) {
-        e2eeCompleter.completeError(error);
       }
     }
 
@@ -194,6 +192,20 @@ class MobileVcWsService {
             )) {
           return;
         }
+        if (e2eeCompleter != null &&
+            !e2eeCompleter.isCompleted &&
+            _isRelayForwardFrame(decoded)) {
+          final error = RelayPairingException(
+            'e2ee_decrypt_failed',
+            relayErrorMessage(const <String, dynamic>{
+              'type': 'relay.error',
+              'code': 'e2ee_decrypt_failed',
+            }),
+          );
+          completeRelayConnectError(error);
+          unawaited(disconnect());
+          return;
+        }
         _queueRelayReceive(
           channel: channel,
           frame: decoded,
@@ -208,10 +220,13 @@ class MobileVcWsService {
                 e2eeState == null) {
               unawaited(() async {
                 try {
-                  e2eeState = await _startPairingE2EEHandshake(
+                  e2eeState = await _startRelayE2EEHandshake(
                     channel: channel,
                     sessionId: relaySessionId,
                     clientId: clientId,
+                    kind: relayPairingSecret.trim().isEmpty
+                        ? relayE2eeHandshakeKindReconnect
+                        : relayE2eeHandshakeKindPairing,
                     pairingSecret: relayPairingSecret,
                     expectedNodeFingerprintHex: relayNodeFingerprintHex,
                     capabilities: relayCapabilities!,
@@ -266,6 +281,7 @@ class MobileVcWsService {
     _relayContext = _RelayContext(
       sessionId: relaySessionId,
       clientIdProvider: () => activeRelayClientId,
+      requiresE2EE: _requiresRelayE2EE(capabilities: relayCapabilities),
     );
     if (pairedCompleter != null) {
       try {
@@ -410,24 +426,36 @@ class MobileVcWsService {
       throw const FormatException(
           'plaintext relay.forward received after E2EE activation');
     }
+    if (_relayContext.requiresE2EE) {
+      throw const FormatException(
+          'plaintext relay.forward received before E2EE activation');
+    }
     final raw =
         base64Url.decode(base64Url.normalize(frame['payload'].toString()));
     final decoded = jsonDecode(utf8.decode(raw));
     return decoded is Map<String, dynamic> ? decoded : null;
   }
 
-  Future<_RelayE2eeHandshakeState> _startPairingE2EEHandshake({
+  Future<_RelayE2eeHandshakeState> _startRelayE2EEHandshake({
     required WebSocketChannel channel,
     required String sessionId,
     required String clientId,
+    required String kind,
     required String pairingSecret,
     required String expectedNodeFingerprintHex,
     required RelayE2eeCapabilitySet capabilities,
     required void Function(_RelayE2eeHandshakeState) updateState,
   }) async {
     final clientEphemeral = await RelayE2eeHandshake.newEphemeralKeyPair();
+    final deviceIdentity = kind == relayE2eeHandshakeKindReconnect
+        ? await _relayDeviceIdentityStore.loadOrCreate()
+        : null;
+    final deviceCredential = kind == relayE2eeHandshakeKindReconnect
+        ? await _relayDeviceCredentialStore.loadOrCreate()
+        : null;
     final handshakeId = 'hs_${const Uuid().v4()}';
     final state = _RelayE2eeHandshakeState(
+      kind: kind,
       sessionId: sessionId,
       clientId: clientId,
       handshakeId: handshakeId,
@@ -435,14 +463,18 @@ class MobileVcWsService {
       expectedNodeFingerprintHex: expectedNodeFingerprintHex.toLowerCase(),
       capabilities: capabilities,
       clientEphemeral: clientEphemeral,
+      deviceIdentity: deviceIdentity,
+      deviceCredential: deviceCredential,
     );
     final hello = RelayE2eeClientHelloFrame(
       sessionId: sessionId,
       clientId: clientId,
       handshakeId: handshakeId,
-      kind: relayE2eeHandshakeKindPairing,
+      kind: kind,
       capabilities: capabilities,
       clientEphemeralPublicKey: clientEphemeral.publicKey,
+      deviceId: deviceIdentity?.fullFingerprintHex ?? '',
+      deviceIdentityPublicKey: deviceIdentity?.publicKey ?? const <int>[],
     );
     updateState(state);
     channel.sink.add(jsonEncode(hello.toJson()));
@@ -459,7 +491,7 @@ class MobileVcWsService {
   }) {
     final type = (frame['type'] ?? '').toString();
     if (type == relayFrameAgentE2eeHello) {
-      unawaited(_completePairingE2EEProof(
+      unawaited(_completeRelayE2EEProof(
         channel: channel,
         pending: state,
         frame: frame,
@@ -492,11 +524,13 @@ class MobileVcWsService {
           throw StateError('Relay E2EE 握手路由不匹配');
         }
         _relayE2eeState = pending.markComplete();
-        _queueRelayDeviceRegister(
-          channel: channel,
-          state: _relayE2eeState!,
-          epoch: _connectionEpoch,
-        );
+        if (_relayE2eeState!.kind == relayE2eeHandshakeKindPairing) {
+          _queueRelayDeviceRegister(
+            channel: channel,
+            state: _relayE2eeState!,
+            epoch: _connectionEpoch,
+          );
+        }
         if (!complete.isCompleted) {
           complete.complete();
         }
@@ -513,7 +547,7 @@ class MobileVcWsService {
     return false;
   }
 
-  Future<void> _completePairingE2EEProof({
+  Future<void> _completeRelayE2EEProof({
     required WebSocketChannel channel,
     required _RelayE2eeHandshakeState? pending,
     required Map<String, dynamic> frame,
@@ -543,7 +577,7 @@ class MobileVcWsService {
       }
       final input = pending.capabilities.applyToHandshake(
         RelayE2eeHandshakeInput(
-          kind: relayE2eeHandshakeKindPairing,
+          kind: pending.kind,
           sessionId: pending.sessionId,
           clientId: pending.clientId,
           handshakeId: pending.handshakeId,
@@ -554,6 +588,8 @@ class MobileVcWsService {
           clientEphemeralPublicKey: pending.clientEphemeral.publicKey,
           nodeEphemeralPublicKey: agentHello.nodeEphemeralPublicKey,
           nodeIdentityPublicKey: agentHello.nodeIdentityPublicKey,
+          deviceIdentityPublicKey:
+              pending.deviceIdentity?.publicKey ?? const <int>[],
           requiresE2EE: false,
           plaintextTestMode: false,
           supportsMultiplexStreams: false,
@@ -562,10 +598,6 @@ class MobileVcWsService {
         ),
       );
       final transcript = RelayE2eeHandshake.transcript(input);
-      final proof = await RelayE2eeHandshake.pairingProof(
-        pairingSecret: pending.pairingSecret,
-        transcript: transcript,
-      );
       final signatureOk = await RelayDeviceIdentityStore.verifyWithPublicKey(
         publicKey: Uint8List.fromList(agentHello.nodeIdentityPublicKey),
         transcript: transcript,
@@ -574,6 +606,7 @@ class MobileVcWsService {
       if (!signatureOk) {
         throw StateError('Relay E2EE 节点签名验证失败');
       }
+      final proofFrame = await _relayE2EEProofFrame(pending, transcript);
       final next = pending.copyWith(
         input: input,
         trafficKeys: await RelayE2eeHandshake.deriveTrafficKeys(
@@ -584,18 +617,49 @@ class MobileVcWsService {
         ),
       );
       updateState(next);
-      channel.sink.add(jsonEncode(RelayE2eeClientProofFrame(
-        sessionId: pending.sessionId,
-        clientId: pending.clientId,
-        handshakeId: pending.handshakeId,
-        kind: relayE2eeHandshakeKindPairing,
-        pairingProof: proof,
-      ).toJson()));
+      channel.sink.add(jsonEncode(proofFrame.toJson()));
     } catch (error, stackTrace) {
       if (!complete.isCompleted) {
         complete.completeError(error, stackTrace);
       }
     }
+  }
+
+  Future<RelayE2eeClientProofFrame> _relayE2EEProofFrame(
+    _RelayE2eeHandshakeState pending,
+    Uint8List transcript,
+  ) async {
+    if (pending.kind == relayE2eeHandshakeKindPairing) {
+      return RelayE2eeClientProofFrame(
+        sessionId: pending.sessionId,
+        clientId: pending.clientId,
+        handshakeId: pending.handshakeId,
+        kind: pending.kind,
+        pairingProof: await RelayE2eeHandshake.pairingProof(
+          pairingSecret: pending.pairingSecret,
+          transcript: transcript,
+        ),
+      );
+    }
+    final identity = pending.deviceIdentity;
+    final credential = pending.deviceCredential;
+    if (identity == null || credential == null) {
+      throw StateError('Relay E2EE 设备凭证不存在');
+    }
+    return RelayE2eeClientProofFrame(
+      sessionId: pending.sessionId,
+      clientId: pending.clientId,
+      handshakeId: pending.handshakeId,
+      kind: pending.kind,
+      deviceProof: await RelayE2eeHandshake.deviceProof(
+        deviceCredential: credential.value,
+        transcript: transcript,
+      ),
+      deviceSignature: await _relayDeviceIdentityStore.signTranscript(
+        identity: identity,
+        transcript: transcript,
+      ),
+    );
   }
 
   Map<String, dynamic> _relayAuthFrame({
@@ -713,8 +777,7 @@ class MobileVcWsService {
           'action': 'relay_device_register',
           'deviceId': identity.fullFingerprintHex,
           'displayName': _defaultRelayDeviceName(),
-          'deviceIdentityPublicKey':
-              encodeRelayFrameBytes(identity.publicKey),
+          'deviceIdentityPublicKey': encodeRelayFrameBytes(identity.publicKey),
           'deviceCredential': credential.value,
         },
       );
@@ -751,6 +814,9 @@ class MobileVcWsService {
         payload: payload,
       );
     }
+    if (relayContext.requiresE2EE) {
+      throw StateError('Relay E2EE stream is not ready');
+    }
     return <String, dynamic>{
       'type': 'relay.forward',
       'version': 1,
@@ -766,11 +832,10 @@ class MobileVcWsService {
   }
 }
 
-bool _requiresPairingE2EE({
-  required String relayPairingSecret,
+bool _requiresRelayE2EE({
   required RelayE2eeCapabilitySet? capabilities,
 }) {
-  if (relayPairingSecret.trim().isEmpty || capabilities == null) {
+  if (capabilities == null) {
     return false;
   }
   capabilities.validateRelayMode();
@@ -795,16 +860,18 @@ void _validateRelayE2EEConnectMode({
   }
   if (relayClientId.trim().isNotEmpty &&
       relayClientReconnectSecret.trim().isNotEmpty) {
-    throw const RelayPairingException(
-      'e2ee_unsupported_version',
-      'Relay E2EE 重连暂未完成：请重新扫码配对，避免使用明文中继重连',
-    );
+    return;
   }
+  throw const FormatException('Relay E2EE 配对信息不完整，请重新扫码');
 }
 
 bool _isRelayE2EEFrame(Map<String, dynamic> frame) {
   final type = (frame['type'] ?? '').toString();
   return type == relayFrameAgentE2eeHello || type == relayFrameAgentE2eeResult;
+}
+
+bool _isRelayForwardFrame(Map<String, dynamic> frame) {
+  return (frame['type'] ?? '').toString() == relayForwardType;
 }
 
 String _hex(Uint8List bytes) {
@@ -823,6 +890,7 @@ String _defaultRelayDeviceName() => defaultTargetPlatform == TargetPlatform.iOS
 
 class _RelayE2eeHandshakeState {
   const _RelayE2eeHandshakeState({
+    required this.kind,
     required this.sessionId,
     required this.clientId,
     required this.handshakeId,
@@ -830,12 +898,15 @@ class _RelayE2eeHandshakeState {
     required this.expectedNodeFingerprintHex,
     required this.capabilities,
     required this.clientEphemeral,
+    this.deviceIdentity,
+    this.deviceCredential,
     this.input,
     this.trafficKeys,
     this.streamCodec,
     this.complete = false,
   });
 
+  final String kind;
   final String sessionId;
   final String clientId;
   final String handshakeId;
@@ -843,6 +914,8 @@ class _RelayE2eeHandshakeState {
   final String expectedNodeFingerprintHex;
   final RelayE2eeCapabilitySet capabilities;
   final RelayE2eeEphemeralKeyPair clientEphemeral;
+  final RelayDeviceIdentity? deviceIdentity;
+  final RelayDeviceCredential? deviceCredential;
   final RelayE2eeHandshakeInput? input;
   final RelayE2eeTrafficKeys? trafficKeys;
   final RelayMobileVcStreamCodec? streamCodec;
@@ -859,6 +932,7 @@ class _RelayE2eeHandshakeState {
     RelayE2eeTrafficKeys? trafficKeys,
   }) {
     return _RelayE2eeHandshakeState(
+      kind: kind,
       sessionId: sessionId,
       clientId: clientId,
       handshakeId: handshakeId,
@@ -866,6 +940,8 @@ class _RelayE2eeHandshakeState {
       expectedNodeFingerprintHex: expectedNodeFingerprintHex,
       capabilities: capabilities,
       clientEphemeral: clientEphemeral,
+      deviceIdentity: deviceIdentity,
+      deviceCredential: deviceCredential,
       input: input ?? this.input,
       trafficKeys: trafficKeys ?? this.trafficKeys,
       streamCodec: streamCodec,
@@ -879,6 +955,7 @@ class _RelayE2eeHandshakeState {
       throw StateError('Relay E2EE traffic keys missing');
     }
     return _RelayE2eeHandshakeState(
+      kind: kind,
       sessionId: sessionId,
       clientId: clientId,
       handshakeId: handshakeId,
@@ -886,6 +963,8 @@ class _RelayE2eeHandshakeState {
       expectedNodeFingerprintHex: expectedNodeFingerprintHex,
       capabilities: capabilities,
       clientEphemeral: clientEphemeral,
+      deviceIdentity: deviceIdentity,
+      deviceCredential: deviceCredential,
       input: input,
       trafficKeys: keys,
       streamCodec: RelayMobileVcStreamCodec.client(
@@ -915,10 +994,12 @@ class _RelayContext {
   const _RelayContext({
     this.sessionId = '',
     this.clientIdProvider = _emptyClientId,
+    this.requiresE2EE = false,
   });
 
   final String sessionId;
   final String Function() clientIdProvider;
+  final bool requiresE2EE;
 }
 
 String _emptyClientId() => '';

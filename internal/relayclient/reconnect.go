@@ -16,11 +16,12 @@ type Handler interface {
 
 func serveWithReconnect(ctx context.Context, cfg Config, handler Handler, conn *websocket.Conn, sessionID string, pairingSecret string, reconnectSecret string) error {
 	for {
-		e2eeHandler := newAgentE2EEHandshakeHandler(
+		e2eeHandler := newAgentE2EEHandshakeHandlerWithDeviceTrust(
 			sessionID,
 			pairingSecret,
 			relayClientCapabilities(cfg),
 			cfg.NodeIdentity,
+			cfg.DeviceTrust,
 		)
 		handler.ServeClientConn(ctx, newGatewayConnWithE2EE(conn, sessionID, e2eeHandler))
 		_ = conn.Close()

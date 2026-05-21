@@ -80,6 +80,56 @@ func TestDeviceTrustStoreVerifiesCredentialAndRejectsRevokedDevice(t *testing.T)
 	}
 }
 
+func TestDeviceTrustStoreVerifiesReconnectDeviceProof(t *testing.T) {
+	store := testDeviceTrustStore(t)
+	deviceIdentity := testNodeIdentity(t)
+	nodeIdentity := testNodeIdentity(t)
+	credential := "credential-one"
+	_, err := store.RegisterDevice(DeviceRegistration{
+		ID: "dev_1", DisplayName: "Pixel", PublicKey: deviceIdentity.PublicKey,
+		DeviceCredential: credential, Now: time.Date(2026, 5, 21, 10, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := ProductionCapabilities().ApplyToHandshake(HandshakeInput{
+		Kind:                     HandshakeKindReconnect,
+		SessionID:                "rs_1",
+		ClientID:                 "rc_1",
+		HandshakeID:              "hs_1",
+		ClientEphemeralPublicKey: testDeviceIdentityPublicKey(t),
+		NodeEphemeralPublicKey:   testDeviceIdentityPublicKey(t),
+		NodeIdentityPublicKey:    nodeIdentity.PublicKey,
+		DeviceIdentityPublicKey:  deviceIdentity.PublicKey,
+	})
+	transcript, err := HandshakeTranscript(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signature, err := deviceIdentity.SignTranscript(transcript)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.VerifyDeviceProof(
+		"dev_1",
+		deviceIdentity.PublicKey,
+		transcript,
+		DeviceProof(credential, transcript),
+		signature,
+	); err != nil {
+		t.Fatalf("verify reconnect proof: %v", err)
+	}
+	if _, err := store.VerifyDeviceProof(
+		"dev_1",
+		deviceIdentity.PublicKey,
+		transcript,
+		DeviceProof("wrong", transcript),
+		signature,
+	); err == nil || !strings.Contains(err.Error(), "device_unknown") {
+		t.Fatalf("expected wrong proof to be unknown, got %v", err)
+	}
+}
+
 func TestDeviceTrustStoreMarksSeenAndReturnsReplacedSession(t *testing.T) {
 	store := testDeviceTrustStore(t)
 	device := registerTestTrustedDevice(t, store, "dev_1", "Pixel", "credential-one")

@@ -26,6 +26,7 @@ type Config struct {
 	Capabilities       e2ee.CapabilitySet
 	NodeFingerprintHex string
 	NodeIdentity       *e2ee.NodeIdentity
+	DeviceTrust        *e2ee.DeviceTrustStore
 }
 
 type ReconnectBackoff struct {

@@ -50,7 +50,7 @@ Questions to answer:
 - Relay E2EE flags: `--require-e2ee[=true|false]`, `--plaintext-test-mode[=true|false]`
 - Relay E2EE capabilities: `e2ee.CapabilitySet`, `e2ee.ProductionCapabilities()`, `e2ee.PlaintextTestCapabilities()`, `ValidateProductionCapabilities`, `ValidatePlaintextTestCapabilities`
 - Relay E2EE handshake control frames: `client.e2ee_hello`, `agent.e2ee_hello`, `client.e2ee_proof`, `agent.e2ee_result`
-- Local relay E2EE handler: `newAgentE2EEHandshakeHandler(sessionID, pairingSecret, capabilities, nodeIdentity)`, `handleClientHello`, `handleClientProof`, `trafficKeys`
+- Local relay E2EE handler: `newAgentE2EEHandshakeHandlerWithDeviceTrust(sessionID, pairingSecret, capabilities, nodeIdentity, deviceTrust)`, `handleClientHello`, `handleClientProof`, `trafficKeys`
 
 #### 3. Contracts
 - Relay server forwards only `relay.forward` envelopes with base64url payloads; it must not parse MobileVC business actions.
@@ -89,8 +89,11 @@ Questions to answer:
 - Local relay client `gatewayConn` consumes E2EE control frames separately from MobileVC payloads. `client.e2ee_hello` produces `agent.e2ee_hello`; `client.e2ee_proof` produces `agent.e2ee_result`.
 - Local agent pairing E2EE uses the one-time pairing secret only as a transcript proof. It signs the transcript with the long-lived node identity, performs fresh ephemeral P-256 ECDH, and derives directional traffic keys with HKDF.
 - Local agent pairing proof validation must bind `sessionId`, `clientId`, `handshakeId`, negotiated capabilities, client/node ephemeral keys, and node identity public key. A proof for a different client or session must fail even if it uses a valid pairing secret.
+- Local agent reconnect E2EE must require a configured `DeviceTrustStore`, validate the stored device public key plus transcript-bound `deviceProof` and `deviceSignature`, perform fresh ephemeral P-256 ECDH, derive new traffic keys, and call `MarkDeviceSeen` only after proof verification succeeds. Unknown devices, wrong proof, bad signature, and stale post-rotation clients return `device_unknown`; revoked devices return `device_revoked`.
 - A completed local agent pairing handshake must create an agent-side MobileVC stream codec before MobileVC business frames are accepted as E2EE. After that point, inbound `relay.forward` frames with `encryption=p256-ecdsa+p256-ecdh+hkdf-sha256+aes-256-gcm` are decrypted through the codec, outbound gateway `WriteJSON` payloads are encrypted through the same codec, and plaintext `encryption=none` business frames are rejected explicitly with an E2EE-required error path. Test-mode plaintext remains available only when no E2EE stream has been activated.
+- A completed local agent reconnect handshake must replace the previous per-connection MobileVC stream codec with the newly derived keys; business `relay.forward` frames before reconnect E2EE completion are rejected, never decoded as plaintext.
 - First-pairing device trust registration must happen after E2EE stream activation through an encrypted MobileVC business action (`relay_device_register`). Device credentials must not appear in relay E2EE handshake control frames, pairing links, relay logs, or plaintext relay envelopes.
+- `cmd/server` must load one local `DeviceTrustStore` instance for relay mode and pass that same instance to both `gateway.Handler.DeviceTrust` and `relayclient.Config.DeviceTrust` so encrypted device registration is immediately visible to reconnect proof validation.
 - MobileVC stream codecs keep per-connection send counters and replay state. Go codecs must serialize `Encode` and `Decode` internally because gateway reads and writes can run concurrently on the same relay connection.
 - Backend UI/security state still must not show "E2EE verified" until encrypted forwarding, replay protection, fingerprint validation, production plaintext rejection, and device-state checks are all active.
 - If a local relay client is created without a handshake handler, any E2EE handshake control frame received by `gatewayConn` must fail explicitly with an E2EE handshake error path; it must not be decoded as a MobileVC JSON payload or silently ignored.
@@ -122,6 +125,9 @@ Questions to answer:
 - Forward with missing or mismatched `clientId` -> `relay.error` with `protocol_error`.
 - E2EE handshake control frame with wrong role/direction/session/client ID -> `relay.error` with `protocol_error`.
 - Local agent E2EE pairing proof with mismatched `sessionId`, `clientId`, or `handshakeId` -> `agent.e2ee_result` with `ok=false`, `errorCode=e2ee_handshake_failed`, then local read error.
+- Local agent E2EE reconnect without a device trust store -> `e2ee_handshake_failed`.
+- Local agent E2EE reconnect for unknown device, wrong device proof, bad device signature, or device public-key mismatch -> `agent.e2ee_result` with `ok=false`, `errorCode=device_unknown`.
+- Local agent E2EE reconnect for revoked device -> `agent.e2ee_result` with `ok=false`, `errorCode=device_revoked`.
 - Local relay client production capabilities with missing `NodeIdentity` -> config error `relay node identity is required for e2ee mode`.
 - Local relay client receives `relay.ping` for a different non-empty session ID -> explicit local read error; do not send `relay.pong`.
 - Post-auth raw websocket frames must be size-bounded while reading, before JSON decode. Frames above the post-auth raw frame limit -> `relay.error` with `frame_too_large`; decoded relay payloads above `MaxPayloadBytes` still -> `payload_too_large`.
@@ -143,6 +149,7 @@ Questions to answer:
 - Good: both Go and Flutter build handshake input from the same explicit capability set before signing/verifying the transcript.
 - Good: handshake control frames carry key/proof/signature bytes as base64url strings and validate before building a `HandshakeInput`.
 - Good: local relay agent answers a valid pairing handshake, verifies the pairing proof against the transcript, and derives the same traffic keys that Flutter derives from its ephemeral key.
+- Good: local relay agent answers a valid reconnect handshake only for a trusted device, verifies device proof and signature against the transcript, and derives fresh traffic keys for the new connection.
 - Good: after local pairing handshake succeeds, the local relay agent decrypts client-to-agent `relay.forward` through `NewAgentMobileVCStreamCodec` and encrypts agent-to-client gateway writes before they leave the local backend.
 - Good: MobileVC stream codec counter/replay state is connection-local and protected against concurrent read/write access.
 - Good: local test relay agent declares `PlaintextTestCapabilities()` and production relay agent declares `ProductionCapabilities()`; never infer mode from missing fields.
@@ -174,6 +181,7 @@ Questions to answer:
 - Relay client tests must cover consuming `client.attached` before `relay.forward`, writing with the attached `clientId`, and timing out register/reconnect response reads.
 - Relay client tests must cover that E2EE handshake control frames are not passed into gateway payload decoding when no handshake handler exists.
 - Relay client tests must cover valid local agent pairing handshake, node signature verification, pairing proof validation, matching derived traffic keys, and mismatched proof routing failure.
+- Relay client tests must cover valid local agent reconnect handshake, unknown device, revoked device, wrong proof, bad signature, matching fresh traffic keys, and no plaintext business frame before E2EE stream activation.
 - Relay client tests must cover encrypted MobileVC `relay.forward` after local pairing handshake: client-to-agent decrypts to gateway JSON, agent-to-client `WriteJSON` emits E2EE metadata, and ciphertext does not contain plaintext business values.
 - Relay client tests must cover `relay.ping` response for the current/no session and rejection of wrong-session pings.
 - Config tests for relay env validation and event-path requirement.
@@ -202,14 +210,15 @@ _ = relayclient.EmitPairingFile(pairingEventPath, event)
 #### 2. Signatures
 - Node trust path: `~/.mobilevc/relay/trusted_devices.json`
 - Store loader: `LoadOrCreateDeviceTrustStore(path)`
-- Credential helpers: `NewDeviceCredential()`, `DeviceCredentialHash(secret)`, `DeviceCredentialMatches(hash, secret)`
-- Device actions: `RegisterDevice`, `ListDevices`, `VerifyDeviceCredential`, `MarkDeviceSeen`, `RevokeDevice`, `ClearTrustedDevicesForNodeRotation`
+- Credential helpers: `NewDeviceCredential()`, `DeviceCredentialHash(secret)`, `DeviceCredentialMatches(hash, secret)`, `DeviceProofMatchesCredentialHash(hash, transcript, expected)`
+- Device actions: `RegisterDevice`, `ListDevices`, `VerifyDeviceCredential`, `VerifyDeviceProof`, `MarkDeviceSeen`, `RevokeDevice`, `ClearTrustedDevicesForNodeRotation`
 
 #### 3. Contracts
 - Local node is the source of truth for trusted E2EE devices; relay server runtime device maps are not persistent trust stores.
 - The store persists device ID, display name, public key, fingerprint, credential hash, timestamps, revoked time, and current active session ID.
 - The store must never persist plaintext device credentials, private keys, traffic keys, pairing secrets, file contents, or conversation payloads.
 - The local gateway may register a device only when the current connection exposes completed relay E2EE metadata. Direct websocket connections and plaintext relay connections must reject `relay_device_register` with an explicit E2EE-required error.
+- Reconnect proof validation uses the stored credential hash to verify a transcript-bound `deviceProof`; it must not require or reconstruct plaintext device credentials on the local node.
 - Store parent directory permission must be owner-only (`0700`) and store file permission must be owner-only (`0600`).
 - Same device identity may have only one active session ID; marking the same device seen with a new session returns the replaced session ID so callers can close the older connection explicitly.
 - Device trust store methods must serialize access internally; concurrent pairing/reconnect/revoke/rotation must not race the map or JSON file.
@@ -227,6 +236,7 @@ _ = relayclient.EmitPairingFile(pairingEventPath, event)
 - Runtime global rotation cleanup -> runtime device list is cleared and previous client reconnect credentials fail as `device_unknown`.
 - Duplicate device registration -> `device_already_bound`; revoked devices must not be silently re-enabled by registering the same ID again.
 - Wrong credential -> `device_unknown`.
+- Wrong device proof, bad device signature, or public-key mismatch -> `device_unknown`.
 - Node rotation cleanup -> trusted device list is cleared and previous credentials fail as `device_unknown`.
 
 #### 5. Good/Base/Bad Cases
@@ -241,6 +251,7 @@ _ = relayclient.EmitPairingFile(pairingEventPath, event)
 - Store creation/reload preserves device public metadata and owner-only permissions.
 - Store file does not contain plaintext credential.
 - Credential verification accepts valid credential and rejects wrong/revoked/rotated devices.
+- Device proof verification accepts a valid transcript-bound proof/signature without plaintext credential storage and rejects wrong proof/signature/public key.
 - Marking a device seen returns the replaced active session ID.
 - Relay runtime tests assert wrong reconnect secret -> `device_unknown`, revoked device -> `device_revoked`, and global rotation clears runtime devices.
 - Fingerprint/public-key tamper causes load failure.

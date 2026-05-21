@@ -2,7 +2,9 @@ package relayclient
 
 import (
 	"fmt"
+	"strings"
 	"sync"
+	"time"
 
 	"mobilevc/internal/relay"
 	"mobilevc/internal/relay/e2ee"
@@ -14,21 +16,28 @@ type agentE2EEHandshakeHandler struct {
 	pairingSecret string
 	capabilities  e2ee.CapabilitySet
 	nodeIdentity  *e2ee.NodeIdentity
-	pending       map[string]pendingPairingHandshake
-	completed     map[string]completedPairingHandshake
+	deviceTrust   *e2ee.DeviceTrustStore
+	pending       map[string]pendingHandshake
+	completed     map[string]completedHandshake
 }
 
-type pendingPairingHandshake struct {
+type pendingHandshake struct {
 	input         e2ee.HandshakeInput
 	nodeEphemeral *e2ee.EphemeralKeyPair
+	deviceID      string
 }
 
-type completedPairingHandshake struct {
+type completedHandshake struct {
 	clientID string
+	deviceID string
 	keys     *e2ee.TrafficKeys
 }
 
 func newAgentE2EEHandshakeHandler(sessionID string, pairingSecret string, capabilities e2ee.CapabilitySet, nodeIdentity *e2ee.NodeIdentity) *agentE2EEHandshakeHandler {
+	return newAgentE2EEHandshakeHandlerWithDeviceTrust(sessionID, pairingSecret, capabilities, nodeIdentity, nil)
+}
+
+func newAgentE2EEHandshakeHandlerWithDeviceTrust(sessionID string, pairingSecret string, capabilities e2ee.CapabilitySet, nodeIdentity *e2ee.NodeIdentity, deviceTrust *e2ee.DeviceTrustStore) *agentE2EEHandshakeHandler {
 	if nodeIdentity == nil {
 		return nil
 	}
@@ -37,9 +46,9 @@ func newAgentE2EEHandshakeHandler(sessionID string, pairingSecret string, capabi
 	}
 	return &agentE2EEHandshakeHandler{
 		sessionID: sessionID, pairingSecret: pairingSecret,
-		capabilities: capabilities, nodeIdentity: nodeIdentity,
-		pending:   map[string]pendingPairingHandshake{},
-		completed: map[string]completedPairingHandshake{},
+		capabilities: capabilities, nodeIdentity: nodeIdentity, deviceTrust: deviceTrust,
+		pending:   map[string]pendingHandshake{},
+		completed: map[string]completedHandshake{},
 	}
 }
 
@@ -54,11 +63,11 @@ func (h *agentE2EEHandshakeHandler) handleClientHello(frame relay.E2EEClientHell
 	if err != nil {
 		return relay.E2EEAgentHelloFrame{}, err
 	}
-	if frame.Kind != e2ee.HandshakeKindPairing {
-		return relay.E2EEAgentHelloFrame{}, fmt.Errorf("%w: reconnect handshake is not wired", e2ee.ErrHandshakeFailed)
-	}
 	if frame.SessionID != h.sessionID {
 		return relay.E2EEAgentHelloFrame{}, fmt.Errorf("%w: invalid session", e2ee.ErrHandshakeFailed)
+	}
+	if frame.Kind == e2ee.HandshakeKindReconnect && h.deviceTrust == nil {
+		return relay.E2EEAgentHelloFrame{}, fmt.Errorf("%w: device trust store is required", e2ee.ErrHandshakeFailed)
 	}
 	nodeEphemeral, err := e2ee.NewEphemeralKeyPair()
 	if err != nil {
@@ -72,6 +81,7 @@ func (h *agentE2EEHandshakeHandler) handleClientHello(frame relay.E2EEClientHell
 		ClientEphemeralPublicKey: material.ClientEphemeralPublicKey,
 		NodeEphemeralPublicKey:   nodeEphemeral.PublicKey,
 		NodeIdentityPublicKey:    h.nodeIdentity.PublicKey,
+		DeviceIdentityPublicKey:  material.DeviceIdentityPublicKey,
 	})
 	transcript, err := e2ee.HandshakeTranscript(input)
 	if err != nil {
@@ -81,8 +91,8 @@ func (h *agentE2EEHandshakeHandler) handleClientHello(frame relay.E2EEClientHell
 	if err != nil {
 		return relay.E2EEAgentHelloFrame{}, err
 	}
-	h.pending[frame.HandshakeID] = pendingPairingHandshake{
-		input: input, nodeEphemeral: nodeEphemeral,
+	h.pending[frame.HandshakeID] = pendingHandshake{
+		input: input, nodeEphemeral: nodeEphemeral, deviceID: strings.TrimSpace(frame.DeviceID),
 	}
 	return relay.E2EEAgentHelloFrame{
 		Type: relay.TypeAgentE2EEHello, Version: relay.Version,
@@ -106,16 +116,16 @@ func (h *agentE2EEHandshakeHandler) handleClientProof(frame relay.E2EEClientProo
 		return e2eeAgentResult(frame, false, relay.CodeE2EEHandshakeFailed), err
 	}
 	pending, ok := h.pending[frame.HandshakeID]
-	if !ok || frame.Kind != e2ee.HandshakeKindPairing || !sameHandshakeRoute(frame, pending.input) {
-		return e2eeAgentResult(frame, false, relay.CodeE2EEHandshakeFailed), fmt.Errorf("%w: missing pending pairing handshake", e2ee.ErrHandshakeFailed)
+	if !ok || frame.Kind != pending.input.Kind || !sameHandshakeRoute(frame, pending.input) {
+		return e2eeAgentResult(frame, false, relay.CodeE2EEHandshakeFailed), fmt.Errorf("%w: missing pending handshake", e2ee.ErrHandshakeFailed)
 	}
 	transcript, err := e2ee.HandshakeTranscript(pending.input)
 	if err != nil {
 		return e2eeAgentResult(frame, false, relay.CodeE2EEHandshakeFailed), err
 	}
-	if !e2ee.VerifyPairingProof(h.pairingSecret, transcript, material.PairingProof) {
+	if code, err := h.verifyProof(pending, material, transcript); err != nil {
 		delete(h.pending, frame.HandshakeID)
-		return e2eeAgentResult(frame, false, relay.CodeE2EEHandshakeFailed), e2ee.ErrHandshakeFailed
+		return e2eeAgentResult(frame, false, code), err
 	}
 	keys, err := e2ee.DeriveHandshakeTrafficKeys(
 		pending.nodeEphemeral.PrivateScalar,
@@ -127,11 +137,35 @@ func (h *agentE2EEHandshakeHandler) handleClientProof(frame relay.E2EEClientProo
 		return e2eeAgentResult(frame, false, relay.CodeE2EEHandshakeFailed), err
 	}
 	delete(h.pending, frame.HandshakeID)
-	h.completed[frame.HandshakeID] = completedPairingHandshake{
+	h.completed[frame.HandshakeID] = completedHandshake{
 		clientID: pending.input.ClientID,
+		deviceID: pending.deviceID,
 		keys:     keys,
 	}
 	return e2eeAgentResult(frame, true, ""), nil
+}
+
+func (h *agentE2EEHandshakeHandler) verifyProof(pending pendingHandshake, material *e2ee.FrameMaterial, transcript []byte) (string, error) {
+	if pending.input.Kind == e2ee.HandshakeKindPairing {
+		if !e2ee.VerifyPairingProof(h.pairingSecret, transcript, material.PairingProof) {
+			return relay.CodeE2EEHandshakeFailed, e2ee.ErrHandshakeFailed
+		}
+		return "", nil
+	}
+	device, err := h.deviceTrust.VerifyDeviceProof(
+		pending.deviceID,
+		pending.input.DeviceIdentityPublicKey,
+		transcript,
+		material.DeviceProof,
+		material.DeviceSignature,
+	)
+	if err != nil {
+		return relayCodeForDeviceTrustError(err), err
+	}
+	if _, _, err := h.deviceTrust.MarkDeviceSeen(device.ID, pending.input.HandshakeID, time.Now().UTC()); err != nil {
+		return relayCodeForDeviceTrustError(err), err
+	}
+	return "", nil
 }
 
 func (h *agentE2EEHandshakeHandler) trafficKeys(handshakeID string) (*e2ee.TrafficKeys, bool) {
@@ -180,4 +214,11 @@ func e2eeAgentResult(frame relay.E2EEClientProofFrame, ok bool, code string) rel
 		SessionID: frame.SessionID, ClientID: frame.ClientID, HandshakeID: frame.HandshakeID,
 		OK: ok, ErrorCode: code,
 	}
+}
+
+func relayCodeForDeviceTrustError(err error) string {
+	if strings.Contains(err.Error(), relay.CodeDeviceRevoked) {
+		return relay.CodeDeviceRevoked
+	}
+	return relay.CodeDeviceUnknown
 }

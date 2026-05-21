@@ -355,18 +355,14 @@ func TestGatewayConnRejectsMismatchedPairingE2EEProofRoute(t *testing.T) {
 	}
 }
 
-func TestGatewayConnRejectsReconnectE2EEHelloWithResult(t *testing.T) {
+func TestGatewayConnHandlesReconnectE2EEHandshake(t *testing.T) {
 	serverConn, clientConn := newRelayClientTestConns(t)
 	defer serverConn.Close()
-	handshake, clientEphemeral := testPairingHandshakeHandler(t)
+	handshake, clientEphemeral, deviceIdentity, credential := testReconnectHandshakeHandler(t)
 	gateway := newGatewayConnWithE2EE(clientConn, "rs_gateway", handshake)
 	t.Cleanup(func() { _ = gateway.Close() })
 
 	capabilities := e2ee.ProductionCapabilities()
-	deviceIdentity, err := e2ee.GenerateNodeIdentity()
-	if err != nil {
-		t.Fatal(err)
-	}
 	clientHello := relay.E2EEClientHelloFrame{
 		Type: relay.TypeClientE2EEHello, Version: relay.Version,
 		SessionID: "rs_gateway", ClientID: "rc_attached", HandshakeID: "hs_reconnect",
@@ -378,21 +374,116 @@ func TestGatewayConnRejectsReconnectE2EEHelloWithResult(t *testing.T) {
 	if err := serverConn.WriteJSON(clientHello); err != nil {
 		t.Fatalf("write reconnect hello: %v", err)
 	}
+	var agentHello relay.E2EEAgentHelloFrame
+	if err := serverConn.ReadJSON(&agentHello); err != nil {
+		t.Fatalf("read reconnect agent hello: %v", err)
+	}
+	agentMaterial, err := e2ee.ValidateAgentHelloFrame(agentHello)
+	if err != nil {
+		t.Fatalf("validate reconnect agent hello: %v", err)
+	}
+	input := capabilities.ApplyToHandshake(e2ee.HandshakeInput{
+		Kind:                     e2ee.HandshakeKindReconnect,
+		SessionID:                "rs_gateway",
+		ClientID:                 "rc_attached",
+		HandshakeID:              "hs_reconnect",
+		ClientEphemeralPublicKey: clientEphemeral.PublicKey,
+		NodeEphemeralPublicKey:   agentMaterial.NodeEphemeralPublicKey,
+		NodeIdentityPublicKey:    agentMaterial.NodeIdentityPublicKey,
+		DeviceIdentityPublicKey:  deviceIdentity.PublicKey,
+	})
+	transcript, err := e2ee.HandshakeTranscript(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deviceSignature, err := deviceIdentity.SignTranscript(transcript)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof := relay.E2EEClientProofFrame{
+		Type: relay.TypeClientE2EEProof, Version: relay.Version,
+		SessionID: "rs_gateway", ClientID: "rc_attached", HandshakeID: "hs_reconnect",
+		Kind:            e2ee.HandshakeKindReconnect,
+		DeviceProof:     e2ee.EncodeFrameBytes(e2ee.DeviceProof(credential, transcript)),
+		DeviceSignature: e2ee.EncodeFrameBytes(deviceSignature),
+	}
+	if err := serverConn.WriteJSON(proof); err != nil {
+		t.Fatalf("write reconnect proof: %v", err)
+	}
 	var result relay.E2EEAgentResultFrame
 	if err := serverConn.ReadJSON(&result); err != nil {
-		t.Fatalf("read reconnect rejection result: %v", err)
+		t.Fatalf("read reconnect result: %v", err)
 	}
-	if result.OK || result.ErrorCode != relay.CodeE2EEUnsupported {
-		t.Fatalf("expected unsupported reconnect result, got %#v", result)
+	if !result.OK {
+		t.Fatalf("unexpected reconnect failure: %#v", result)
 	}
-	if result.SessionID != "rs_gateway" || result.ClientID != "rc_attached" || result.HandshakeID != "hs_reconnect" {
-		t.Fatalf("reconnect rejection route mismatch: %#v", result)
+	agentKeys, ok := handshake.trafficKeys("hs_reconnect")
+	if !ok {
+		t.Fatal("missing reconnect traffic keys")
 	}
+	clientKeys, err := e2ee.DeriveHandshakeTrafficKeys(
+		clientEphemeral.PrivateScalar,
+		agentMaterial.NodeEphemeralPublicKey,
+		input,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(agentKeys.ClientToAgent) != string(clientKeys.ClientToAgent) ||
+		string(agentKeys.AgentToClient) != string(clientKeys.AgentToClient) {
+		t.Fatal("reconnect traffic keys differ")
+	}
+}
 
-	var payload map[string]any
-	err = gateway.ReadJSON(&payload)
-	if err == nil || !strings.Contains(err.Error(), "reconnect handshake is not wired") {
-		t.Fatalf("expected reconnect wiring read error, got %v", err)
+func TestGatewayConnRejectsReconnectE2EEProofFailures(t *testing.T) {
+	tests := []struct {
+		name         string
+		deviceID     string
+		mutateProof  func(*relay.E2EEClientProofFrame)
+		revokeDevice bool
+		wantCode     string
+	}{
+		{name: "unknown device", deviceID: "dev_unknown", wantCode: relay.CodeDeviceUnknown},
+		{name: "wrong credential", mutateProof: func(frame *relay.E2EEClientProofFrame) {
+			frame.DeviceProof = e2ee.EncodeFrameBytes([]byte("wrong-proof"))
+		}, wantCode: relay.CodeDeviceUnknown},
+		{name: "bad signature", mutateProof: func(frame *relay.E2EEClientProofFrame) {
+			frame.DeviceSignature = e2ee.EncodeFrameBytes([]byte("bad-signature"))
+		}, wantCode: relay.CodeDeviceUnknown},
+		{name: "revoked device", revokeDevice: true, wantCode: relay.CodeDeviceRevoked},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			serverConn, clientConn := newRelayClientTestConns(t)
+			defer serverConn.Close()
+			handshake, clientEphemeral, deviceIdentity, credential := testReconnectHandshakeHandler(t)
+			if tt.revokeDevice {
+				if _, err := handshake.deviceTrust.RevokeDevice("dev_pixel", time.Now().UTC()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			gateway := newGatewayConnWithE2EE(clientConn, "rs_gateway", handshake)
+			t.Cleanup(func() { _ = gateway.Close() })
+
+			deviceID := "dev_pixel"
+			if tt.deviceID != "" {
+				deviceID = tt.deviceID
+			}
+			proof := driveReconnectHello(t, serverConn, clientEphemeral, deviceIdentity, deviceID, credential)
+			if tt.mutateProof != nil {
+				tt.mutateProof(proof)
+			}
+			if err := serverConn.WriteJSON(proof); err != nil {
+				t.Fatalf("write reconnect proof: %v", err)
+			}
+			var result relay.E2EEAgentResultFrame
+			if err := serverConn.ReadJSON(&result); err != nil {
+				t.Fatalf("read reconnect result: %v", err)
+			}
+			if result.OK || result.ErrorCode != tt.wantCode {
+				t.Fatalf("unexpected reconnect result: %#v", result)
+			}
+		})
 	}
 }
 
@@ -585,6 +676,89 @@ func testPairingHandshakeHandler(t *testing.T) (*agentE2EEHandshakeHandler, *e2e
 		e2ee.ProductionCapabilities(),
 		nodeIdentity,
 	), clientEphemeral
+}
+
+func testReconnectHandshakeHandler(t *testing.T) (*agentE2EEHandshakeHandler, *e2ee.EphemeralKeyPair, *e2ee.NodeIdentity, string) {
+	t.Helper()
+	nodeIdentity, err := e2ee.GenerateNodeIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	deviceIdentity, err := e2ee.GenerateNodeIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientEphemeral, err := e2ee.NewEphemeralKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	trustStore, err := e2ee.LoadOrCreateDeviceTrustStore(t.TempDir() + "/" + e2ee.DeviceTrustFileName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential := "device-credential-128-bit-minimum"
+	if _, err := trustStore.RegisterDevice(e2ee.DeviceRegistration{
+		ID: "dev_pixel", DisplayName: "Pixel", PublicKey: deviceIdentity.PublicKey,
+		DeviceCredential: credential,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return newAgentE2EEHandshakeHandlerWithDeviceTrust(
+		"rs_gateway",
+		"pair-secret-128-bit-minimum",
+		e2ee.ProductionCapabilities(),
+		nodeIdentity,
+		trustStore,
+	), clientEphemeral, deviceIdentity, credential
+}
+
+func driveReconnectHello(t *testing.T, serverConn *websocket.Conn, clientEphemeral *e2ee.EphemeralKeyPair, deviceIdentity *e2ee.NodeIdentity, deviceID string, credential string) *relay.E2EEClientProofFrame {
+	t.Helper()
+	capabilities := e2ee.ProductionCapabilities()
+	clientHello := relay.E2EEClientHelloFrame{
+		Type: relay.TypeClientE2EEHello, Version: relay.Version,
+		SessionID: "rs_gateway", ClientID: "rc_attached", HandshakeID: "hs_reconnect",
+		Kind: e2ee.HandshakeKindReconnect, Capabilities: &capabilities,
+		ClientEphemeralPublicKey: e2ee.EncodeFrameBytes(clientEphemeral.PublicKey),
+		DeviceID:                 deviceID,
+		DeviceIdentityPublicKey:  e2ee.EncodeFrameBytes(deviceIdentity.PublicKey),
+	}
+	if err := serverConn.WriteJSON(clientHello); err != nil {
+		t.Fatalf("write reconnect hello: %v", err)
+	}
+	var agentHello relay.E2EEAgentHelloFrame
+	if err := serverConn.ReadJSON(&agentHello); err != nil {
+		t.Fatalf("read reconnect agent hello: %v", err)
+	}
+	agentMaterial, err := e2ee.ValidateAgentHelloFrame(agentHello)
+	if err != nil {
+		t.Fatalf("validate reconnect agent hello: %v", err)
+	}
+	input := capabilities.ApplyToHandshake(e2ee.HandshakeInput{
+		Kind:                     e2ee.HandshakeKindReconnect,
+		SessionID:                "rs_gateway",
+		ClientID:                 "rc_attached",
+		HandshakeID:              "hs_reconnect",
+		ClientEphemeralPublicKey: clientEphemeral.PublicKey,
+		NodeEphemeralPublicKey:   agentMaterial.NodeEphemeralPublicKey,
+		NodeIdentityPublicKey:    agentMaterial.NodeIdentityPublicKey,
+		DeviceIdentityPublicKey:  deviceIdentity.PublicKey,
+	})
+	transcript, err := e2ee.HandshakeTranscript(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deviceSignature, err := deviceIdentity.SignTranscript(transcript)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &relay.E2EEClientProofFrame{
+		Type: relay.TypeClientE2EEProof, Version: relay.Version,
+		SessionID: "rs_gateway", ClientID: "rc_attached", HandshakeID: "hs_reconnect",
+		Kind:            e2ee.HandshakeKindReconnect,
+		DeviceProof:     e2ee.EncodeFrameBytes(e2ee.DeviceProof(credential, transcript)),
+		DeviceSignature: e2ee.EncodeFrameBytes(deviceSignature),
+	}
 }
 
 func driveGatewayE2EEHandshake(t *testing.T, serverConn *websocket.Conn, clientEphemeral *e2ee.EphemeralKeyPair) *e2ee.TrafficKeys {

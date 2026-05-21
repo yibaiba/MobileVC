@@ -217,12 +217,23 @@ func validateHandshakeInput(input HandshakeInput) error {
 
 func proof(purpose string, secret string, transcript []byte) []byte {
 	secretHash := sha256.Sum256([]byte(secret))
+	encoded, err := proofFromSecretHash(purpose, secretHash[:], transcript)
+	if err != nil {
+		return nil
+	}
+	return encoded
+}
+
+func proofFromSecretHash(purpose string, secretHash []byte, transcript []byte) ([]byte, error) {
+	if len(secretHash) != sha256.Size {
+		return nil, ErrHandshakeFailed
+	}
 	transcriptHash := sha256.Sum256(transcript)
-	material := append([]byte(purpose+"|"), secretHash[:]...)
+	material := append([]byte(purpose+"|"), secretHash...)
 	material = append(material, '|')
 	material = append(material, transcriptHash[:]...)
 	sum := sha256.Sum256(material)
-	return []byte(base64.RawURLEncoding.EncodeToString(sum[:]))
+	return []byte(base64.RawURLEncoding.EncodeToString(sum[:])), nil
 }
 
 func appendBytes(out []byte, value []byte) ([]byte, error) {
