@@ -150,6 +150,17 @@ func (c *gatewayConn) handleClientE2EEHello(raw map[string]any) error {
 	if c.e2ee == nil {
 		return fmt.Errorf("relay e2ee handshake is not connected to the local agent yet")
 	}
+	if frame.Kind == e2ee.HandshakeKindReconnect {
+		result := relay.E2EEAgentResultFrame{
+			Type: relay.TypeAgentE2EEResult, Version: relay.Version,
+			SessionID: frame.SessionID, ClientID: frame.ClientID, HandshakeID: frame.HandshakeID,
+			OK: false, ErrorCode: relay.CodeE2EEUnsupported,
+		}
+		if err := c.writeControl(result); err != nil {
+			return err
+		}
+		return fmt.Errorf("%w: reconnect handshake is not wired", e2ee.ErrHandshakeFailed)
+	}
 	response, err := c.e2ee.handleClientHello(frame)
 	if err != nil {
 		return err

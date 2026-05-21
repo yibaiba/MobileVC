@@ -355,6 +355,47 @@ func TestGatewayConnRejectsMismatchedPairingE2EEProofRoute(t *testing.T) {
 	}
 }
 
+func TestGatewayConnRejectsReconnectE2EEHelloWithResult(t *testing.T) {
+	serverConn, clientConn := newRelayClientTestConns(t)
+	defer serverConn.Close()
+	handshake, clientEphemeral := testPairingHandshakeHandler(t)
+	gateway := newGatewayConnWithE2EE(clientConn, "rs_gateway", handshake)
+	t.Cleanup(func() { _ = gateway.Close() })
+
+	capabilities := e2ee.ProductionCapabilities()
+	deviceIdentity, err := e2ee.GenerateNodeIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientHello := relay.E2EEClientHelloFrame{
+		Type: relay.TypeClientE2EEHello, Version: relay.Version,
+		SessionID: "rs_gateway", ClientID: "rc_attached", HandshakeID: "hs_reconnect",
+		Kind: e2ee.HandshakeKindReconnect, Capabilities: &capabilities,
+		ClientEphemeralPublicKey: e2ee.EncodeFrameBytes(clientEphemeral.PublicKey),
+		DeviceID:                 "dev_pixel",
+		DeviceIdentityPublicKey:  e2ee.EncodeFrameBytes(deviceIdentity.PublicKey),
+	}
+	if err := serverConn.WriteJSON(clientHello); err != nil {
+		t.Fatalf("write reconnect hello: %v", err)
+	}
+	var result relay.E2EEAgentResultFrame
+	if err := serverConn.ReadJSON(&result); err != nil {
+		t.Fatalf("read reconnect rejection result: %v", err)
+	}
+	if result.OK || result.ErrorCode != relay.CodeE2EEUnsupported {
+		t.Fatalf("expected unsupported reconnect result, got %#v", result)
+	}
+	if result.SessionID != "rs_gateway" || result.ClientID != "rc_attached" || result.HandshakeID != "hs_reconnect" {
+		t.Fatalf("reconnect rejection route mismatch: %#v", result)
+	}
+
+	var payload map[string]any
+	err = gateway.ReadJSON(&payload)
+	if err == nil || !strings.Contains(err.Error(), "reconnect handshake is not wired") {
+		t.Fatalf("expected reconnect wiring read error, got %v", err)
+	}
+}
+
 func TestGatewayConnCloseUnblocksFullReadQueueSend(t *testing.T) {
 	serverConn, clientConn := newRelayClientTestConns(t)
 	defer serverConn.Close()
