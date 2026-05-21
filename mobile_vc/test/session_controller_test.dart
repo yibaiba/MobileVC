@@ -1,10 +1,16 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:mobile_vc/core/config/app_config.dart';
+import 'package:mobile_vc/core/relay_e2ee/relay_e2ee_capability.dart';
+import 'package:mobile_vc/core/relay_e2ee/relay_device_identity.dart';
+import 'package:mobile_vc/core/relay_e2ee/relay_e2ee_crypto.dart';
+import 'package:mobile_vc/core/relay_e2ee/relay_e2ee_handshake.dart';
+import 'package:mobile_vc/core/relay_e2ee/relay_e2ee_handshake_frames.dart';
 import 'package:mobile_vc/data/models/events.dart';
 import 'package:mobile_vc/data/models/runtime_meta.dart';
 import 'package:mobile_vc/data/models/session_models.dart';
@@ -14,6 +20,79 @@ import 'package:mobile_vc/features/session/session_controller.dart';
 Future<void> _flushEvents() async {
   await Future<void>.delayed(const Duration(milliseconds: 1));
   await Future<void>.delayed(const Duration(milliseconds: 1));
+}
+
+Future<void> _servePairingE2eeRelay(
+  WebSocket socket,
+  RelayE2eeEphemeralKeyPair nodeIdentity,
+) async {
+  final capabilities = RelayE2eeCapabilitySet.production();
+  await for (final raw in socket) {
+    final frame = jsonDecode(raw as String) as Map<String, dynamic>;
+    switch ((frame['type'] ?? '').toString()) {
+      case 'client.pair':
+        socket.add(jsonEncode(const <String, dynamic>{
+          'type': 'client.paired',
+          'version': 1,
+          'sessionId': 'rs_test',
+          'clientId': 'rc_test',
+          'clientReconnectSecret': 'reconnect_secret',
+        }));
+      case relayFrameClientE2eeHello:
+        final hello = RelayE2eeClientHelloFrame.fromJson(frame);
+        final nodeEphemeral = await RelayE2eeHandshake.newEphemeralKeyPair();
+        final input = capabilities.applyToHandshake(
+          RelayE2eeHandshakeInput(
+            kind: relayE2eeHandshakeKindPairing,
+            sessionId: hello.sessionId,
+            clientId: hello.clientId,
+            handshakeId: hello.handshakeId,
+            relayProtocolVersion: 0,
+            e2eeProtocolVersion: 0,
+            tunnelProtocolVersion: 0,
+            cryptoSuite: '',
+            clientEphemeralPublicKey: hello.clientEphemeralPublicKey,
+            nodeEphemeralPublicKey: nodeEphemeral.publicKey,
+            nodeIdentityPublicKey: nodeIdentity.publicKey,
+            requiresE2EE: false,
+            plaintextTestMode: false,
+            supportsMultiplexStreams: false,
+            supportsFileDownload: false,
+            supportsDeviceManagement: false,
+          ),
+        );
+        final transcript = RelayE2eeHandshake.transcript(input);
+        final signature = await RelayDeviceIdentityStore.signWithPrivateScalar(
+          privateScalar: nodeIdentity.privateScalar,
+          transcript: transcript,
+        );
+        socket.add(jsonEncode(RelayE2eeAgentHelloFrame(
+          sessionId: hello.sessionId,
+          clientId: hello.clientId,
+          handshakeId: hello.handshakeId,
+          capabilities: capabilities,
+          nodeEphemeralPublicKey: nodeEphemeral.publicKey,
+          nodeIdentityPublicKey: nodeIdentity.publicKey,
+          nodeSignature: signature,
+        ).toJson()));
+      case relayFrameClientE2eeProof:
+        final proof = RelayE2eeClientProofFrame.fromJson(frame);
+        socket.add(jsonEncode(RelayE2eeAgentResultFrame(
+          sessionId: proof.sessionId,
+          clientId: proof.clientId,
+          handshakeId: proof.handshakeId,
+          ok: true,
+        ).toJson()));
+    }
+  }
+}
+
+String _testHex(Uint8List bytes) {
+  final buffer = StringBuffer();
+  for (final byte in bytes) {
+    buffer.write(byte.toRadixString(16).padLeft(2, '0'));
+  }
+  return buffer.toString();
 }
 
 ActionNeededSignal _expectSignal(
@@ -156,6 +235,55 @@ void main() {
           sessionId: 'rs_test',
           clientId: 'rc_test',
           clientReconnectSecret: 'bad_secret',
+        ),
+        throwsA(isA<RelayPairingException>()),
+      );
+    });
+
+    test(
+        'relay pairing runs production E2EE handshake before connect completes',
+        () async {
+      final nodeIdentity = await RelayE2eeHandshake.newEphemeralKeyPair();
+      final nodeFingerprint = await RelayE2eeCrypto.fingerprint(
+        nodeIdentity.publicKey,
+      );
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(server.close);
+      server.transform(WebSocketTransformer()).listen((socket) {
+        _servePairingE2eeRelay(socket, nodeIdentity);
+      });
+      final service = MobileVcWsService();
+      addTearDown(service.dispose);
+
+      await service.connectRelay(
+        relayUrl: 'ws://127.0.0.1:${server.port}',
+        sessionId: 'rs_test',
+        pairingSecret: 'pair-secret-128-bit-minimum',
+        nodeFingerprintHex: _testHex(nodeFingerprint),
+        relayCapabilities: RelayE2eeCapabilitySet.production(),
+      );
+
+      expect(service.hasRelayE2eeHandshake, isTrue);
+      expect(service.takeRelaySession()?.clientId, 'rc_test');
+    });
+
+    test('relay pairing rejects E2EE node fingerprint mismatch', () async {
+      final nodeIdentity = await RelayE2eeHandshake.newEphemeralKeyPair();
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(server.close);
+      server.transform(WebSocketTransformer()).listen((socket) {
+        _servePairingE2eeRelay(socket, nodeIdentity);
+      });
+      final service = MobileVcWsService();
+      addTearDown(service.dispose);
+
+      expect(
+        service.connectRelay(
+          relayUrl: 'ws://127.0.0.1:${server.port}',
+          sessionId: 'rs_test',
+          pairingSecret: 'pair-secret-128-bit-minimum',
+          nodeFingerprintHex: '0' * 64,
+          relayCapabilities: RelayE2eeCapabilitySet.production(),
         ),
         throwsA(isA<RelayPairingException>()),
       );
@@ -8206,6 +8334,8 @@ class _FakeMobileVcWsService extends MobileVcWsService {
     String pairingSecret = '',
     String clientId = '',
     String clientReconnectSecret = '',
+    String nodeFingerprintHex = '',
+    RelayE2eeCapabilitySet? relayCapabilities,
   }) async {
     connectCalls++;
     _relaySession = RelaySession(
@@ -8221,6 +8351,8 @@ class _FakeMobileVcWsService extends MobileVcWsService {
       pairingSecret: pairingSecret,
       clientId: clientId,
       clientReconnectSecret: clientReconnectSecret,
+      nodeFingerprintHex: nodeFingerprintHex,
+      relayCapabilities: relayCapabilities,
     ));
   }
 
@@ -8261,6 +8393,8 @@ class _RelayConnectCall {
     required this.pairingSecret,
     required this.clientId,
     required this.clientReconnectSecret,
+    required this.nodeFingerprintHex,
+    required this.relayCapabilities,
   });
 
   final String relayUrl;
@@ -8268,4 +8402,6 @@ class _RelayConnectCall {
   final String pairingSecret;
   final String clientId;
   final String clientReconnectSecret;
+  final String nodeFingerprintHex;
+  final RelayE2eeCapabilitySet? relayCapabilities;
 }

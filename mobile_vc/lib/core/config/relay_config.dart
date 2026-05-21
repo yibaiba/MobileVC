@@ -97,29 +97,26 @@ RelayE2eeCapabilitySet? _parseRelayCapabilities(Uri uri) {
   if (!hasCapabilities) {
     return null;
   }
-  final capabilities = RelayE2eeCapabilitySet(
-    relayProtocolVersion: _requiredInt(uri, 'relayProtocolVersion'),
-    e2eeProtocolVersion: _requiredInt(uri, 'e2eeProtocolVersion'),
-    cryptoSuite: _requiredString(uri, 'cryptoSuite'),
-    tunnelProtocolVersion: _requiredInt(uri, 'tunnelProtocolVersion'),
-    supportsMultiplexStreams: _requiredBool(
+  return RelayE2eeCapabilitySet.fromJson(<String, Object?>{
+    'relayProtocolVersion': _requiredInt(uri, 'relayProtocolVersion'),
+    'e2eeProtocolVersion': _requiredInt(uri, 'e2eeProtocolVersion'),
+    'cryptoSuite': _requiredString(uri, 'cryptoSuite'),
+    'tunnelProtocolVersion': _requiredInt(uri, 'tunnelProtocolVersion'),
+    'supportsMultiplexStreams': _requiredBool(
       uri,
       'supportsMultiplexStreams',
     ),
-    supportsFileDownload: _requiredBool(uri, 'supportsFileDownloadStream'),
-    supportsDeviceManagement: _requiredBool(
+    'supportsFileDownloadStream': _requiredBool(
+      uri,
+      'supportsFileDownloadStream',
+    ),
+    'supportsDeviceManagement': _requiredBool(
       uri,
       'supportsDeviceManagement',
     ),
-    requiresE2EE: _requiredBool(uri, 'requiresE2EE'),
-    plaintextTestMode: _requiredBool(uri, 'plaintextTestMode'),
-  );
-  if (capabilities.plaintextTestMode) {
-    capabilities.validatePlaintextTestMode();
-  } else {
-    capabilities.validateProduction();
-  }
-  return capabilities;
+    'requiresE2EE': _requiredBool(uri, 'requiresE2EE'),
+    'plaintextTestMode': _requiredBool(uri, 'plaintextTestMode'),
+  });
 }
 
 const _relayCapabilityQueryKeys = <String>{

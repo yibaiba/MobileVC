@@ -45,6 +45,28 @@ class RelayE2eeCapabilitySet {
     );
   }
 
+  factory RelayE2eeCapabilitySet.fromJson(Map<String, Object?> json) {
+    final capabilities = RelayE2eeCapabilitySet(
+      relayProtocolVersion: _requiredInt(json, 'relayProtocolVersion'),
+      e2eeProtocolVersion: _requiredInt(json, 'e2eeProtocolVersion'),
+      cryptoSuite: _requiredString(json, 'cryptoSuite'),
+      tunnelProtocolVersion: _requiredInt(json, 'tunnelProtocolVersion'),
+      supportsMultiplexStreams: _requiredBool(
+        json,
+        'supportsMultiplexStreams',
+      ),
+      supportsFileDownload: _requiredBool(json, 'supportsFileDownloadStream'),
+      supportsDeviceManagement: _requiredBool(
+        json,
+        'supportsDeviceManagement',
+      ),
+      requiresE2EE: _requiredBool(json, 'requiresE2EE'),
+      plaintextTestMode: _requiredBool(json, 'plaintextTestMode'),
+    );
+    capabilities.validateRelayMode();
+    return capabilities;
+  }
+
   final int relayProtocolVersion;
   final int e2eeProtocolVersion;
   final String cryptoSuite;
@@ -70,6 +92,14 @@ class RelayE2eeCapabilitySet {
     if (requiresE2EE || !plaintextTestMode) {
       throw ArgumentError('plaintext test mode must be explicit');
     }
+  }
+
+  void validateRelayMode() {
+    if (plaintextTestMode) {
+      validatePlaintextTestMode();
+      return;
+    }
+    validateProduction();
   }
 
   RelayE2eeHandshakeInput applyToHandshake(RelayE2eeHandshakeInput input) {
@@ -121,4 +151,41 @@ class RelayE2eeCapabilitySet {
       throw ArgumentError('unsupported E2EE capability version');
     }
   }
+}
+
+String _requiredString(Map<String, Object?> json, String key) {
+  final value = json[key];
+  if (value is! String || value.trim().isEmpty) {
+    throw FormatException('$key is required');
+  }
+  return value;
+}
+
+int _requiredInt(Map<String, Object?> json, String key) {
+  final value = json[key];
+  if (value is int) {
+    return value;
+  }
+  if (value is String) {
+    final parsed = int.tryParse(value);
+    if (parsed != null) {
+      return parsed;
+    }
+  }
+  throw FormatException('$key must be an integer');
+}
+
+bool _requiredBool(Map<String, Object?> json, String key) {
+  final value = json[key];
+  if (value is bool) {
+    return value;
+  }
+  if (value is String) {
+    return switch (value.toLowerCase()) {
+      'true' => true,
+      'false' => false,
+      _ => throw FormatException('$key must be a boolean'),
+    };
+  }
+  throw FormatException('$key must be a boolean');
 }

@@ -87,6 +87,7 @@ final wsUrl = config.wsUrlFor();
 - `AppConfig.fromLaunchUri(String raw, {AppConfig fallback}) -> AppConfig?`
 - `validateRelayUrl(String raw) -> void`
 - `MobileVcWsService.connectRelay({required relayUrl, required sessionId, required pairingSecret})`
+- Relay E2EE connect metadata: `nodeFingerprintHex`, `relayCapabilities`
 - Relay QR: `mobilevc://relay/v1?relay=<url>&session=<id>&secret=<secret>&exp=<unix-seconds>`
 
 #### 3. Contracts
@@ -94,6 +95,12 @@ final wsUrl = config.wsUrlFor();
 - Relay scan selects `ConnectionMode.relay` without overwriting direct `host`, `port`, or `token`.
 - Persist only `connectionMode` and `relayUrl`; never persist `relaySessionId`, `relayPairingSecret`, or `relayPairingExpiresAt`.
 - Relay connect must wait for `client.paired`; pairing `relay.error` is a connection failure, not a successful connection.
+- Production E2EE relay pairing must not consider `client.paired` alone as connected. When the pairing link capabilities require E2EE and plaintext test-mode is off, Flutter must complete `client.e2ee_hello` -> `agent.e2ee_hello` -> `client.e2ee_proof` -> `agent.e2ee_result ok` before `connectRelay` returns.
+- Plaintext relay test-mode must remain explicit. If capability hints are absent or `plaintextTestMode=true`, Flutter must not send E2EE handshake frames because older/local test relay agents may not have the local E2EE handler wired.
+- Pairing-link capability hints are non-secret metadata and may be persisted as `relayCapabilities`; pairing secret and expiry remain non-persistent.
+- Production E2EE pairing must verify that the node identity public key fingerprint from `agent.e2ee_hello` matches `AppConfig.relayNodeFingerprintHex` before sending `client.e2ee_proof`.
+- `client.e2ee_proof` must be sent only after node signature verification and transcript-bound pairing proof generation. Do not complete pairing on `agent.e2ee_hello`; wait for `agent.e2ee_result ok`.
+- A completed Flutter pairing handshake may keep derived traffic keys in memory for the next encrypted-forwarding slice, but this is not enough to show verified UI while `relay.forward` still uses plaintext.
 - Relay mode must not send direct backend `AUTH_TOKEN` in relay envelopes or control frames.
 - HTTP `/download` is disabled in relay mode and must show `Relay 模式暂不支持下载`.
 
@@ -173,6 +180,9 @@ await prefs.setString('mobilevc.app_config', jsonEncode(config.toJson()));
 - Unsupported relay/e2ee/tunnel version or crypto suite -> validation error.
 - Relay pairing URI with partial, malformed, or contradictory capability hints -> import failure, not silent direct/relay fallback.
 - Relay pairing URI with missing or malformed `nodeFingerprint` -> import failure.
+- Production E2EE pairing with fingerprint mismatch -> connection failure with `e2ee_fingerprint_mismatch`; do not send pairing proof.
+- Production E2EE pairing with `agent.e2ee_result ok=false` -> connection failure using the result error code.
+- Production E2EE pairing timeout before `agent.e2ee_result ok` -> `Relay E2EE 握手超时`.
 - E2EE handshake frame with missing capabilities, malformed base64url material, invalid P-256 public key, invalid kind, or pairing/reconnect field mixup -> `FormatException` / explicit connection failure.
 - E2EE handshake frame with plaintext-test capabilities where production handshake is required -> validation error; do not silently continue as plaintext.
 - `agent.e2ee_result` with `ok=false` and no `errorCode`, or `ok=true` and an `errorCode` -> `FormatException`.
@@ -188,15 +198,23 @@ await prefs.setString('mobilevc.app_config', jsonEncode(config.toJson()));
 #### 5. Good/Base/Bad Cases
 - Good: status chip text is derived from `RelaySecurityState.title` and verified styling is gated by `canShowVerified`.
 - Good: pairing UI shows the evaluator-provided short fingerprint plus full copyable fingerprint detail.
+- Good: `connectRelay` stores pending E2EE state before sending `client.e2ee_hello`, so a fast `agent.e2ee_hello` cannot arrive before state exists.
+- Good: capability hints from QR/import survive config persistence, but pairing secret and expiry do not.
+- Good: production E2EE handshake success is tracked separately from verified UI; encrypted forwarding must still be wired before showing verified security.
 - Base: relay test-mode remains usable for local debugging but is visually marked as non-production.
 - Bad: showing "安全", "已加密", or shield/verified styling just because `connectionMode == relay`.
 - Bad: hiding fingerprint mismatch behind a reconnect retry.
+- Bad: completing relay connect immediately after `client.paired` in production E2EE mode.
+- Bad: sending `client.e2ee_hello` in plaintext test-mode where the local agent may intentionally have no E2EE handler.
+- Bad: marking relay as verified because handshake traffic keys were derived while business frames remain plaintext.
 
 #### 6. Tests Required
 - Verified state only when every condition is true.
 - Capability tests assert production success, production plaintext-test rejection, missing tunnel feature rejection, explicit plaintext test-mode validation, unsupported version rejection, and handshake transcript binding.
 - Handshake frame tests assert pairing/reconnect frame round-trip, device identity requirement on reconnect, malformed base64url rejection, production capability enforcement, and proof field mixup rejection.
 - Config/import tests assert relay pairing URI capability hints validate and invalid hints fail explicitly.
+- Config/import tests assert relay capability hints persist as non-secret config while pairing secret and expiry do not.
+- Service tests assert production E2EE relay pairing waits for `agent.e2ee_result ok`, verifies node fingerprint, and rejects fingerprint mismatch.
 - Config/import tests assert relay pairing URI node fingerprint is required.
 - Tunnel tests assert required fields, unexpected-field rejection, unknown stream type rejection, per-stream sequence allocation, per-stream replay rejection, and zero-window rejection.
 - Test-mode, fingerprint mismatch, revoked device, decrypt failure, unsupported capability, and plaintext-not-rejected states cannot show verified.

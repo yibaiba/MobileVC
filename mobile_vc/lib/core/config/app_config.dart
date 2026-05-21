@@ -3,7 +3,10 @@ import 'app_config_engine_models.dart';
 import 'app_connection_endpoint.dart';
 import 'app_connection_environment.dart';
 import 'app_connection_urls.dart';
+import '../relay_e2ee/relay_e2ee_capability.dart';
 import 'relay_config.dart';
+
+const Object _unchanged = Object();
 
 class AppConfig {
   static const String adbIcePort = AdbIceConfig.port;
@@ -31,6 +34,7 @@ class AppConfig {
     this.relayClientId = '',
     this.relayClientReconnectSecret = '',
     this.relayNodeFingerprintHex = '',
+    this.relayCapabilities,
   });
 
   final String host;
@@ -55,6 +59,7 @@ class AppConfig {
   final String relayClientId;
   final String relayClientReconnectSecret;
   final String relayNodeFingerprintHex;
+  final RelayE2eeCapabilitySet? relayCapabilities;
 
   bool get isRelayMode => connectionMode == ConnectionMode.relay.name;
 
@@ -124,6 +129,7 @@ class AppConfig {
     String? relayClientId,
     String? relayClientReconnectSecret,
     String? relayNodeFingerprintHex,
+    Object? relayCapabilities = _unchanged,
   }) {
     final nextEngine = engine ?? this.engine;
     final nextModels = AppConfigEngineModels.resolve(
@@ -171,6 +177,9 @@ class AppConfig {
           relayClientReconnectSecret ?? this.relayClientReconnectSecret,
       relayNodeFingerprintHex:
           relayNodeFingerprintHex ?? this.relayNodeFingerprintHex,
+      relayCapabilities: identical(relayCapabilities, _unchanged)
+          ? this.relayCapabilities
+          : relayCapabilities as RelayE2eeCapabilitySet?,
     );
   }
 
@@ -232,6 +241,8 @@ class AppConfig {
           'relayClientReconnectSecret': relayClientReconnectSecret,
         if (relayNodeFingerprintHex.trim().isNotEmpty)
           'relayNodeFingerprintHex': relayNodeFingerprintHex,
+        if (relayCapabilities != null)
+          'relayCapabilities': relayCapabilities!.toJson(),
         if (secureTransport != null) 'secureTransport': secureTransport!,
       };
 
@@ -277,6 +288,7 @@ class AppConfig {
           (json['relayClientReconnectSecret'] ?? '').toString(),
       relayNodeFingerprintHex:
           (json['relayNodeFingerprintHex'] ?? '').toString(),
+      relayCapabilities: _relayCapabilitiesFromJson(json['relayCapabilities']),
     );
   }
 
@@ -310,6 +322,7 @@ class AppConfig {
         relayClientId: '',
         relayClientReconnectSecret: '',
         relayNodeFingerprintHex: relayPairing.nodeFingerprintHex,
+        relayCapabilities: relayPairing.capabilities,
       );
     }
     final uri = Uri.tryParse(trimmed);
@@ -350,6 +363,18 @@ class AppConfig {
 
   AdbIceConfig get _adbIceConfig =>
       AdbIceConfig(host: host, rawJson: adbIceServersJson);
+}
+
+RelayE2eeCapabilitySet? _relayCapabilitiesFromJson(Object? value) {
+  if (value == null) {
+    return null;
+  }
+  if (value is! Map) {
+    throw const FormatException('invalid relay capabilities');
+  }
+  return RelayE2eeCapabilitySet.fromJson(
+    Map<String, Object?>.from(value),
+  );
 }
 
 String _launchUriPort(Uri uri, String fallbackPort) {

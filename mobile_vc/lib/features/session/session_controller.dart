@@ -1825,6 +1825,8 @@ class SessionController extends ChangeNotifier {
       pairingSecret: pairingSecret,
       clientId: clientId,
       clientReconnectSecret: clientReconnectSecret,
+      nodeFingerprintHex: _config.relayNodeFingerprintHex,
+      relayCapabilities: _config.relayCapabilities,
     );
     final relaySession = _service.takeRelaySession();
     _config = _config.copyWith(

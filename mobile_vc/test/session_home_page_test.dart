@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:mobile_vc/core/config/app_config.dart';
+import 'package:mobile_vc/core/relay_e2ee/relay_e2ee_capability.dart';
 import 'package:mobile_vc/data/models/events.dart';
 import 'package:mobile_vc/data/models/runtime_meta.dart';
 import 'package:mobile_vc/data/models/session_models.dart';
@@ -167,6 +168,8 @@ class _FakeMobileVcWsService extends MobileVcWsService {
     String pairingSecret = '',
     String clientId = '',
     String clientReconnectSecret = '',
+    String nodeFingerprintHex = '',
+    RelayE2eeCapabilitySet? relayCapabilities,
   }) async {}
 
   @override

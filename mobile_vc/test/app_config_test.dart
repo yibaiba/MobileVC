@@ -249,6 +249,27 @@ void main() {
       parsedPairing.capabilities!.validatePlaintextTestMode();
     });
 
+    test('relay capability hints are stored as non-secret config', () {
+      final config = AppConfig.fromLaunchUri(
+        'mobilevc://relay/v1?relay=wss%3A%2F%2Frelay.example.test'
+        '&session=rs_test&secret=pair_secret&exp=1760000000'
+        '&nodeFingerprint=$testNodeFingerprint'
+        '&relayProtocolVersion=1&e2eeProtocolVersion=1'
+        '&cryptoSuite=p256-ecdsa%2Bp256-ecdh%2Bhkdf-sha256%2Baes-256-gcm'
+        '&tunnelProtocolVersion=1&supportsMultiplexStreams=true'
+        '&supportsFileDownloadStream=true&supportsDeviceManagement=true'
+        '&requiresE2EE=true&plaintextTestMode=false',
+      );
+
+      expect(config, isNotNull);
+      config!.relayCapabilities!.validateProduction();
+      final json = config.toJson();
+      expect(json.containsKey('relayPairingSecret'), isFalse);
+      expect(json['relayCapabilities'], isA<Map<String, Object>>());
+      final restored = AppConfig.fromJson(json);
+      restored.relayCapabilities!.validateProduction();
+    });
+
     test('relay pairing uri rejects invalid capability hints', () {
       expect(
         () => parseRelayPairingUri(
