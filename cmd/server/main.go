@@ -16,6 +16,7 @@ import (
 	"mobilevc/internal/gateway"
 	"mobilevc/internal/logx"
 	"mobilevc/internal/push"
+	"mobilevc/internal/relay/e2ee"
 	"mobilevc/internal/relayclient"
 	"mobilevc/internal/tts"
 )
@@ -50,7 +51,10 @@ func main() {
 	logConfigSummary(summary, cfg.AuthToken)
 	pushService := initPushService()
 	wsHandler := initWebSocketHandler(cfg, sessionStore, pushService)
-	startRelayClient(cfg, wsHandler)
+	if err := startRelayClient(cfg, wsHandler); err != nil {
+		logx.Error("relay", "start relay client failed: %v", err)
+		panic(err)
+	}
 	ttsHandler := initTTSHandler(cfg)
 	mux := buildMux(cfg, wsHandler, ttsHandler)
 	startHTTPServer(addr, summary, mux, startedAt)
@@ -144,25 +148,39 @@ func initWebSocketHandler(cfg config.Config, sessionStore *data.FileStore, pushS
 	return wsHandler
 }
 
-func startRelayClient(cfg config.Config, wsHandler *gateway.Handler) {
+func startRelayClient(cfg config.Config, wsHandler *gateway.Handler) error {
 	if !cfg.Relay.Enabled {
-		return
+		return nil
+	}
+	relayCfg, err := relayConfig(cfg)
+	if err != nil {
+		return err
 	}
 	go func() {
-		err := relayclient.Run(context.Background(), relayConfig(cfg), wsHandler, relayclient.EmitPairingFile)
+		err := relayclient.Run(context.Background(), relayCfg, wsHandler, relayclient.EmitPairingFile)
 		if err != nil {
 			logx.Error("relay", "relay client stopped: %v", err)
 		}
 	}()
+	return nil
 }
 
-func relayConfig(cfg config.Config) relayclient.Config {
-	return relayclient.Config{
-		RelayURL:         cfg.Relay.URL,
-		PairingTTL:       cfg.Relay.PairingTTL,
-		AgentGracePeriod: cfg.Relay.AgentGracePeriod,
-		PairingEventPath: cfg.Relay.PairingEventPath,
+func relayConfig(cfg config.Config) (relayclient.Config, error) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return relayclient.Config{}, fmt.Errorf("resolve relay node identity home: %w", err)
 	}
+	identity, err := e2ee.LoadOrCreateNodeIdentity(e2ee.DefaultNodeIdentityPath(homeDir))
+	if err != nil {
+		return relayclient.Config{}, err
+	}
+	return relayclient.Config{
+		RelayURL:           cfg.Relay.URL,
+		PairingTTL:         cfg.Relay.PairingTTL,
+		AgentGracePeriod:   cfg.Relay.AgentGracePeriod,
+		PairingEventPath:   cfg.Relay.PairingEventPath,
+		NodeFingerprintHex: fmt.Sprintf("%x", identity.Fingerprint),
+	}, nil
 }
 
 func initTTSHandler(cfg config.Config) *tts.HTTPHandler {

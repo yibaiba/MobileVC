@@ -742,7 +742,32 @@ function buildRelayPairingUri(pairing) {
   uri.searchParams.set('session', pairing.sessionId);
   uri.searchParams.set('secret', pairing.pairingSecret);
   uri.searchParams.set('exp', String(pairing.expiresAt));
+  if (pairing.nodeFingerprintHex) {
+    uri.searchParams.set('nodeFingerprint', pairing.nodeFingerprintHex);
+  }
+  appendRelayCapabilityParams(uri, pairing.capabilities);
   return uri.toString();
+}
+
+function appendRelayCapabilityParams(uri, capabilities) {
+  if (!capabilities || typeof capabilities !== 'object') {
+    return;
+  }
+  for (const key of [
+    'relayProtocolVersion',
+    'e2eeProtocolVersion',
+    'cryptoSuite',
+    'tunnelProtocolVersion',
+    'supportsMultiplexStreams',
+    'supportsFileDownloadStream',
+    'supportsDeviceManagement',
+    'requiresE2EE',
+    'plaintextTestMode',
+  ]) {
+    if (Object.prototype.hasOwnProperty.call(capabilities, key)) {
+      uri.searchParams.set(key, String(capabilities[key]));
+    }
+  }
 }
 
 function redactRelaySecret(rawUri) {

@@ -30,6 +30,7 @@ class AppConfig {
     this.relayPairingExpiresAt = 0,
     this.relayClientId = '',
     this.relayClientReconnectSecret = '',
+    this.relayNodeFingerprintHex = '',
   });
 
   final String host;
@@ -53,6 +54,7 @@ class AppConfig {
   final int relayPairingExpiresAt;
   final String relayClientId;
   final String relayClientReconnectSecret;
+  final String relayNodeFingerprintHex;
 
   bool get isRelayMode => connectionMode == ConnectionMode.relay.name;
 
@@ -121,6 +123,7 @@ class AppConfig {
     int? relayPairingExpiresAt,
     String? relayClientId,
     String? relayClientReconnectSecret,
+    String? relayNodeFingerprintHex,
   }) {
     final nextEngine = engine ?? this.engine;
     final nextModels = AppConfigEngineModels.resolve(
@@ -166,6 +169,8 @@ class AppConfig {
       relayClientId: relayClientId ?? this.relayClientId,
       relayClientReconnectSecret:
           relayClientReconnectSecret ?? this.relayClientReconnectSecret,
+      relayNodeFingerprintHex:
+          relayNodeFingerprintHex ?? this.relayNodeFingerprintHex,
     );
   }
 
@@ -225,6 +230,8 @@ class AppConfig {
         if (relayClientId.trim().isNotEmpty) 'relayClientId': relayClientId,
         if (relayClientReconnectSecret.trim().isNotEmpty)
           'relayClientReconnectSecret': relayClientReconnectSecret,
+        if (relayNodeFingerprintHex.trim().isNotEmpty)
+          'relayNodeFingerprintHex': relayNodeFingerprintHex,
         if (secureTransport != null) 'secureTransport': secureTransport!,
       };
 
@@ -268,6 +275,8 @@ class AppConfig {
       relayClientId: (json['relayClientId'] ?? '').toString(),
       relayClientReconnectSecret:
           (json['relayClientReconnectSecret'] ?? '').toString(),
+      relayNodeFingerprintHex:
+          (json['relayNodeFingerprintHex'] ?? '').toString(),
     );
   }
 
@@ -300,6 +309,7 @@ class AppConfig {
         relayPairingExpiresAt: relayPairing.expiresAt,
         relayClientId: '',
         relayClientReconnectSecret: '',
+        relayNodeFingerprintHex: relayPairing.nodeFingerprintHex,
       );
     }
     final uri = Uri.tryParse(trimmed);

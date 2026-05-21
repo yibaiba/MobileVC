@@ -18,12 +18,13 @@ import (
 )
 
 type Config struct {
-	RelayURL         string
-	PairingTTL       time.Duration
-	AgentGracePeriod time.Duration
-	PairingEventPath string
-	ReconnectBackoff ReconnectBackoff
-	Capabilities     e2ee.CapabilitySet
+	RelayURL           string
+	PairingTTL         time.Duration
+	AgentGracePeriod   time.Duration
+	PairingEventPath   string
+	ReconnectBackoff   ReconnectBackoff
+	Capabilities       e2ee.CapabilitySet
+	NodeFingerprintHex string
 }
 
 type ReconnectBackoff struct {
@@ -32,12 +33,13 @@ type ReconnectBackoff struct {
 }
 
 type PairingReadyEvent struct {
-	Type          string             `json:"type"`
-	RelayURL      string             `json:"relayUrl"`
-	SessionID     string             `json:"sessionId"`
-	PairingSecret string             `json:"pairingSecret"`
-	ExpiresAt     int64              `json:"expiresAt"`
-	Capabilities  e2ee.CapabilitySet `json:"capabilities"`
+	Type               string             `json:"type"`
+	RelayURL           string             `json:"relayUrl"`
+	SessionID          string             `json:"sessionId"`
+	PairingSecret      string             `json:"pairingSecret"`
+	ExpiresAt          int64              `json:"expiresAt"`
+	Capabilities       e2ee.CapabilitySet `json:"capabilities"`
+	NodeFingerprintHex string             `json:"nodeFingerprintHex"`
 }
 
 type LocalPairingEmitter func(string, PairingReadyEvent) error
@@ -83,12 +85,13 @@ func Run(ctx context.Context, cfg Config, handler Handler, emit LocalPairingEmit
 		return err
 	}
 	if err := emit(cfg.PairingEventPath, PairingReadyEvent{
-		Type:          "mobilevc.relay.pairing_ready",
-		RelayURL:      cfg.RelayURL,
-		SessionID:     sessionID,
-		PairingSecret: pairingSecret,
-		ExpiresAt:     expiresAt.Unix(),
-		Capabilities:  req.Capabilities,
+		Type:               "mobilevc.relay.pairing_ready",
+		RelayURL:           cfg.RelayURL,
+		SessionID:          sessionID,
+		PairingSecret:      pairingSecret,
+		ExpiresAt:          expiresAt.Unix(),
+		Capabilities:       req.Capabilities,
+		NodeFingerprintHex: strings.TrimSpace(cfg.NodeFingerprintHex),
 	}); err != nil {
 		_ = conn.Close()
 		return err
@@ -114,7 +117,26 @@ func validateConfig(cfg Config) error {
 	if strings.TrimSpace(cfg.PairingEventPath) == "" {
 		return fmt.Errorf("relay pairing event path is required")
 	}
+	if !isFingerprintHex(cfg.NodeFingerprintHex) {
+		return fmt.Errorf("relay node fingerprint is required")
+	}
 	return nil
+}
+
+func isFingerprintHex(value string) bool {
+	normalized := strings.TrimSpace(value)
+	if len(normalized) != 64 {
+		return false
+	}
+	for _, char := range normalized {
+		if (char >= '0' && char <= '9') ||
+			(char >= 'a' && char <= 'f') ||
+			(char >= 'A' && char <= 'F') {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func connectAndRegister(ctx context.Context, cfg Config, req agentRegisterRequest) (*websocket.Conn, error) {

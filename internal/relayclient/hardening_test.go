@@ -238,12 +238,13 @@ func TestRegisterAgentSendsExplicitCapabilities(t *testing.T) {
 
 func TestPairingEventIncludesCapabilities(t *testing.T) {
 	event := PairingReadyEvent{
-		Type:          "mobilevc.relay.pairing_ready",
-		RelayURL:      "wss://relay.example.test",
-		SessionID:     "rs_capability",
-		PairingSecret: "pair-secret",
-		ExpiresAt:     time.Now().Add(time.Minute).Unix(),
-		Capabilities:  e2ee.PlaintextTestCapabilities(),
+		Type:               "mobilevc.relay.pairing_ready",
+		RelayURL:           "wss://relay.example.test",
+		SessionID:          "rs_capability",
+		PairingSecret:      "pair-secret",
+		ExpiresAt:          time.Now().Add(time.Minute).Unix(),
+		Capabilities:       e2ee.PlaintextTestCapabilities(),
+		NodeFingerprintHex: testNodeFingerprintHex,
 	}
 
 	raw, err := json.Marshal(event)
@@ -257,7 +258,24 @@ func TestPairingEventIncludesCapabilities(t *testing.T) {
 	if err := e2ee.ValidatePlaintextTestCapabilities(decoded.Capabilities); err != nil {
 		t.Fatalf("decoded capabilities: %v", err)
 	}
+	if decoded.NodeFingerprintHex != testNodeFingerprintHex {
+		t.Fatalf("node fingerprint: got %q", decoded.NodeFingerprintHex)
+	}
 }
+
+func TestValidateConfigRequiresNodeFingerprint(t *testing.T) {
+	err := validateConfig(Config{
+		RelayURL:         "wss://relay.example.test",
+		PairingTTL:       time.Minute,
+		AgentGracePeriod: time.Minute,
+		PairingEventPath: "/tmp/mobilevc-relay-pairing.json",
+	})
+	if err == nil || !strings.Contains(err.Error(), "node fingerprint") {
+		t.Fatalf("expected node fingerprint config error, got %v", err)
+	}
+}
+
+const testNodeFingerprintHex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
 func newRelayClientTestConns(t *testing.T) (*websocket.Conn, *websocket.Conn) {
 	t.Helper()

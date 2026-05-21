@@ -150,6 +150,8 @@ await prefs.setString('mobilevc.app_config', jsonEncode(config.toJson()));
 - `RelayE2eeCapabilitySet.plaintextTestMode()` is explicit test mode only and must not be presented as verified.
 - Capability values must be applied to `RelayE2eeHandshakeInput` before generating or validating the transcript.
 - `mobilevc://relay/v1` pairing links may include capability hints using the same capability field names; if any capability hint is present, all capability fields are required and must validate before import succeeds.
+- `mobilevc://relay/v1` pairing links must include `nodeFingerprint` as a 64-character hex SHA-256 fingerprint. Import must fail if the fingerprint is missing or malformed.
+- `AppConfig.relayNodeFingerprintHex` is non-secret pairing metadata and may be persisted; pairing secrets and pairing expiry remain non-persistent.
 - `RelayTunnelFrame.validate()` must enforce both required fields and unexpected-field rejection per frame type; `ping` and `pong` carry no stream metadata.
 - `RelayTunnelCounterState.nextSeq(streamId)` must allocate sequence numbers per stream ID, not globally across the relay tunnel.
 - Fingerprint mismatch, revoked device, decrypt failure, unsupported version, missing capability, or missing plaintext rejection must produce neutral or blocking copy, not security-positive copy.
@@ -163,6 +165,7 @@ await prefs.setString('mobilevc.app_config', jsonEncode(config.toJson()));
 - Production capability missing multiplex stream, file download stream, or device management support -> validation error.
 - Unsupported relay/e2ee/tunnel version or crypto suite -> validation error.
 - Relay pairing URI with partial, malformed, or contradictory capability hints -> import failure, not silent direct/relay fallback.
+- Relay pairing URI with missing or malformed `nodeFingerprint` -> import failure.
 - Tunnel frame with an unknown stream type, missing required field, or unexpected field for its frame type -> `FormatException`.
 - Fingerprint mismatch -> `指纹已变化`, blocking.
 - Device revoked -> `设备已撤销`, blocking.
@@ -183,6 +186,7 @@ await prefs.setString('mobilevc.app_config', jsonEncode(config.toJson()));
 - Verified state only when every condition is true.
 - Capability tests assert production success, production plaintext-test rejection, missing tunnel feature rejection, explicit plaintext test-mode validation, unsupported version rejection, and handshake transcript binding.
 - Config/import tests assert relay pairing URI capability hints validate and invalid hints fail explicitly.
+- Config/import tests assert relay pairing URI node fingerprint is required.
 - Tunnel tests assert required fields, unexpected-field rejection, unknown stream type rejection, per-stream sequence allocation, per-stream replay rejection, and zero-window rejection.
 - Test-mode, fingerprint mismatch, revoked device, decrypt failure, unsupported capability, and plaintext-not-rejected states cannot show verified.
 - Direct mode never implies E2EE verified.

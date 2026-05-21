@@ -49,6 +49,8 @@ test('buildRelayPairingUri does not include direct backend token', () => {
     sessionId: 'rs_test',
     pairingSecret: 'pair_secret',
     expiresAt: 1760000000,
+    nodeFingerprintHex: TEST_NODE_FINGERPRINT,
+    capabilities: plaintextCapabilities(),
   });
 
   const parsed = new URL(uri);
@@ -57,6 +59,9 @@ test('buildRelayPairingUri does not include direct backend token', () => {
   assert.equal(parsed.searchParams.get('relay'), 'wss://relay.example.test');
   assert.equal(parsed.searchParams.get('session'), 'rs_test');
   assert.equal(parsed.searchParams.get('secret'), 'pair_secret');
+  assert.equal(parsed.searchParams.get('nodeFingerprint'), TEST_NODE_FINGERPRINT);
+  assert.equal(parsed.searchParams.get('relayProtocolVersion'), '1');
+  assert.equal(parsed.searchParams.get('plaintextTestMode'), 'true');
   assert.equal(parsed.searchParams.has('token'), false);
 });
 
@@ -69,6 +74,8 @@ test('relay pairing event file is read locally and removable', () => {
     sessionId: 'rs_test',
     pairingSecret: 'pair_secret',
     expiresAt: 1760000000,
+    nodeFingerprintHex: TEST_NODE_FINGERPRINT,
+    capabilities: plaintextCapabilities(),
   };
   fs.writeFileSync(eventPath, `${JSON.stringify(event)}\n`, { mode: 0o600 });
 
@@ -115,3 +122,19 @@ test('resolveBinaryInfo can fall back to bundled package paths in repo', () => {
   const info = resolveBinaryInfo('darwin-arm64');
   assert.ok(info.binaryPath.endsWith('/packages/server-darwin-arm64/bin/mobilevc-server'));
 });
+
+const TEST_NODE_FINGERPRINT = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+
+function plaintextCapabilities() {
+  return {
+    relayProtocolVersion: 1,
+    e2eeProtocolVersion: 1,
+    cryptoSuite: 'p256-ecdsa+p256-ecdh+hkdf-sha256+aes-256-gcm',
+    tunnelProtocolVersion: 1,
+    supportsMultiplexStreams: true,
+    supportsFileDownloadStream: true,
+    supportsDeviceManagement: true,
+    requiresE2EE: false,
+    plaintextTestMode: true,
+  };
+}

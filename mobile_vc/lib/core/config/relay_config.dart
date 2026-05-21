@@ -8,6 +8,7 @@ class RelayPairing {
     required this.sessionId,
     required this.pairingSecret,
     required this.expiresAt,
+    required this.nodeFingerprintHex,
     this.capabilities,
   });
 
@@ -15,6 +16,7 @@ class RelayPairing {
   final String sessionId;
   final String pairingSecret;
   final int expiresAt;
+  final String nodeFingerprintHex;
   final RelayE2eeCapabilitySet? capabilities;
 }
 
@@ -53,9 +55,15 @@ RelayPairing? parseRelayPairingUri(String raw) {
   final sessionId = (uri.queryParameters['session'] ?? '').trim();
   final secret = (uri.queryParameters['secret'] ?? '').trim();
   final expiresAt = int.tryParse(uri.queryParameters['exp'] ?? '');
+  final nodeFingerprintHex =
+      (uri.queryParameters['nodeFingerprint'] ?? '').trim().toLowerCase();
   final capabilities = _parseRelayCapabilities(uri);
   if (relayUrl.isEmpty || sessionId.isEmpty || secret.isEmpty) {
     throw const FormatException('relay pairing uri is missing fields');
+  }
+  if (!_isFingerprintHex(nodeFingerprintHex)) {
+    throw const FormatException(
+        'relay pairing uri is missing node fingerprint');
   }
   validateRelayUrl(relayUrl);
   return RelayPairing(
@@ -63,8 +71,23 @@ RelayPairing? parseRelayPairingUri(String raw) {
     sessionId: sessionId,
     pairingSecret: secret,
     expiresAt: expiresAt ?? 0,
+    nodeFingerprintHex: nodeFingerprintHex,
     capabilities: capabilities,
   );
+}
+
+bool _isFingerprintHex(String value) {
+  if (value.length != 64) {
+    return false;
+  }
+  for (final unit in value.codeUnits) {
+    final isDigit = unit >= 0x30 && unit <= 0x39;
+    final isLowerHex = unit >= 0x61 && unit <= 0x66;
+    if (!isDigit && !isLowerHex) {
+      return false;
+    }
+  }
+  return true;
 }
 
 RelayE2eeCapabilitySet? _parseRelayCapabilities(Uri uri) {
