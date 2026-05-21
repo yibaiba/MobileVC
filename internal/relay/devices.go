@@ -61,13 +61,11 @@ func (s *Server) RotateSessionCredentials(sessionID string) bool {
 		s.mu.Unlock()
 		return false
 	}
-	for _, device := range state.devices {
-		device.Revoked = true
-	}
 	client := state.client
 	state.client = nil
 	state.clientID = ""
 	state.clientReconnectHash = ""
+	state.devices = map[string]*deviceState{}
 	state.pairingHash = ""
 	state.pairingConsumed = true
 	s.mu.Unlock()

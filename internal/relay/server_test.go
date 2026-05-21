@@ -155,7 +155,7 @@ func TestRelayRejectsClientReconnectWithWrongSecret(t *testing.T) {
 	if err := bad.ReadJSON(&errFrame); err != nil {
 		t.Fatalf("read reconnect error: %v", err)
 	}
-	if errFrame.Code != CodePairingRejected {
+	if errFrame.Code != CodeDeviceUnknown {
 		t.Fatalf("unexpected reconnect error: %#v", errFrame)
 	}
 }

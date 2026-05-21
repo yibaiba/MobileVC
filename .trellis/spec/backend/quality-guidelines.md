@@ -146,6 +146,8 @@ _ = relayclient.EmitPairingFile(pairingEventPath, event)
 - Same device identity may have only one active session ID; marking the same device seen with a new session returns the replaced session ID so callers can close the older connection explicitly.
 - Device trust store methods must serialize access internally; concurrent pairing/reconnect/revoke/rotation must not race the map or JSON file.
 - `ClearTrustedDevicesForNodeRotation` only clears device trust as part of a broader node identity rotation flow. It must not be presented as complete global rotate by itself.
+- Relay runtime client reconnect must return stable device lifecycle error codes: revoked devices fail with `device_revoked`; unknown devices, wrong reconnect credentials, and post-rotation stale clients fail with `device_unknown`.
+- Relay runtime `RotateSessionCredentials` clears runtime device records and reconnect secrets for that session. Single-device `RevokeDevice` keeps the device visible as revoked; global rotation intentionally makes previous runtime devices unknown.
 
 #### 4. Validation & Error Matrix
 - Empty store path -> explicit config error.
@@ -153,6 +155,8 @@ _ = relayclient.EmitPairingFile(pairingEventPath, event)
 - Stored fingerprint mismatch -> load error.
 - Unknown device -> `device_unknown`.
 - Revoked device -> `device_revoked`.
+- Wrong runtime client reconnect secret -> `device_unknown`.
+- Runtime global rotation cleanup -> runtime device list is cleared and previous client reconnect credentials fail as `device_unknown`.
 - Duplicate device registration -> `device_already_bound`; revoked devices must not be silently re-enabled by registering the same ID again.
 - Wrong credential -> `device_unknown`.
 - Node rotation cleanup -> trusted device list is cleared and previous credentials fail as `device_unknown`.
@@ -160,6 +164,7 @@ _ = relayclient.EmitPairingFile(pairingEventPath, event)
 #### 5. Good/Base/Bad Cases
 - Good: local node stores only `DeviceCredentialHash(deviceCredential)` while Flutter keeps the plaintext credential in platform secure storage.
 - Good: revoke clears `ActiveSessionID` and later reconnect fails before E2EE traffic keys are accepted.
+- Good: relay runtime single-device revoke returns `device_revoked`, while global rotation returns `device_unknown` for old reconnect credentials.
 - Base: relay server may keep runtime connection state for routing/caps, but not durable device trust.
 - Bad: persisting E2EE device trust in the public relay server database.
 - Bad: writing plaintext device credential or private key material into JSON, logs, pairing links, or relay frames.
@@ -169,6 +174,7 @@ _ = relayclient.EmitPairingFile(pairingEventPath, event)
 - Store file does not contain plaintext credential.
 - Credential verification accepts valid credential and rejects wrong/revoked/rotated devices.
 - Marking a device seen returns the replaced active session ID.
+- Relay runtime tests assert wrong reconnect secret -> `device_unknown`, revoked device -> `device_revoked`, and global rotation clears runtime devices.
 - Fingerprint/public-key tamper causes load failure.
 - Concurrent registration/seen/revoke operations do not race or lose device records.
 

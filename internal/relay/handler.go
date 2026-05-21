@@ -66,7 +66,7 @@ func (s *Server) clientLoop(peer *peerConn) {
 	go peer.StartWriter(s.cfg.PingInterval)
 	sessionID, clientID, err := s.authenticateClient(peer, peer.remote)
 	if err != nil {
-		writeError(peer, CodePairingRejected)
+		writeError(peer, errorCode(err, CodePairingRejected))
 		return
 	}
 	logx.Info("relay", "client paired: sessionID=%s clientID=%s remote=%s", sessionID, clientID, peer.remote)

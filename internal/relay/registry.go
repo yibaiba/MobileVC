@@ -139,10 +139,10 @@ func (s *Server) reconnectClient(peer *peerConn, raw []byte) (string, string, er
 	}
 	s.mu.Lock()
 	state := s.sessions[strings.TrimSpace(frame.SessionID)]
-	device := s.reconnectableDevice(state, frame.ClientID, frame.ClientReconnectSecret)
-	if device == nil {
+	device, err := s.reconnectableDevice(state, frame.ClientID, frame.ClientReconnectSecret)
+	if err != nil {
 		s.mu.Unlock()
-		return "", "", errors.New("client reconnect rejected")
+		return "", "", err
 	}
 	previousClient := state.client
 	state.client = peer
@@ -177,25 +177,29 @@ func (s *Server) canPair(state *sessionState, remote string) bool {
 }
 
 func (s *Server) canReconnectClient(state *sessionState, clientID string, secret string) bool {
-	return s.reconnectableDevice(state, clientID, secret) != nil
+	_, err := s.reconnectableDevice(state, clientID, secret)
+	return err == nil
 }
 
-func (s *Server) reconnectableDevice(state *sessionState, clientID string, secret string) *deviceState {
+func (s *Server) reconnectableDevice(state *sessionState, clientID string, secret string) (*deviceState, error) {
 	if state == nil || state.agent == nil {
-		return nil
+		return nil, newCodeError(CodeDeviceUnknown, "client reconnect rejected")
 	}
 	normalizedID := strings.TrimSpace(clientID)
 	if normalizedID == "" {
-		return nil
+		return nil, newCodeError(CodeDeviceUnknown, "client reconnect rejected")
 	}
 	device := state.devices[normalizedID]
-	if device == nil || device.Revoked {
-		return nil
+	if device == nil {
+		return nil, newCodeError(CodeDeviceUnknown, "client reconnect rejected")
+	}
+	if device.Revoked {
+		return nil, newCodeError(CodeDeviceRevoked, "client reconnect rejected")
 	}
 	if !SecretHashMatches(device.ReconnectHash, secret) {
-		return nil
+		return nil, newCodeError(CodeDeviceUnknown, "client reconnect rejected")
 	}
-	return device
+	return device, nil
 }
 
 func (s *Server) recordPairingFailure(state *sessionState, remote string) {

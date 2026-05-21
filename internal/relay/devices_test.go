@@ -80,7 +80,7 @@ func TestRelayRevokedDeviceCannotReconnect(t *testing.T) {
 	reconnected := dialRelay(t, server.URL, "/relay/client")
 	defer reconnected.Close()
 	writeReconnectClient(t, reconnected, sessionID, clientID, reconnectSecret)
-	readPairingRejected(t, reconnected)
+	readRelayError(t, reconnected, CodeDeviceRevoked)
 }
 
 func TestRelayRotateSessionCredentialsRevokesDevices(t *testing.T) {
@@ -101,14 +101,37 @@ func TestRelayRotateSessionCredentialsRevokesDevices(t *testing.T) {
 		t.Fatal("expected credential rotation to succeed")
 	}
 	devices := relayServer.Devices(sessionID)
-	if got := onlyDevice(t, devices); !got.Revoked || got.Connected {
-		t.Fatalf("unexpected rotated device: %#v", got)
+	if len(devices) != 0 {
+		t.Fatalf("rotation should clear runtime devices: %#v", devices)
 	}
 
 	reconnected := dialRelay(t, server.URL, "/relay/client")
 	defer reconnected.Close()
 	writeReconnectClient(t, reconnected, sessionID, clientID, reconnectSecret)
-	readPairingRejected(t, reconnected)
+	readRelayError(t, reconnected, CodeDeviceUnknown)
+}
+
+func TestRelayClientReconnectWrongSecretReturnsDeviceUnknown(t *testing.T) {
+	relayServer, server := newInspectableRelayServer(t, Config{})
+	defer server.Close()
+
+	sessionID := "rs_device_wrong_secret"
+	secret := "pair-secret-128-bit-minimum"
+	agent := dialRelay(t, server.URL, "/relay/agent")
+	defer agent.Close()
+	registerAgent(t, agent, sessionID, secret, "reconnect-secret", time.Now().Add(time.Minute))
+
+	client := dialRelay(t, server.URL, "/relay/client")
+	clientID, _ := pairClientWithReconnectSecret(t, client, sessionID, secret)
+	readAttached(t, agent, clientID)
+	if got := onlyDevice(t, relayServer.Devices(sessionID)); got.ClientID != clientID {
+		t.Fatalf("unexpected device: %#v", got)
+	}
+
+	reconnected := dialRelay(t, server.URL, "/relay/client")
+	defer reconnected.Close()
+	writeReconnectClient(t, reconnected, sessionID, clientID, "wrong-secret")
+	readRelayError(t, reconnected, CodeDeviceUnknown)
 }
 
 func reconnectClient(t *testing.T, conn interface {
@@ -141,11 +164,16 @@ func writeReconnectClient(t *testing.T, conn interface{ WriteJSON(any) error }, 
 
 func readPairingRejected(t *testing.T, conn interface{ ReadJSON(any) error }) {
 	t.Helper()
+	readRelayError(t, conn, CodePairingRejected)
+}
+
+func readRelayError(t *testing.T, conn interface{ ReadJSON(any) error }, wantCode string) {
+	t.Helper()
 	var errFrame ErrorFrame
 	if err := conn.ReadJSON(&errFrame); err != nil {
-		t.Fatalf("read pairing rejected: %v", err)
+		t.Fatalf("read relay error: %v", err)
 	}
-	if errFrame.Code != CodePairingRejected {
+	if errFrame.Code != wantCode {
 		t.Fatalf("unexpected error frame: %#v", errFrame)
 	}
 }
