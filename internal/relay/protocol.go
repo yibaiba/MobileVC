@@ -12,6 +12,10 @@ const (
 	TypeClientReconnect = "client.reconnect"
 	TypeClientPaired    = "client.paired"
 	TypeClientAttached  = "client.attached"
+	TypeClientE2EEHello = e2ee.FrameTypeClientE2EEHello
+	TypeAgentE2EEHello  = e2ee.FrameTypeAgentE2EEHello
+	TypeClientE2EEProof = e2ee.FrameTypeClientE2EEProof
+	TypeAgentE2EEResult = e2ee.FrameTypeAgentE2EEResult
 	TypeRelayForward    = "relay.forward"
 	TypeRelayError      = "relay.error"
 	TypeRelayPing       = "relay.ping"
@@ -108,6 +112,11 @@ type ClientAttachedFrame struct {
 	SessionID string `json:"sessionId"`
 	ClientID  string `json:"clientId"`
 }
+
+type E2EEClientHelloFrame = e2ee.ClientHelloFrame
+type E2EEAgentHelloFrame = e2ee.AgentHelloFrame
+type E2EEClientProofFrame = e2ee.ClientProofFrame
+type E2EEAgentResultFrame = e2ee.AgentResultFrame
 
 type ForwardEnvelope struct {
 	Type            string `json:"type"`

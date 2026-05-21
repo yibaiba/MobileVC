@@ -49,6 +49,7 @@ Questions to answer:
 - Relay E2EE env: `RELAY_REQUIRE_E2EE=true|false`, `RELAY_PLAINTEXT_TEST_MODE=true|false`
 - Relay E2EE flags: `--require-e2ee[=true|false]`, `--plaintext-test-mode[=true|false]`
 - Relay E2EE capabilities: `e2ee.CapabilitySet`, `e2ee.ProductionCapabilities()`, `e2ee.PlaintextTestCapabilities()`, `ValidateProductionCapabilities`, `ValidatePlaintextTestCapabilities`
+- Relay E2EE handshake control frames: `client.e2ee_hello`, `agent.e2ee_hello`, `client.e2ee_proof`, `agent.e2ee_result`
 
 #### 3. Contracts
 - Relay server forwards only `relay.forward` envelopes with base64url payloads; it must not parse MobileVC business actions.
@@ -57,6 +58,12 @@ Questions to answer:
 - E2EE `relay.forward` frames use `encryption=p256-ecdsa+p256-ecdh+hkdf-sha256+aes-256-gcm`, `payloadEncoding=base64url`, non-zero `streamId`, and non-empty `handshakeId`. Counter `0` is valid because stream counters start at zero.
 - E2EE capability negotiation fields are `relayProtocolVersion`, `e2eeProtocolVersion`, `cryptoSuite`, `tunnelProtocolVersion`, `supportsMultiplexStreams`, `supportsFileDownloadStream`, `supportsDeviceManagement`, `requiresE2EE`, and `plaintextTestMode`; these fields are bound into the handshake transcript before deriving traffic keys.
 - Production capabilities must require E2EE, disable plaintext test mode, use the supported relay/e2ee/tunnel versions, use the supported crypto suite, and support multiplex streams, file download streams, and device management.
+- E2EE handshake control frames are relay control frames, not MobileVC business payloads. Public keys, signatures, pairing proofs, device proofs, and device signatures are base64url strings in JSON, never raw byte arrays.
+- `client.e2ee_hello` carries `sessionId`, `clientId`, `handshakeId`, `kind`, `capabilities`, `clientEphemeralPublicKey`, and for reconnect only `deviceId` plus `deviceIdentityPublicKey`.
+- `agent.e2ee_hello` carries `sessionId`, `clientId`, `handshakeId`, `capabilities`, `nodeEphemeralPublicKey`, `nodeIdentityPublicKey`, and `nodeSignature`.
+- `client.e2ee_proof` carries exactly one proof family: pairing uses `pairingProof`; reconnect uses `deviceProof` plus `deviceSignature`.
+- `agent.e2ee_result` uses `ok=true` without `errorCode`, or `ok=false` with a stable relay/E2EE error code.
+- E2EE handshake frame validators must reject missing routing IDs, missing capabilities, unsupported capability versions, malformed base64url material, invalid P-256 public keys, invalid handshake kind, and pairing/reconnect field mixups.
 - `agent.register` must include an explicit `capabilities` object. Production relay mode rejects plaintext-test capabilities with `e2ee_unsupported_version`; plaintext test relay mode requires explicit plaintext-test capabilities.
 - Local pairing event files must include the same capability object so QR/link import can validate version and test-mode hints before connecting.
 - Local relay client pairing events must include `nodeFingerprintHex` derived from the local node identity public key; relay links must never omit the node fingerprint because Flutter uses it to verify the handshake public key later.
@@ -89,6 +96,10 @@ Questions to answer:
 - Invalid relay boolean env value -> config error; do not silently fall back to defaults.
 - `RELAY_REQUIRE_E2EE=true` together with `RELAY_PLAINTEXT_TEST_MODE=true` -> config error.
 - Capability production validation with `plaintextTestMode=true`, missing required tunnel features, unsupported versions, or unsupported crypto suite -> E2EE handshake failure / unsupported version path.
+- E2EE handshake frame with malformed base64url key/proof/signature material -> `e2ee_handshake_failed`.
+- E2EE handshake frame with invalid P-256 public key material -> `e2ee_handshake_failed`.
+- E2EE pairing proof frame containing reconnect-only fields, or reconnect proof frame containing `pairingProof` -> `e2ee_handshake_failed`.
+- `agent.e2ee_result` with `ok=true` and `errorCode`, or `ok=false` without `errorCode` -> protocol/handshake failure.
 - Plaintext-test capability validation requires `requiresE2EE=false` and `plaintextTestMode=true`; implicit plaintext is invalid.
 - Missing or incompatible `agent.register.capabilities` -> `relay.error` with `e2ee_unsupported_version` when the relay can classify the incompatibility, otherwise `unauthorized`.
 - Tunnel frames with unknown stream types, missing required fields, or unexpected fields for their frame type -> explicit tunnel validation error.
@@ -108,6 +119,7 @@ Questions to answer:
 - Good: backend writes pairing data to an owner-only temp file, launcher reads and deletes it, logs show only redacted URI.
 - Good: public relay starts with E2EE required and rejects plaintext before forwarding payloads.
 - Good: both Go and Flutter build handshake input from the same explicit capability set before signing/verifying the transcript.
+- Good: handshake control frames carry key/proof/signature bytes as base64url strings and validate before building a `HandshakeInput`.
 - Good: local test relay agent declares `PlaintextTestCapabilities()` and production relay agent declares `ProductionCapabilities()`; never infer mode from missing fields.
 - Good: `mobilevc://relay/v1` includes `nodeFingerprint=<64 lowercase hex chars>` plus capability hints, but never includes node private keys, device private keys, or traffic keys.
 - Good: relay-only backend logs `health=http://127.0.0.1:<port>/healthz` and `ws=ws://127.0.0.1:<port>/ws?token=<redacted>`; it must not concatenate `localhost` with a full host:port listen address.
@@ -123,6 +135,7 @@ Questions to answer:
 - Relay pairing, one-time secret consumption, URL validation, oversized payload, and opaque unknown business payload forwarding.
 - Network exposure tests must cover listen address plus generated health/version/websocket URLs for LAN and relay-only modes.
 - E2EE capability tests must cover production success, plaintext-test rejection in production, missing tunnel feature rejection, explicit plaintext test-mode validation, unsupported version rejection, and applying capabilities to handshake transcript input.
+- E2EE handshake frame tests must cover pairing frame round-trip, reconnect device identity requirements, malformed base64url material, invalid P-256 public keys, missing capabilities, and pairing/reconnect field mixups.
 - Relay registration tests must cover explicit capability emission, production rejection of plaintext-test capabilities, and pairing event capability serialization.
 - Launcher/backend tests must cover relay pairing links carrying node fingerprint and capability query parameters without leaking direct backend auth tokens.
 - E2EE tunnel tests must cover required fields, unexpected-field rejection, unknown stream type rejection, per-stream sequence allocation, per-stream replay rejection, and zero-window rejection.

@@ -138,6 +138,7 @@ await prefs.setString('mobilevc.app_config', jsonEncode(config.toJson()));
 - Security input: `RelaySecurityInput`
 - Evaluator: `RelaySecurityStateEvaluator.evaluate(input)`
 - Capability input: `RelayE2eeCapabilitySet`
+- Handshake frame DTOs: `RelayE2eeClientHelloFrame`, `RelayE2eeAgentHelloFrame`, `RelayE2eeClientProofFrame`, `RelayE2eeAgentResultFrame`
 - Verified gate: `RelaySecurityState.canShowVerified`
 - Blocking states: `fingerprintMismatch`, `deviceRevoked`, `plaintextDisabled`, `encryptionUnavailable`
 
@@ -149,6 +150,12 @@ await prefs.setString('mobilevc.app_config', jsonEncode(config.toJson()));
 - `RelayE2eeCapabilitySet.production()` must require E2EE, disable plaintext test-mode, and require multiplex streams, file download streams, and device management before it can be used for verified security state.
 - `RelayE2eeCapabilitySet.plaintextTestMode()` is explicit test mode only and must not be presented as verified.
 - Capability values must be applied to `RelayE2eeHandshakeInput` before generating or validating the transcript.
+- Relay E2EE handshake control frame JSON must match Go exactly: `client.e2ee_hello`, `agent.e2ee_hello`, `client.e2ee_proof`, and `agent.e2ee_result`.
+- Public keys, signatures, pairing proofs, device proofs, and device signatures in E2EE handshake frames are base64url strings. Flutter must not serialize these fields as JSON byte arrays.
+- `RelayE2eeClientHelloFrame` validates production capabilities, required routing IDs, valid handshake kind, valid client ephemeral P-256 key, and reconnect-only device identity fields.
+- `RelayE2eeAgentHelloFrame` validates production capabilities, node ephemeral key, node identity key, and non-empty node signature before the app builds/verifies a handshake transcript.
+- `RelayE2eeClientProofFrame` must not mix pairing and reconnect proof fields. Pairing uses only `pairingProof`; reconnect uses `deviceProof` plus `deviceSignature`.
+- `RelayE2eeAgentResultFrame` must use `ok=true` without `errorCode`, or `ok=false` with an actionable relay/E2EE error code.
 - `mobilevc://relay/v1` pairing links may include capability hints using the same capability field names; if any capability hint is present, all capability fields are required and must validate before import succeeds.
 - `mobilevc://relay/v1` pairing links must include `nodeFingerprint` as a 64-character hex SHA-256 fingerprint. Import must fail if the fingerprint is missing or malformed.
 - `AppConfig.relayNodeFingerprintHex` is non-secret pairing metadata and may be persisted; pairing secrets and pairing expiry remain non-persistent.
@@ -166,6 +173,9 @@ await prefs.setString('mobilevc.app_config', jsonEncode(config.toJson()));
 - Unsupported relay/e2ee/tunnel version or crypto suite -> validation error.
 - Relay pairing URI with partial, malformed, or contradictory capability hints -> import failure, not silent direct/relay fallback.
 - Relay pairing URI with missing or malformed `nodeFingerprint` -> import failure.
+- E2EE handshake frame with missing capabilities, malformed base64url material, invalid P-256 public key, invalid kind, or pairing/reconnect field mixup -> `FormatException` / explicit connection failure.
+- E2EE handshake frame with plaintext-test capabilities where production handshake is required -> validation error; do not silently continue as plaintext.
+- `agent.e2ee_result` with `ok=false` and no `errorCode`, or `ok=true` and an `errorCode` -> `FormatException`.
 - Tunnel frame with an unknown stream type, missing required field, or unexpected field for its frame type -> `FormatException`.
 - Fingerprint mismatch -> `指纹已变化`, blocking.
 - Device revoked -> `设备已撤销`, blocking.
@@ -185,6 +195,7 @@ await prefs.setString('mobilevc.app_config', jsonEncode(config.toJson()));
 #### 6. Tests Required
 - Verified state only when every condition is true.
 - Capability tests assert production success, production plaintext-test rejection, missing tunnel feature rejection, explicit plaintext test-mode validation, unsupported version rejection, and handshake transcript binding.
+- Handshake frame tests assert pairing/reconnect frame round-trip, device identity requirement on reconnect, malformed base64url rejection, production capability enforcement, and proof field mixup rejection.
 - Config/import tests assert relay pairing URI capability hints validate and invalid hints fail explicitly.
 - Config/import tests assert relay pairing URI node fingerprint is required.
 - Tunnel tests assert required fields, unexpected-field rejection, unknown stream type rejection, per-stream sequence allocation, per-stream replay rejection, and zero-window rejection.
