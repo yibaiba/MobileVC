@@ -143,6 +143,13 @@ func TestValidateHandshakeFramesRejectInvalidShapes(t *testing.T) {
 		t.Fatal("expected missing capabilities to fail")
 	}
 
+	plaintextCapabilities := PlaintextTestCapabilities()
+	hello.Capabilities = &plaintextCapabilities
+	hello.ClientEphemeralPublicKey = EncodeFrameBytes(input.ClientEphemeralPublicKey)
+	if _, err := ValidateClientHelloFrame(hello); err == nil {
+		t.Fatal("expected plaintext-test capabilities to fail")
+	}
+
 	result := AgentResultFrame{
 		Type:        FrameTypeAgentE2EEResult,
 		Version:     RelayProtocolVersion,

@@ -2,26 +2,148 @@ package relay
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"strings"
 	"time"
 
 	"mobilevc/internal/logx"
+	"mobilevc/internal/relay/e2ee"
 )
 
 func (s *Server) forwardLoop(peer *peerConn, sessionID string, direction string) {
 	for {
-		var env ForwardEnvelope
-		if err := peer.ReadJSON(&env); err != nil {
+		raw, err := peer.ReadRawFrame()
+		if err != nil {
 			return
 		}
-		if err := s.forwardEnvelope(peer, sessionID, direction, env); err != nil {
+		if err := s.dispatchPostAuthFrame(peer, sessionID, direction, raw); err != nil {
 			if errors.Is(err, errPayloadTooLarge) {
 				continue
 			}
 			return
 		}
 	}
+}
+
+func (s *Server) dispatchPostAuthFrame(peer *peerConn, sessionID string, direction string, raw []byte) error {
+	frame, _, err := decodeControlFrame(raw)
+	if err != nil {
+		writeError(peer, CodeProtocolError)
+		return err
+	}
+	if frame.Type == TypeRelayForward {
+		var env ForwardEnvelope
+		if err := json.Unmarshal(raw, &env); err != nil {
+			writeError(peer, CodeProtocolError)
+			return err
+		}
+		return s.forwardEnvelope(peer, sessionID, direction, env)
+	}
+	if isE2EEHandshakeFrameType(frame.Type) {
+		return s.forwardE2EEHandshakeFrame(peer, sessionID, direction, frame.Type, raw)
+	}
+	writeError(peer, CodeProtocolError)
+	return errors.New("unsupported post-auth relay frame")
+}
+
+func isE2EEHandshakeFrameType(frameType string) bool {
+	switch frameType {
+	case TypeClientE2EEHello, TypeAgentE2EEHello, TypeClientE2EEProof, TypeAgentE2EEResult:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Server) forwardE2EEHandshakeFrame(peer *peerConn, sessionID string, direction string, frameType string, raw []byte) error {
+	if int64(len(raw)) > s.cfg.MaxControlFrameBytes {
+		writeError(peer, CodeFrameTooLarge)
+		return errors.New("e2ee handshake control frame too large")
+	}
+	frame, err := decodeE2EEHandshakeFrame(frameType, raw)
+	if err != nil {
+		writeError(peer, CodeE2EEHandshakeFailed)
+		return err
+	}
+	if err := s.validateE2EEHandshakeRouting(peer, sessionID, direction, frame); err != nil {
+		writeError(peer, CodeProtocolError)
+		return err
+	}
+	target := s.targetConn(sessionID, direction)
+	if target == nil {
+		writeError(peer, CodeTargetUnavailable)
+		return errors.New("target unavailable")
+	}
+	if err := target.Enqueue(frame); err != nil {
+		writeError(peer, CodeQueueFull)
+		return err
+	}
+	return nil
+}
+
+func decodeE2EEHandshakeFrame(frameType string, raw []byte) (any, error) {
+	switch frameType {
+	case TypeClientE2EEHello:
+		var frame E2EEClientHelloFrame
+		if err := json.Unmarshal(raw, &frame); err != nil {
+			return nil, err
+		}
+		_, err := e2ee.ValidateClientHelloFrame(frame)
+		return frame, err
+	case TypeAgentE2EEHello:
+		var frame E2EEAgentHelloFrame
+		if err := json.Unmarshal(raw, &frame); err != nil {
+			return nil, err
+		}
+		_, err := e2ee.ValidateAgentHelloFrame(frame)
+		return frame, err
+	case TypeClientE2EEProof:
+		var frame E2EEClientProofFrame
+		if err := json.Unmarshal(raw, &frame); err != nil {
+			return nil, err
+		}
+		_, err := e2ee.ValidateClientProofFrame(frame)
+		return frame, err
+	case TypeAgentE2EEResult:
+		var frame E2EEAgentResultFrame
+		if err := json.Unmarshal(raw, &frame); err != nil {
+			return nil, err
+		}
+		return frame, e2ee.ValidateAgentResultFrame(frame)
+	default:
+		return nil, errors.New("unsupported e2ee handshake frame")
+	}
+}
+
+func (s *Server) validateE2EEHandshakeRouting(peer *peerConn, sessionID string, direction string, frame any) error {
+	var frameSessionID string
+	var clientID string
+	var expectedRole peerRole
+	var expectedDirection string
+	switch typed := frame.(type) {
+	case E2EEClientHelloFrame:
+		frameSessionID, clientID = typed.SessionID, typed.ClientID
+		expectedRole, expectedDirection = roleClient, DirectionClientToAgent
+	case E2EEClientProofFrame:
+		frameSessionID, clientID = typed.SessionID, typed.ClientID
+		expectedRole, expectedDirection = roleClient, DirectionClientToAgent
+	case E2EEAgentHelloFrame:
+		frameSessionID, clientID = typed.SessionID, typed.ClientID
+		expectedRole, expectedDirection = roleAgent, DirectionAgentToClient
+	case E2EEAgentResultFrame:
+		frameSessionID, clientID = typed.SessionID, typed.ClientID
+		expectedRole, expectedDirection = roleAgent, DirectionAgentToClient
+	default:
+		return errors.New("unsupported e2ee handshake routing")
+	}
+	if peer.role != expectedRole || direction != expectedDirection || frameSessionID != sessionID {
+		return errors.New("invalid e2ee handshake routing")
+	}
+	if !s.forwardClientIDMatches(peer, sessionID, clientID) {
+		return errors.New("invalid e2ee handshake client id")
+	}
+	return nil
 }
 
 func (s *Server) forwardEnvelope(peer *peerConn, sessionID string, direction string, env ForwardEnvelope) error {

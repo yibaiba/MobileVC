@@ -64,6 +64,7 @@ Questions to answer:
 - `client.e2ee_proof` carries exactly one proof family: pairing uses `pairingProof`; reconnect uses `deviceProof` plus `deviceSignature`.
 - `agent.e2ee_result` uses `ok=true` without `errorCode`, or `ok=false` with a stable relay/E2EE error code.
 - E2EE handshake frame validators must reject missing routing IDs, missing capabilities, unsupported capability versions, malformed base64url material, invalid P-256 public keys, invalid handshake kind, and pairing/reconnect field mixups.
+- After auth, relay forwards E2EE handshake control frames between the paired client and agent without treating them as `relay.forward` payloads. Routing validation must still bind role, direction, session ID, and current active `clientId`.
 - `agent.register` must include an explicit `capabilities` object. Production relay mode rejects plaintext-test capabilities with `e2ee_unsupported_version`; plaintext test relay mode requires explicit plaintext-test capabilities.
 - Local pairing event files must include the same capability object so QR/link import can validate version and test-mode hints before connecting.
 - Local relay client pairing events must include `nodeFingerprintHex` derived from the local node identity public key; relay links must never omit the node fingerprint because Flutter uses it to verify the handshake public key later.
@@ -108,6 +109,8 @@ Questions to answer:
 - Unknown forward encryption suite -> `relay.error` with `e2ee_unsupported_version`.
 - E2EE forward missing `streamId` or `handshakeId` -> `relay.error` with `protocol_error`.
 - Forward with missing or mismatched `clientId` -> `relay.error` with `protocol_error`.
+- E2EE handshake control frame with wrong role/direction/session/client ID -> `relay.error` with `protocol_error`.
+- E2EE handshake control frame larger than `MaxControlFrameBytes` -> `relay.error` with `frame_too_large`.
 - First agent-to-client forward with an empty `clientId` after successful client pairing -> relay fills the current active `clientId`; wrong non-empty `clientId` still -> `protocol_error`.
 - Missing `client.attached` before the relay websocket closes -> local relay client write returns the underlying read/close error.
 - Per-IP or role capacity exceeded before upgrade -> HTTP 429.
@@ -136,6 +139,7 @@ Questions to answer:
 - Network exposure tests must cover listen address plus generated health/version/websocket URLs for LAN and relay-only modes.
 - E2EE capability tests must cover production success, plaintext-test rejection in production, missing tunnel feature rejection, explicit plaintext test-mode validation, unsupported version rejection, and applying capabilities to handshake transcript input.
 - E2EE handshake frame tests must cover pairing frame round-trip, reconnect device identity requirements, malformed base64url material, invalid P-256 public keys, missing capabilities, and pairing/reconnect field mixups.
+- Relay integration tests must prove E2EE handshake control frames forward in both directions in production E2EE mode and invalid handshake frames return `e2ee_handshake_failed`.
 - Relay registration tests must cover explicit capability emission, production rejection of plaintext-test capabilities, and pairing event capability serialization.
 - Launcher/backend tests must cover relay pairing links carrying node fingerprint and capability query parameters without leaking direct backend auth tokens.
 - E2EE tunnel tests must cover required fields, unexpected-field rejection, unknown stream type rejection, per-stream sequence allocation, per-stream replay rejection, and zero-window rejection.

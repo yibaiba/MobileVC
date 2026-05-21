@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+
+	"mobilevc/internal/relay/e2ee"
 )
 
 func TestRelayPairingAndOpaqueForwarding(t *testing.T) {
@@ -240,6 +242,92 @@ func TestRelayForwardsE2EEFrameWhenE2EERequired(t *testing.T) {
 	}
 	if got.Encryption != EncryptionE2EEV1 || got.StreamID != 9 || got.HandshakeID != "hs_required" {
 		t.Fatalf("unexpected e2ee forward metadata: %#v", got)
+	}
+}
+
+func TestRelayForwardsE2EEHandshakeControlFrames(t *testing.T) {
+	server := newLimitedTestRelayServer(t, Config{RequireE2EE: true})
+	defer server.Close()
+
+	sessionID := "rs_e2ee_handshake"
+	secret := "pair-secret-128-bit-minimum"
+	agent := dialRelay(t, server.URL, "/relay/agent")
+	defer agent.Close()
+	registerAgentWithCapabilities(t, agent, sessionID, secret, "reconnect-secret", time.Now().Add(time.Minute), productionAgentCapabilities())
+	client := dialRelay(t, server.URL, "/relay/client")
+	defer client.Close()
+	clientID := pairClient(t, client, sessionID, secret)
+	readAttached(t, agent, clientID)
+
+	clientEphemeral, err := e2ee.NewEphemeralKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	capabilities := e2ee.ProductionCapabilities()
+	clientHello := E2EEClientHelloFrame{
+		Type: TypeClientE2EEHello, Version: Version,
+		SessionID: sessionID, ClientID: clientID, HandshakeID: "hs_control_1",
+		Kind: e2ee.HandshakeKindPairing, Capabilities: &capabilities,
+		ClientEphemeralPublicKey: e2ee.EncodeFrameBytes(clientEphemeral.PublicKey),
+	}
+	if err := client.WriteJSON(clientHello); err != nil {
+		t.Fatalf("send client e2ee hello: %v", err)
+	}
+	var gotHello E2EEClientHelloFrame
+	if err := agent.ReadJSON(&gotHello); err != nil {
+		t.Fatalf("agent read e2ee hello: %v", err)
+	}
+	if gotHello.Type != TypeClientE2EEHello || gotHello.HandshakeID != "hs_control_1" {
+		t.Fatalf("unexpected e2ee hello: %#v", gotHello)
+	}
+
+	result := E2EEAgentResultFrame{
+		Type: TypeAgentE2EEResult, Version: Version,
+		SessionID: sessionID, ClientID: clientID, HandshakeID: "hs_control_1",
+		OK: true,
+	}
+	if err := agent.WriteJSON(result); err != nil {
+		t.Fatalf("send agent e2ee result: %v", err)
+	}
+	var gotResult E2EEAgentResultFrame
+	if err := client.ReadJSON(&gotResult); err != nil {
+		t.Fatalf("client read e2ee result: %v", err)
+	}
+	if gotResult.Type != TypeAgentE2EEResult || !gotResult.OK {
+		t.Fatalf("unexpected e2ee result: %#v", gotResult)
+	}
+}
+
+func TestRelayRejectsInvalidE2EEHandshakeControlFrame(t *testing.T) {
+	server := newLimitedTestRelayServer(t, Config{RequireE2EE: true})
+	defer server.Close()
+
+	sessionID := "rs_bad_e2ee_handshake"
+	secret := "pair-secret-128-bit-minimum"
+	agent := dialRelay(t, server.URL, "/relay/agent")
+	defer agent.Close()
+	registerAgentWithCapabilities(t, agent, sessionID, secret, "reconnect-secret", time.Now().Add(time.Minute), productionAgentCapabilities())
+	client := dialRelay(t, server.URL, "/relay/client")
+	defer client.Close()
+	clientID := pairClient(t, client, sessionID, secret)
+	readAttached(t, agent, clientID)
+
+	capabilities := e2ee.ProductionCapabilities()
+	badHello := E2EEClientHelloFrame{
+		Type: TypeClientE2EEHello, Version: Version,
+		SessionID: sessionID, ClientID: clientID, HandshakeID: "hs_bad",
+		Kind: e2ee.HandshakeKindPairing, Capabilities: &capabilities,
+		ClientEphemeralPublicKey: "not-base64url",
+	}
+	if err := client.WriteJSON(badHello); err != nil {
+		t.Fatalf("send invalid e2ee hello: %v", err)
+	}
+	var errFrame ErrorFrame
+	if err := client.ReadJSON(&errFrame); err != nil {
+		t.Fatalf("read invalid e2ee error: %v", err)
+	}
+	if errFrame.Code != CodeE2EEHandshakeFailed {
+		t.Fatalf("unexpected error frame: %#v", errFrame)
 	}
 }
 

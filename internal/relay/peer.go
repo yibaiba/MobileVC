@@ -2,6 +2,7 @@ package relay
 
 import (
 	"errors"
+	"io"
 	"sync"
 	"time"
 
@@ -41,6 +42,14 @@ func newPeerConn(conn *websocket.Conn, role peerRole, remote string, queueSize i
 
 func (p *peerConn) ReadJSON(v any) error {
 	return p.conn.ReadJSON(v)
+}
+
+func (p *peerConn) ReadRawFrame() ([]byte, error) {
+	_, reader, err := p.conn.NextReader()
+	if err != nil {
+		return nil, err
+	}
+	return io.ReadAll(reader)
 }
 
 func (p *peerConn) Enqueue(v any) error {

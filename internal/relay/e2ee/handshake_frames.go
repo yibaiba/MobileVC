@@ -206,7 +206,7 @@ func requiredCapabilities(capabilities *CapabilitySet) (CapabilitySet, error) {
 	if capabilities == nil {
 		return CapabilitySet{}, fmt.Errorf("%w: missing capabilities", ErrHandshakeFailed)
 	}
-	if err := validateCapabilityVersions(*capabilities); err != nil {
+	if err := ValidateProductionCapabilities(*capabilities); err != nil {
 		return CapabilitySet{}, err
 	}
 	return *capabilities, nil
