@@ -128,6 +128,60 @@ Correct:
 await prefs.setString('mobilevc.app_config', jsonEncode(config.toJson()));
 ```
 
+### Scenario: Flutter Relay E2EE Security State
+
+#### 1. Scope / Trigger
+- Trigger: any Flutter change that displays relay trust, encrypted status, fingerprint confirmation, E2EE diagnostics, or device revoke/plaintext-disabled errors.
+- Applies to `lib/core/relay_e2ee`, relay connection settings, pairing/import UI, and future relay security/device management views.
+
+#### 2. Signatures
+- Security input: `RelaySecurityInput`
+- Evaluator: `RelaySecurityStateEvaluator.evaluate(input)`
+- Verified gate: `RelaySecurityState.canShowVerified`
+- Blocking states: `fingerprintMismatch`, `deviceRevoked`, `plaintextDisabled`, `encryptionUnavailable`
+
+#### 3. Contracts
+- UI may show "E2EE 已验证" only when `canShowVerified == true`.
+- `canShowVerified` requires relay mode, confirmed node fingerprint, completed E2EE handshake, compatible protocol/tunnel capabilities, multiplex stream support, file download support, device management support, E2EE required, plaintext test-mode off, device not revoked, and production plaintext rejection active.
+- Relay plaintext test-mode must be labeled as test mode and must never look verified.
+- Fingerprint mismatch, revoked device, decrypt failure, unsupported version, missing capability, or missing plaintext rejection must produce neutral or blocking copy, not security-positive copy.
+- Full fingerprint and short fingerprint are derived from the node public key; UI must not invent or truncate fingerprint values outside this evaluator.
+
+#### 4. Validation & Error Matrix
+- Direct mode -> `LAN 直连`, not verified.
+- Relay plaintext test mode -> `Relay 测试模式`, not verified.
+- Fingerprint mismatch -> `指纹已变化`, blocking.
+- Device revoked -> `设备已撤销`, blocking.
+- Decrypt failure or unsupported E2EE capability -> `加密不可用`, blocking.
+- E2EE required but plaintext rejection not confirmed -> `明文拒绝未启用`, blocking.
+
+#### 5. Good/Base/Bad Cases
+- Good: status chip text is derived from `RelaySecurityState.title` and verified styling is gated by `canShowVerified`.
+- Good: pairing UI shows the evaluator-provided short fingerprint plus full copyable fingerprint detail.
+- Base: relay test-mode remains usable for local debugging but is visually marked as non-production.
+- Bad: showing "安全", "已加密", or shield/verified styling just because `connectionMode == relay`.
+- Bad: hiding fingerprint mismatch behind a reconnect retry.
+
+#### 6. Tests Required
+- Verified state only when every condition is true.
+- Test-mode, fingerprint mismatch, revoked device, decrypt failure, unsupported capability, and plaintext-not-rejected states cannot show verified.
+- Direct mode never implies E2EE verified.
+
+#### 7. Wrong vs Correct
+
+Wrong:
+
+```dart
+final verified = config.connectionMode == 'relay';
+```
+
+Correct:
+
+```dart
+final state = await RelaySecurityStateEvaluator.evaluate(input);
+final verified = state.canShowVerified;
+```
+
 
 ---
 
