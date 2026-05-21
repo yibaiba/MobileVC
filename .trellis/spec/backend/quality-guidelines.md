@@ -51,6 +51,9 @@ Questions to answer:
 - Relay E2EE capabilities: `e2ee.CapabilitySet`, `e2ee.ProductionCapabilities()`, `e2ee.PlaintextTestCapabilities()`, `ValidateProductionCapabilities`, `ValidatePlaintextTestCapabilities`
 - Relay E2EE handshake control frames: `client.e2ee_hello`, `agent.e2ee_hello`, `client.e2ee_proof`, `agent.e2ee_result`
 - Local relay E2EE handler: `newAgentE2EEHandshakeHandlerWithDeviceTrust(sessionID, pairingSecret, capabilities, nodeIdentity, deviceTrust)`, `handleClientHello`, `handleClientProof`, `trafficKeys`
+- Relay E2EE device business actions: `relay_device_register`, `relay_device_list`, `relay_device_revoke`
+- Relay E2EE device result events: `relay_device_register_result`, `relay_device_list_result`, `relay_device_revoke_result`
+- Gateway relay metadata: `gateway.RelayE2EEInfo{Enabled, SessionID, ClientID, HandshakeID, DeviceID}`
 
 #### 3. Contracts
 - Relay server forwards only `relay.forward` envelopes with base64url payloads; it must not parse MobileVC business actions.
@@ -93,6 +96,10 @@ Questions to answer:
 - A completed local agent pairing handshake must create an agent-side MobileVC stream codec before MobileVC business frames are accepted as E2EE. After that point, inbound `relay.forward` frames with `encryption=p256-ecdsa+p256-ecdh+hkdf-sha256+aes-256-gcm` are decrypted through the codec, outbound gateway `WriteJSON` payloads are encrypted through the same codec, and plaintext `encryption=none` business frames are rejected explicitly with an E2EE-required error path. Test-mode plaintext remains available only when no E2EE stream has been activated.
 - A completed local agent reconnect handshake must replace the previous per-connection MobileVC stream codec with the newly derived keys; business `relay.forward` frames before reconnect E2EE completion are rejected, never decoded as plaintext.
 - First-pairing device trust registration must happen after E2EE stream activation through an encrypted MobileVC business action (`relay_device_register`). Device credentials must not appear in relay E2EE handshake control frames, pairing links, relay logs, or plaintext relay envelopes.
+- Relay device list and single-device revoke are encrypted MobileVC business actions, not relay control frames. They must require completed relay E2EE plus a bound `DeviceID` on `gateway.RelayE2EEInfo`.
+- `relay_device_list_result` returns trusted device metadata only: device ID, display name, fingerprint, created/last-seen/revoked timestamps, active session ID, connected/current/revoked flags. It must not include credentials, private keys, traffic keys, pairing secrets, or payload contents.
+- `relay_device_revoke` must reject revoking the current management device from that same relay client. Global rotate is a separate node-identity operation; do not fake it by clearing the device JSON store alone.
+- Single-device revoke must update the local trust store and close currently tracked relay gateway connections for the target device so revoke takes effect immediately, not only on the next reconnect.
 - `cmd/server` must load one local `DeviceTrustStore` instance for relay mode and pass that same instance to both `gateway.Handler.DeviceTrust` and `relayclient.Config.DeviceTrust` so encrypted device registration is immediately visible to reconnect proof validation.
 - MobileVC stream codecs keep per-connection send counters and replay state. Go codecs must serialize `Encode` and `Decode` internally because gateway reads and writes can run concurrently on the same relay connection.
 - Backend UI/security state still must not show "E2EE verified" until encrypted forwarding, replay protection, fingerprint validation, production plaintext rejection, and device-state checks are all active.
@@ -128,6 +135,10 @@ Questions to answer:
 - Local agent E2EE reconnect without a device trust store -> `e2ee_handshake_failed`.
 - Local agent E2EE reconnect for unknown device, wrong device proof, bad device signature, or device public-key mismatch -> `agent.e2ee_result` with `ok=false`, `errorCode=device_unknown`.
 - Local agent E2EE reconnect for revoked device -> `agent.e2ee_result` with `ok=false`, `errorCode=device_revoked`.
+- Direct/LAN or plaintext relay `relay_device_list` / `relay_device_revoke` -> error code `e2ee_required`.
+- Relay E2EE management without a bound device ID -> error code `device_unknown`.
+- `relay_device_revoke` with an empty, unknown, or current management device ID -> error code `device_unknown`.
+- Successful `relay_device_revoke` -> `relay_device_revoke_result` plus refreshed device list; active target device connection is closed if currently tracked.
 - Local relay client production capabilities with missing `NodeIdentity` -> config error `relay node identity is required for e2ee mode`.
 - Local relay client receives `relay.ping` for a different non-empty session ID -> explicit local read error; do not send `relay.pong`.
 - Post-auth raw websocket frames must be size-bounded while reading, before JSON decode. Frames above the post-auth raw frame limit -> `relay.error` with `frame_too_large`; decoded relay payloads above `MaxPayloadBytes` still -> `payload_too_large`.
@@ -151,6 +162,8 @@ Questions to answer:
 - Good: local relay agent answers a valid pairing handshake, verifies the pairing proof against the transcript, and derives the same traffic keys that Flutter derives from its ephemeral key.
 - Good: local relay agent answers a valid reconnect handshake only for a trusted device, verifies device proof and signature against the transcript, and derives fresh traffic keys for the new connection.
 - Good: after local pairing handshake succeeds, the local relay agent decrypts client-to-agent `relay.forward` through `NewAgentMobileVCStreamCodec` and encrypts agent-to-client gateway writes before they leave the local backend.
+- Good: after first-pairing `relay_device_register_result`, the gateway binds the relay connection's device ID so the same phone can request `relay_device_list` without reconnecting.
+- Good: `relay_device_revoke` revokes a different bound device, clears its active state, closes any tracked active connection for that device, then emits a refreshed list.
 - Good: MobileVC stream codec counter/replay state is connection-local and protected against concurrent read/write access.
 - Good: local test relay agent declares `PlaintextTestCapabilities()` and production relay agent declares `ProductionCapabilities()`; never infer mode from missing fields.
 - Good: `mobilevc://relay/v1` includes `nodeFingerprint=<64 lowercase hex chars>` plus capability hints, but never includes node private keys, device private keys, or traffic keys.
@@ -165,6 +178,7 @@ Questions to answer:
 - Bad: showing "E2EE verified" after handshake-only traffic keys exist while `relay.forward` still carries plaintext MobileVC payloads.
 - Bad: falling back to plaintext decode after an E2EE decrypt failure, or allowing plaintext `relay.forward` after the E2EE stream has been activated.
 - Bad: accepting a duplicate `agent.register` for an existing `sessionId` after disconnect; that bypasses reconnect-secret semantics.
+- Bad: implementing global rotate as only `ClearTrustedDevicesForNodeRotation`; real rotate must also replace node identity and close/rekey active relay sessions.
 
 #### 6. Tests Required
 - Relay pairing, one-time secret consumption, URL validation, oversized payload, and opaque unknown business payload forwarding.
@@ -183,6 +197,7 @@ Questions to answer:
 - Relay client tests must cover valid local agent pairing handshake, node signature verification, pairing proof validation, matching derived traffic keys, and mismatched proof routing failure.
 - Relay client tests must cover valid local agent reconnect handshake, unknown device, revoked device, wrong proof, bad signature, matching fresh traffic keys, and no plaintext business frame before E2EE stream activation.
 - Relay client tests must cover encrypted MobileVC `relay.forward` after local pairing handshake: client-to-agent decrypts to gateway JSON, agent-to-client `WriteJSON` emits E2EE metadata, and ciphertext does not contain plaintext business values.
+- Gateway relay device tests must cover list/revoke requiring bound relay E2EE, list result metadata/current flags, same-device revoke rejection, store update after revoke, and active target connection closure.
 - Relay client tests must cover `relay.ping` response for the current/no session and rejection of wrong-session pings.
 - Config tests for relay env validation and event-path requirement.
 - Launcher tests that pairing event files are read locally and removed.

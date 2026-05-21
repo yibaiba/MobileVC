@@ -899,6 +899,114 @@ void main() {
       expect(controller.connected, isTrue);
     });
 
+    test('relay device register result enables management list refresh',
+        () async {
+      SharedPreferences.setMockInitialValues({});
+      final service = _FakeMobileVcWsService()
+        ..relayE2eeHandshake = true
+        ..relayE2eeDeviceBinding = false;
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.saveConfig(const AppConfig(
+        connectionMode: 'relay',
+        relayUrl: 'wss://relay.example.test',
+        relaySessionId: 'rs_test',
+        relayClientId: 'rc_test',
+        relayClientReconnectSecret: 'reconnect_secret',
+      ));
+      await controller.connect();
+      await _flushEvents();
+
+      expect(
+        service.sentPayloads
+            .where((payload) => payload['action'] == 'relay_device_list'),
+        isEmpty,
+      );
+
+      service.emit(RelayDeviceRegisterResultEvent.fromJson(const {
+        'type': 'relay_device_register_result',
+        'sessionId': 'rs_test',
+        'deviceId': 'dev_current',
+        'fingerprintHex':
+            '1111111111111111111111111111111111111111111111111111111111111111',
+        'status': 'registered',
+      }));
+      await _flushEvents();
+
+      expect(service.markedRelayDeviceId, 'dev_current');
+      expect(
+        service.sentPayloads
+            .where((payload) => payload['action'] == 'relay_device_list'),
+        hasLength(1),
+      );
+    });
+
+    test('relay device list and revoke use E2EE management actions', () async {
+      SharedPreferences.setMockInitialValues({});
+      final service = _FakeMobileVcWsService()
+        ..relayE2eeHandshake = true
+        ..relayE2eeDeviceBinding = true;
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.saveConfig(const AppConfig(
+        connectionMode: 'relay',
+        relayUrl: 'wss://relay.example.test',
+        relaySessionId: 'rs_test',
+        relayClientId: 'rc_test',
+        relayClientReconnectSecret: 'reconnect_secret',
+      ));
+      await controller.connect();
+      await _flushEvents();
+
+      expect(
+        service.sentPayloads
+            .where((payload) => payload['action'] == 'relay_device_list'),
+        isNotEmpty,
+      );
+
+      service.emit(RelayDeviceListResultEvent.fromJson(const {
+        'type': 'relay_device_list_result',
+        'sessionId': 'rs_test',
+        'devices': [
+          {
+            'deviceId': 'dev_current',
+            'displayName': 'Pixel',
+            'fingerprintHex':
+                '1111111111111111111111111111111111111111111111111111111111111111',
+            'createdAt': '2026-05-21T10:00:00Z',
+            'lastSeenAt': '2026-05-21T10:02:00Z',
+            'activeSessionId': 'hs_current',
+            'connected': true,
+            'currentDevice': true,
+          },
+          {
+            'deviceId': 'dev_lost',
+            'displayName': 'Old phone',
+            'fingerprintHex':
+                '2222222222222222222222222222222222222222222222222222222222222222',
+            'createdAt': '2026-05-20T10:00:00Z',
+            'lastSeenAt': '2026-05-20T10:02:00Z',
+          },
+        ],
+      }));
+      await _flushEvents();
+
+      expect(controller.relayDevices.length, 2);
+      controller.revokeRelayDevice('dev_lost');
+      expect(service.sentPayloads.last, {
+        'action': 'relay_device_revoke',
+        'deviceId': 'dev_lost',
+      });
+
+      controller.revokeRelayDevice('dev_current');
+      expect(service.sentPayloads.last['deviceId'], 'dev_lost');
+      expect(controller.relayDeviceStatus, contains('不能'));
+    });
+
     test('relay connect rejects public ws url before service connect',
         () async {
       final service = _FakeMobileVcWsService();
@@ -8770,9 +8878,24 @@ class _FakeMobileVcWsService extends MobileVcWsService {
   final List<_RelayConnectCall> connectedRelays = [];
   int connectCalls = 0;
   int disconnectCalls = 0;
+  bool relayE2eeHandshake = false;
+  bool relayE2eeDeviceBinding = false;
+  String markedRelayDeviceId = '';
 
   @override
   Stream<AppEvent> get events => _controller.stream;
+
+  @override
+  bool get hasRelayE2eeHandshake => relayE2eeHandshake;
+
+  @override
+  bool get hasRelayE2eeDeviceBinding => relayE2eeDeviceBinding;
+
+  @override
+  void markRelayDeviceRegistered(RelayDeviceRegisterResultEvent event) {
+    markedRelayDeviceId = event.deviceId;
+    relayE2eeDeviceBinding = event.deviceId.trim().isNotEmpty;
+  }
 
   @override
   Future<void> connect(String url) async {

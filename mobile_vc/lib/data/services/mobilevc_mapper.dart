@@ -17,6 +17,12 @@ class MobileVcMapper {
         return ProgressEvent.fromJson(json);
       case 'error':
         return ErrorEvent.fromJson(json);
+      case 'relay_device_register_result':
+        return RelayDeviceRegisterResultEvent.fromJson(json);
+      case 'relay_device_list_result':
+        return RelayDeviceListResultEvent.fromJson(json);
+      case 'relay_device_revoke_result':
+        return RelayDeviceRevokeResultEvent.fromJson(json);
       case 'prompt_request':
         return PromptRequestEvent.fromJson(json);
       case 'interaction_request':

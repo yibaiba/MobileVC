@@ -179,6 +179,16 @@ func (h *agentE2EEHandshakeHandler) trafficKeys(handshakeID string) (*e2ee.Traff
 	return completed.keys, ok
 }
 
+func (h *agentE2EEHandshakeHandler) completedDeviceID(handshakeID string) string {
+	if h == nil {
+		return ""
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	return h.completed[handshakeID].deviceID
+}
+
 func (h *agentE2EEHandshakeHandler) completedCodec(handshakeID string) (*e2ee.MobileVCStreamCodec, bool, error) {
 	if h == nil {
 		return nil, false, nil

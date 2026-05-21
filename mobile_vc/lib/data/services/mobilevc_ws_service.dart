@@ -42,6 +42,9 @@ class MobileVcWsService {
   Stream<AppEvent> get events => _events.stream;
   bool get isConnected => _channel != null;
   bool get hasRelayE2eeHandshake => _relayE2eeState?.complete == true;
+  bool get hasRelayE2eeDeviceBinding =>
+      hasRelayE2eeHandshake &&
+      _relayE2eeState?.boundDeviceId.trim().isNotEmpty == true;
 
   Future<void> connect(String url) async {
     await _connectChannel(Uri.parse(url));
@@ -384,6 +387,18 @@ class MobileVcWsService {
   _RelayE2eeHandshakeState? _relayE2eeState;
   Future<void> _relaySendQueue = Future<void>.value();
   Future<void> _relayReceiveQueue = Future<void>.value();
+
+  void markRelayDeviceRegistered(
+    RelayDeviceRegisterResultEvent event,
+  ) {
+    final state = _relayE2eeState;
+    final deviceId = event.deviceId.trim();
+    if (state == null || !state.complete || deviceId.isEmpty) {
+      return;
+    }
+    final next = state.copyWithBoundDeviceId(deviceId);
+    _relayE2eeState = next;
+  }
 
   RelaySession? takeRelaySession() {
     final session = _relaySession;
@@ -903,6 +918,7 @@ class _RelayE2eeHandshakeState {
     this.input,
     this.trafficKeys,
     this.streamCodec,
+    this.boundDeviceId = '',
     this.complete = false,
   });
 
@@ -919,6 +935,7 @@ class _RelayE2eeHandshakeState {
   final RelayE2eeHandshakeInput? input;
   final RelayE2eeTrafficKeys? trafficKeys;
   final RelayMobileVcStreamCodec? streamCodec;
+  final String boundDeviceId;
   final bool complete;
 
   bool matches(String sessionId, String clientId, String handshakeId) {
@@ -945,6 +962,27 @@ class _RelayE2eeHandshakeState {
       input: input ?? this.input,
       trafficKeys: trafficKeys ?? this.trafficKeys,
       streamCodec: streamCodec,
+      boundDeviceId: boundDeviceId,
+      complete: complete,
+    );
+  }
+
+  _RelayE2eeHandshakeState copyWithBoundDeviceId(String deviceId) {
+    return _RelayE2eeHandshakeState(
+      kind: kind,
+      sessionId: sessionId,
+      clientId: clientId,
+      handshakeId: handshakeId,
+      pairingSecret: pairingSecret,
+      expectedNodeFingerprintHex: expectedNodeFingerprintHex,
+      capabilities: capabilities,
+      clientEphemeral: clientEphemeral,
+      deviceIdentity: deviceIdentity,
+      deviceCredential: deviceCredential,
+      input: input,
+      trafficKeys: trafficKeys,
+      streamCodec: streamCodec,
+      boundDeviceId: deviceId.trim(),
       complete: complete,
     );
   }
@@ -973,6 +1011,7 @@ class _RelayE2eeHandshakeState {
         handshakeId: handshakeId,
         keys: keys,
       ),
+      boundDeviceId: boundDeviceId,
       complete: true,
     );
   }

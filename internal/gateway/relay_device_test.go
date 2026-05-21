@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"mobilevc/internal/protocol"
 	"mobilevc/internal/relay"
@@ -20,7 +21,7 @@ func TestRegisterRelayDeviceRequiresE2EE(t *testing.T) {
 	}
 	h.DeviceTrust = store
 
-	_, err = h.registerRelayDevice(staticRelayClientConn{}, testRelayDeviceRegisterRequest(t))
+	_, err = h.registerRelayDevice(&staticRelayClientConn{}, testRelayDeviceRegisterRequest(t))
 	if err == nil || !strings.Contains(err.Error(), relay.CodeE2EERequired) {
 		t.Fatalf("expected e2ee required error, got %v", err)
 	}
@@ -36,7 +37,7 @@ func TestRegisterRelayDevicePersistsTrustedDeviceWithoutPlaintextCredential(t *t
 	h.DeviceTrust = store
 	req := testRelayDeviceRegisterRequest(t)
 
-	result, err := h.registerRelayDevice(staticRelayClientConn{
+	result, err := h.registerRelayDevice(&staticRelayClientConn{
 		info: RelayE2EEInfo{
 			Enabled:     true,
 			SessionID:   "rs_gateway",
@@ -62,6 +63,135 @@ func TestRegisterRelayDevicePersistsTrustedDeviceWithoutPlaintextCredential(t *t
 	}
 }
 
+func TestRelayDeviceListAndRevokeRequireBoundE2EEDevice(t *testing.T) {
+	h := NewHandler("test", nil)
+	store, err := e2ee.LoadOrCreateDeviceTrustStore(filepath.Join(t.TempDir(), e2ee.DeviceTrustFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.DeviceTrust = store
+
+	if _, err := h.listRelayDevices(&staticRelayClientConn{}); err == nil || !strings.Contains(err.Error(), relay.CodeE2EERequired) {
+		t.Fatalf("expected e2ee required for direct list, got %v", err)
+	}
+	if _, err := h.listRelayDevices(&staticRelayClientConn{
+		info: RelayE2EEInfo{
+			Enabled: true, SessionID: "rs_gateway", ClientID: "rc_attached", HandshakeID: "hs_pairing",
+		},
+	}); err == nil || !strings.Contains(err.Error(), relay.CodeDeviceUnknown) {
+		t.Fatalf("expected bound device requirement, got %v", err)
+	}
+}
+
+func TestRelayDeviceListMarksCurrentAndRevokeUpdatesStore(t *testing.T) {
+	store, err := e2ee.LoadOrCreateDeviceTrustStore(filepath.Join(t.TempDir(), e2ee.DeviceTrustFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	active := registerGatewayTestDevice(t, store, "dev_active", "Pixel", "active-credential")
+	other := registerGatewayTestDevice(t, store, "dev_lost", "iPhone", "lost-credential")
+	if _, _, err := store.MarkDeviceSeen(active.ID, "hs_active", time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.MarkDeviceSeen(other.ID, "hs_other", time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	h := NewHandler("test", nil)
+	h.DeviceTrust = store
+	client := &staticRelayClientConn{
+		info: RelayE2EEInfo{
+			Enabled: true, SessionID: "rs_gateway", ClientID: "rc_attached", HandshakeID: "hs_active", DeviceID: active.ID,
+		},
+	}
+
+	list, err := h.listRelayDevices(client)
+	if err != nil {
+		t.Fatalf("list relay devices: %v", err)
+	}
+	if len(list.Devices) != 2 {
+		t.Fatalf("unexpected device count: %#v", list.Devices)
+	}
+	if !findRelayDevice(list.Devices, active.ID).CurrentDevice || !findRelayDevice(list.Devices, active.ID).Connected {
+		t.Fatalf("active device not marked current/connected: %#v", list.Devices)
+	}
+
+	revoked, err := h.revokeRelayDevice(client, protocol.RelayDeviceRevokeRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "relay_device_revoke"},
+		DeviceID:    other.ID,
+	})
+	if err != nil {
+		t.Fatalf("revoke relay device: %v", err)
+	}
+	if revoked.DeviceID != other.ID || revoked.Status != "revoked" {
+		t.Fatalf("unexpected revoke result: %#v", revoked)
+	}
+	list, err = h.listRelayDevices(client)
+	if err != nil {
+		t.Fatalf("list after revoke: %v", err)
+	}
+	if !findRelayDevice(list.Devices, other.ID).Revoked || findRelayDevice(list.Devices, other.ID).Connected {
+		t.Fatalf("revoked device not reflected in list: %#v", list.Devices)
+	}
+}
+
+func TestRelayDeviceRevokeClosesTrackedTargetConnections(t *testing.T) {
+	store, err := e2ee.LoadOrCreateDeviceTrustStore(filepath.Join(t.TempDir(), e2ee.DeviceTrustFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	active := registerGatewayTestDevice(t, store, "dev_active", "Pixel", "active-credential")
+	other := registerGatewayTestDevice(t, store, "dev_lost", "iPhone", "lost-credential")
+	h := NewHandler("test", nil)
+	h.DeviceTrust = store
+	targetConn := &staticRelayClientConn{
+		info: RelayE2EEInfo{
+			Enabled: true, SessionID: "rs_gateway", ClientID: "rc_lost", HandshakeID: "hs_other", DeviceID: other.ID,
+		},
+	}
+	h.trackRelayE2EEConnection("conn-lost", targetConn)
+
+	_, err = h.revokeRelayDevice(&staticRelayClientConn{
+		info: RelayE2EEInfo{
+			Enabled: true, SessionID: "rs_gateway", ClientID: "rc_attached", HandshakeID: "hs_active", DeviceID: active.ID,
+		},
+	}, protocol.RelayDeviceRevokeRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "relay_device_revoke"},
+		DeviceID:    other.ID,
+	})
+	if err != nil {
+		t.Fatalf("revoke relay device: %v", err)
+	}
+	if targetConn.closeCount != 1 {
+		t.Fatalf("expected target relay connection to close once, got %d", targetConn.closeCount)
+	}
+	h.closeRelayDeviceConnections(other.ID)
+	if targetConn.closeCount != 1 {
+		t.Fatalf("expected revoked device registry entry to be removed, got %d closes", targetConn.closeCount)
+	}
+}
+
+func TestRelayDeviceRevokeRejectsCurrentManagementDevice(t *testing.T) {
+	store, err := e2ee.LoadOrCreateDeviceTrustStore(filepath.Join(t.TempDir(), e2ee.DeviceTrustFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	active := registerGatewayTestDevice(t, store, "dev_active", "Pixel", "active-credential")
+	h := NewHandler("test", nil)
+	h.DeviceTrust = store
+
+	_, err = h.revokeRelayDevice(&staticRelayClientConn{
+		info: RelayE2EEInfo{
+			Enabled: true, SessionID: "rs_gateway", ClientID: "rc_attached", HandshakeID: "hs_active", DeviceID: active.ID,
+		},
+	}, protocol.RelayDeviceRevokeRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "relay_device_revoke"},
+		DeviceID:    active.ID,
+	})
+	if err == nil || !strings.Contains(err.Error(), relay.CodeDeviceUnknown) {
+		t.Fatalf("expected current-device revoke rejection, got %v", err)
+	}
+}
+
 func testRelayDeviceRegisterRequest(t *testing.T) protocol.RelayDeviceRegisterRequestEvent {
 	t.Helper()
 	identity, err := e2ee.GenerateNodeIdentity()
@@ -79,16 +209,45 @@ func testRelayDeviceRegisterRequest(t *testing.T) protocol.RelayDeviceRegisterRe
 	}
 }
 
-type staticRelayClientConn struct {
-	info RelayE2EEInfo
+func registerGatewayTestDevice(t *testing.T, store *e2ee.DeviceTrustStore, id string, name string, credential string) e2ee.TrustedDevice {
+	t.Helper()
+	identity, err := e2ee.GenerateNodeIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	device, err := store.RegisterDevice(e2ee.DeviceRegistration{
+		ID: id, DisplayName: name, PublicKey: identity.PublicKey,
+		DeviceCredential: credential, Now: time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return device
 }
 
-func (c staticRelayClientConn) ReadJSON(any) error  { return nil }
-func (c staticRelayClientConn) WriteJSON(any) error { return nil }
-func (c staticRelayClientConn) Close() error        { return nil }
-func (c staticRelayClientConn) RemoteAddr() string  { return "relay:test" }
-func (c staticRelayClientConn) Origin() string      { return "relay" }
-func (c staticRelayClientConn) RelayE2EEInfo() RelayE2EEInfo {
+func findRelayDevice(devices []protocol.RelayTrustedDevice, id string) protocol.RelayTrustedDevice {
+	for _, device := range devices {
+		if device.DeviceID == id {
+			return device
+		}
+	}
+	return protocol.RelayTrustedDevice{}
+}
+
+type staticRelayClientConn struct {
+	info       RelayE2EEInfo
+	closeCount int
+}
+
+func (c *staticRelayClientConn) ReadJSON(any) error  { return nil }
+func (c *staticRelayClientConn) WriteJSON(any) error { return nil }
+func (c *staticRelayClientConn) Close() error {
+	c.closeCount++
+	return nil
+}
+func (c *staticRelayClientConn) RemoteAddr() string { return "relay:test" }
+func (c *staticRelayClientConn) Origin() string     { return "relay" }
+func (c *staticRelayClientConn) RelayE2EEInfo() RelayE2EEInfo {
 	return c.info
 }
 

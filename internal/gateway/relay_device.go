@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"mobilevc/internal/protocol"
@@ -39,12 +40,91 @@ func (h *Handler) registerRelayDevice(client ClientConn, req protocol.RelayDevic
 	if err != nil {
 		return protocol.RelayDeviceRegisterResultEvent{}, err
 	}
+	if bound, ok := client.(relayDeviceBoundClientConn); ok {
+		bound.SetRelayE2EEDeviceID(device.ID)
+	}
 	return protocol.NewRelayDeviceRegisterResultEvent(
 		info.SessionID,
 		device.ID,
 		fmt.Sprintf("%x", device.Fingerprint),
 		"registered",
 	), nil
+}
+
+func (h *Handler) listRelayDevices(client ClientConn) (protocol.RelayDeviceListResultEvent, error) {
+	info, err := h.relayDeviceManagementInfo(client)
+	if err != nil {
+		return protocol.RelayDeviceListResultEvent{}, err
+	}
+	devices, err := h.DeviceTrust.ListDevices()
+	if err != nil {
+		return protocol.RelayDeviceListResultEvent{}, err
+	}
+	return protocol.NewRelayDeviceListResultEvent(
+		info.SessionID,
+		relayTrustedDevices(devices, info.HandshakeID, info.DeviceID),
+	), nil
+}
+
+func (h *Handler) revokeRelayDevice(client ClientConn, req protocol.RelayDeviceRevokeRequestEvent) (protocol.RelayDeviceRevokeResultEvent, error) {
+	info, err := h.relayDeviceManagementInfo(client)
+	if err != nil {
+		return protocol.RelayDeviceRevokeResultEvent{}, err
+	}
+	deviceID := strings.TrimSpace(req.DeviceID)
+	if deviceID == "" {
+		return protocol.RelayDeviceRevokeResultEvent{}, fmt.Errorf("%s: missing relay device id", relay.CodeDeviceUnknown)
+	}
+	if deviceID == info.DeviceID {
+		return protocol.RelayDeviceRevokeResultEvent{}, fmt.Errorf("%s: cannot revoke the active management device", relay.CodeDeviceUnknown)
+	}
+	if _, err := h.DeviceTrust.RevokeDevice(deviceID, time.Now().UTC()); err != nil {
+		return protocol.RelayDeviceRevokeResultEvent{}, err
+	}
+	h.closeRelayDeviceConnections(deviceID)
+	return protocol.NewRelayDeviceRevokeResultEvent(info.SessionID, deviceID, "revoked"), nil
+}
+
+func (h *Handler) relayDeviceManagementInfo(client ClientConn) (RelayE2EEInfo, error) {
+	info, ok := relayE2EEInfo(client)
+	if !ok || !info.Enabled {
+		return RelayE2EEInfo{}, fmt.Errorf("%s: relay device management requires e2ee", relay.CodeE2EERequired)
+	}
+	if h.DeviceTrust == nil {
+		return RelayE2EEInfo{}, errors.New("relay device trust store is not configured")
+	}
+	if strings.TrimSpace(info.DeviceID) == "" {
+		return RelayE2EEInfo{}, fmt.Errorf("%s: relay device identity is not bound to this e2ee session", relay.CodeDeviceUnknown)
+	}
+	return info, nil
+}
+
+func relayTrustedDevices(devices []e2ee.TrustedDevice, currentHandshakeID string, currentDeviceID string) []protocol.RelayTrustedDevice {
+	out := make([]protocol.RelayTrustedDevice, 0, len(devices))
+	for _, device := range devices {
+		revoked := !device.RevokedAt.IsZero()
+		activeSessionID := strings.TrimSpace(device.ActiveSessionID)
+		out = append(out, protocol.RelayTrustedDevice{
+			DeviceID:        device.ID,
+			DisplayName:     device.DisplayName,
+			FingerprintHex:  fmt.Sprintf("%x", device.Fingerprint),
+			CreatedAt:       device.CreatedAt.UTC().Format(time.RFC3339Nano),
+			LastSeenAt:      device.LastSeenAt.UTC().Format(time.RFC3339Nano),
+			RevokedAt:       relayDeviceOptionalTime(device.RevokedAt),
+			ActiveSessionID: activeSessionID,
+			Connected:       !revoked && activeSessionID != "",
+			CurrentDevice:   device.ID == currentDeviceID || activeSessionID == strings.TrimSpace(currentHandshakeID),
+			Revoked:         revoked,
+		})
+	}
+	return out
+}
+
+func relayDeviceOptionalTime(value time.Time) string {
+	if value.IsZero() {
+		return ""
+	}
+	return value.UTC().Format(time.RFC3339Nano)
 }
 
 func relayE2EEInfo(client ClientConn) (RelayE2EEInfo, bool) {
@@ -54,6 +134,122 @@ func relayE2EEInfo(client ClientConn) (RelayE2EEInfo, bool) {
 	}
 	info := relayClient.RelayE2EEInfo()
 	return info, info.SessionID != "" && info.ClientID != "" && info.HandshakeID != ""
+}
+
+type relayDeviceBoundClientConn interface {
+	SetRelayE2EEDeviceID(string)
+}
+
+type relayDeviceConnectionRegistry struct {
+	mu             sync.Mutex
+	connectionByID map[string]relayDeviceConnection
+	idsByDevice    map[string]map[string]struct{}
+}
+
+type relayDeviceConnection struct {
+	deviceID string
+	client   ClientConn
+}
+
+func newRelayDeviceConnectionRegistry() *relayDeviceConnectionRegistry {
+	return &relayDeviceConnectionRegistry{
+		connectionByID: map[string]relayDeviceConnection{},
+		idsByDevice:    map[string]map[string]struct{}{},
+	}
+}
+
+func (h *Handler) trackRelayE2EEConnection(connectionID string, client ClientConn) {
+	if h.relayDeviceConns == nil {
+		h.relayDeviceConns = newRelayDeviceConnectionRegistry()
+	}
+	info, ok := relayE2EEInfo(client)
+	if !ok || !info.Enabled {
+		return
+	}
+	deviceID := strings.TrimSpace(info.DeviceID)
+	if deviceID == "" {
+		return
+	}
+	h.relayDeviceConns.track(connectionID, deviceID, client)
+}
+
+func (h *Handler) forgetRelayE2EEConnection(connectionID string) {
+	if h.relayDeviceConns == nil {
+		return
+	}
+	h.relayDeviceConns.forget(connectionID)
+}
+
+func (h *Handler) closeRelayDeviceConnections(deviceID string) {
+	if h.relayDeviceConns == nil {
+		return
+	}
+	for _, client := range h.relayDeviceConns.takeDevice(deviceID) {
+		_ = client.Close()
+	}
+}
+
+func (r *relayDeviceConnectionRegistry) track(connectionID string, deviceID string, client ClientConn) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	trimmedConnectionID := strings.TrimSpace(connectionID)
+	trimmedDeviceID := strings.TrimSpace(deviceID)
+	if trimmedConnectionID == "" || trimmedDeviceID == "" || client == nil {
+		return
+	}
+	r.forgetLocked(trimmedConnectionID)
+	r.connectionByID[trimmedConnectionID] = relayDeviceConnection{
+		deviceID: trimmedDeviceID,
+		client:   client,
+	}
+	if r.idsByDevice[trimmedDeviceID] == nil {
+		r.idsByDevice[trimmedDeviceID] = map[string]struct{}{}
+	}
+	r.idsByDevice[trimmedDeviceID][trimmedConnectionID] = struct{}{}
+}
+
+func (r *relayDeviceConnectionRegistry) forget(connectionID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.forgetLocked(strings.TrimSpace(connectionID))
+}
+
+func (r *relayDeviceConnectionRegistry) takeDevice(deviceID string) []ClientConn {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	trimmedDeviceID := strings.TrimSpace(deviceID)
+	if trimmedDeviceID == "" {
+		return nil
+	}
+	ids := r.idsByDevice[trimmedDeviceID]
+	if len(ids) == 0 {
+		return nil
+	}
+	clients := make([]ClientConn, 0, len(ids))
+	for connectionID := range ids {
+		if tracked, ok := r.connectionByID[connectionID]; ok && tracked.client != nil {
+			clients = append(clients, tracked.client)
+		}
+		delete(r.connectionByID, connectionID)
+	}
+	delete(r.idsByDevice, trimmedDeviceID)
+	return clients
+}
+
+func (r *relayDeviceConnectionRegistry) forgetLocked(connectionID string) {
+	if connectionID == "" {
+		return
+	}
+	tracked, ok := r.connectionByID[connectionID]
+	if !ok {
+		return
+	}
+	delete(r.connectionByID, connectionID)
+	ids := r.idsByDevice[tracked.deviceID]
+	delete(ids, connectionID)
+	if len(ids) == 0 {
+		delete(r.idsByDevice, tracked.deviceID)
+	}
 }
 
 func relayDeviceRegisterErrorCode(err error) string {

@@ -30,6 +30,7 @@ type gatewayConn struct {
 	e2ee       *agentE2EEHandshakeHandler
 	stream     *e2ee.MobileVCStreamCodec
 	streamHS   string
+	deviceID   string
 }
 
 type readResult struct {
@@ -363,10 +364,23 @@ func (c *gatewayConn) Origin() string {
 func (c *gatewayConn) RelayE2EEInfo() gateway.RelayE2EEInfo {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	deviceID := c.deviceID
+	if c.e2ee != nil && c.streamHS != "" {
+		if completedDeviceID := c.e2ee.completedDeviceID(c.streamHS); completedDeviceID != "" {
+			deviceID = completedDeviceID
+		}
+	}
 	return gateway.RelayE2EEInfo{
 		Enabled:     c.stream != nil,
 		SessionID:   c.sessionID,
 		ClientID:    c.clientID,
 		HandshakeID: c.streamHS,
+		DeviceID:    deviceID,
 	}
+}
+
+func (c *gatewayConn) SetRelayE2EEDeviceID(deviceID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.deviceID = strings.TrimSpace(deviceID)
 }

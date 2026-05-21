@@ -220,6 +220,7 @@ class SessionController extends ChangeNotifier {
       <String, SessionDeltaKnown>{};
   bool _fileListLoading = false;
   bool _fileReading = false;
+  bool _relayDeviceListLoading = false;
   bool _canResumeCurrentSession = false;
   bool _sessionRuntimeAlive = false;
   bool _selectedSessionExternalNative = false;
@@ -230,6 +231,7 @@ class SessionController extends ChangeNotifier {
   Timer? _sessionLoadingTimeout;
   static const Duration _sessionLoadingTimeoutDuration = Duration(seconds: 15);
   String _connectionMessage = '未连接';
+  String _relayDeviceStatus = '';
   String _selectedSessionId = '';
   String _selectedSessionTitle = 'MobileVC';
   String _currentDirectoryPath = '';
@@ -277,6 +279,7 @@ class SessionController extends ChangeNotifier {
   final List<SessionSummary> _sessions = [];
   final Map<String, SessionSummary> _pendingDeletedSessions =
       <String, SessionSummary>{};
+  final List<RelayTrustedDevice> _relayDevices = [];
   final List<SkillDefinition> _skills = [];
   final List<MemoryItem> _memoryItems = [];
   final List<PermissionRule> _sessionPermissionRules = [];
@@ -494,6 +497,11 @@ class SessionController extends ChangeNotifier {
       List.unmodifiable(_currentDirectoryItems);
   List<HistoryContext> get recentDiffs => List.unmodifiable(_recentDiffs);
   List<SessionSummary> get sessions => List.unmodifiable(_sessions);
+  List<RelayTrustedDevice> get relayDevices => List.unmodifiable(_relayDevices);
+  bool get relayDeviceListLoading => _relayDeviceListLoading;
+  String get relayDeviceStatus => _relayDeviceStatus;
+  bool get canManageRelayDevices =>
+      connected && _config.isRelayMode && _service.hasRelayE2eeDeviceBinding;
   List<SkillDefinition> get skills => List.unmodifiable(_skills);
   List<MemoryItem> get memoryItems => List.unmodifiable(_memoryItems);
   List<PermissionRule> get sessionPermissionRules =>
@@ -1753,6 +1761,9 @@ class SessionController extends ChangeNotifier {
       _claudeModelCatalogMessage = '';
       _claudeModelCatalogUnavailable = false;
       _claudeModelCatalog.clear();
+      _relayDevices.clear();
+      _relayDeviceStatus = '';
+      _relayDeviceListLoading = false;
       await switchWorkingDirectory(_config.cwd);
       requestRuntimeInfo('context');
       requestSkillCatalog();
@@ -1763,6 +1774,9 @@ class SessionController extends ChangeNotifier {
       requestPermissionRuleList();
       requestReviewState();
       requestTaskSnapshot();
+      if (canManageRelayDevices) {
+        requestRelayDeviceList();
+      }
       if (_selectedSessionId.trim().isNotEmpty) {
         _requestSessionResume(reason: silently ? 'reconnect' : 'connect');
       } else {
@@ -1863,6 +1877,9 @@ class SessionController extends ChangeNotifier {
     _sessionListSyncedSinceConnect = false;
     _fileListLoading = false;
     _fileReading = false;
+    _relayDeviceListLoading = false;
+    _relayDeviceStatus = '';
+    _relayDevices.clear();
     _sessionRuntimeAlive = false;
     _selectedSessionExternalNative = false;
     _executionActive = false;
@@ -2463,6 +2480,43 @@ class SessionController extends ChangeNotifier {
     }
     _fileReading = true;
     _service.send({'action': 'fs_read', 'path': target});
+    notifyListeners();
+  }
+
+  void requestRelayDeviceList() {
+    if (!canManageRelayDevices) {
+      _relayDeviceStatus =
+          _config.isRelayMode ? 'Relay E2EE 未就绪，暂不能读取设备列表' : '当前不是 Relay 模式';
+      notifyListeners();
+      return;
+    }
+    _relayDeviceListLoading = true;
+    _relayDeviceStatus = '正在读取 Relay 设备列表...';
+    _service.send({'action': 'relay_device_list'});
+    notifyListeners();
+  }
+
+  void revokeRelayDevice(String deviceId) {
+    final target = deviceId.trim();
+    if (target.isEmpty) {
+      return;
+    }
+    if (!canManageRelayDevices) {
+      _relayDeviceStatus = 'Relay E2EE 未就绪，不能撤销设备';
+      notifyListeners();
+      return;
+    }
+    final targetDevice = _relayDevices.cast<RelayTrustedDevice?>().firstWhere(
+          (device) => device?.deviceId == target,
+          orElse: () => null,
+        );
+    if (targetDevice?.currentDevice == true) {
+      _relayDeviceStatus = '不能从当前手机撤销当前设备，请在本机管理端执行全局轮换';
+      notifyListeners();
+      return;
+    }
+    _relayDeviceStatus = '正在撤销设备...';
+    _service.send({'action': 'relay_device_revoke', 'deviceId': target});
     notifyListeners();
   }
 
@@ -4345,6 +4399,13 @@ class SessionController extends ChangeNotifier {
       case ErrorEvent error:
         _fileListLoading = false;
         _fileReading = false;
+        if (error.code.startsWith('device_') ||
+            error.code.startsWith('e2ee_')) {
+          _relayDeviceListLoading = false;
+          _relayDeviceStatus = error.message.trim().isEmpty
+              ? 'Relay 设备管理失败：${error.code}'
+              : error.message.trim();
+        }
         final errorMessage = error.message.trim();
         if (error.code == 'ws_closed' ||
             error.code == 'ws_stream_error' ||
@@ -4389,6 +4450,27 @@ class SessionController extends ChangeNotifier {
           ),
         );
         _handleMutationFailure(error);
+        break;
+      case RelayDeviceListResultEvent result:
+        _relayDeviceListLoading = false;
+        _relayDevices
+          ..clear()
+          ..addAll(result.devices);
+        _relayDeviceStatus = result.devices.isEmpty
+            ? '当前没有已绑定设备'
+            : '已同步 ${result.devices.length} 台 Relay 设备';
+        break;
+      case RelayDeviceRegisterResultEvent result:
+        _service.markRelayDeviceRegistered(result);
+        _relayDeviceStatus = 'Relay 设备已绑定';
+        if (canManageRelayDevices) {
+          requestRelayDeviceList();
+        }
+        break;
+      case RelayDeviceRevokeResultEvent result:
+        _relayDeviceStatus =
+            result.status.trim().isNotEmpty ? '设备已撤销' : '设备撤销完成';
+        requestRelayDeviceList();
         break;
       case PromptRequestEvent prompt:
         if (prompt.isReview && _reviewShouldAutoAccept(prompt.runtimeMeta)) {

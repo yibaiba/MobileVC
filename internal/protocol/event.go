@@ -46,6 +46,8 @@ const (
 	EventTypeADBWebRTCAnswer           = "adb_webrtc_answer"
 	EventTypeADBWebRTCState            = "adb_webrtc_state"
 	EventTypeRelayDeviceRegisterResult = "relay_device_register_result"
+	EventTypeRelayDeviceListResult     = "relay_device_list_result"
+	EventTypeRelayDeviceRevokeResult   = "relay_device_revoke_result"
 )
 
 type RuntimeMeta struct {
@@ -101,6 +103,39 @@ type RelayDeviceRegisterResultEvent struct {
 	DeviceID       string `json:"deviceId"`
 	FingerprintHex string `json:"fingerprintHex"`
 	Status         string `json:"status"`
+}
+
+type RelayDeviceListRequestEvent struct {
+	ClientEvent
+}
+
+type RelayDeviceRevokeRequestEvent struct {
+	ClientEvent
+	DeviceID string `json:"deviceId"`
+}
+
+type RelayTrustedDevice struct {
+	DeviceID        string `json:"deviceId"`
+	DisplayName     string `json:"displayName"`
+	FingerprintHex  string `json:"fingerprintHex"`
+	CreatedAt       string `json:"createdAt"`
+	LastSeenAt      string `json:"lastSeenAt"`
+	RevokedAt       string `json:"revokedAt,omitempty"`
+	ActiveSessionID string `json:"activeSessionId,omitempty"`
+	Connected       bool   `json:"connected"`
+	CurrentDevice   bool   `json:"currentDevice"`
+	Revoked         bool   `json:"revoked"`
+}
+
+type RelayDeviceListResultEvent struct {
+	Event
+	Devices []RelayTrustedDevice `json:"devices"`
+}
+
+type RelayDeviceRevokeResultEvent struct {
+	Event
+	DeviceID string `json:"deviceId"`
+	Status   string `json:"status"`
 }
 
 type ExecRequestEvent struct {
@@ -1018,6 +1053,24 @@ func NewRelayDeviceRegisterResultEvent(sessionID, deviceID, fingerprintHex, stat
 		DeviceID:       deviceID,
 		FingerprintHex: fingerprintHex,
 		Status:         status,
+	}
+}
+
+func NewRelayDeviceListResultEvent(sessionID string, devices []RelayTrustedDevice) RelayDeviceListResultEvent {
+	if devices == nil {
+		devices = []RelayTrustedDevice{}
+	}
+	return RelayDeviceListResultEvent{
+		Event:   NewBaseEvent(EventTypeRelayDeviceListResult, sessionID),
+		Devices: devices,
+	}
+}
+
+func NewRelayDeviceRevokeResultEvent(sessionID, deviceID, status string) RelayDeviceRevokeResultEvent {
+	return RelayDeviceRevokeResultEvent{
+		Event:    NewBaseEvent(EventTypeRelayDeviceRevokeResult, sessionID),
+		DeviceID: deviceID,
+		Status:   status,
 	}
 }
 

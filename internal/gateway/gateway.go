@@ -57,15 +57,16 @@ func normalizePermissionModeForClaude(mode string) string {
 }
 
 type Handler struct {
-	AuthToken       string
-	NewExecRunner   func() engine.Runner
-	NewPtyRunner    func() engine.Runner
-	Upgrader        websocket.Upgrader
-	SkillLauncher   *skills.Launcher
-	SessionStore    data.Store
-	PushService     push.Service
-	DeviceTrust     *e2ee.DeviceTrustStore
-	runtimeSessions *runtimeSessionRegistry
+	AuthToken        string
+	NewExecRunner    func() engine.Runner
+	NewPtyRunner     func() engine.Runner
+	Upgrader         websocket.Upgrader
+	SkillLauncher    *skills.Launcher
+	SessionStore     data.Store
+	PushService      push.Service
+	DeviceTrust      *e2ee.DeviceTrustStore
+	runtimeSessions  *runtimeSessionRegistry
+	relayDeviceConns *relayDeviceConnectionRegistry
 
 	muProgressPush   sync.Mutex
 	lastProgressPush map[string]time.Time
@@ -83,6 +84,7 @@ func NewHandler(authToken string, sessionStore data.Store) *Handler {
 		SkillLauncher:    skills.NewLauncher(sessionStore),
 		SessionStore:     sessionStore,
 		PushService:      &push.NoopService{},
+		relayDeviceConns: newRelayDeviceConnectionRegistry(),
 		lastProgressPush: make(map[string]time.Time),
 		Upgrader: websocket.Upgrader{
 			ReadBufferSize:  1024,
@@ -130,6 +132,7 @@ type RelayE2EEInfo struct {
 	SessionID   string
 	ClientID    string
 	HandshakeID string
+	DeviceID    string
 }
 
 type websocketClientConn struct {
@@ -691,6 +694,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 	defer func() {
 		stopADBStream("")
 		cancel()
+		h.forgetRelayE2EEConnection(connectionID)
 		if strings.TrimSpace(selectedSessionID) != "" {
 			h.runtimeSessions.Release(selectedSessionID, connectionID, false)
 		} else if runtimeSvc != nil {
@@ -733,6 +737,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			logx.Info("ws", "connection read loop ended: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
 			return
 		}
+		h.trackRelayE2EEConnection(connectionID, client)
 		payloadBytes, err := json.Marshal(payload)
 		if err != nil {
 			logx.Warn("ws", "invalid websocket json payload: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
@@ -761,7 +766,35 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				emit(protocol.NewErrorEventWithCode(selectedSessionID, err.Error(), "", relayDeviceRegisterErrorCode(err)))
 				continue
 			}
+			h.trackRelayE2EEConnection(connectionID, client)
 			emit(result)
+		case "relay_device_list":
+			result, err := h.listRelayDevices(client)
+			if err != nil {
+				logx.Warn("ws", "relay device list failed: connectionID=%s remoteAddr=%s err=%v", connectionID, remoteAddr, err)
+				emit(protocol.NewErrorEventWithCode(selectedSessionID, err.Error(), "", relayDeviceRegisterErrorCode(err)))
+				continue
+			}
+			emit(result)
+		case "relay_device_revoke":
+			var req protocol.RelayDeviceRevokeRequestEvent
+			if err := json.Unmarshal(payloadBytes, &req); err != nil {
+				logx.Warn("ws", "invalid relay_device_revoke request: connectionID=%s remoteAddr=%s err=%v", connectionID, remoteAddr, err)
+				emit(protocol.NewErrorEventWithCode(selectedSessionID, fmt.Sprintf("invalid relay_device_revoke request: %v", err), "", "e2ee_handshake_failed"))
+				continue
+			}
+			result, err := h.revokeRelayDevice(client, req)
+			if err != nil {
+				logx.Warn("ws", "relay device revoke failed: connectionID=%s remoteAddr=%s err=%v", connectionID, remoteAddr, err)
+				emit(protocol.NewErrorEventWithCode(selectedSessionID, err.Error(), "", relayDeviceRegisterErrorCode(err)))
+				continue
+			}
+			emit(result)
+			if strings.TrimSpace(req.DeviceID) != "" {
+				if list, err := h.listRelayDevices(client); err == nil {
+					emit(list)
+				}
+			}
 		case "session_create":
 			var req protocol.SessionCreateRequestEvent
 			if err := json.Unmarshal(payloadBytes, &req); err != nil {

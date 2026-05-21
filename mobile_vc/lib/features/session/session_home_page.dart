@@ -9,6 +9,7 @@ import 'package:share_plus/share_plus.dart';
 import '../../core/config/app_config.dart';
 import '../../core/config/app_connection_endpoint.dart';
 import '../../core/config/app_connection_environment.dart';
+import '../../data/models/events.dart';
 import '../../data/models/session_models.dart';
 import '../../features/adb/adb_debug_page.dart';
 import '../../features/chat/chat_timeline.dart';
@@ -674,6 +675,17 @@ class _SessionHomePageState extends State<SessionHomePage> {
                           child: const Text('断开连接'),
                         ),
                       ),
+                    if (controller.config.isRelayMode) ...[
+                      const SizedBox(height: 10),
+                      SizedBox(
+                        width: double.infinity,
+                        child: OutlinedButton.icon(
+                          onPressed: () => _openRelaySecurity(context),
+                          icon: const Icon(Icons.verified_user_outlined),
+                          label: const Text('Relay 安全设备'),
+                        ),
+                      ),
+                    ],
                   ],
                 ),
               ),
@@ -984,6 +996,53 @@ class _SessionHomePageState extends State<SessionHomePage> {
         ),
       ),
     );
+  }
+
+  Future<void> _openRelaySecurity(BuildContext context) async {
+    if (controller.canManageRelayDevices) {
+      controller.requestRelayDeviceList();
+    }
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      showDragHandle: true,
+      backgroundColor: Colors.transparent,
+      builder: (context) => ListenableBuilder(
+        listenable: controller,
+        builder: (context, _) => _RelaySecuritySheet(
+          controller: controller,
+          onRefresh: controller.requestRelayDeviceList,
+          onRevoke: (device) => _confirmRelayDeviceRevoke(context, device),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _confirmRelayDeviceRevoke(
+    BuildContext context,
+    RelayTrustedDevice device,
+  ) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('撤销 Relay 设备'),
+        content: Text('撤销后，${device.displayTitle} 需要重新配对才能连接。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('撤销'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true) {
+      controller.revokeRelayDevice(device.deviceId);
+    }
   }
 
   Future<void> _openModelSwitcher(BuildContext context) async {
@@ -2027,6 +2086,257 @@ class _SessionObservationBanner extends StatelessWidget {
   }
 }
 
+class _RelaySecuritySheet extends StatelessWidget {
+  const _RelaySecuritySheet({
+    required this.controller,
+    required this.onRefresh,
+    required this.onRevoke,
+  });
+
+  final SessionController controller;
+  final VoidCallback onRefresh;
+  final ValueChanged<RelayTrustedDevice> onRevoke;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final devices = controller.relayDevices;
+    return DraggableScrollableSheet(
+      initialChildSize: 0.72,
+      minChildSize: 0.42,
+      maxChildSize: 0.92,
+      expand: false,
+      builder: (context, scrollController) {
+        return DecoratedBox(
+          decoration: BoxDecoration(
+            color: scheme.surface,
+            borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
+          ),
+          child: ListView(
+            controller: scrollController,
+            padding: const EdgeInsets.fromLTRB(16, 10, 16, 24),
+            children: [
+              Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      'Relay 安全设备',
+                      style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                            fontWeight: FontWeight.w800,
+                          ),
+                    ),
+                  ),
+                  IconButton(
+                    onPressed:
+                        controller.canManageRelayDevices ? onRefresh : null,
+                    icon: controller.relayDeviceListLoading
+                        ? const SizedBox.square(
+                            dimension: 18,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.refresh),
+                    tooltip: '刷新',
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              _RelaySecurityStatus(controller: controller),
+              if (controller.relayDeviceStatus.trim().isNotEmpty) ...[
+                const SizedBox(height: 10),
+                Text(
+                  controller.relayDeviceStatus,
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                        color: scheme.onSurfaceVariant,
+                      ),
+                ),
+              ],
+              const SizedBox(height: 14),
+              if (devices.isEmpty && !controller.relayDeviceListLoading)
+                _EmptyRelayDeviceState(
+                    canManage: controller.canManageRelayDevices)
+              else
+                for (final device in devices) ...[
+                  _RelayDeviceTile(
+                    device: device,
+                    onRevoke: device.revoked || device.currentDevice
+                        ? null
+                        : () => onRevoke(device),
+                  ),
+                  const SizedBox(height: 10),
+                ],
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _RelaySecurityStatus extends StatelessWidget {
+  const _RelaySecurityStatus({required this.controller});
+
+  final SessionController controller;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final ready = controller.canManageRelayDevices;
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: ready
+            ? scheme.primaryContainer.withValues(alpha: 0.62)
+            : scheme.errorContainer.withValues(alpha: 0.42),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(
+          color: ready
+              ? scheme.primary.withValues(alpha: 0.18)
+              : scheme.error.withValues(alpha: 0.16),
+        ),
+      ),
+      child: Row(
+        children: [
+          Icon(
+            ready ? Icons.lock_outlined : Icons.lock_open_outlined,
+            color: ready ? scheme.primary : scheme.error,
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              ready ? '当前连接已完成 Relay E2EE 设备绑定' : '需要 Relay E2EE 绑定完成后才能管理设备',
+              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                    fontWeight: FontWeight.w700,
+                    color: ready
+                        ? scheme.onPrimaryContainer
+                        : scheme.onErrorContainer,
+                  ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _EmptyRelayDeviceState extends StatelessWidget {
+  const _EmptyRelayDeviceState({required this.canManage});
+
+  final bool canManage;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: scheme.surfaceContainerHighest.withValues(alpha: 0.42),
+        borderRadius: BorderRadius.circular(16),
+      ),
+      child: Text(
+        canManage ? '还没有绑定设备' : '当前连接不可管理 Relay 设备',
+        style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+              color: scheme.onSurfaceVariant,
+            ),
+      ),
+    );
+  }
+}
+
+class _RelayDeviceTile extends StatelessWidget {
+  const _RelayDeviceTile({
+    required this.device,
+    required this.onRevoke,
+  });
+
+  final RelayTrustedDevice device;
+  final VoidCallback? onRevoke;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final status = device.revoked
+        ? '已撤销'
+        : device.currentDevice
+            ? '当前设备'
+            : device.connected
+                ? '在线'
+                : '未连接';
+    final statusColor = device.revoked
+        ? scheme.error
+        : device.connected || device.currentDevice
+            ? const Color(0xFF15803D)
+            : scheme.onSurfaceVariant;
+    return Material(
+      color: scheme.surfaceContainerHighest.withValues(alpha: 0.34),
+      borderRadius: BorderRadius.circular(16),
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Expanded(
+                  child: Text(
+                    device.displayTitle,
+                    style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                          fontWeight: FontWeight.w800,
+                        ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Text(
+                  status,
+                  style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                        color: statusColor,
+                        fontWeight: FontWeight.w800,
+                      ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Text(
+              _shortFingerprint(device.fingerprintHex),
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                color: scheme.onSurfaceVariant,
+                fontFeatures: const [FontFeature.tabularFigures()],
+              ),
+            ),
+            const SizedBox(height: 6),
+            Text(
+              '最后连接：${_formatRelayDeviceTime(device.lastSeenAt)}',
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: scheme.onSurfaceVariant,
+                  ),
+            ),
+            if (device.revokedAt != null) ...[
+              const SizedBox(height: 4),
+              Text(
+                '撤销时间：${_formatRelayDeviceTime(device.revokedAt)}',
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                      color: scheme.error,
+                    ),
+              ),
+            ],
+            if (onRevoke != null) ...[
+              const SizedBox(height: 10),
+              Align(
+                alignment: Alignment.centerRight,
+                child: FilledButton.tonalIcon(
+                  onPressed: onRevoke,
+                  icon: const Icon(Icons.block),
+                  label: const Text('撤销'),
+                ),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 class _ConnectionDot extends StatelessWidget {
   const _ConnectionDot({required this.connected});
 
@@ -2071,4 +2381,25 @@ String _portForHostInput(String rawHost, String rawPort) {
     return rawPort.trim();
   }
   return uri.hasPort && uri.port > 0 ? uri.port.toString() : '';
+}
+
+String _shortFingerprint(String value) {
+  final normalized = value.trim();
+  if (normalized.isEmpty) {
+    return 'fingerprint unavailable';
+  }
+  final prefix = normalized.length <= 16
+      ? normalized
+      : '${normalized.substring(0, 8)} ${normalized.substring(8, 16)}';
+  return 'fp $prefix';
+}
+
+String _formatRelayDeviceTime(DateTime? value) {
+  if (value == null) {
+    return '-';
+  }
+  final local = value.toLocal();
+  String two(int input) => input.toString().padLeft(2, '0');
+  return '${local.year}-${two(local.month)}-${two(local.day)} '
+      '${two(local.hour)}:${two(local.minute)}';
 }
