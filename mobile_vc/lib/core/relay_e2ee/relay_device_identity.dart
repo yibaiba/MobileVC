@@ -82,13 +82,24 @@ class RelayDeviceIdentityStore {
     required RelayDeviceIdentity identity,
     required Uint8List transcript,
   }) async {
+    return signWithPrivateScalar(
+      privateScalar: identity.privateScalar,
+      transcript: transcript,
+    );
+  }
+
+  static Future<Uint8List> signWithPrivateScalar({
+    required Uint8List privateScalar,
+    required Uint8List transcript,
+  }) async {
+    final p256 = pc.ECDomainParameters('secp256r1');
     final signer = pc.Signer('SHA-256/DET-ECDSA');
     signer.init(
       true,
       pc.PrivateKeyParameter<pc.PrivateKey>(
         pc.ECPrivateKey(
-          _bytesToBigInt(identity.privateScalar),
-          _p256,
+          _bytesToBigInt(privateScalar),
+          p256,
         ),
       ),
     );
@@ -101,14 +112,27 @@ class RelayDeviceIdentityStore {
     required Uint8List transcript,
     required Uint8List signature,
   }) async {
-    final point = _p256.curve.decodePoint(publicKey);
+    return verifyWithPublicKey(
+      publicKey: publicKey,
+      transcript: transcript,
+      signature: signature,
+    );
+  }
+
+  static Future<bool> verifyWithPublicKey({
+    required Uint8List publicKey,
+    required Uint8List transcript,
+    required Uint8List signature,
+  }) async {
+    final p256 = pc.ECDomainParameters('secp256r1');
+    final point = p256.curve.decodePoint(publicKey);
     if (point == null || point.isInfinity) {
       throw ArgumentError.value(publicKey, 'publicKey', 'invalid public key');
     }
     final signer = pc.Signer('SHA-256/DET-ECDSA');
     signer.init(
       false,
-      pc.PublicKeyParameter<pc.PublicKey>(pc.ECPublicKey(point, _p256)),
+      pc.PublicKeyParameter<pc.PublicKey>(pc.ECPublicKey(point, p256)),
     );
     return signer.verifySignature(
       transcript,

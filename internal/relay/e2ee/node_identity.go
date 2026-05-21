@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"os"
 	"path/filepath"
 	"strings"
@@ -138,11 +139,11 @@ func (n *NodeIdentity) SignTranscript(transcript []byte) ([]byte, error) {
 		return nil, errors.New("node identity private key is required")
 	}
 	digest := sha256.Sum256(transcript)
-	signature, err := n.PrivateKey.Sign(rand.Reader, digest[:], nil)
+	r, s, err := ecdsa.Sign(rand.Reader, n.PrivateKey, digest[:])
 	if err != nil {
 		return nil, fmt.Errorf("sign node identity transcript: %w", err)
 	}
-	return signature, nil
+	return encodeP256Signature(r, s), nil
 }
 
 func VerifyNodeSignature(publicKey []byte, transcript []byte, signature []byte) (bool, error) {
@@ -150,8 +151,12 @@ func VerifyNodeSignature(publicKey []byte, transcript []byte, signature []byte) 
 	if err != nil {
 		return false, fmt.Errorf("parse node public key: %w", err)
 	}
+	r, s, err := decodeP256Signature(signature)
+	if err != nil {
+		return false, err
+	}
 	digest := sha256.Sum256(transcript)
-	return ecdsa.VerifyASN1(parsed, digest[:], signature), nil
+	return ecdsa.Verify(parsed, digest[:], r, s), nil
 }
 
 func newNodeIdentity(privateKey *ecdsa.PrivateKey) (*NodeIdentity, error) {
@@ -164,4 +169,23 @@ func newNodeIdentity(privateKey *ecdsa.PrivateKey) (*NodeIdentity, error) {
 		PublicKey:   publicKey,
 		Fingerprint: Fingerprint(publicKey),
 	}, nil
+}
+
+func encodeP256Signature(r *big.Int, s *big.Int) []byte {
+	out := make([]byte, KeyLength*2)
+	r.FillBytes(out[:KeyLength])
+	s.FillBytes(out[KeyLength:])
+	return out
+}
+
+func decodeP256Signature(signature []byte) (*big.Int, *big.Int, error) {
+	if len(signature) != KeyLength*2 {
+		return nil, nil, fmt.Errorf("invalid p256 signature length")
+	}
+	r := new(big.Int).SetBytes(signature[:KeyLength])
+	s := new(big.Int).SetBytes(signature[KeyLength:])
+	if r.Sign() <= 0 || s.Sign() <= 0 {
+		return nil, nil, fmt.Errorf("invalid p256 signature scalar")
+	}
+	return r, s, nil
 }
