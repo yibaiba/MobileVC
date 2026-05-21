@@ -100,42 +100,57 @@ func ValidateTunnelFrame(frame TunnelFrame) error {
 	}
 	switch frame.Type {
 	case TunnelFrameStreamOpen:
-		return requireTunnelFields(frame, true, true, false, false, true, false, false)
+		return validateTunnelFields(frame, tunnelFieldRule{
+			streamID: true, streamType: true, window: true, metadata: true,
+		})
 	case TunnelFrameStreamData:
-		return requireTunnelFields(frame, true, false, true, false, false, true, false)
+		return validateTunnelFields(frame, tunnelFieldRule{
+			streamID: true, seq: true, payload: true,
+		})
 	case TunnelFrameStreamAck:
-		return requireTunnelFields(frame, true, false, false, true, true, false, false)
+		return validateTunnelFields(frame, tunnelFieldRule{
+			streamID: true, ack: true, window: true,
+		})
 	case TunnelFrameStreamClose:
-		return requireTunnelFields(frame, true, false, true, false, false, false, false)
+		return validateTunnelFields(frame, tunnelFieldRule{
+			streamID: true, seq: true,
+		})
 	case TunnelFrameStreamReset:
-		return requireTunnelFields(frame, true, false, false, false, false, false, false)
+		return validateTunnelFields(frame, tunnelFieldRule{
+			streamID: true, metadata: true,
+		})
 	case TunnelFrameStreamError:
-		return requireTunnelFields(frame, true, false, false, false, false, false, true)
+		return validateTunnelFields(frame, tunnelFieldRule{
+			streamID: true, errorCode: true, metadata: true,
+		})
 	case TunnelFramePing, TunnelFramePong:
-		return requireTunnelFields(frame, false, false, false, false, false, false, false)
+		return validateTunnelFields(frame, tunnelFieldRule{})
 	default:
 		return fmt.Errorf("unknown tunnel frame type: %s", frame.Type)
 	}
 }
 
 type TunnelCounterState struct {
-	nextSeq uint64
+	nextSeq map[uint64]uint64
 	seen    map[uint64]map[uint64]struct{}
 	windows map[uint64]uint32
 }
 
 func NewTunnelCounterState() *TunnelCounterState {
 	return &TunnelCounterState{
-		nextSeq: 1,
+		nextSeq: map[uint64]uint64{},
 		seen:    map[uint64]map[uint64]struct{}{},
 		windows: map[uint64]uint32{},
 	}
 }
 
-func (s *TunnelCounterState) NextSeq() uint64 {
-	seq := s.nextSeq
-	s.nextSeq++
-	return seq
+func (s *TunnelCounterState) NextSeq(streamID uint64) (uint64, error) {
+	if streamID == 0 {
+		return 0, errors.New("tunnel frame missing streamId")
+	}
+	seq := s.nextSeq[streamID] + 1
+	s.nextSeq[streamID] = seq
+	return seq, nil
 }
 
 func (s *TunnelCounterState) Observe(frame TunnelFrame) error {
@@ -163,38 +178,76 @@ func (s *TunnelCounterState) Observe(frame TunnelFrame) error {
 	return nil
 }
 
-func requireTunnelFields(
-	frame TunnelFrame,
-	streamID bool,
-	streamType bool,
-	seq bool,
-	ack bool,
-	window bool,
-	payload bool,
-	errorCode bool,
-) error {
-	if streamID && frame.StreamID == 0 {
+type tunnelFieldRule struct {
+	streamID   bool
+	streamType bool
+	seq        bool
+	ack        bool
+	window     bool
+	payload    bool
+	errorCode  bool
+	metadata   bool
+}
+
+func validateTunnelFields(frame TunnelFrame, rule tunnelFieldRule) error {
+	if rule.streamID && frame.StreamID == 0 {
 		return errors.New("tunnel frame missing streamId")
 	}
-	if streamType && strings.TrimSpace(frame.StreamType) == "" {
+	if !rule.streamID && frame.StreamID != 0 {
+		return errors.New("tunnel frame has unexpected streamId")
+	}
+	if rule.streamType && strings.TrimSpace(frame.StreamType) == "" {
 		return errors.New("tunnel frame missing streamType")
 	}
-	if seq && frame.Seq == 0 {
+	if !rule.streamType && strings.TrimSpace(frame.StreamType) != "" {
+		return errors.New("tunnel frame has unexpected streamType")
+	}
+	if rule.streamType && !isTunnelStreamType(frame.StreamType) {
+		return fmt.Errorf("unknown tunnel stream type: %s", frame.StreamType)
+	}
+	if rule.seq && frame.Seq == 0 {
 		return errors.New("tunnel frame missing seq")
 	}
-	if ack && frame.Ack == 0 {
+	if !rule.seq && frame.Seq != 0 {
+		return errors.New("tunnel frame has unexpected seq")
+	}
+	if rule.ack && frame.Ack == 0 {
 		return errors.New("tunnel frame missing ack")
 	}
-	if window && frame.Window == 0 {
+	if !rule.ack && frame.Ack != 0 {
+		return errors.New("tunnel frame has unexpected ack")
+	}
+	if rule.window && frame.Window == 0 {
 		return errors.New("tunnel frame missing window")
 	}
-	if payload && len(frame.Payload) == 0 {
+	if !rule.window && frame.Window != 0 {
+		return errors.New("tunnel frame has unexpected window")
+	}
+	if rule.payload && len(frame.Payload) == 0 {
 		return errors.New("tunnel frame missing payload")
 	}
-	if errorCode && strings.TrimSpace(frame.ErrorCode) == "" {
+	if !rule.payload && len(frame.Payload) != 0 {
+		return errors.New("tunnel frame has unexpected payload")
+	}
+	if rule.errorCode && strings.TrimSpace(frame.ErrorCode) == "" {
 		return errors.New("tunnel frame missing errorCode")
 	}
+	if !rule.errorCode && strings.TrimSpace(frame.ErrorCode) != "" {
+		return errors.New("tunnel frame has unexpected errorCode")
+	}
+	if !rule.metadata && len(frame.Metadata) != 0 {
+		return errors.New("tunnel frame has unexpected metadata")
+	}
 	return nil
+}
+
+func isTunnelStreamType(streamType string) bool {
+	switch streamType {
+	case TunnelStreamMobileVCWS, TunnelStreamFileDownload:
+		return true
+	default:
+		return false
+	}
 }
 
 func sortedMetadata(metadata map[string]string) map[string]string {

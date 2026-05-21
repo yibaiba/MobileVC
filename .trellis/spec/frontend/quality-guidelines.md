@@ -149,6 +149,8 @@ await prefs.setString('mobilevc.app_config', jsonEncode(config.toJson()));
 - `RelayE2eeCapabilitySet.production()` must require E2EE, disable plaintext test-mode, and require multiplex streams, file download streams, and device management before it can be used for verified security state.
 - `RelayE2eeCapabilitySet.plaintextTestMode()` is explicit test mode only and must not be presented as verified.
 - Capability values must be applied to `RelayE2eeHandshakeInput` before generating or validating the transcript.
+- `RelayTunnelFrame.validate()` must enforce both required fields and unexpected-field rejection per frame type; `ping` and `pong` carry no stream metadata.
+- `RelayTunnelCounterState.nextSeq(streamId)` must allocate sequence numbers per stream ID, not globally across the relay tunnel.
 - Fingerprint mismatch, revoked device, decrypt failure, unsupported version, missing capability, or missing plaintext rejection must produce neutral or blocking copy, not security-positive copy.
 - Relay error codes for E2EE, device, stream, and download failures must map to actionable Chinese copy through `relayErrorMessage`; do not show raw server messages such as `e2ee required` to users.
 - Full fingerprint and short fingerprint are derived from the node public key; UI must not invent or truncate fingerprint values outside this evaluator.
@@ -159,6 +161,7 @@ await prefs.setString('mobilevc.app_config', jsonEncode(config.toJson()));
 - Production capability with plaintext test-mode enabled -> validation error.
 - Production capability missing multiplex stream, file download stream, or device management support -> validation error.
 - Unsupported relay/e2ee/tunnel version or crypto suite -> validation error.
+- Tunnel frame with an unknown stream type, missing required field, or unexpected field for its frame type -> `FormatException`.
 - Fingerprint mismatch -> `指纹已变化`, blocking.
 - Device revoked -> `设备已撤销`, blocking.
 - Decrypt failure or unsupported E2EE capability -> `加密不可用`, blocking.
@@ -177,6 +180,7 @@ await prefs.setString('mobilevc.app_config', jsonEncode(config.toJson()));
 #### 6. Tests Required
 - Verified state only when every condition is true.
 - Capability tests assert production success, production plaintext-test rejection, missing tunnel feature rejection, explicit plaintext test-mode validation, unsupported version rejection, and handshake transcript binding.
+- Tunnel tests assert required fields, unexpected-field rejection, unknown stream type rejection, per-stream sequence allocation, per-stream replay rejection, and zero-window rejection.
 - Test-mode, fingerprint mismatch, revoked device, decrypt failure, unsupported capability, and plaintext-not-rejected states cannot show verified.
 - Direct mode never implies E2EE verified.
 - Relay E2EE/device/stream/download error-code mapping tests assert Chinese actionable copy and do not expose raw backend English messages.

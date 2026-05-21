@@ -61,7 +61,10 @@ func TestTunnelCounterStateRejectsReplayPerStreamAndTracksWindows(t *testing.T) 
 	if err := state.Observe(open); err != nil {
 		t.Fatal(err)
 	}
-	seq := state.NextSeq()
+	seq, err := state.NextSeq(7)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if seq != 1 {
 		t.Fatalf("first seq: got %d want 1", seq)
 	}
@@ -80,6 +83,13 @@ func TestTunnelCounterStateRejectsReplayPerStreamAndTracksWindows(t *testing.T) 
 	if err := state.Observe(otherStream); err != nil {
 		t.Fatalf("same seq on different stream should be independent: %v", err)
 	}
+	otherSeq, err := state.NextSeq(8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if otherSeq != 1 {
+		t.Fatalf("first seq on other stream: got %d want 1", otherSeq)
+	}
 }
 
 func TestTunnelCounterStateRejectsZeroWindow(t *testing.T) {
@@ -90,5 +100,35 @@ func TestTunnelCounterStateRejectsZeroWindow(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "window") {
 		t.Fatalf("expected zero window failure, got %v", err)
+	}
+}
+
+func TestTunnelFrameRejectsUnexpectedFields(t *testing.T) {
+	invalidData := TunnelFrame{
+		Type: TunnelFrameStreamData, Version: TunnelVersion,
+		StreamID: 7, StreamType: TunnelStreamMobileVCWS,
+		Seq: 1, Payload: []byte("chunk"),
+	}
+	if err := ValidateTunnelFrame(invalidData); err == nil || !strings.Contains(err.Error(), "unexpected streamType") {
+		t.Fatalf("expected unexpected streamType failure, got %v", err)
+	}
+
+	invalidPing := TunnelFrame{
+		Type: TunnelFramePing, Version: TunnelVersion,
+		Metadata: map[string]string{"route": "/ws"},
+	}
+	if err := ValidateTunnelFrame(invalidPing); err == nil || !strings.Contains(err.Error(), "unexpected metadata") {
+		t.Fatalf("expected unexpected metadata failure, got %v", err)
+	}
+}
+
+func TestTunnelFrameRejectsUnknownStreamType(t *testing.T) {
+	frame := TunnelFrame{
+		Type: TunnelFrameStreamOpen, Version: TunnelVersion,
+		StreamID: 7, StreamType: "unknown.route", Window: 32,
+	}
+
+	if err := ValidateTunnelFrame(frame); err == nil || !strings.Contains(err.Error(), "unknown tunnel stream type") {
+		t.Fatalf("expected unknown stream type failure, got %v", err)
 	}
 }

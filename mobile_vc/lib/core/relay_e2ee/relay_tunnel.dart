@@ -104,54 +104,94 @@ class RelayTunnelFrame {
     }
     switch (type) {
       case tunnelFrameStreamOpen:
-        _require(streamId: true, streamType: true, window: true);
+        _validateFields(
+          const _RelayTunnelFieldRule(
+            streamId: true,
+            streamType: true,
+            window: true,
+            metadata: true,
+          ),
+        );
       case tunnelFrameStreamData:
-        _require(streamId: true, seq: true, payload: true);
+        _validateFields(
+          const _RelayTunnelFieldRule(streamId: true, seq: true, payload: true),
+        );
       case tunnelFrameStreamAck:
-        _require(streamId: true, ack: true, window: true);
+        _validateFields(
+          const _RelayTunnelFieldRule(streamId: true, ack: true, window: true),
+        );
       case tunnelFrameStreamClose:
-        _require(streamId: true, seq: true);
+        _validateFields(
+          const _RelayTunnelFieldRule(streamId: true, seq: true),
+        );
       case tunnelFrameStreamReset:
-        _require(streamId: true);
+        _validateFields(
+          const _RelayTunnelFieldRule(streamId: true, metadata: true),
+        );
       case tunnelFrameStreamError:
-        _require(streamId: true, errorCode: true);
+        _validateFields(
+          const _RelayTunnelFieldRule(
+            streamId: true,
+            errorCode: true,
+            metadata: true,
+          ),
+        );
       case tunnelFramePing:
       case tunnelFramePong:
-        break;
+        _validateFields(const _RelayTunnelFieldRule());
       default:
         throw FormatException('unknown tunnel frame type: $type');
     }
   }
 
-  void _require({
-    bool streamId = false,
-    bool streamType = false,
-    bool seq = false,
-    bool ack = false,
-    bool window = false,
-    bool payload = false,
-    bool errorCode = false,
-  }) {
-    if (streamId && this.streamId == 0) {
+  void _validateFields(_RelayTunnelFieldRule rule) {
+    if (rule.streamId && streamId == 0) {
       throw const FormatException('tunnel frame missing streamId');
     }
-    if (streamType && this.streamType.trim().isEmpty) {
+    if (!rule.streamId && streamId != 0) {
+      throw const FormatException('tunnel frame has unexpected streamId');
+    }
+    if (rule.streamType && streamType.trim().isEmpty) {
       throw const FormatException('tunnel frame missing streamType');
     }
-    if (seq && this.seq == 0) {
+    if (!rule.streamType && streamType.trim().isNotEmpty) {
+      throw const FormatException('tunnel frame has unexpected streamType');
+    }
+    if (rule.streamType && !_isTunnelStreamType(streamType)) {
+      throw FormatException('unknown tunnel stream type: $streamType');
+    }
+    if (rule.seq && seq == 0) {
       throw const FormatException('tunnel frame missing seq');
     }
-    if (ack && this.ack == 0) {
+    if (!rule.seq && seq != 0) {
+      throw const FormatException('tunnel frame has unexpected seq');
+    }
+    if (rule.ack && ack == 0) {
       throw const FormatException('tunnel frame missing ack');
     }
-    if (window && this.window == 0) {
+    if (!rule.ack && ack != 0) {
+      throw const FormatException('tunnel frame has unexpected ack');
+    }
+    if (rule.window && window == 0) {
       throw const FormatException('tunnel frame missing window');
     }
-    if (payload && this.payload.isEmpty) {
+    if (!rule.window && window != 0) {
+      throw const FormatException('tunnel frame has unexpected window');
+    }
+    if (rule.payload && payload.isEmpty) {
       throw const FormatException('tunnel frame missing payload');
     }
-    if (errorCode && this.errorCode.trim().isEmpty) {
+    if (!rule.payload && payload.isNotEmpty) {
+      throw const FormatException('tunnel frame has unexpected payload');
+    }
+    if (rule.errorCode && errorCode.trim().isEmpty) {
       throw const FormatException('tunnel frame missing errorCode');
+    }
+    if (!rule.errorCode && errorCode.trim().isNotEmpty) {
+      throw const FormatException('tunnel frame has unexpected errorCode');
+    }
+    if (!rule.metadata && metadata.isNotEmpty) {
+      throw const FormatException('tunnel frame has unexpected metadata');
     }
   }
 
@@ -165,11 +205,18 @@ class RelayTunnelFrame {
 }
 
 class RelayTunnelCounterState {
-  var _nextSeq = 1;
+  final Map<int, int> _nextSeq = <int, int>{};
   final Map<int, Set<int>> _seen = <int, Set<int>>{};
   final Map<int, int> windows = <int, int>{};
 
-  int nextSeq() => _nextSeq++;
+  int nextSeq(int streamId) {
+    if (streamId == 0) {
+      throw const FormatException('tunnel frame missing streamId');
+    }
+    final seq = (_nextSeq[streamId] ?? 0) + 1;
+    _nextSeq[streamId] = seq;
+    return seq;
+  }
 
   void observe(RelayTunnelFrame frame) {
     frame.validate();
@@ -190,4 +237,33 @@ class RelayTunnelCounterState {
     }
     seenByStream.add(frame.seq);
   }
+}
+
+class _RelayTunnelFieldRule {
+  const _RelayTunnelFieldRule({
+    this.streamId = false,
+    this.streamType = false,
+    this.seq = false,
+    this.ack = false,
+    this.window = false,
+    this.payload = false,
+    this.errorCode = false,
+    this.metadata = false,
+  });
+
+  final bool streamId;
+  final bool streamType;
+  final bool seq;
+  final bool ack;
+  final bool window;
+  final bool payload;
+  final bool errorCode;
+  final bool metadata;
+}
+
+bool _isTunnelStreamType(String streamType) {
+  return switch (streamType) {
+    tunnelStreamMobileVcWs || tunnelStreamFileDownload => true,
+    _ => false,
+  };
 }

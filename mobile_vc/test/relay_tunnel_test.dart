@@ -54,7 +54,7 @@ void main() {
       window: 8,
     ));
 
-    final seq = state.nextSeq();
+    final seq = state.nextSeq(7);
     expect(seq, 1);
 
     final data = RelayTunnelFrame(
@@ -72,6 +72,7 @@ void main() {
       seq: seq,
       payload: const <int>[1, 2, 3],
     ));
+    expect(state.nextSeq(8), 1);
   });
 
   test('zero stream window fails explicitly', () {
@@ -82,6 +83,39 @@ void main() {
         streamId: 7,
         streamType: tunnelStreamFileDownload,
       )),
+      throwsFormatException,
+    );
+  });
+
+  test('rejects unexpected fields for frame type', () {
+    expect(
+      () => const RelayTunnelFrame(
+        type: tunnelFrameStreamData,
+        streamId: 7,
+        streamType: tunnelStreamMobileVcWs,
+        seq: 1,
+        payload: <int>[1],
+      ).validate(),
+      throwsFormatException,
+    );
+
+    expect(
+      () => const RelayTunnelFrame(
+        type: tunnelFramePing,
+        metadata: <String, String>{'route': '/ws'},
+      ).validate(),
+      throwsFormatException,
+    );
+  });
+
+  test('rejects unknown stream type', () {
+    expect(
+      () => const RelayTunnelFrame(
+        type: tunnelFrameStreamOpen,
+        streamId: 7,
+        streamType: 'unknown.route',
+        window: 32,
+      ).validate(),
       throwsFormatException,
     );
   });
