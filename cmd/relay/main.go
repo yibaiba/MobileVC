@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 
 	"mobilevc/internal/logx"
@@ -71,6 +72,8 @@ func parseRelayFlags(args []string) (relay.Overrides, bool, error) {
 	fs.StringVar(&overrides.TrustedProxyCIDRs, "trusted-proxy-cidrs", "", "comma-separated trusted proxy CIDRs")
 	fs.StringVar(&overrides.HTTPAllowlist, "http-allowlist", "", "comma-separated METHOD:/path HTTP allowlist")
 	fs.StringVar(&overrides.WSAllowlist, "ws-allowlist", "", "comma-separated METHOD:/path websocket allowlist")
+	requireE2EE := optionalBoolFlag(fs, "require-e2ee", "reject plaintext relay.forward frames")
+	plaintextTestMode := optionalBoolFlag(fs, "plaintext-test-mode", "allow plaintext relay.forward frames for local test mode only")
 	fs.BoolVar(&showHelp, "help", false, "show help")
 	if err := fs.Parse(args); err != nil {
 		return relay.Overrides{}, false, err
@@ -101,5 +104,50 @@ func parseRelayFlags(args []string) (relay.Overrides, bool, error) {
 		}
 		duration.set(parsed)
 	}
+	if requireE2EE.IsSet() {
+		value := requireE2EE.Value()
+		overrides.RequireE2EE = &value
+	}
+	if plaintextTestMode.IsSet() {
+		value := plaintextTestMode.Value()
+		overrides.PlaintextTestMode = &value
+	}
 	return overrides, false, nil
+}
+
+type optionalBool struct {
+	value bool
+	set   bool
+}
+
+func optionalBoolFlag(fs *flag.FlagSet, name string, usage string) *optionalBool {
+	flagValue := &optionalBool{}
+	fs.Var(flagValue, name, usage)
+	return flagValue
+}
+
+func (b *optionalBool) Set(raw string) error {
+	parsed, err := strconv.ParseBool(raw)
+	if err != nil {
+		return fmt.Errorf("must be a valid boolean: %w", err)
+	}
+	b.value = parsed
+	b.set = true
+	return nil
+}
+
+func (b *optionalBool) String() string {
+	return strconv.FormatBool(b.value)
+}
+
+func (b *optionalBool) IsBoolFlag() bool {
+	return true
+}
+
+func (b *optionalBool) IsSet() bool {
+	return b.set
+}
+
+func (b *optionalBool) Value() bool {
+	return b.value
 }

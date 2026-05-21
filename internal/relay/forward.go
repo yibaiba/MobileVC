@@ -32,7 +32,7 @@ func (s *Server) forwardEnvelope(peer *peerConn, sessionID string, direction str
 		return err
 	}
 	if err := s.validateForward(peer, sessionID, direction, env); err != nil {
-		writeError(peer, CodeProtocolError)
+		writeError(peer, forwardValidationErrorCode(err))
 		return err
 	}
 	if size, err := s.validatePayloadSize(env.Payload); err != nil {
@@ -83,10 +83,31 @@ func (s *Server) validateForward(peer *peerConn, sessionID string, direction str
 	if err := validateForwardMetadata(env, sessionID, direction); err != nil {
 		return err
 	}
+	if err := s.forwardSecurityPolicy().Validate(env); err != nil {
+		return err
+	}
 	if !s.forwardClientIDMatches(peer, sessionID, env.ClientID) {
 		return errors.New("invalid forward client id")
 	}
 	return nil
+}
+
+func (s *Server) forwardSecurityPolicy() ForwardSecurityPolicy {
+	return ForwardSecurityPolicy{
+		RequireE2EE:       s.cfg.RequireE2EE,
+		PlaintextTestMode: s.cfg.PlaintextTestMode,
+	}
+}
+
+func forwardValidationErrorCode(err error) string {
+	switch {
+	case errors.Is(err, ErrE2EERequired):
+		return CodeE2EERequired
+	case errors.Is(err, ErrE2EEUnsupported):
+		return CodeE2EEUnsupported
+	default:
+		return CodeProtocolError
+	}
 }
 
 func validateForwardMetadata(env ForwardEnvelope, sessionID string, direction string) error {
@@ -96,7 +117,7 @@ func validateForwardMetadata(env ForwardEnvelope, sessionID string, direction st
 	if env.SessionID != sessionID || env.Direction != direction {
 		return errors.New("invalid forward routing")
 	}
-	if env.ContentType != ContentTypeMobileVC || env.Encryption != EncryptionNone {
+	if env.ContentType != ContentTypeMobileVC {
 		return errors.New("invalid forward content")
 	}
 	if env.PayloadEncoding != PayloadBase64URL || strings.TrimSpace(env.MessageID) == "" {

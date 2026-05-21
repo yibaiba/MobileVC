@@ -50,6 +50,30 @@ func TestParseRelayFlags(t *testing.T) {
 	}
 }
 
+func TestParseRelayFlagsReadsE2EEModeOnlyWhenSet(t *testing.T) {
+	defaultOverrides, _, err := parseRelayFlags(nil)
+	if err != nil {
+		t.Fatalf("parse default flags: %v", err)
+	}
+	if defaultOverrides.RequireE2EE != nil || defaultOverrides.PlaintextTestMode != nil {
+		t.Fatalf("unset e2ee flags should not override env: %#v", defaultOverrides)
+	}
+
+	overrides, _, err := parseRelayFlags([]string{
+		"--require-e2ee=false",
+		"--plaintext-test-mode",
+	})
+	if err != nil {
+		t.Fatalf("parse e2ee flags: %v", err)
+	}
+	if overrides.RequireE2EE == nil || *overrides.RequireE2EE {
+		t.Fatalf("expected require e2ee false override: %#v", overrides.RequireE2EE)
+	}
+	if overrides.PlaintextTestMode == nil || !*overrides.PlaintextTestMode {
+		t.Fatalf("expected plaintext test mode true override: %#v", overrides.PlaintextTestMode)
+	}
+}
+
 func TestParseRelayFlagsRejectsInvalidDuration(t *testing.T) {
 	if _, _, err := parseRelayFlags([]string{"--ping-interval", "bad"}); err == nil {
 		t.Fatal("expected invalid duration to fail")

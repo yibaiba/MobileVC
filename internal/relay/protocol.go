@@ -35,6 +35,17 @@ const (
 	CodeQueueFull            = "queue_full"
 	CodeAgentDisconnected    = "agent_disconnected"
 	CodeControllerDisconnect = "controller_disconnected"
+	CodeE2EERequired         = "e2ee_required"
+	CodeE2EEUnsupported      = "e2ee_unsupported_version"
+	CodeE2EEHandshakeFailed  = "e2ee_handshake_failed"
+	CodeE2EEDecryptFailed    = "e2ee_decrypt_failed"
+	CodeE2EEReplayDetected   = "e2ee_replay_detected"
+	CodeDeviceRevoked        = "device_revoked"
+	CodeDeviceUnknown        = "device_unknown"
+	CodeStreamCancelled      = "stream_cancelled"
+	CodeStreamWindowExceeded = "stream_window_exceeded"
+	CodeDownloadDenied       = "download_denied"
+	CodeDownloadFailed       = "download_failed"
 )
 
 type ControlFrame struct {
@@ -151,6 +162,28 @@ func defaultErrorMessage(code string) string {
 		return "agent disconnected"
 	case CodeControllerDisconnect:
 		return "controller disconnected"
+	case CodeE2EERequired:
+		return "e2ee required"
+	case CodeE2EEUnsupported:
+		return "e2ee unsupported version"
+	case CodeE2EEHandshakeFailed:
+		return "e2ee handshake failed"
+	case CodeE2EEDecryptFailed:
+		return "e2ee decrypt failed"
+	case CodeE2EEReplayDetected:
+		return "e2ee replay detected"
+	case CodeDeviceRevoked:
+		return "device revoked"
+	case CodeDeviceUnknown:
+		return "device unknown"
+	case CodeStreamCancelled:
+		return "stream cancelled"
+	case CodeStreamWindowExceeded:
+		return "stream window exceeded"
+	case CodeDownloadDenied:
+		return "download denied"
+	case CodeDownloadFailed:
+		return "download failed"
 	default:
 		return "protocol error"
 	}

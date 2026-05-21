@@ -186,6 +186,63 @@ func TestRelayRejectsForwardWithWrongClientID(t *testing.T) {
 	}
 }
 
+func TestRelayRejectsPlaintextForwardWhenE2EERequired(t *testing.T) {
+	server := newLimitedTestRelayServer(t, Config{RequireE2EE: true})
+	defer server.Close()
+
+	sessionID := "rs_e2ee_required"
+	secret := "pair-secret-128-bit-minimum"
+	agent := dialRelay(t, server.URL, "/relay/agent")
+	defer agent.Close()
+	registerAgent(t, agent, sessionID, secret, "reconnect-secret", time.Now().Add(time.Minute))
+	client := dialRelay(t, server.URL, "/relay/client")
+	defer client.Close()
+	clientID := pairClient(t, client, sessionID, secret)
+	readAttached(t, agent, clientID)
+
+	env := testEnvelope(sessionID, clientID, DirectionClientToAgent, []byte(`{"action":"x"}`))
+	if err := client.WriteJSON(env); err != nil {
+		t.Fatalf("send plaintext forward: %v", err)
+	}
+	var errFrame ErrorFrame
+	if err := client.ReadJSON(&errFrame); err != nil {
+		t.Fatalf("read e2ee required error: %v", err)
+	}
+	if errFrame.Code != CodeE2EERequired {
+		t.Fatalf("unexpected error frame: %#v", errFrame)
+	}
+}
+
+func TestRelayForwardsE2EEFrameWhenE2EERequired(t *testing.T) {
+	server := newLimitedTestRelayServer(t, Config{RequireE2EE: true})
+	defer server.Close()
+
+	sessionID := "rs_e2ee_forward"
+	secret := "pair-secret-128-bit-minimum"
+	agent := dialRelay(t, server.URL, "/relay/agent")
+	defer agent.Close()
+	registerAgent(t, agent, sessionID, secret, "reconnect-secret", time.Now().Add(time.Minute))
+	client := dialRelay(t, server.URL, "/relay/client")
+	defer client.Close()
+	clientID := pairClient(t, client, sessionID, secret)
+	readAttached(t, agent, clientID)
+
+	env := testEnvelope(sessionID, clientID, DirectionClientToAgent, []byte(`sealed`))
+	env.Encryption = EncryptionE2EEV1
+	env.StreamID = 9
+	env.HandshakeID = "hs_required"
+	if err := client.WriteJSON(env); err != nil {
+		t.Fatalf("send e2ee forward: %v", err)
+	}
+	var got ForwardEnvelope
+	if err := agent.ReadJSON(&got); err != nil {
+		t.Fatalf("agent read e2ee forward: %v", err)
+	}
+	if got.Encryption != EncryptionE2EEV1 || got.StreamID != 9 || got.HandshakeID != "hs_required" {
+		t.Fatalf("unexpected e2ee forward metadata: %#v", got)
+	}
+}
+
 func TestRelayRejectsSessionIDReuseAfterAgentDisconnect(t *testing.T) {
 	server := newTestRelayServer(t)
 	defer server.Close()

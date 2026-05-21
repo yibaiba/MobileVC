@@ -44,9 +44,14 @@ Questions to answer:
 - Relay capacity env: `RELAY_MAX_AGENT_CONNS`, `RELAY_MAX_CLIENT_CONNS`, `RELAY_MAX_CONNS_PER_IP`, `RELAY_FORWARD_QUEUE_SIZE`
 - Relay liveness env: `RELAY_PING_INTERVAL`, `RELAY_PONG_TIMEOUT`, `RELAY_AGENT_GRACE_PERIOD`
 - Trusted proxy env: `RELAY_TRUSTED_PROXY_CIDRS=<comma-separated-cidrs>`
+- Relay E2EE env: `RELAY_REQUIRE_E2EE=true|false`, `RELAY_PLAINTEXT_TEST_MODE=true|false`
+- Relay E2EE flags: `--require-e2ee[=true|false]`, `--plaintext-test-mode[=true|false]`
 
 #### 3. Contracts
 - Relay server forwards only `relay.forward` envelopes with base64url payloads; it must not parse MobileVC business actions.
+- Production relay defaults to `RELAY_REQUIRE_E2EE=true` and `RELAY_PLAINTEXT_TEST_MODE=false`; plaintext `relay.forward` frames are rejected unless plaintext test mode is explicitly enabled.
+- Plaintext test mode is for local/debug rollout only. It must be enabled explicitly with `RELAY_REQUIRE_E2EE=false` plus `RELAY_PLAINTEXT_TEST_MODE=true`, or equivalent flags.
+- E2EE `relay.forward` frames use `encryption=p256-ecdsa+p256-ecdh+hkdf-sha256+aes-256-gcm`, `payloadEncoding=base64url`, non-zero `streamId`, and non-empty `handshakeId`. Counter `0` is valid because stream counters start at zero.
 - `agent.register` sends only secret hashes; plaintext pairing secret is local-only and written through `RELAY_PAIRING_EVENT_PATH`.
 - `client.pair` is the only place a client sends the one-time pairing secret.
 - Direct backend `AUTH_TOKEN` must not appear in relay control frames, relay envelopes, relay QR URIs, relay logs, or relay event files.
@@ -68,7 +73,12 @@ Questions to answer:
 - Public `ws://` relay URL -> config error; only loopback/LAN development hosts may use `ws://`.
 - Missing `RELAY_PAIRING_EVENT_PATH` in relay mode -> config error.
 - Invalid relay duration / integer / byte env value -> config error; do not silently fall back to defaults.
+- Invalid relay boolean env value -> config error; do not silently fall back to defaults.
+- `RELAY_REQUIRE_E2EE=true` together with `RELAY_PLAINTEXT_TEST_MODE=true` -> config error.
 - Oversized decoded relay payload -> `relay.error` with `payload_too_large`.
+- Plaintext `relay.forward` while E2EE is required and plaintext test mode is off -> `relay.error` with `e2ee_required`.
+- Unknown forward encryption suite -> `relay.error` with `e2ee_unsupported_version`.
+- E2EE forward missing `streamId` or `handshakeId` -> `relay.error` with `protocol_error`.
 - Forward with missing or mismatched `clientId` -> `relay.error` with `protocol_error`.
 - First agent-to-client forward with an empty `clientId` after successful client pairing -> relay fills the current active `clientId`; wrong non-empty `clientId` still -> `protocol_error`.
 - Missing `client.attached` before the relay websocket closes -> local relay client write returns the underlying read/close error.
@@ -79,13 +89,17 @@ Questions to answer:
 
 #### 5. Good/Base/Bad Cases
 - Good: backend writes pairing data to an owner-only temp file, launcher reads and deletes it, logs show only redacted URI.
+- Good: public relay starts with E2EE required and rejects plaintext before forwarding payloads.
+- Good: local test relay uses explicit `--require-e2ee=false --plaintext-test-mode=true` and UI/logs label it as test-only.
 - Good: relay behind a trusted reverse proxy enforces caps by forwarded client IP, while direct internet clients cannot spoof forwarded headers.
 - Base: direct `/ws?token=...` path still performs token and origin checks.
 - Bad: printing `mobilevc.relay.pairing_ready` JSON to stdout/stderr because server logs then retain the one-time secret.
+- Bad: accepting `encryption=none` on a long-lived public relay session because E2EE handshake code is not fully integrated yet.
 - Bad: accepting a duplicate `agent.register` for an existing `sessionId` after disconnect; that bypasses reconnect-secret semantics.
 
 #### 6. Tests Required
 - Relay pairing, one-time secret consumption, URL validation, oversized payload, and opaque unknown business payload forwarding.
+- Relay plaintext rejection, plaintext test-mode allowance, E2EE metadata validation, unsupported encryption rejection, config env parsing, and CLI flag parsing.
 - Relay per-IP caps, trusted forwarded IP positive/negative cases, ping writer shutdown, mismatched `clientId`, duplicate session register rejection, and reconnect within grace.
 - Relay agent-disconnect grace expiry must remove orphan sessions and close paired clients.
 - Relay client tests must cover consuming `client.attached` before `relay.forward`, writing with the attached `clientId`, and timing out register/reconnect response reads.

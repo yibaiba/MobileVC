@@ -28,6 +28,8 @@ const (
 	defaultForwardQueueSize        = 64
 	defaultHTTPAllowedRoutes       = "GET:/healthz,GET:/version,GET:/download"
 	defaultWSAllowedRoutes         = "GET:/ws"
+	defaultRequireE2EE             = true
+	defaultPlaintextTestMode       = false
 )
 
 type RouteRule struct {
@@ -55,6 +57,8 @@ type Config struct {
 	TrustedProxyCIDRs       string
 	HTTPAllowedRoutes       []RouteRule
 	WSAllowedRoutes         []RouteRule
+	RequireE2EE             bool
+	PlaintextTestMode       bool
 }
 
 type Overrides struct {
@@ -77,6 +81,8 @@ type Overrides struct {
 	TrustedProxyCIDRs       string
 	HTTPAllowlist           string
 	WSAllowlist             string
+	RequireE2EE             *bool
+	PlaintextTestMode       *bool
 }
 
 func LoadConfigFromEnv() (Config, error) {
@@ -122,6 +128,12 @@ func applyOverrides(cfg *Config, overrides Overrides) error {
 			return fmt.Errorf("--ws-allowlist: %w", err)
 		}
 		cfg.WSAllowedRoutes = rules
+	}
+	if overrides.RequireE2EE != nil {
+		cfg.RequireE2EE = *overrides.RequireE2EE
+	}
+	if overrides.PlaintextTestMode != nil {
+		cfg.PlaintextTestMode = *overrides.PlaintextTestMode
 	}
 	return nil
 }
@@ -193,6 +205,14 @@ func loadConfigFromEnv() (Config, error) {
 		PairingTTL:        pairingTTL,
 		AgentGracePeriod:  grace,
 		TrustedProxyCIDRs: strings.TrimSpace(os.Getenv("RELAY_TRUSTED_PROXY_CIDRS")),
+		RequireE2EE:       defaultRequireE2EE,
+		PlaintextTestMode: defaultPlaintextTestMode,
+	}
+	if cfg.RequireE2EE, err = getEnvBool("RELAY_REQUIRE_E2EE", defaultRequireE2EE); err != nil {
+		return Config{}, err
+	}
+	if cfg.PlaintextTestMode, err = getEnvBool("RELAY_PLAINTEXT_TEST_MODE", defaultPlaintextTestMode); err != nil {
+		return Config{}, err
 	}
 	cfg.HTTPAllowedRoutes, err = parseRouteRules(getEnv("RELAY_HTTP_ALLOWLIST", defaultHTTPAllowedRoutes))
 	if err != nil {
@@ -283,6 +303,9 @@ func (c Config) Validate() error {
 	if len(c.HTTPAllowedRoutes) == 0 && len(c.WSAllowedRoutes) == 0 {
 		return fmt.Errorf("relay route allowlist cannot be empty")
 	}
+	if c.RequireE2EE && c.PlaintextTestMode {
+		return fmt.Errorf("RELAY_REQUIRE_E2EE and RELAY_PLAINTEXT_TEST_MODE cannot both be true")
+	}
 	return nil
 }
 
@@ -342,6 +365,17 @@ func getEnvInt(key string, fallback int) (int, error) {
 		parsed, err := strconv.Atoi(value)
 		if err != nil {
 			return 0, fmt.Errorf("%s must be a valid integer: %w", key, err)
+		}
+		return parsed, nil
+	}
+	return fallback, nil
+}
+
+func getEnvBool(key string, fallback bool) (bool, error) {
+	if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+		parsed, err := strconv.ParseBool(value)
+		if err != nil {
+			return false, fmt.Errorf("%s must be a valid boolean: %w", key, err)
 		}
 		return parsed, nil
 	}

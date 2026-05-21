@@ -46,6 +46,32 @@ func TestLoadConfigFromEnvReadsPayloadByteLimit(t *testing.T) {
 	}
 }
 
+func TestLoadConfigFromEnvReadsE2EEMode(t *testing.T) {
+	withRelayEnv(t, map[string]string{
+		"RELAY_REQUIRE_E2EE":        "false",
+		"RELAY_PLAINTEXT_TEST_MODE": "true",
+	})
+
+	cfg, err := LoadConfigFromEnv()
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.RequireE2EE || !cfg.PlaintextTestMode {
+		t.Fatalf("unexpected e2ee config: %#v", cfg)
+	}
+}
+
+func TestLoadConfigRejectsConflictingE2EEMode(t *testing.T) {
+	withRelayEnv(t, map[string]string{
+		"RELAY_REQUIRE_E2EE":        "true",
+		"RELAY_PLAINTEXT_TEST_MODE": "true",
+	})
+
+	if _, err := LoadConfigFromEnv(); err == nil {
+		t.Fatal("expected conflicting e2ee config to fail")
+	}
+}
+
 func TestLoadConfigFromEnvReadsDefaultRouteAllowlists(t *testing.T) {
 	withRelayEnv(t, map[string]string{})
 
@@ -130,6 +156,8 @@ func withRelayEnv(t *testing.T, values map[string]string) {
 		"RELAY_MAX_PAYLOAD_BYTES",
 		"RELAY_HTTP_ALLOWLIST",
 		"RELAY_WS_ALLOWLIST",
+		"RELAY_REQUIRE_E2EE",
+		"RELAY_PLAINTEXT_TEST_MODE",
 	}
 	for _, key := range keys {
 		t.Setenv(key, "")

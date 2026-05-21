@@ -145,6 +145,7 @@ await prefs.setString('mobilevc.app_config', jsonEncode(config.toJson()));
 - `canShowVerified` requires relay mode, confirmed node fingerprint, completed E2EE handshake, compatible protocol/tunnel capabilities, multiplex stream support, file download support, device management support, E2EE required, plaintext test-mode off, device not revoked, and production plaintext rejection active.
 - Relay plaintext test-mode must be labeled as test mode and must never look verified.
 - Fingerprint mismatch, revoked device, decrypt failure, unsupported version, missing capability, or missing plaintext rejection must produce neutral or blocking copy, not security-positive copy.
+- Relay error codes for E2EE, device, stream, and download failures must map to actionable Chinese copy through `relayErrorMessage`; do not show raw server messages such as `e2ee required` to users.
 - Full fingerprint and short fingerprint are derived from the node public key; UI must not invent or truncate fingerprint values outside this evaluator.
 
 #### 4. Validation & Error Matrix
@@ -154,6 +155,9 @@ await prefs.setString('mobilevc.app_config', jsonEncode(config.toJson()));
 - Device revoked -> `设备已撤销`, blocking.
 - Decrypt failure or unsupported E2EE capability -> `加密不可用`, blocking.
 - E2EE required but plaintext rejection not confirmed -> `明文拒绝未启用`, blocking.
+- `relay.error` code `e2ee_required` -> copy tells the user plaintext is disabled and both phone/local service must be updated/re-paired for E2EE.
+- `relay.error` code `e2ee_unsupported_version` -> copy tells the user the E2EE version is incompatible and both endpoints must be updated.
+- `relay.error` codes `device_revoked` / `device_unknown` -> copy tells the user to re-authorize or re-pair instead of retrying direct websocket fallback.
 
 #### 5. Good/Base/Bad Cases
 - Good: status chip text is derived from `RelaySecurityState.title` and verified styling is gated by `canShowVerified`.
@@ -166,6 +170,7 @@ await prefs.setString('mobilevc.app_config', jsonEncode(config.toJson()));
 - Verified state only when every condition is true.
 - Test-mode, fingerprint mismatch, revoked device, decrypt failure, unsupported capability, and plaintext-not-rejected states cannot show verified.
 - Direct mode never implies E2EE verified.
+- Relay E2EE/device/stream/download error-code mapping tests assert Chinese actionable copy and do not expose raw backend English messages.
 
 #### 7. Wrong vs Correct
 

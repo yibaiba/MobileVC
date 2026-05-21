@@ -386,6 +386,18 @@ bool isRelayAuthError(Map<String, dynamic> frame, bool authPending) =>
 String relayErrorMessage(Map<String, dynamic> frame) =>
     switch ((frame['code'] ?? '').toString()) {
       'payload_too_large' => 'Relay 数据包过大：当前消息超过中继限制，请关闭 ADB 截屏流或减少单次同步内容后重试',
+      'e2ee_required' => 'Relay 已禁用明文连接：请更新手机端和本机服务，重新配对并启用 E2EE',
+      'e2ee_unsupported_version' => 'Relay E2EE 版本不兼容：请更新手机端和本机服务后重新连接',
+      'e2ee_fingerprint_mismatch' => 'Relay 节点指纹不一致：请停止连接并重新确认配对链接',
+      'e2ee_handshake_failed' => 'Relay E2EE 握手失败：请重新配对，确认链接未过期',
+      'e2ee_decrypt_failed' => 'Relay E2EE 解密失败：消息认证未通过，请重新连接',
+      'e2ee_replay_detected' => 'Relay 检测到重复或过期的加密消息：请重新连接',
+      'device_revoked' => '此设备已被本机撤销：请在本机重新授权后再配对',
+      'device_unknown' => '此设备未绑定或本机身份已轮换：请重新配对',
+      'stream_cancelled' => 'Relay 加密流已取消',
+      'stream_window_exceeded' => 'Relay 加密流窗口超限：请重试或减少并发传输',
+      'download_denied' => '本机文件策略拒绝下载：请选择允许的工作区文件',
+      'download_failed' => 'Relay 加密下载失败：请重试并查看本机日志',
       _ => (frame['message'] ?? 'Relay error').toString(),
     };
 

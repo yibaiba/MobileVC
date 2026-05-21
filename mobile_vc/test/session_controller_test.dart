@@ -83,6 +83,33 @@ void main() {
       expect(message, isNot(contains('payload too large')));
     });
 
+    test('relay e2ee errors are actionable', () {
+      expect(
+        relayErrorMessage(const <String, dynamic>{
+          'type': 'relay.error',
+          'code': 'e2ee_required',
+          'message': 'e2ee required',
+        }),
+        contains('禁用明文连接'),
+      );
+      expect(
+        relayErrorMessage(const <String, dynamic>{
+          'type': 'relay.error',
+          'code': 'e2ee_unsupported_version',
+          'message': 'e2ee unsupported version',
+        }),
+        contains('版本不兼容'),
+      );
+      expect(
+        relayErrorMessage(const <String, dynamic>{
+          'type': 'relay.error',
+          'code': 'device_revoked',
+          'message': 'device revoked',
+        }),
+        contains('已被本机撤销'),
+      );
+    });
+
     test('relay auth error is pending for reconnect attempts', () {
       expect(
         isRelayAuthError(

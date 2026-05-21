@@ -51,6 +51,7 @@ func baseTestRelayConfig() Config {
 		MaxControlFrameBytes:    16 * 1024,
 		MaxPayloadBytes:         defaultMaxPayloadBytes,
 		ForwardQueueSize:        4,
+		PlaintextTestMode:       true,
 		HTTPAllowedRoutes: []RouteRule{
 			{Method: http.MethodGet, Path: "/healthz"},
 			{Method: http.MethodGet, Path: "/version"},
@@ -74,6 +75,10 @@ func applyTestOverrides(cfg *Config, overrides Config) {
 	}
 	if overrides.TrustedProxyCIDRs != "" {
 		cfg.TrustedProxyCIDRs = overrides.TrustedProxyCIDRs
+	}
+	if overrides.RequireE2EE {
+		cfg.RequireE2EE = true
+		cfg.PlaintextTestMode = false
 	}
 }
 
