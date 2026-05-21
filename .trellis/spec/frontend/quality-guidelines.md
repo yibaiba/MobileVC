@@ -137,6 +137,7 @@ await prefs.setString('mobilevc.app_config', jsonEncode(config.toJson()));
 #### 2. Signatures
 - Security input: `RelaySecurityInput`
 - Evaluator: `RelaySecurityStateEvaluator.evaluate(input)`
+- Capability input: `RelayE2eeCapabilitySet`
 - Verified gate: `RelaySecurityState.canShowVerified`
 - Blocking states: `fingerprintMismatch`, `deviceRevoked`, `plaintextDisabled`, `encryptionUnavailable`
 
@@ -144,6 +145,10 @@ await prefs.setString('mobilevc.app_config', jsonEncode(config.toJson()));
 - UI may show "E2EE 已验证" only when `canShowVerified == true`.
 - `canShowVerified` requires relay mode, confirmed node fingerprint, completed E2EE handshake, compatible protocol/tunnel capabilities, multiplex stream support, file download support, device management support, E2EE required, plaintext test-mode off, device not revoked, and production plaintext rejection active.
 - Relay plaintext test-mode must be labeled as test mode and must never look verified.
+- Flutter E2EE capability fields must match the Go relay E2EE capability contract: `relayProtocolVersion`, `e2eeProtocolVersion`, `cryptoSuite`, `tunnelProtocolVersion`, `supportsMultiplexStreams`, `supportsFileDownloadStream`, `supportsDeviceManagement`, `requiresE2EE`, and `plaintextTestMode`.
+- `RelayE2eeCapabilitySet.production()` must require E2EE, disable plaintext test-mode, and require multiplex streams, file download streams, and device management before it can be used for verified security state.
+- `RelayE2eeCapabilitySet.plaintextTestMode()` is explicit test mode only and must not be presented as verified.
+- Capability values must be applied to `RelayE2eeHandshakeInput` before generating or validating the transcript.
 - Fingerprint mismatch, revoked device, decrypt failure, unsupported version, missing capability, or missing plaintext rejection must produce neutral or blocking copy, not security-positive copy.
 - Relay error codes for E2EE, device, stream, and download failures must map to actionable Chinese copy through `relayErrorMessage`; do not show raw server messages such as `e2ee required` to users.
 - Full fingerprint and short fingerprint are derived from the node public key; UI must not invent or truncate fingerprint values outside this evaluator.
@@ -151,6 +156,9 @@ await prefs.setString('mobilevc.app_config', jsonEncode(config.toJson()));
 #### 4. Validation & Error Matrix
 - Direct mode -> `LAN 直连`, not verified.
 - Relay plaintext test mode -> `Relay 测试模式`, not verified.
+- Production capability with plaintext test-mode enabled -> validation error.
+- Production capability missing multiplex stream, file download stream, or device management support -> validation error.
+- Unsupported relay/e2ee/tunnel version or crypto suite -> validation error.
 - Fingerprint mismatch -> `指纹已变化`, blocking.
 - Device revoked -> `设备已撤销`, blocking.
 - Decrypt failure or unsupported E2EE capability -> `加密不可用`, blocking.
@@ -168,6 +176,7 @@ await prefs.setString('mobilevc.app_config', jsonEncode(config.toJson()));
 
 #### 6. Tests Required
 - Verified state only when every condition is true.
+- Capability tests assert production success, production plaintext-test rejection, missing tunnel feature rejection, explicit plaintext test-mode validation, unsupported version rejection, and handshake transcript binding.
 - Test-mode, fingerprint mismatch, revoked device, decrypt failure, unsupported capability, and plaintext-not-rejected states cannot show verified.
 - Direct mode never implies E2EE verified.
 - Relay E2EE/device/stream/download error-code mapping tests assert Chinese actionable copy and do not expose raw backend English messages.

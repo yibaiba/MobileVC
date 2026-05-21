@@ -48,12 +48,15 @@ Questions to answer:
 - Trusted proxy env: `RELAY_TRUSTED_PROXY_CIDRS=<comma-separated-cidrs>`
 - Relay E2EE env: `RELAY_REQUIRE_E2EE=true|false`, `RELAY_PLAINTEXT_TEST_MODE=true|false`
 - Relay E2EE flags: `--require-e2ee[=true|false]`, `--plaintext-test-mode[=true|false]`
+- Relay E2EE capabilities: `e2ee.CapabilitySet`, `e2ee.ProductionCapabilities()`, `e2ee.PlaintextTestCapabilities()`, `ValidateProductionCapabilities`, `ValidatePlaintextTestCapabilities`
 
 #### 3. Contracts
 - Relay server forwards only `relay.forward` envelopes with base64url payloads; it must not parse MobileVC business actions.
 - Production relay defaults to `RELAY_REQUIRE_E2EE=true` and `RELAY_PLAINTEXT_TEST_MODE=false`; plaintext `relay.forward` frames are rejected unless plaintext test mode is explicitly enabled.
 - Plaintext test mode is for local/debug rollout only. It must be enabled explicitly with `RELAY_REQUIRE_E2EE=false` plus `RELAY_PLAINTEXT_TEST_MODE=true`, or equivalent flags.
 - E2EE `relay.forward` frames use `encryption=p256-ecdsa+p256-ecdh+hkdf-sha256+aes-256-gcm`, `payloadEncoding=base64url`, non-zero `streamId`, and non-empty `handshakeId`. Counter `0` is valid because stream counters start at zero.
+- E2EE capability negotiation fields are `relayProtocolVersion`, `e2eeProtocolVersion`, `cryptoSuite`, `tunnelProtocolVersion`, `supportsMultiplexStreams`, `supportsFileDownloadStream`, `supportsDeviceManagement`, `requiresE2EE`, and `plaintextTestMode`; these fields are bound into the handshake transcript before deriving traffic keys.
+- Production capabilities must require E2EE, disable plaintext test mode, use the supported relay/e2ee/tunnel versions, use the supported crypto suite, and support multiplex streams, file download streams, and device management.
 - `agent.register` sends only secret hashes; plaintext pairing secret is local-only and written through `RELAY_PAIRING_EVENT_PATH`.
 - `client.pair` is the only place a client sends the one-time pairing secret.
 - Direct backend `AUTH_TOKEN` must not appear in relay control frames, relay envelopes, relay QR URIs, relay logs, or relay event files.
@@ -79,6 +82,8 @@ Questions to answer:
 - Invalid relay duration / integer / byte env value -> config error; do not silently fall back to defaults.
 - Invalid relay boolean env value -> config error; do not silently fall back to defaults.
 - `RELAY_REQUIRE_E2EE=true` together with `RELAY_PLAINTEXT_TEST_MODE=true` -> config error.
+- Capability production validation with `plaintextTestMode=true`, missing required tunnel features, unsupported versions, or unsupported crypto suite -> E2EE handshake failure / unsupported version path.
+- Plaintext-test capability validation requires `requiresE2EE=false` and `plaintextTestMode=true`; implicit plaintext is invalid.
 - Oversized decoded relay payload -> `relay.error` with `payload_too_large`.
 - Plaintext `relay.forward` while E2EE is required and plaintext test mode is off -> `relay.error` with `e2ee_required`.
 - Unknown forward encryption suite -> `relay.error` with `e2ee_unsupported_version`.
@@ -94,17 +99,20 @@ Questions to answer:
 #### 5. Good/Base/Bad Cases
 - Good: backend writes pairing data to an owner-only temp file, launcher reads and deletes it, logs show only redacted URI.
 - Good: public relay starts with E2EE required and rejects plaintext before forwarding payloads.
+- Good: both Go and Flutter build handshake input from the same explicit capability set before signing/verifying the transcript.
 - Good: relay-only backend logs `health=http://127.0.0.1:<port>/healthz` and `ws=ws://127.0.0.1:<port>/ws?token=<redacted>`; it must not concatenate `localhost` with a full host:port listen address.
 - Good: local test relay uses explicit `--require-e2ee=false --plaintext-test-mode=true` and UI/logs label it as test-only.
 - Good: relay behind a trusted reverse proxy enforces caps by forwarded client IP, while direct internet clients cannot spoof forwarded headers.
 - Base: direct `/ws?token=...` path still performs token and origin checks.
 - Bad: printing `mobilevc.relay.pairing_ready` JSON to stdout/stderr because server logs then retain the one-time secret.
 - Bad: accepting `encryption=none` on a long-lived public relay session because E2EE handshake code is not fully integrated yet.
+- Bad: deriving UI security state from local config only while ignoring negotiated E2EE/tunnel capabilities.
 - Bad: accepting a duplicate `agent.register` for an existing `sessionId` after disconnect; that bypasses reconnect-secret semantics.
 
 #### 6. Tests Required
 - Relay pairing, one-time secret consumption, URL validation, oversized payload, and opaque unknown business payload forwarding.
 - Network exposure tests must cover listen address plus generated health/version/websocket URLs for LAN and relay-only modes.
+- E2EE capability tests must cover production success, plaintext-test rejection in production, missing tunnel feature rejection, explicit plaintext test-mode validation, unsupported version rejection, and applying capabilities to handshake transcript input.
 - Relay plaintext rejection, plaintext test-mode allowance, E2EE metadata validation, unsupported encryption rejection, config env parsing, and CLI flag parsing.
 - Relay per-IP caps, trusted forwarded IP positive/negative cases, ping writer shutdown, mismatched `clientId`, duplicate session register rejection, and reconnect within grace.
 - Relay agent-disconnect grace expiry must remove orphan sessions and close paired clients.
