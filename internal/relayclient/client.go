@@ -25,6 +25,7 @@ type Config struct {
 	ReconnectBackoff   ReconnectBackoff
 	Capabilities       e2ee.CapabilitySet
 	NodeFingerprintHex string
+	NodeIdentity       *e2ee.NodeIdentity
 }
 
 type ReconnectBackoff struct {
@@ -97,7 +98,7 @@ func Run(ctx context.Context, cfg Config, handler Handler, emit LocalPairingEmit
 		return err
 	}
 	defer removePairingEventFile(cfg.PairingEventPath)
-	return serveWithReconnect(ctx, cfg, handler, conn, sessionID, reconnectSecret)
+	return serveWithReconnect(ctx, cfg, handler, conn, sessionID, pairingSecret, reconnectSecret)
 }
 
 func relayClientCapabilities(cfg Config) e2ee.CapabilitySet {
@@ -119,6 +120,9 @@ func validateConfig(cfg Config) error {
 	}
 	if !isFingerprintHex(cfg.NodeFingerprintHex) {
 		return fmt.Errorf("relay node fingerprint is required")
+	}
+	if err := e2ee.ValidateProductionCapabilities(relayClientCapabilities(cfg)); err == nil && cfg.NodeIdentity == nil {
+		return fmt.Errorf("relay node identity is required for e2ee mode")
 	}
 	return nil
 }

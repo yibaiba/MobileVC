@@ -3,6 +3,7 @@ package relayclient
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -108,14 +109,34 @@ func TestGatewayConnRespondsToRelayPing(t *testing.T) {
 	}
 }
 
+func TestGatewayConnRejectsWrongSessionRelayPing(t *testing.T) {
+	serverConn, clientConn := newRelayClientTestConns(t)
+	defer serverConn.Close()
+	gateway := newGatewayConn(clientConn, "rs_gateway")
+	t.Cleanup(func() { _ = gateway.Close() })
+
+	if err := serverConn.WriteJSON(map[string]any{
+		"type":      relay.TypeRelayPing,
+		"version":   relay.Version,
+		"sessionId": "rs_other",
+	}); err != nil {
+		t.Fatalf("write relay ping: %v", err)
+	}
+	var payload map[string]any
+	err := gateway.ReadJSON(&payload)
+	if err == nil || !strings.Contains(err.Error(), "relay ping routing") {
+		t.Fatalf("expected relay ping routing error, got %v", err)
+	}
+}
+
 func TestGatewayConnRejectsE2EEControlFramesUntilHandshakeIsWired(t *testing.T) {
 	serverConn, clientConn := newRelayClientTestConns(t)
 	defer serverConn.Close()
 	gateway := newGatewayConn(clientConn, "rs_gateway")
 	t.Cleanup(func() { _ = gateway.Close() })
 
-	if err := serverConn.WriteJSON(relay.E2EEAgentHelloFrame{
-		Type: relay.TypeAgentE2EEHello, Version: relay.Version,
+	if err := serverConn.WriteJSON(relay.E2EEClientHelloFrame{
+		Type: relay.TypeClientE2EEHello, Version: relay.Version,
 		SessionID: "rs_gateway", ClientID: "rc_attached", HandshakeID: "hs_test",
 	}); err != nil {
 		t.Fatalf("write e2ee control frame: %v", err)
@@ -124,6 +145,161 @@ func TestGatewayConnRejectsE2EEControlFramesUntilHandshakeIsWired(t *testing.T) 
 	err := gateway.ReadJSON(&payload)
 	if err == nil || !strings.Contains(err.Error(), "e2ee handshake") {
 		t.Fatalf("expected explicit e2ee control rejection, got %v", err)
+	}
+}
+
+func TestGatewayConnHandlesPairingE2EEHandshake(t *testing.T) {
+	serverConn, clientConn := newRelayClientTestConns(t)
+	defer serverConn.Close()
+	nodeIdentity, err := e2ee.GenerateNodeIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	capabilities := e2ee.ProductionCapabilities()
+	handshake := newAgentE2EEHandshakeHandler(
+		"rs_gateway",
+		"pair-secret-128-bit-minimum",
+		capabilities,
+		nodeIdentity,
+	)
+	gateway := newGatewayConnWithE2EE(clientConn, "rs_gateway", handshake)
+	t.Cleanup(func() { _ = gateway.Close() })
+
+	clientEphemeral, err := e2ee.NewEphemeralKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientHello := relay.E2EEClientHelloFrame{
+		Type: relay.TypeClientE2EEHello, Version: relay.Version,
+		SessionID: "rs_gateway", ClientID: "rc_attached", HandshakeID: "hs_pairing",
+		Kind: e2ee.HandshakeKindPairing, Capabilities: &capabilities,
+		ClientEphemeralPublicKey: e2ee.EncodeFrameBytes(clientEphemeral.PublicKey),
+	}
+	if err := serverConn.WriteJSON(clientHello); err != nil {
+		t.Fatalf("write client hello: %v", err)
+	}
+	var agentHello relay.E2EEAgentHelloFrame
+	if err := serverConn.ReadJSON(&agentHello); err != nil {
+		t.Fatalf("read agent hello: %v", err)
+	}
+	agentMaterial, err := e2ee.ValidateAgentHelloFrame(agentHello)
+	if err != nil {
+		t.Fatalf("validate agent hello: %v", err)
+	}
+	if fmt.Sprintf("%x", e2ee.Fingerprint(agentMaterial.NodeIdentityPublicKey)) != testNodeFingerprintHexFromIdentity(nodeIdentity) {
+		t.Fatal("agent hello node identity fingerprint mismatch")
+	}
+	input := capabilities.ApplyToHandshake(e2ee.HandshakeInput{
+		Kind:                     e2ee.HandshakeKindPairing,
+		SessionID:                "rs_gateway",
+		ClientID:                 "rc_attached",
+		HandshakeID:              "hs_pairing",
+		ClientEphemeralPublicKey: clientEphemeral.PublicKey,
+		NodeEphemeralPublicKey:   agentMaterial.NodeEphemeralPublicKey,
+		NodeIdentityPublicKey:    agentMaterial.NodeIdentityPublicKey,
+	})
+	transcript, err := e2ee.HandshakeTranscript(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verified, err := e2ee.VerifyNodeSignature(
+		agentMaterial.NodeIdentityPublicKey,
+		transcript,
+		agentMaterial.NodeSignature,
+	)
+	if err != nil || !verified {
+		t.Fatalf("node signature verification failed: verified=%v err=%v", verified, err)
+	}
+	proof := relay.E2EEClientProofFrame{
+		Type: relay.TypeClientE2EEProof, Version: relay.Version,
+		SessionID: "rs_gateway", ClientID: "rc_attached", HandshakeID: "hs_pairing",
+		Kind:         e2ee.HandshakeKindPairing,
+		PairingProof: e2ee.EncodeFrameBytes(e2ee.PairingProof("pair-secret-128-bit-minimum", transcript)),
+	}
+	if err := serverConn.WriteJSON(proof); err != nil {
+		t.Fatalf("write client proof: %v", err)
+	}
+	var result relay.E2EEAgentResultFrame
+	if err := serverConn.ReadJSON(&result); err != nil {
+		t.Fatalf("read agent result: %v", err)
+	}
+	if err := e2ee.ValidateAgentResultFrame(result); err != nil {
+		t.Fatalf("validate agent result: %v", err)
+	}
+	if !result.OK {
+		t.Fatalf("unexpected failed result: %#v", result)
+	}
+	agentKeys, ok := handshake.trafficKeys("hs_pairing")
+	if !ok {
+		t.Fatal("missing completed agent traffic keys")
+	}
+	clientKeys, err := e2ee.DeriveHandshakeTrafficKeys(
+		clientEphemeral.PrivateScalar,
+		agentMaterial.NodeEphemeralPublicKey,
+		input,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(agentKeys.ClientToAgent) != string(clientKeys.ClientToAgent) ||
+		string(agentKeys.AgentToClient) != string(clientKeys.AgentToClient) {
+		t.Fatal("agent and client traffic keys differ")
+	}
+}
+
+func TestGatewayConnRejectsMismatchedPairingE2EEProofRoute(t *testing.T) {
+	serverConn, clientConn := newRelayClientTestConns(t)
+	defer serverConn.Close()
+	handshake, clientEphemeral := testPairingHandshakeHandler(t)
+	gateway := newGatewayConnWithE2EE(clientConn, "rs_gateway", handshake)
+	t.Cleanup(func() { _ = gateway.Close() })
+
+	capabilities := e2ee.ProductionCapabilities()
+	clientHello := relay.E2EEClientHelloFrame{
+		Type: relay.TypeClientE2EEHello, Version: relay.Version,
+		SessionID: "rs_gateway", ClientID: "rc_attached", HandshakeID: "hs_pairing",
+		Kind: e2ee.HandshakeKindPairing, Capabilities: &capabilities,
+		ClientEphemeralPublicKey: e2ee.EncodeFrameBytes(clientEphemeral.PublicKey),
+	}
+	if err := serverConn.WriteJSON(clientHello); err != nil {
+		t.Fatalf("write client hello: %v", err)
+	}
+	var agentHello relay.E2EEAgentHelloFrame
+	if err := serverConn.ReadJSON(&agentHello); err != nil {
+		t.Fatalf("read agent hello: %v", err)
+	}
+	agentMaterial, err := e2ee.ValidateAgentHelloFrame(agentHello)
+	if err != nil {
+		t.Fatalf("validate agent hello: %v", err)
+	}
+	input := capabilities.ApplyToHandshake(e2ee.HandshakeInput{
+		Kind:                     e2ee.HandshakeKindPairing,
+		SessionID:                "rs_gateway",
+		ClientID:                 "rc_attached",
+		HandshakeID:              "hs_pairing",
+		ClientEphemeralPublicKey: clientEphemeral.PublicKey,
+		NodeEphemeralPublicKey:   agentMaterial.NodeEphemeralPublicKey,
+		NodeIdentityPublicKey:    agentMaterial.NodeIdentityPublicKey,
+	})
+	transcript, err := e2ee.HandshakeTranscript(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof := relay.E2EEClientProofFrame{
+		Type: relay.TypeClientE2EEProof, Version: relay.Version,
+		SessionID: "rs_gateway", ClientID: "rc_other", HandshakeID: "hs_pairing",
+		Kind:         e2ee.HandshakeKindPairing,
+		PairingProof: e2ee.EncodeFrameBytes(e2ee.PairingProof("pair-secret-128-bit-minimum", transcript)),
+	}
+	if err := serverConn.WriteJSON(proof); err != nil {
+		t.Fatalf("write client proof: %v", err)
+	}
+	var result relay.E2EEAgentResultFrame
+	if err := serverConn.ReadJSON(&result); err != nil {
+		t.Fatalf("read agent result: %v", err)
+	}
+	if result.OK || result.ErrorCode != relay.CodeE2EEHandshakeFailed {
+		t.Fatalf("expected handshake failure result, got %#v", result)
 	}
 }
 
@@ -295,6 +471,28 @@ func TestValidateConfigRequiresNodeFingerprint(t *testing.T) {
 }
 
 const testNodeFingerprintHex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+func testNodeFingerprintHexFromIdentity(identity *e2ee.NodeIdentity) string {
+	return fmt.Sprintf("%x", identity.Fingerprint)
+}
+
+func testPairingHandshakeHandler(t *testing.T) (*agentE2EEHandshakeHandler, *e2ee.EphemeralKeyPair) {
+	t.Helper()
+	nodeIdentity, err := e2ee.GenerateNodeIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientEphemeral, err := e2ee.NewEphemeralKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return newAgentE2EEHandshakeHandler(
+		"rs_gateway",
+		"pair-secret-128-bit-minimum",
+		e2ee.ProductionCapabilities(),
+		nodeIdentity,
+	), clientEphemeral
+}
 
 func newRelayClientTestConns(t *testing.T) (*websocket.Conn, *websocket.Conn) {
 	t.Helper()

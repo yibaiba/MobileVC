@@ -50,6 +50,7 @@ Questions to answer:
 - Relay E2EE flags: `--require-e2ee[=true|false]`, `--plaintext-test-mode[=true|false]`
 - Relay E2EE capabilities: `e2ee.CapabilitySet`, `e2ee.ProductionCapabilities()`, `e2ee.PlaintextTestCapabilities()`, `ValidateProductionCapabilities`, `ValidatePlaintextTestCapabilities`
 - Relay E2EE handshake control frames: `client.e2ee_hello`, `agent.e2ee_hello`, `client.e2ee_proof`, `agent.e2ee_result`
+- Local relay E2EE handler: `newAgentE2EEHandshakeHandler(sessionID, pairingSecret, capabilities, nodeIdentity)`, `handleClientHello`, `handleClientProof`, `trafficKeys`
 
 #### 3. Contracts
 - Relay server forwards only `relay.forward` envelopes with base64url payloads; it must not parse MobileVC business actions.
@@ -84,7 +85,13 @@ Questions to answer:
 - Agent reconnect uses `agent.reconnect` plus `agentReconnectSecret` only during the grace window. New `agent.register` must not replace an existing session ID.
 - When an agent disconnects, relay schedules cleanup at `RELAY_AGENT_GRACE_PERIOD`; if the same session is still disconnected then, remove the session and close the paired client connection. Do not wait for another reconnect attempt to discover expiry.
 - When a client pairs, relay sends `client.attached` to the agent with `sessionId` and relay-assigned `clientId`. The local relay client must consume this control frame separately from MobileVC payloads so the first local backend event can use the active `clientId`.
-- Until the local relay client E2EE handshake state machine is wired, any E2EE handshake control frame received by `gatewayConn` must fail explicitly with an E2EE handshake error path; it must not be decoded as a MobileVC JSON payload or silently ignored.
+- Local relay client production E2EE capabilities require a loaded node identity. The backend must pass the same node identity used for pairing-link fingerprint generation into `relayclient.Config.NodeIdentity`.
+- Local relay client `gatewayConn` consumes E2EE control frames separately from MobileVC payloads. `client.e2ee_hello` produces `agent.e2ee_hello`; `client.e2ee_proof` produces `agent.e2ee_result`.
+- Local agent pairing E2EE uses the one-time pairing secret only as a transcript proof. It signs the transcript with the long-lived node identity, performs fresh ephemeral P-256 ECDH, and derives directional traffic keys with HKDF.
+- Local agent pairing proof validation must bind `sessionId`, `clientId`, `handshakeId`, negotiated capabilities, client/node ephemeral keys, and node identity public key. A proof for a different client or session must fail even if it uses a valid pairing secret.
+- A completed local agent pairing handshake may store derived traffic keys in memory for the next encrypted-forwarding slice, but this does not mean MobileVC business payloads are encrypted yet. Flutter/backend UI must not show "E2EE verified" until encrypted forwarding, replay protection, fingerprint validation, and production plaintext rejection are all active.
+- If a local relay client is created without a handshake handler, any E2EE handshake control frame received by `gatewayConn` must fail explicitly with an E2EE handshake error path; it must not be decoded as a MobileVC JSON payload or silently ignored.
+- Relay application `relay.ping` frames may include an optional `sessionId`; local relay client must only answer pings with an empty session or the current session. Wrong-session pings are protocol errors.
 - Local relay client reconnect backoff is bounded and retries only within the current disconnect's `RELAY_AGENT_GRACE_PERIOD`; each later disconnect starts a new grace window.
 - Local relay client `agent.register` and `agent.reconnect` writes and response reads must use control-frame deadlines. A relay accepting the websocket but never replying must surface as an explicit error, not an infinite wait.
 
@@ -111,6 +118,9 @@ Questions to answer:
 - E2EE forward missing `streamId` or `handshakeId` -> `relay.error` with `protocol_error`.
 - Forward with missing or mismatched `clientId` -> `relay.error` with `protocol_error`.
 - E2EE handshake control frame with wrong role/direction/session/client ID -> `relay.error` with `protocol_error`.
+- Local agent E2EE pairing proof with mismatched `sessionId`, `clientId`, or `handshakeId` -> `agent.e2ee_result` with `ok=false`, `errorCode=e2ee_handshake_failed`, then local read error.
+- Local relay client production capabilities with missing `NodeIdentity` -> config error `relay node identity is required for e2ee mode`.
+- Local relay client receives `relay.ping` for a different non-empty session ID -> explicit local read error; do not send `relay.pong`.
 - Post-auth raw websocket frames must be size-bounded while reading, before JSON decode. Frames above the post-auth raw frame limit -> `relay.error` with `frame_too_large`; decoded relay payloads above `MaxPayloadBytes` still -> `payload_too_large`.
 - First agent-to-client forward with an empty `clientId` after successful client pairing -> relay fills the current active `clientId`; wrong non-empty `clientId` still -> `protocol_error`.
 - Missing `client.attached` before the relay websocket closes -> local relay client write returns the underlying read/close error.
@@ -125,6 +135,8 @@ Questions to answer:
 - Good: public relay starts with E2EE required and rejects plaintext before forwarding payloads.
 - Good: both Go and Flutter build handshake input from the same explicit capability set before signing/verifying the transcript.
 - Good: handshake control frames carry key/proof/signature bytes as base64url strings and validate before building a `HandshakeInput`.
+- Good: local relay agent answers a valid pairing handshake, verifies the pairing proof against the transcript, and derives the same traffic keys that Flutter derives from its ephemeral key.
+- Good: after local pairing handshake succeeds, code still treats business `relay.forward` encryption as a separate unfinished slice and keeps user-visible verified security disabled.
 - Good: local test relay agent declares `PlaintextTestCapabilities()` and production relay agent declares `ProductionCapabilities()`; never infer mode from missing fields.
 - Good: `mobilevc://relay/v1` includes `nodeFingerprint=<64 lowercase hex chars>` plus capability hints, but never includes node private keys, device private keys, or traffic keys.
 - Good: relay-only backend logs `health=http://127.0.0.1:<port>/healthz` and `ws=ws://127.0.0.1:<port>/ws?token=<redacted>`; it must not concatenate `localhost` with a full host:port listen address.
@@ -134,6 +146,8 @@ Questions to answer:
 - Bad: printing `mobilevc.relay.pairing_ready` JSON to stdout/stderr because server logs then retain the one-time secret.
 - Bad: accepting `encryption=none` on a long-lived public relay session because E2EE handshake code is not fully integrated yet.
 - Bad: deriving UI security state from local config only while ignoring negotiated E2EE/tunnel capabilities.
+- Bad: returning `agent.e2ee_result ok=true` for a proof whose `clientId` differs from the pending hello's `clientId`.
+- Bad: showing "E2EE verified" after handshake-only traffic keys exist while `relay.forward` still carries plaintext MobileVC payloads.
 - Bad: accepting a duplicate `agent.register` for an existing `sessionId` after disconnect; that bypasses reconnect-secret semantics.
 
 #### 6. Tests Required
@@ -149,7 +163,9 @@ Questions to answer:
 - Relay per-IP caps, trusted forwarded IP positive/negative cases, ping writer shutdown, mismatched `clientId`, duplicate session register rejection, and reconnect within grace.
 - Relay agent-disconnect grace expiry must remove orphan sessions and close paired clients.
 - Relay client tests must cover consuming `client.attached` before `relay.forward`, writing with the attached `clientId`, and timing out register/reconnect response reads.
-- Relay client tests must cover that E2EE handshake control frames are not passed into gateway payload decoding before the local handshake state machine exists.
+- Relay client tests must cover that E2EE handshake control frames are not passed into gateway payload decoding when no handshake handler exists.
+- Relay client tests must cover valid local agent pairing handshake, node signature verification, pairing proof validation, matching derived traffic keys, and mismatched proof routing failure.
+- Relay client tests must cover `relay.ping` response for the current/no session and rejection of wrong-session pings.
 - Config tests for relay env validation and event-path requirement.
 - Launcher tests that pairing event files are read locally and removed.
 

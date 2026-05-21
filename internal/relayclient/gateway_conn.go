@@ -25,6 +25,7 @@ type gatewayConn struct {
 	readErr    error
 	closeCh    chan struct{}
 	closeOnce  sync.Once
+	e2ee       *agentE2EEHandshakeHandler
 }
 
 type readResult struct {
@@ -35,10 +36,14 @@ type readResult struct {
 const relayReadQueueSize = 8
 
 func newGatewayConn(conn *websocket.Conn, sessionID string) *gatewayConn {
+	return newGatewayConnWithE2EE(conn, sessionID, nil)
+}
+
+func newGatewayConnWithE2EE(conn *websocket.Conn, sessionID string, e2eeHandler *agentE2EEHandshakeHandler) *gatewayConn {
 	gateway := &gatewayConn{
 		conn: conn, sessionID: sessionID,
 		attachCh: make(chan struct{}), readCh: make(chan readResult, relayReadQueueSize),
-		readDone: make(chan struct{}), closeCh: make(chan struct{}),
+		readDone: make(chan struct{}), closeCh: make(chan struct{}), e2ee: e2eeHandler,
 	}
 	go gateway.readLoop()
 	return gateway
@@ -64,23 +69,105 @@ func (c *gatewayConn) readLoop() {
 	defer close(c.readCh)
 	defer close(c.readDone)
 	for {
-		var env relay.ForwardEnvelope
-		if err := c.conn.ReadJSON(&env); err != nil {
+		var raw map[string]any
+		if err := c.conn.ReadJSON(&raw); err != nil {
 			c.setReadError(err)
 			c.sendReadResult(readResult{err: err})
 			return
 		}
-		if c.acceptClientAttached(env) {
-			continue
-		}
-		if c.acceptRelayPing(env) {
-			continue
-		}
-		if c.rejectE2EEControlFrame(env) {
+		env, err := c.dispatchRawFrame(raw)
+		if err != nil {
+			c.setReadError(err)
+			c.sendReadResult(readResult{err: err})
 			return
 		}
-		c.sendReadResult(readResult{env: env})
+		if env == nil {
+			continue
+		}
+		c.sendReadResult(readResult{env: *env})
 	}
+}
+
+func (c *gatewayConn) dispatchRawFrame(raw map[string]any) (*relay.ForwardEnvelope, error) {
+	frameType, _ := raw["type"].(string)
+	switch frameType {
+	case relay.TypeClientAttached:
+		var frame relay.ClientAttachedFrame
+		if err := decodeRawFrame(raw, &frame); err != nil {
+			return nil, err
+		}
+		if frame.SessionID == c.sessionID {
+			c.setClientID(frame.ClientID)
+		}
+		return nil, nil
+	case relay.TypeRelayPing:
+		var frame relayPingFrame
+		if err := decodeRawFrame(raw, &frame); err != nil {
+			return nil, err
+		}
+		if strings.TrimSpace(frame.SessionID) != "" && frame.SessionID != c.sessionID {
+			return nil, fmt.Errorf("invalid relay ping routing")
+		}
+		if err := c.writeControl(relay.ControlFrame{Type: relay.TypeRelayPong, Version: relay.Version}); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	case relay.TypeClientE2EEHello:
+		return nil, c.handleClientE2EEHello(raw)
+	case relay.TypeClientE2EEProof:
+		return nil, c.handleClientE2EEProof(raw)
+	case relay.TypeAgentE2EEHello, relay.TypeAgentE2EEResult:
+		return nil, fmt.Errorf("unexpected agent e2ee control frame on local relay agent")
+	}
+	var env relay.ForwardEnvelope
+	if err := decodeRawFrame(raw, &env); err != nil {
+		return nil, err
+	}
+	return &env, nil
+}
+
+func decodeRawFrame(raw map[string]any, out any) error {
+	encoded, err := json.Marshal(raw)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(encoded, out)
+}
+
+type relayPingFrame struct {
+	Type      string `json:"type"`
+	Version   int    `json:"version"`
+	SessionID string `json:"sessionId,omitempty"`
+}
+
+func (c *gatewayConn) handleClientE2EEHello(raw map[string]any) error {
+	var frame relay.E2EEClientHelloFrame
+	if err := decodeRawFrame(raw, &frame); err != nil {
+		return err
+	}
+	if c.e2ee == nil {
+		return fmt.Errorf("relay e2ee handshake is not connected to the local agent yet")
+	}
+	response, err := c.e2ee.handleClientHello(frame)
+	if err != nil {
+		return err
+	}
+	return c.writeControl(response)
+}
+
+func (c *gatewayConn) handleClientE2EEProof(raw map[string]any) error {
+	var frame relay.E2EEClientProofFrame
+	if err := decodeRawFrame(raw, &frame); err != nil {
+		return err
+	}
+	if c.e2ee == nil {
+		return fmt.Errorf("relay e2ee handshake is not connected to the local agent yet")
+	}
+	response, err := c.e2ee.handleClientProof(frame)
+	if writeErr := c.writeControl(response); writeErr != nil {
+		return writeErr
+	}
+	return err
 }
 
 func (c *gatewayConn) sendReadResult(result readResult) {
@@ -114,41 +201,6 @@ func (c *gatewayConn) WriteJSON(v any) error {
 		return err
 	}
 	return c.writeForward(payload)
-}
-
-func (c *gatewayConn) acceptClientAttached(env relay.ForwardEnvelope) bool {
-	if env.Type != relay.TypeClientAttached || env.SessionID != c.sessionID {
-		return false
-	}
-	c.setClientID(env.ClientID)
-	return true
-}
-
-func (c *gatewayConn) acceptRelayPing(env relay.ForwardEnvelope) bool {
-	if env.Type != relay.TypeRelayPing {
-		return false
-	}
-	if strings.TrimSpace(env.SessionID) != "" && env.SessionID != c.sessionID {
-		return false
-	}
-	if err := c.writeControl(relay.ControlFrame{Type: relay.TypeRelayPong, Version: relay.Version}); err != nil {
-		c.setReadError(err)
-		c.sendReadResult(readResult{err: err})
-	}
-	return true
-}
-
-func (c *gatewayConn) rejectE2EEControlFrame(env relay.ForwardEnvelope) bool {
-	switch env.Type {
-	case relay.TypeClientE2EEHello, relay.TypeClientE2EEProof:
-		c.setReadError(fmt.Errorf("unexpected client e2ee control frame on relay agent connection"))
-	case relay.TypeAgentE2EEHello, relay.TypeAgentE2EEResult:
-		c.setReadError(fmt.Errorf("relay e2ee handshake is not connected to the local agent yet"))
-	default:
-		return false
-	}
-	c.sendReadResult(readResult{err: c.readError()})
-	return true
 }
 
 func (c *gatewayConn) setClientID(clientID string) {

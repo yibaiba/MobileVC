@@ -180,6 +180,7 @@ func relayConfig(cfg config.Config) (relayclient.Config, error) {
 		AgentGracePeriod:   cfg.Relay.AgentGracePeriod,
 		PairingEventPath:   cfg.Relay.PairingEventPath,
 		NodeFingerprintHex: fmt.Sprintf("%x", identity.Fingerprint),
+		NodeIdentity:       identity,
 	}, nil
 }
 
