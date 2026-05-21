@@ -116,7 +116,7 @@ _ = relayclient.EmitPairingFile(pairingEventPath, event)
 - Node trust path: `~/.mobilevc/relay/trusted_devices.json`
 - Store loader: `LoadOrCreateDeviceTrustStore(path)`
 - Credential helpers: `NewDeviceCredential()`, `DeviceCredentialHash(secret)`, `DeviceCredentialMatches(hash, secret)`
-- Device actions: `RegisterDevice`, `ListDevices`, `VerifyDeviceCredential`, `MarkDeviceSeen`, `RevokeDevice`, `GlobalRotate`
+- Device actions: `RegisterDevice`, `ListDevices`, `VerifyDeviceCredential`, `MarkDeviceSeen`, `RevokeDevice`, `ClearTrustedDevicesForNodeRotation`
 
 #### 3. Contracts
 - Local node is the source of truth for trusted E2EE devices; relay server runtime device maps are not persistent trust stores.
@@ -124,6 +124,8 @@ _ = relayclient.EmitPairingFile(pairingEventPath, event)
 - The store must never persist plaintext device credentials, private keys, traffic keys, pairing secrets, file contents, or conversation payloads.
 - Store parent directory permission must be owner-only (`0700`) and store file permission must be owner-only (`0600`).
 - Same device identity may have only one active session ID; marking the same device seen with a new session returns the replaced session ID so callers can close the older connection explicitly.
+- Device trust store methods must serialize access internally; concurrent pairing/reconnect/revoke/rotation must not race the map or JSON file.
+- `ClearTrustedDevicesForNodeRotation` only clears device trust as part of a broader node identity rotation flow. It must not be presented as complete global rotate by itself.
 
 #### 4. Validation & Error Matrix
 - Empty store path -> explicit config error.
@@ -131,8 +133,9 @@ _ = relayclient.EmitPairingFile(pairingEventPath, event)
 - Stored fingerprint mismatch -> load error.
 - Unknown device -> `device_unknown`.
 - Revoked device -> `device_revoked`.
+- Duplicate device registration -> `device_already_bound`; revoked devices must not be silently re-enabled by registering the same ID again.
 - Wrong credential -> `device_unknown`.
-- Global rotate -> trusted device list is cleared and previous credentials fail as `device_unknown`.
+- Node rotation cleanup -> trusted device list is cleared and previous credentials fail as `device_unknown`.
 
 #### 5. Good/Base/Bad Cases
 - Good: local node stores only `DeviceCredentialHash(deviceCredential)` while Flutter keeps the plaintext credential in platform secure storage.
@@ -147,6 +150,7 @@ _ = relayclient.EmitPairingFile(pairingEventPath, event)
 - Credential verification accepts valid credential and rejects wrong/revoked/rotated devices.
 - Marking a device seen returns the replaced active session ID.
 - Fingerprint/public-key tamper causes load failure.
+- Concurrent registration/seen/revoke operations do not race or lose device records.
 
 #### 7. Wrong vs Correct
 

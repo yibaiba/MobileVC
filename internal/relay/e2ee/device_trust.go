@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -35,6 +36,7 @@ type TrustedDevice struct {
 
 type DeviceTrustStore struct {
 	path string
+	mu   sync.Mutex
 	file deviceTrustFile
 }
 
@@ -112,6 +114,8 @@ func (s *DeviceTrustStore) RegisterDevice(reg DeviceRegistration) (TrustedDevice
 	if s == nil {
 		return TrustedDevice{}, errors.New("device trust store is required")
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	now := reg.Now.UTC()
 	if now.IsZero() {
 		now = time.Now().UTC()
@@ -119,6 +123,9 @@ func (s *DeviceTrustStore) RegisterDevice(reg DeviceRegistration) (TrustedDevice
 	normalized, err := normalizeDeviceRegistration(reg)
 	if err != nil {
 		return TrustedDevice{}, err
+	}
+	if _, exists := s.file.Devices[normalized.ID]; exists {
+		return TrustedDevice{}, errors.New("device_already_bound")
 	}
 	device := trustedDeviceFile{
 		ID: normalized.ID, DisplayName: normalized.DisplayName,
@@ -139,6 +146,8 @@ func (s *DeviceTrustStore) ListDevices() ([]TrustedDevice, error) {
 	if s == nil {
 		return nil, errors.New("device trust store is required")
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	devices := make([]TrustedDevice, 0, len(s.file.Devices))
 	for _, encoded := range s.file.Devices {
 		device, err := encoded.toTrusted()
@@ -154,23 +163,30 @@ func (s *DeviceTrustStore) ListDevices() ([]TrustedDevice, error) {
 }
 
 func (s *DeviceTrustStore) VerifyDeviceCredential(deviceID string, credential string) (TrustedDevice, error) {
-	device, err := s.deviceByID(deviceID)
-	if err != nil {
-		return TrustedDevice{}, err
+	if s == nil {
+		return TrustedDevice{}, errors.New("device trust store is required")
 	}
-	if !device.RevokedAt.IsZero() {
-		return TrustedDevice{}, errors.New("device_revoked")
-	}
-	if !DeviceCredentialMatches(device.CredentialHash, credential) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	encoded, ok := s.file.Devices[strings.TrimSpace(deviceID)]
+	if !ok {
 		return TrustedDevice{}, errors.New("device_unknown")
 	}
-	return device, nil
+	if strings.TrimSpace(encoded.RevokedAt) != "" {
+		return TrustedDevice{}, errors.New("device_revoked")
+	}
+	if !DeviceCredentialMatches(encoded.CredentialHash, credential) {
+		return TrustedDevice{}, errors.New("device_unknown")
+	}
+	return encoded.toTrusted()
 }
 
 func (s *DeviceTrustStore) MarkDeviceSeen(deviceID string, sessionID string, now time.Time) (TrustedDevice, string, error) {
 	if s == nil {
 		return TrustedDevice{}, "", errors.New("device trust store is required")
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	encoded, ok := s.file.Devices[strings.TrimSpace(deviceID)]
 	if !ok {
 		return TrustedDevice{}, "", errors.New("device_unknown")
@@ -196,6 +212,8 @@ func (s *DeviceTrustStore) RevokeDevice(deviceID string, now time.Time) (Trusted
 	if s == nil {
 		return TrustedDevice{}, errors.New("device trust store is required")
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	encoded, ok := s.file.Devices[strings.TrimSpace(deviceID)]
 	if !ok {
 		return TrustedDevice{}, errors.New("device_unknown")
@@ -212,15 +230,19 @@ func (s *DeviceTrustStore) RevokeDevice(deviceID string, now time.Time) (Trusted
 	return encoded.toTrusted()
 }
 
-func (s *DeviceTrustStore) GlobalRotate() error {
+func (s *DeviceTrustStore) ClearTrustedDevicesForNodeRotation() error {
 	if s == nil {
 		return errors.New("device trust store is required")
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.file.Devices = map[string]trustedDeviceFile{}
 	return s.save()
 }
 
 func (s *DeviceTrustStore) load() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	raw, err := os.ReadFile(s.path)
 	if err != nil {
 		return fmt.Errorf("read device trust store: %w", err)
@@ -262,17 +284,6 @@ func (s *DeviceTrustStore) save() error {
 		return fmt.Errorf("write device trust store: %w", err)
 	}
 	return os.Chmod(s.path, 0o600)
-}
-
-func (s *DeviceTrustStore) deviceByID(deviceID string) (TrustedDevice, error) {
-	if s == nil {
-		return TrustedDevice{}, errors.New("device trust store is required")
-	}
-	encoded, ok := s.file.Devices[strings.TrimSpace(deviceID)]
-	if !ok {
-		return TrustedDevice{}, errors.New("device_unknown")
-	}
-	return encoded.toTrusted()
 }
 
 func normalizeDeviceRegistration(reg DeviceRegistration) (DeviceRegistration, error) {

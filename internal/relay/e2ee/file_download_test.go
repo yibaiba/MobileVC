@@ -9,9 +9,10 @@ import (
 )
 
 func TestFileDownloadOpenFrameKeepsPathInsideTunnelMetadata(t *testing.T) {
+	size := int64(1234)
 	frame, err := NewFileDownloadOpenFrame(42, FileDownloadMetadata{
 		Path: "/workspace/build/app-release.apk", FileName: "app-release.apk",
-		ContentType: "application/vnd.android.package-archive", Size: 1234,
+		ContentType: "application/vnd.android.package-archive", Size: &size,
 	}, 4)
 	if err != nil {
 		t.Fatal(err)
@@ -29,6 +30,15 @@ func TestFileDownloadOpenFrameKeepsPathInsideTunnelMetadata(t *testing.T) {
 	}
 	if decoded.Metadata["fileName"] != "app-release.apk" || decoded.Metadata["size"] != "1234" {
 		t.Fatalf("metadata mismatch: %#v", decoded.Metadata)
+	}
+	withoutSize, err := NewFileDownloadOpenFrame(43, FileDownloadMetadata{
+		Path: "/workspace/build/app-release.apk",
+	}, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := withoutSize.Metadata["size"]; ok {
+		t.Fatalf("unexpected default size metadata: %#v", withoutSize.Metadata)
 	}
 
 	_, err = NewFileDownloadOpenFrame(42, FileDownloadMetadata{}, 4)

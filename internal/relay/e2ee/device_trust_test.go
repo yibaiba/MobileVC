@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -71,6 +72,12 @@ func TestDeviceTrustStoreVerifiesCredentialAndRejectsRevokedDevice(t *testing.T)
 	if _, err := store.VerifyDeviceCredential(device.ID, "credential-one"); err == nil || !strings.Contains(err.Error(), "device_revoked") {
 		t.Fatalf("expected revoked credential failure, got %v", err)
 	}
+	if _, err := store.RegisterDevice(DeviceRegistration{
+		ID: device.ID, DisplayName: "Pixel rebound", PublicKey: testDeviceIdentityPublicKey(t),
+		DeviceCredential: "credential-rebound", Now: time.Date(2026, 5, 21, 11, 1, 0, 0, time.UTC),
+	}); err == nil || !strings.Contains(err.Error(), "device_already_bound") {
+		t.Fatalf("expected duplicate revoked registration failure, got %v", err)
+	}
 }
 
 func TestDeviceTrustStoreMarksSeenAndReturnsReplacedSession(t *testing.T) {
@@ -93,12 +100,12 @@ func TestDeviceTrustStoreMarksSeenAndReturnsReplacedSession(t *testing.T) {
 	}
 }
 
-func TestDeviceTrustStoreGlobalRotateClearsTrustedDevices(t *testing.T) {
+func TestDeviceTrustStoreClearTrustedDevicesForNodeRotation(t *testing.T) {
 	store := testDeviceTrustStore(t)
 	registerTestTrustedDevice(t, store, "dev_1", "Pixel", "credential-one")
 	registerTestTrustedDevice(t, store, "dev_2", "iPhone", "credential-two")
 
-	if err := store.GlobalRotate(); err != nil {
+	if err := store.ClearTrustedDevicesForNodeRotation(); err != nil {
 		t.Fatal(err)
 	}
 	devices, err := store.ListDevices()
@@ -110,6 +117,33 @@ func TestDeviceTrustStoreGlobalRotateClearsTrustedDevices(t *testing.T) {
 	}
 	if _, err := store.VerifyDeviceCredential("dev_1", "credential-one"); err == nil || !strings.Contains(err.Error(), "device_unknown") {
 		t.Fatalf("expected rotated device failure, got %v", err)
+	}
+}
+
+func TestDeviceTrustStoreSerializesConcurrentUpdates(t *testing.T) {
+	store := testDeviceTrustStore(t)
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, err := store.RegisterDevice(DeviceRegistration{
+				ID: "dev_" + string(rune('a'+i)), DisplayName: "Device",
+				PublicKey: testDeviceIdentityPublicKey(t), DeviceCredential: "credential",
+				Now: time.Date(2026, 5, 21, 10, i, 0, 0, time.UTC),
+			})
+			if err != nil {
+				t.Errorf("register device %d: %v", i, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+	devices, err := store.ListDevices()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(devices) != 20 {
+		t.Fatalf("device count: got %d want 20", len(devices))
 	}
 }
 

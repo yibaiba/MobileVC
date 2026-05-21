@@ -22,7 +22,7 @@ type FileDownloadMetadata struct {
 	Path        string
 	FileName    string
 	ContentType string
-	Size        int64
+	Size        *int64
 }
 
 func NewFileDownloadOpenFrame(streamID uint64, metadata FileDownloadMetadata, window uint32) (TunnelFrame, error) {
@@ -182,8 +182,8 @@ func (m FileDownloadMetadata) toMap() map[string]string {
 	if strings.TrimSpace(m.ContentType) != "" {
 		out["contentType"] = m.ContentType
 	}
-	if m.Size >= 0 {
-		out["size"] = strconv.FormatInt(m.Size, 10)
+	if m.Size != nil && *m.Size >= 0 {
+		out["size"] = strconv.FormatInt(*m.Size, 10)
 	}
 	return out
 }
