@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 
+	"mobilevc/internal/gateway"
 	"mobilevc/internal/relay"
 	"mobilevc/internal/relay/e2ee"
 )
@@ -28,6 +29,7 @@ type gatewayConn struct {
 	closeOnce  sync.Once
 	e2ee       *agentE2EEHandshakeHandler
 	stream     *e2ee.MobileVCStreamCodec
+	streamHS   string
 }
 
 type readResult struct {
@@ -202,6 +204,7 @@ func (c *gatewayConn) activateE2EEStream(handshakeID string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.stream = codec
+	c.streamHS = handshakeID
 	return nil
 }
 
@@ -366,4 +369,15 @@ func (c *gatewayConn) RemoteAddr() string {
 
 func (c *gatewayConn) Origin() string {
 	return "relay"
+}
+
+func (c *gatewayConn) RelayE2EEInfo() gateway.RelayE2EEInfo {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return gateway.RelayE2EEInfo{
+		Enabled:     c.stream != nil,
+		SessionID:   c.sessionID,
+		ClientID:    c.clientID,
+		HandshakeID: c.streamHS,
+	}
 }

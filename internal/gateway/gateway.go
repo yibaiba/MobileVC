@@ -26,6 +26,7 @@ import (
 	"mobilevc/internal/logx"
 	"mobilevc/internal/protocol"
 	"mobilevc/internal/push"
+	"mobilevc/internal/relay/e2ee"
 	"mobilevc/internal/session"
 )
 
@@ -63,6 +64,7 @@ type Handler struct {
 	SkillLauncher   *skills.Launcher
 	SessionStore    data.Store
 	PushService     push.Service
+	DeviceTrust     *e2ee.DeviceTrustStore
 	runtimeSessions *runtimeSessionRegistry
 
 	muProgressPush   sync.Mutex
@@ -117,6 +119,17 @@ type ClientConn interface {
 	Close() error
 	RemoteAddr() string
 	Origin() string
+}
+
+type relayE2EEClientConn interface {
+	RelayE2EEInfo() RelayE2EEInfo
+}
+
+type RelayE2EEInfo struct {
+	Enabled     bool
+	SessionID   string
+	ClientID    string
+	HandshakeID string
 }
 
 type websocketClientConn struct {
@@ -735,6 +748,20 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 		}
 
 		switch clientEvent.Action {
+		case "relay_device_register":
+			var req protocol.RelayDeviceRegisterRequestEvent
+			if err := json.Unmarshal(payloadBytes, &req); err != nil {
+				logx.Warn("ws", "invalid relay_device_register request: connectionID=%s remoteAddr=%s err=%v", connectionID, remoteAddr, err)
+				emit(protocol.NewErrorEventWithCode(selectedSessionID, fmt.Sprintf("invalid relay_device_register request: %v", err), "", "e2ee_handshake_failed"))
+				continue
+			}
+			result, err := h.registerRelayDevice(client, req)
+			if err != nil {
+				logx.Warn("ws", "relay device registration failed: connectionID=%s remoteAddr=%s err=%v", connectionID, remoteAddr, err)
+				emit(protocol.NewErrorEventWithCode(selectedSessionID, err.Error(), "", relayDeviceRegisterErrorCode(err)))
+				continue
+			}
+			emit(result)
 		case "session_create":
 			var req protocol.SessionCreateRequestEvent
 			if err := json.Unmarshal(payloadBytes, &req); err != nil {

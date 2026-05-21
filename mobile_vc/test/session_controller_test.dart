@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
@@ -27,6 +28,7 @@ Future<void> _servePairingE2eeRelay(
   WebSocket socket,
   RelayE2eeEphemeralKeyPair nodeIdentity,
   List<Map<String, dynamic>>? observedForwards,
+  List<Map<String, dynamic>>? observedPlaintexts,
 ) async {
   final capabilities = RelayE2eeCapabilitySet.production();
   RelayMobileVcStreamCodec? codec;
@@ -112,6 +114,7 @@ Future<void> _servePairingE2eeRelay(
           throw StateError('test relay e2ee codec missing');
         }
         final decoded = await relayCodec.decodeJson(frame);
+        observedPlaintexts?.add(Map<String, dynamic>.from(decoded));
         if (decoded['type'] == 'ping') {
           socket.add(jsonEncode(await relayCodec.encodeJson(
             messageId: 'msg_server_ack',
@@ -122,6 +125,37 @@ Future<void> _servePairingE2eeRelay(
           )));
         }
     }
+  }
+}
+
+MobileVcWsService _testRelayService({int seed = 101}) {
+  final store = _MemoryRelaySecureStore();
+  return MobileVcWsService(
+    relayDeviceIdentityStore: RelayDeviceIdentityStore(
+      secureStore: store,
+      random: Random(seed),
+    ),
+    relayDeviceCredentialStore: RelayDeviceCredentialStore(
+      secureStore: store,
+      random: Random(seed + 1),
+    ),
+  );
+}
+
+class _MemoryRelaySecureStore implements RelaySecureStore {
+  final Map<String, String> values = <String, String>{};
+
+  @override
+  Future<String?> read(String key) async => values[key];
+
+  @override
+  Future<void> write(String key, String value) async {
+    values[key] = value;
+  }
+
+  @override
+  Future<void> delete(String key) async {
+    values.remove(key);
   }
 }
 
@@ -311,9 +345,9 @@ void main() {
       final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
       addTearDown(server.close);
       server.transform(WebSocketTransformer()).listen((socket) {
-        _servePairingE2eeRelay(socket, nodeIdentity, null);
+        _servePairingE2eeRelay(socket, nodeIdentity, null, null);
       });
-      final service = MobileVcWsService();
+      final service = _testRelayService();
       addTearDown(service.dispose);
 
       await service.connectRelay(
@@ -336,10 +370,16 @@ void main() {
       final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
       addTearDown(server.close);
       final observedForwards = <Map<String, dynamic>>[];
+      final observedPlaintexts = <Map<String, dynamic>>[];
       server.transform(WebSocketTransformer()).listen((socket) {
-        _servePairingE2eeRelay(socket, nodeIdentity, observedForwards);
+        _servePairingE2eeRelay(
+          socket,
+          nodeIdentity,
+          observedForwards,
+          observedPlaintexts,
+        );
       });
-      final service = MobileVcWsService();
+      final service = _testRelayService();
       addTearDown(service.dispose);
       final events = <AppEvent>[];
       final subscription = service.events.listen(events.add);
@@ -356,9 +396,19 @@ void main() {
       expect(service.send(const <String, dynamic>{'type': 'ping'}), isTrue);
       await Future<void>.delayed(const Duration(milliseconds: 100));
 
-      expect(observedForwards.single['encryption'], relayE2eeSuite);
-      expect(observedForwards.single['payload'].toString(),
+      expect(observedForwards, hasLength(greaterThanOrEqualTo(2)));
+      expect(observedForwards[0]['encryption'], relayE2eeSuite);
+      expect(observedForwards[1]['encryption'], relayE2eeSuite);
+      expect(observedForwards[1]['payload'].toString(),
           isNot(contains('ping')));
+      expect(
+        observedPlaintexts.first['action'],
+        'relay_device_register',
+      );
+      expect(
+        observedForwards[0]['payload'].toString(),
+        isNot(contains(observedPlaintexts.first['deviceCredential'])),
+      );
       expect(events.whereType<PongEvent>().single.sessionId, 'session-test');
       expect(events.whereType<ErrorEvent>(), isEmpty);
     });
@@ -368,9 +418,9 @@ void main() {
       final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
       addTearDown(server.close);
       server.transform(WebSocketTransformer()).listen((socket) {
-        _servePairingE2eeRelay(socket, nodeIdentity, null);
+        _servePairingE2eeRelay(socket, nodeIdentity, null, null);
       });
-      final service = MobileVcWsService();
+      final service = _testRelayService();
       addTearDown(service.dispose);
 
       expect(

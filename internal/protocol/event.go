@@ -6,45 +6,46 @@ import (
 )
 
 const (
-	EventTypeLog                      = "log"
-	EventTypeProgress                 = "progress"
-	EventTypeError                    = "error"
-	EventTypeClientActionAck          = "client_action_ack"
-	EventTypePromptRequest            = "prompt_request"
-	EventTypeInteractionRequest       = "interaction_request"
-	EventTypeSessionResumeResult      = "session_resume_result"
-	EventTypeSessionResumeNotice      = "session_resume_notice"
-	EventTypeSessionState             = "session_state"
-	EventTypeAgentState               = "agent_state"
-	EventTypeAIStatus                 = "ai_status"
-	EventTypeRuntimePhase             = "runtime_phase"
-	EventTypeTaskSnapshot             = "task_snapshot"
-	EventTypeFSListResult             = "fs_list_result"
-	EventTypeFSReadResult             = "fs_read_result"
-	EventTypeStepUpdate               = "step_update"
-	EventTypeFileDiff                 = "file_diff"
-	EventTypeRuntimeInfoResult        = "runtime_info_result"
-	EventTypeRuntimeProcessList       = "runtime_process_list_result"
-	EventTypeRuntimeProcessLog        = "runtime_process_log_result"
-	EventTypeSessionCreated           = "session_created"
-	EventTypeSessionListResult        = "session_list_result"
-	EventTypeSessionHistory           = "session_history"
-	EventTypeSessionDelta             = "session_delta"
-	EventTypeReviewState              = "review_state"
-	EventTypeSkillCatalogResult       = "skill_catalog_result"
-	EventTypeMemoryListResult         = "memory_list_result"
-	EventTypeCatalogAuthoringResult   = "catalog_authoring_result"
-	EventTypeSessionContextResult     = "session_context_result"
-	EventTypePermissionRuleListResult = "permission_rule_list_result"
-	EventTypePermissionAutoApplied    = "permission_auto_applied"
-	EventTypeSkillSyncResult          = "skill_sync_result"
-	EventTypeCatalogSyncStatus        = "catalog_sync_status"
-	EventTypeCatalogSyncResult        = "catalog_sync_result"
-	EventTypeADBDevicesResult         = "adb_devices_result"
-	EventTypeADBStreamState           = "adb_stream_state"
-	EventTypeADBFrame                 = "adb_frame"
-	EventTypeADBWebRTCAnswer          = "adb_webrtc_answer"
-	EventTypeADBWebRTCState           = "adb_webrtc_state"
+	EventTypeLog                       = "log"
+	EventTypeProgress                  = "progress"
+	EventTypeError                     = "error"
+	EventTypeClientActionAck           = "client_action_ack"
+	EventTypePromptRequest             = "prompt_request"
+	EventTypeInteractionRequest        = "interaction_request"
+	EventTypeSessionResumeResult       = "session_resume_result"
+	EventTypeSessionResumeNotice       = "session_resume_notice"
+	EventTypeSessionState              = "session_state"
+	EventTypeAgentState                = "agent_state"
+	EventTypeAIStatus                  = "ai_status"
+	EventTypeRuntimePhase              = "runtime_phase"
+	EventTypeTaskSnapshot              = "task_snapshot"
+	EventTypeFSListResult              = "fs_list_result"
+	EventTypeFSReadResult              = "fs_read_result"
+	EventTypeStepUpdate                = "step_update"
+	EventTypeFileDiff                  = "file_diff"
+	EventTypeRuntimeInfoResult         = "runtime_info_result"
+	EventTypeRuntimeProcessList        = "runtime_process_list_result"
+	EventTypeRuntimeProcessLog         = "runtime_process_log_result"
+	EventTypeSessionCreated            = "session_created"
+	EventTypeSessionListResult         = "session_list_result"
+	EventTypeSessionHistory            = "session_history"
+	EventTypeSessionDelta              = "session_delta"
+	EventTypeReviewState               = "review_state"
+	EventTypeSkillCatalogResult        = "skill_catalog_result"
+	EventTypeMemoryListResult          = "memory_list_result"
+	EventTypeCatalogAuthoringResult    = "catalog_authoring_result"
+	EventTypeSessionContextResult      = "session_context_result"
+	EventTypePermissionRuleListResult  = "permission_rule_list_result"
+	EventTypePermissionAutoApplied     = "permission_auto_applied"
+	EventTypeSkillSyncResult           = "skill_sync_result"
+	EventTypeCatalogSyncStatus         = "catalog_sync_status"
+	EventTypeCatalogSyncResult         = "catalog_sync_result"
+	EventTypeADBDevicesResult          = "adb_devices_result"
+	EventTypeADBStreamState            = "adb_stream_state"
+	EventTypeADBFrame                  = "adb_frame"
+	EventTypeADBWebRTCAnswer           = "adb_webrtc_answer"
+	EventTypeADBWebRTCState            = "adb_webrtc_state"
+	EventTypeRelayDeviceRegisterResult = "relay_device_register_result"
 )
 
 type RuntimeMeta struct {
@@ -85,6 +86,21 @@ type ClientEvent struct {
 	Action         string `json:"action"`
 	SessionID      string `json:"sessionId,omitempty"`
 	ClientActionID string `json:"clientActionId,omitempty"`
+}
+
+type RelayDeviceRegisterRequestEvent struct {
+	ClientEvent
+	DeviceID                string `json:"deviceId"`
+	DisplayName             string `json:"displayName"`
+	DeviceIdentityPublicKey string `json:"deviceIdentityPublicKey"`
+	DeviceCredential        string `json:"deviceCredential"`
+}
+
+type RelayDeviceRegisterResultEvent struct {
+	Event
+	DeviceID       string `json:"deviceId"`
+	FingerprintHex string `json:"fingerprintHex"`
+	Status         string `json:"status"`
 }
 
 type ExecRequestEvent struct {
@@ -993,6 +1009,15 @@ func NewClientActionAckEvent(sessionID, action, clientActionID, status string, d
 		ClientActionID: clientActionID,
 		Status:         status,
 		Duplicate:      duplicate,
+	}
+}
+
+func NewRelayDeviceRegisterResultEvent(sessionID, deviceID, fingerprintHex, status string) RelayDeviceRegisterResultEvent {
+	return RelayDeviceRegisterResultEvent{
+		Event:          NewBaseEvent(EventTypeRelayDeviceRegisterResult, sessionID),
+		DeviceID:       deviceID,
+		FingerprintHex: fingerprintHex,
+		Status:         status,
 	}
 }
 

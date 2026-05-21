@@ -16,10 +16,23 @@ import '../models/runtime_meta.dart';
 import 'mobilevc_mapper.dart';
 
 class MobileVcWsService {
-  MobileVcWsService({MobileVcMapper? mapper})
-      : _mapper = mapper ?? const MobileVcMapper();
+  MobileVcWsService({
+    MobileVcMapper? mapper,
+    RelayDeviceIdentityStore? relayDeviceIdentityStore,
+    RelayDeviceCredentialStore? relayDeviceCredentialStore,
+  })  : _mapper = mapper ?? const MobileVcMapper(),
+        _relayDeviceIdentityStore = relayDeviceIdentityStore ??
+            RelayDeviceIdentityStore(
+              secureStore: const FlutterRelaySecureStore(),
+            ),
+        _relayDeviceCredentialStore = relayDeviceCredentialStore ??
+            RelayDeviceCredentialStore(
+              secureStore: const FlutterRelaySecureStore(),
+            );
 
   final MobileVcMapper _mapper;
+  final RelayDeviceIdentityStore _relayDeviceIdentityStore;
+  final RelayDeviceCredentialStore _relayDeviceCredentialStore;
   final StreamController<AppEvent> _events =
       StreamController<AppEvent>.broadcast();
   WebSocketChannel? _channel;
@@ -479,6 +492,11 @@ class MobileVcWsService {
           throw StateError('Relay E2EE 握手路由不匹配');
         }
         _relayE2eeState = pending.markComplete();
+        _queueRelayDeviceRegister(
+          channel: channel,
+          state: _relayE2eeState!,
+          epoch: _connectionEpoch,
+        );
         if (!complete.isCompleted) {
           complete.complete();
         }
@@ -678,6 +696,50 @@ class MobileVcWsService {
     });
   }
 
+  void _queueRelayDeviceRegister({
+    required WebSocketChannel channel,
+    required _RelayE2eeHandshakeState state,
+    required int epoch,
+  }) {
+    _relaySendQueue = _relaySendQueue.then((_) async {
+      if (epoch != _connectionEpoch || _channel != channel) {
+        return;
+      }
+      final identity = await _relayDeviceIdentityStore.loadOrCreate();
+      final credential = await _relayDeviceCredentialStore.loadOrCreate();
+      final frame = await state.streamCodec!.encodeJson(
+        messageId: 'msg_${const Uuid().v4()}',
+        payload: <String, dynamic>{
+          'action': 'relay_device_register',
+          'deviceId': identity.fullFingerprintHex,
+          'displayName': _defaultRelayDeviceName(),
+          'deviceIdentityPublicKey':
+              encodeRelayFrameBytes(identity.publicKey),
+          'deviceCredential': credential.value,
+        },
+      );
+      if (epoch != _connectionEpoch || _channel != channel) {
+        return;
+      }
+      channel.sink.add(jsonEncode(frame));
+    }).catchError((Object error, StackTrace stackTrace) {
+      _events.add(ErrorEvent(
+        timestamp: DateTime.now(),
+        sessionId: '',
+        runtimeMeta: const RuntimeMeta(),
+        raw: <String, dynamic>{
+          'type': 'error',
+          'code': 'device_unknown',
+          'msg': 'Relay device registration failed: $error',
+          'stack': stackTrace.toString(),
+        },
+        code: 'device_unknown',
+        message: 'Relay 设备绑定失败：$error',
+      ));
+      unawaited(disconnect());
+    });
+  }
+
   Future<Map<String, dynamic>> _encodeRelayFrame(
     Map<String, dynamic> payload,
     _RelayContext relayContext,
@@ -752,6 +814,12 @@ String _hex(Uint8List bytes) {
   }
   return buffer.toString();
 }
+
+String _defaultRelayDeviceName() => defaultTargetPlatform == TargetPlatform.iOS
+    ? 'iPhone'
+    : defaultTargetPlatform == TargetPlatform.android
+        ? 'Android Device'
+        : 'MobileVC Device';
 
 class _RelayE2eeHandshakeState {
   const _RelayE2eeHandshakeState({
