@@ -3,9 +3,10 @@ import 'dart:typed_data';
 
 import 'relay_e2ee_crypto.dart';
 import 'relay_e2ee_handshake.dart';
+import 'relay_tunnel.dart';
 
 const relayMobileVcStreamId = 1;
-const relayMobileVcStreamType = 'mobilevc.ws';
+const relayMobileVcStreamType = tunnelStreamMobileVcWs;
 const relayForwardType = 'relay.forward';
 const relayForwardContentTypeMobileVc = 'mobilevc.ws.v1';
 const relayForwardPayloadBase64Url = 'base64url';
