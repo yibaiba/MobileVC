@@ -68,6 +68,40 @@ void main() {
     );
     expect(tampered, isFalse);
   });
+
+  test('device credential persists only in secure store and hashes stably',
+      () async {
+    final store = MemoryRelaySecureStore();
+    final credentials = RelayDeviceCredentialStore(
+      secureStore: store,
+      random: Random(19),
+    );
+
+    final first = await credentials.loadOrCreate();
+    final second = await credentials.loadOrCreate();
+    final firstHash = await first.hash();
+    final secondHash =
+        await RelayDeviceCredentialStore.hashCredential(second.value);
+
+    expect(second.value, first.value);
+    expect(first.value, isNot(firstHash));
+    expect(firstHash, secondHash);
+    expect(store.values.keys, ['mobilevc.relay.device_credential.v1']);
+  });
+
+  test('reset deletes persisted device credential', () async {
+    final store = MemoryRelaySecureStore();
+    final credentials = RelayDeviceCredentialStore(
+      secureStore: store,
+      random: Random(23),
+    );
+
+    final first = await credentials.loadOrCreate();
+    await credentials.reset();
+    final second = await credentials.loadOrCreate();
+
+    expect(second.value, isNot(first.value));
+  });
 }
 
 class MemoryRelaySecureStore implements RelaySecureStore {

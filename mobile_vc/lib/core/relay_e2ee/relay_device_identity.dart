@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:math';
 import 'dart:typed_data';
 
+import 'package:cryptography/cryptography.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:pointycastle/pointycastle.dart' as pc;
 
@@ -226,5 +227,51 @@ class RelayDeviceIdentityStore {
         ..write(digits[byte & 0x0f]);
     }
     return buffer.toString();
+  }
+}
+
+class RelayDeviceCredential {
+  const RelayDeviceCredential(this.value);
+
+  final String value;
+
+  Future<String> hash() => RelayDeviceCredentialStore.hashCredential(value);
+}
+
+class RelayDeviceCredentialStore {
+  RelayDeviceCredentialStore({
+    required RelaySecureStore secureStore,
+    Random? random,
+  })  : _secureStore = secureStore,
+        _random = random ?? Random.secure();
+
+  static const _credentialName = 'mobilevc.relay.device_credential.v1';
+
+  final RelaySecureStore _secureStore;
+  final Random _random;
+
+  Future<RelayDeviceCredential> loadOrCreate() async {
+    final stored = await _secureStore.read(_credentialName);
+    if (stored != null && stored.trim().isNotEmpty) {
+      return RelayDeviceCredential(stored);
+    }
+    final credential = RelayDeviceCredential(_newCredential());
+    await _secureStore.write(_credentialName, credential.value);
+    return credential;
+  }
+
+  Future<void> reset() => _secureStore.delete(_credentialName);
+
+  String _newCredential() {
+    final bytes = Uint8List(relayE2eeKeyLength);
+    for (var i = 0; i < bytes.length; i++) {
+      bytes[i] = _random.nextInt(256);
+    }
+    return base64Url.encode(bytes).replaceAll('=', '');
+  }
+
+  static Future<String> hashCredential(String credential) async {
+    final hash = await Sha256().hash(utf8.encode(credential));
+    return base64Url.encode(hash.bytes).replaceAll('=', '');
   }
 }

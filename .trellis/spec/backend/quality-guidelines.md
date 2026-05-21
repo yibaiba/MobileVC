@@ -106,6 +106,62 @@ Correct:
 _ = relayclient.EmitPairingFile(pairingEventPath, event)
 ```
 
+### Scenario: Relay E2EE Device Trust Store
+
+#### 1. Scope / Trigger
+- Trigger: any backend change that stores relay E2EE node/device trust, device credentials, revocation state, or global rotation state.
+- Applies to `internal/relay/e2ee` and any future local-node device management API layered above it.
+
+#### 2. Signatures
+- Node trust path: `~/.mobilevc/relay/trusted_devices.json`
+- Store loader: `LoadOrCreateDeviceTrustStore(path)`
+- Credential helpers: `NewDeviceCredential()`, `DeviceCredentialHash(secret)`, `DeviceCredentialMatches(hash, secret)`
+- Device actions: `RegisterDevice`, `ListDevices`, `VerifyDeviceCredential`, `MarkDeviceSeen`, `RevokeDevice`, `GlobalRotate`
+
+#### 3. Contracts
+- Local node is the source of truth for trusted E2EE devices; relay server runtime device maps are not persistent trust stores.
+- The store persists device ID, display name, public key, fingerprint, credential hash, timestamps, revoked time, and current active session ID.
+- The store must never persist plaintext device credentials, private keys, traffic keys, pairing secrets, file contents, or conversation payloads.
+- Store parent directory permission must be owner-only (`0700`) and store file permission must be owner-only (`0600`).
+- Same device identity may have only one active session ID; marking the same device seen with a new session returns the replaced session ID so callers can close the older connection explicitly.
+
+#### 4. Validation & Error Matrix
+- Empty store path -> explicit config error.
+- Invalid device public key -> registration/load error.
+- Stored fingerprint mismatch -> load error.
+- Unknown device -> `device_unknown`.
+- Revoked device -> `device_revoked`.
+- Wrong credential -> `device_unknown`.
+- Global rotate -> trusted device list is cleared and previous credentials fail as `device_unknown`.
+
+#### 5. Good/Base/Bad Cases
+- Good: local node stores only `DeviceCredentialHash(deviceCredential)` while Flutter keeps the plaintext credential in platform secure storage.
+- Good: revoke clears `ActiveSessionID` and later reconnect fails before E2EE traffic keys are accepted.
+- Base: relay server may keep runtime connection state for routing/caps, but not durable device trust.
+- Bad: persisting E2EE device trust in the public relay server database.
+- Bad: writing plaintext device credential or private key material into JSON, logs, pairing links, or relay frames.
+
+#### 6. Tests Required
+- Store creation/reload preserves device public metadata and owner-only permissions.
+- Store file does not contain plaintext credential.
+- Credential verification accepts valid credential and rejects wrong/revoked/rotated devices.
+- Marking a device seen returns the replaced active session ID.
+- Fingerprint/public-key tamper causes load failure.
+
+#### 7. Wrong vs Correct
+
+Wrong:
+
+```go
+device.CredentialHash = plaintextCredential
+```
+
+Correct:
+
+```go
+device.CredentialHash = DeviceCredentialHash(plaintextCredential)
+```
+
 
 ---
 
