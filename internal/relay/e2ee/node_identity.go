@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
 const (
@@ -27,6 +28,12 @@ type NodeIdentity struct {
 	Fingerprint []byte
 }
 
+type NodeIdentityStore struct {
+	path     string
+	mu       sync.Mutex
+	identity *NodeIdentity
+}
+
 type nodeIdentityFile struct {
 	Version          int    `json:"version"`
 	Curve            string `json:"curve"`
@@ -37,6 +44,50 @@ type nodeIdentityFile struct {
 
 func DefaultNodeIdentityPath(homeDir string) string {
 	return filepath.Join(homeDir, ".mobilevc", "relay", NodeIdentityFileName)
+}
+
+func LoadOrCreateNodeIdentityStore(path string) (*NodeIdentityStore, error) {
+	identity, err := LoadOrCreateNodeIdentity(path)
+	if err != nil {
+		return nil, err
+	}
+	return &NodeIdentityStore{
+		path:     strings.TrimSpace(path),
+		identity: identity,
+	}, nil
+}
+
+func (s *NodeIdentityStore) Current() (*NodeIdentity, error) {
+	if s == nil {
+		return nil, errors.New("node identity store is required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.identity == nil {
+		identity, err := LoadOrCreateNodeIdentity(s.path)
+		if err != nil {
+			return nil, err
+		}
+		s.identity = identity
+	}
+	return s.identity, nil
+}
+
+func (s *NodeIdentityStore) Rotate() (*NodeIdentity, error) {
+	if s == nil {
+		return nil, errors.New("node identity store is required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	identity, err := GenerateNodeIdentity()
+	if err != nil {
+		return nil, err
+	}
+	if err := SaveNodeIdentity(s.path, identity); err != nil {
+		return nil, err
+	}
+	s.identity = identity
+	return identity, nil
 }
 
 func LoadOrCreateNodeIdentity(path string) (*NodeIdentity, error) {

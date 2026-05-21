@@ -23,6 +23,8 @@ class MobileVcMapper {
         return RelayDeviceListResultEvent.fromJson(json);
       case 'relay_device_revoke_result':
         return RelayDeviceRevokeResultEvent.fromJson(json);
+      case 'relay_device_rotate_result':
+        return RelayDeviceRotateResultEvent.fromJson(json);
       case 'prompt_request':
         return PromptRequestEvent.fromJson(json);
       case 'interaction_request':

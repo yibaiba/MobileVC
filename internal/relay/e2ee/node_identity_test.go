@@ -32,6 +32,39 @@ func TestLoadOrCreateNodeIdentityPersistsStableIdentity(t *testing.T) {
 	assertStoredIdentityHasNoPlaintextSecrets(t, path)
 }
 
+func TestNodeIdentityStoreRotatePersistsNewIdentity(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".mobilevc", "relay", NodeIdentityFileName)
+	store, err := LoadOrCreateNodeIdentityStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rotated, err := store.Rotate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := store.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := LoadNodeIdentity(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(first.Fingerprint, rotated.Fingerprint) {
+		t.Fatal("node identity rotation kept the same fingerprint")
+	}
+	if !bytes.Equal(rotated.Fingerprint, current.Fingerprint) ||
+		!bytes.Equal(rotated.Fingerprint, reloaded.Fingerprint) {
+		t.Fatal("rotated node identity was not kept current and persisted")
+	}
+	assertMode(t, filepath.Dir(path), 0o700)
+	assertMode(t, path, 0o600)
+}
+
 func TestNodeIdentitySignsAndVerifiesTranscript(t *testing.T) {
 	identity, err := GenerateNodeIdentity()
 	if err != nil {

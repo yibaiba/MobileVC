@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"encoding/base64"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -170,6 +171,72 @@ func TestRelayDeviceRevokeClosesTrackedTargetConnections(t *testing.T) {
 	}
 }
 
+func TestRelayDeviceRotateReplacesNodeIdentityAndClearsDevices(t *testing.T) {
+	store, err := e2ee.LoadOrCreateDeviceTrustStore(filepath.Join(t.TempDir(), e2ee.DeviceTrustFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	active := registerGatewayTestDevice(t, store, "dev_active", "Pixel", "active-credential")
+	other := registerGatewayTestDevice(t, store, "dev_lost", "iPhone", "lost-credential")
+	nodeStore, err := e2ee.LoadOrCreateNodeIdentityStore(filepath.Join(t.TempDir(), e2ee.NodeIdentityFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := nodeStore.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := NewHandler("test", nil)
+	h.DeviceTrust = store
+	h.NodeIdentity = nodeStore
+	activeConn := &rotatingRelayClientConn{
+		staticRelayClientConn: staticRelayClientConn{
+			info: RelayE2EEInfo{
+				Enabled: true, SessionID: "rs_gateway", ClientID: "rc_active", HandshakeID: "hs_active", DeviceID: active.ID,
+			},
+		},
+	}
+	otherConn := &rotatingRelayClientConn{
+		staticRelayClientConn: staticRelayClientConn{
+			info: RelayE2EEInfo{
+				Enabled: true, SessionID: "rs_gateway", ClientID: "rc_lost", HandshakeID: "hs_other", DeviceID: other.ID,
+			},
+		},
+	}
+	h.trackRelayE2EEConnection("conn-active", activeConn)
+	h.trackRelayE2EEConnection("conn-lost", otherConn)
+
+	result, err := h.rotateRelayDevices(activeConn)
+	if err != nil {
+		t.Fatalf("rotate relay devices: %v", err)
+	}
+	after, err := nodeStore.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != "rotated" || result.NodeFingerprintHex == "" {
+		t.Fatalf("unexpected rotate result: %#v", result)
+	}
+	if result.NodeFingerprintHex == fmt.Sprintf("%x", before.Fingerprint) ||
+		result.NodeFingerprintHex != fmt.Sprintf("%x", after.Fingerprint) {
+		t.Fatalf("unexpected node fingerprint before=%x after=%x result=%s", before.Fingerprint, after.Fingerprint, result.NodeFingerprintHex)
+	}
+	devices, err := store.ListDevices()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(devices) != 0 {
+		t.Fatalf("rotation left trusted devices: %#v", devices)
+	}
+	h.closeAllRelayDeviceConnections()
+	if activeConn.rotateCount != 1 || otherConn.rotateCount != 1 {
+		t.Fatalf("expected all tracked relay sessions to rotate, got active=%d other=%d", activeConn.rotateCount, otherConn.rotateCount)
+	}
+	if activeConn.closeCount != 1 || otherConn.closeCount != 1 {
+		t.Fatalf("expected all tracked relay connections to close, got active=%d other=%d", activeConn.closeCount, otherConn.closeCount)
+	}
+}
+
 func TestRelayDeviceRevokeRejectsCurrentManagementDevice(t *testing.T) {
 	store, err := e2ee.LoadOrCreateDeviceTrustStore(filepath.Join(t.TempDir(), e2ee.DeviceTrustFileName))
 	if err != nil {
@@ -249,6 +316,16 @@ func (c *staticRelayClientConn) RemoteAddr() string { return "relay:test" }
 func (c *staticRelayClientConn) Origin() string     { return "relay" }
 func (c *staticRelayClientConn) RelayE2EEInfo() RelayE2EEInfo {
 	return c.info
+}
+
+type rotatingRelayClientConn struct {
+	staticRelayClientConn
+	rotateCount int
+}
+
+func (c *rotatingRelayClientConn) RotateRelaySession() error {
+	c.rotateCount++
+	return c.Close()
 }
 
 func readTestFile(t *testing.T, path string) string {

@@ -1007,6 +1007,52 @@ void main() {
       expect(controller.relayDeviceStatus, contains('不能'));
     });
 
+    test('relay device rotate clears local binding and disconnects', () async {
+      SharedPreferences.setMockInitialValues({});
+      final service = _FakeMobileVcWsService()
+        ..relayE2eeHandshake = true
+        ..relayE2eeDeviceBinding = true;
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.saveConfig(const AppConfig(
+        connectionMode: 'relay',
+        relayUrl: 'wss://relay.example.test',
+        relaySessionId: 'rs_test',
+        relayClientId: 'rc_test',
+        relayClientReconnectSecret: 'reconnect_secret',
+        relayNodeFingerprintHex:
+            '1111111111111111111111111111111111111111111111111111111111111111',
+      ));
+      await controller.connect();
+      await _flushEvents();
+
+      controller.rotateRelayDevices();
+      expect(service.sentPayloads.last, {'action': 'relay_device_rotate'});
+
+      service.emit(RelayDeviceRotateResultEvent.fromJson(const {
+        'type': 'relay_device_rotate_result',
+        'sessionId': 'rs_test',
+        'nodeFingerprintHex':
+            '2222222222222222222222222222222222222222222222222222222222222222',
+        'status': 'rotated',
+      }));
+      await _flushEvents();
+
+      expect(service.resetRelayBindingCalls, 1);
+      expect(service.disconnectCalls, greaterThanOrEqualTo(1));
+      expect(controller.connected, isFalse);
+      expect(controller.config.relaySessionId, isEmpty);
+      expect(controller.config.relayClientId, isEmpty);
+      expect(controller.config.relayClientReconnectSecret, isEmpty);
+      expect(
+        controller.config.relayNodeFingerprintHex,
+        '2222222222222222222222222222222222222222222222222222222222222222',
+      );
+      expect(controller.relayDeviceStatus, contains('重新配对'));
+    });
+
     test('relay connect rejects public ws url before service connect',
         () async {
       final service = _FakeMobileVcWsService();
@@ -8878,6 +8924,7 @@ class _FakeMobileVcWsService extends MobileVcWsService {
   final List<_RelayConnectCall> connectedRelays = [];
   int connectCalls = 0;
   int disconnectCalls = 0;
+  int resetRelayBindingCalls = 0;
   bool relayE2eeHandshake = false;
   bool relayE2eeDeviceBinding = false;
   String markedRelayDeviceId = '';
@@ -8895,6 +8942,13 @@ class _FakeMobileVcWsService extends MobileVcWsService {
   void markRelayDeviceRegistered(RelayDeviceRegisterResultEvent event) {
     markedRelayDeviceId = event.deviceId;
     relayE2eeDeviceBinding = event.deviceId.trim().isNotEmpty;
+  }
+
+  @override
+  Future<void> resetRelayDeviceBinding() async {
+    resetRelayBindingCalls++;
+    relayE2eeHandshake = false;
+    relayE2eeDeviceBinding = false;
   }
 
   @override

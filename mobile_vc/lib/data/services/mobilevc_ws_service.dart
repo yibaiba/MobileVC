@@ -400,6 +400,12 @@ class MobileVcWsService {
     _relayE2eeState = next;
   }
 
+  Future<void> resetRelayDeviceBinding() async {
+    await _relayDeviceIdentityStore.reset();
+    await _relayDeviceCredentialStore.reset();
+    _relayE2eeState = null;
+  }
+
   RelaySession? takeRelaySession() {
     final session = _relaySession;
     _relaySession = null;

@@ -48,6 +48,7 @@ const (
 	EventTypeRelayDeviceRegisterResult = "relay_device_register_result"
 	EventTypeRelayDeviceListResult     = "relay_device_list_result"
 	EventTypeRelayDeviceRevokeResult   = "relay_device_revoke_result"
+	EventTypeRelayDeviceRotateResult   = "relay_device_rotate_result"
 )
 
 type RuntimeMeta struct {
@@ -114,6 +115,10 @@ type RelayDeviceRevokeRequestEvent struct {
 	DeviceID string `json:"deviceId"`
 }
 
+type RelayDeviceRotateRequestEvent struct {
+	ClientEvent
+}
+
 type RelayTrustedDevice struct {
 	DeviceID        string `json:"deviceId"`
 	DisplayName     string `json:"displayName"`
@@ -136,6 +141,12 @@ type RelayDeviceRevokeResultEvent struct {
 	Event
 	DeviceID string `json:"deviceId"`
 	Status   string `json:"status"`
+}
+
+type RelayDeviceRotateResultEvent struct {
+	Event
+	NodeFingerprintHex string `json:"nodeFingerprintHex"`
+	Status             string `json:"status"`
 }
 
 type ExecRequestEvent struct {
@@ -1071,6 +1082,14 @@ func NewRelayDeviceRevokeResultEvent(sessionID, deviceID, status string) RelayDe
 		Event:    NewBaseEvent(EventTypeRelayDeviceRevokeResult, sessionID),
 		DeviceID: deviceID,
 		Status:   status,
+	}
+}
+
+func NewRelayDeviceRotateResultEvent(sessionID, nodeFingerprintHex, status string) RelayDeviceRotateResultEvent {
+	return RelayDeviceRotateResultEvent{
+		Event:              NewBaseEvent(EventTypeRelayDeviceRotateResult, sessionID),
+		NodeFingerprintHex: nodeFingerprintHex,
+		Status:             status,
 	}
 }
 

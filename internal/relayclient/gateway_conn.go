@@ -278,6 +278,9 @@ func (c *gatewayConn) waitAttached() error {
 func (c *gatewayConn) setReadError(err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.readErr != nil {
+		return
+	}
 	c.readErr = err
 }
 
@@ -288,6 +291,20 @@ func (c *gatewayConn) readError() error {
 		return c.readErr
 	}
 	return fmt.Errorf("relay connection closed before client attached")
+}
+
+func (c *gatewayConn) closeReason() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.readErr
+}
+
+func (c *gatewayConn) setCloseReason(err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.readErr == nil {
+		c.readErr = err
+	}
 }
 
 func (c *gatewayConn) writeForward(payload []byte) error {
@@ -346,6 +363,11 @@ func (c *gatewayConn) currentClientID() string {
 func (c *gatewayConn) Close() error {
 	c.closeOnce.Do(func() { close(c.closeCh) })
 	return c.conn.Close()
+}
+
+func (c *gatewayConn) RotateRelaySession() error {
+	c.setCloseReason(errRelaySessionRotated)
+	return c.Close()
 }
 
 func (c *gatewayConn) RemoteAddr() string {

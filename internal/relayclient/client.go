@@ -3,6 +3,7 @@ package relayclient
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -26,6 +27,7 @@ type Config struct {
 	Capabilities       e2ee.CapabilitySet
 	NodeFingerprintHex string
 	NodeIdentity       *e2ee.NodeIdentity
+	NodeIdentityStore  *e2ee.NodeIdentityStore
 	DeviceTrust        *e2ee.DeviceTrustStore
 }
 
@@ -48,6 +50,8 @@ type LocalPairingEmitter func(string, PairingReadyEvent) error
 
 const relayControlTimeout = 10 * time.Second
 
+var errRelaySessionRotated = errors.New("relay session rotated")
+
 type agentRegisterRequest struct {
 	SessionID       string
 	PairSecret      string
@@ -65,6 +69,20 @@ func Run(ctx context.Context, cfg Config, handler Handler, emit LocalPairingEmit
 	if err := validateConfig(cfg); err != nil {
 		return err
 	}
+	for {
+		err := runRegisteredSession(ctx, cfg, handler, emit)
+		if errors.Is(err, errRelaySessionRotated) {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			logx.Info("relay", "relay session rotated; registering a new relay session")
+			continue
+		}
+		return err
+	}
+}
+
+func runRegisteredSession(ctx context.Context, cfg Config, handler Handler, emit LocalPairingEmitter) error {
 	pairingSecret, err := relay.NewSecret()
 	if err != nil {
 		return err
@@ -86,6 +104,11 @@ func Run(ctx context.Context, cfg Config, handler Handler, emit LocalPairingEmit
 	if err != nil {
 		return err
 	}
+	nodeFingerprintHex := currentNodeFingerprintHex(cfg)
+	if nodeFingerprintHex == "" {
+		_ = conn.Close()
+		return fmt.Errorf("relay node fingerprint is required")
+	}
 	if err := emit(cfg.PairingEventPath, PairingReadyEvent{
 		Type:               "mobilevc.relay.pairing_ready",
 		RelayURL:           cfg.RelayURL,
@@ -93,7 +116,7 @@ func Run(ctx context.Context, cfg Config, handler Handler, emit LocalPairingEmit
 		PairingSecret:      pairingSecret,
 		ExpiresAt:          expiresAt.Unix(),
 		Capabilities:       req.Capabilities,
-		NodeFingerprintHex: strings.TrimSpace(cfg.NodeFingerprintHex),
+		NodeFingerprintHex: nodeFingerprintHex,
 	}); err != nil {
 		_ = conn.Close()
 		return err
@@ -119,13 +142,38 @@ func validateConfig(cfg Config) error {
 	if strings.TrimSpace(cfg.PairingEventPath) == "" {
 		return fmt.Errorf("relay pairing event path is required")
 	}
-	if !isFingerprintHex(cfg.NodeFingerprintHex) {
+	if currentNodeFingerprintHex(cfg) == "" {
 		return fmt.Errorf("relay node fingerprint is required")
 	}
 	if err := e2ee.ValidateProductionCapabilities(relayClientCapabilities(cfg)); err == nil && cfg.NodeIdentity == nil {
-		return fmt.Errorf("relay node identity is required for e2ee mode")
+		if cfg.NodeIdentityStore == nil {
+			return fmt.Errorf("relay node identity is required for e2ee mode")
+		}
+		if _, err := cfg.NodeIdentityStore.Current(); err != nil {
+			return fmt.Errorf("load relay node identity: %w", err)
+		}
 	}
 	return nil
+}
+
+func currentNodeIdentity(cfg Config) (*e2ee.NodeIdentity, error) {
+	if cfg.NodeIdentityStore != nil {
+		return cfg.NodeIdentityStore.Current()
+	}
+	if cfg.NodeIdentity != nil {
+		return cfg.NodeIdentity, nil
+	}
+	return nil, fmt.Errorf("relay node identity is required for e2ee mode")
+}
+
+func currentNodeFingerprintHex(cfg Config) string {
+	if identity, err := currentNodeIdentity(cfg); err == nil && identity != nil {
+		return fmt.Sprintf("%x", identity.Fingerprint)
+	}
+	if isFingerprintHex(cfg.NodeFingerprintHex) {
+		return strings.TrimSpace(cfg.NodeFingerprintHex)
+	}
+	return ""
 }
 
 func isFingerprintHex(value string) bool {

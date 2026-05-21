@@ -2,6 +2,7 @@ package relayclient
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -16,14 +17,22 @@ type Handler interface {
 
 func serveWithReconnect(ctx context.Context, cfg Config, handler Handler, conn *websocket.Conn, sessionID string, pairingSecret string, reconnectSecret string) error {
 	for {
+		nodeIdentity, err := currentNodeIdentity(cfg)
+		if err != nil {
+			return err
+		}
 		e2eeHandler := newAgentE2EEHandshakeHandlerWithDeviceTrust(
 			sessionID,
 			pairingSecret,
 			relayClientCapabilities(cfg),
-			cfg.NodeIdentity,
+			nodeIdentity,
 			cfg.DeviceTrust,
 		)
-		handler.ServeClientConn(ctx, newGatewayConnWithE2EE(conn, sessionID, e2eeHandler))
+		gatewayConn := newGatewayConnWithE2EE(conn, sessionID, e2eeHandler)
+		handler.ServeClientConn(ctx, gatewayConn)
+		if errors.Is(gatewayConn.closeReason(), errRelaySessionRotated) {
+			return errRelaySessionRotated
+		}
 		_ = conn.Close()
 		if ctx.Err() != nil {
 			return ctx.Err()

@@ -152,8 +152,9 @@ await prefs.setString('mobilevc.app_config', jsonEncode(config.toJson()));
 - Handshake frame DTOs: `RelayE2eeClientHelloFrame`, `RelayE2eeAgentHelloFrame`, `RelayE2eeClientProofFrame`, `RelayE2eeAgentResultFrame`
 - Verified gate: `RelaySecurityState.canShowVerified`
 - Blocking states: `fingerprintMismatch`, `deviceRevoked`, `plaintextDisabled`, `encryptionUnavailable`
-- Relay device events: `RelayDeviceRegisterResultEvent`, `RelayDeviceListResultEvent`, `RelayDeviceRevokeResultEvent`
-- Controller device actions: `SessionController.requestRelayDeviceList()`, `SessionController.revokeRelayDevice(deviceId)`
+- Relay device events: `RelayDeviceRegisterResultEvent`, `RelayDeviceListResultEvent`, `RelayDeviceRevokeResultEvent`, `RelayDeviceRotateResultEvent`
+- Controller device actions: `SessionController.requestRelayDeviceList()`, `SessionController.revokeRelayDevice(deviceId)`, `SessionController.rotateRelayDevices()`
+- Service reset action: `MobileVcWsService.resetRelayDeviceBinding()`
 - Service device binding gate: `MobileVcWsService.hasRelayE2eeDeviceBinding`
 
 #### 3. Contracts
@@ -182,6 +183,7 @@ await prefs.setString('mobilevc.app_config', jsonEncode(config.toJson()));
 - First-pairing device registration is complete only after `relay_device_register_result` arrives. Until then, do not show the device management view as ready or send `relay_device_list`.
 - Relay device list/revoke requests are normal MobileVC business payloads and therefore must pass through the active encrypted relay stream. They must never use relay control frames or plaintext fallback.
 - Same-device revoke must be blocked in Flutter before sending, and the backend still enforces it. The UI copy must direct global rotation to a separate management path, not pretend same-device revoke is rotate.
+- Global rotate must be a separate confirmed action. It sends `relay_device_rotate` only when backend-confirmed relay E2EE device binding is present. On `relay_device_rotate_result`, Flutter must reset secure device identity and credential storage, clear active E2EE state, clear relay session/client reconnect fields from persisted config, disconnect, and tell the user to import the newly generated relay link before reconnecting.
 
 #### 4. Validation & Error Matrix
 - Direct mode -> `LAN 直连`, not verified.
@@ -196,6 +198,8 @@ await prefs.setString('mobilevc.app_config', jsonEncode(config.toJson()));
 - Relay E2EE handshake completed but `relay_device_register_result` not received -> device management unavailable / neutral waiting state.
 - `relay_device_list` before backend-confirmed device binding -> blocked in controller with "Relay E2EE 未就绪" copy.
 - Revoking the current device from the phone UI -> blocked locally with a clear message; do not send `relay_device_revoke`.
+- Global rotate before backend-confirmed device binding -> blocked in controller with "Relay E2EE 未就绪" copy.
+- `relay_device_rotate_result` -> clear local relay device binding, clear persisted relay session/client reconnect fields, disconnect, and show "重新配对" copy. Do not auto-reconnect with the old session.
 - Production E2EE pairing timeout before `agent.e2ee_result ok` -> `Relay E2EE 握手超时`.
 - Persisted production E2EE reconnect -> send `client.reconnect`, wait for `client.paired`, complete reconnect `client.e2ee_hello` -> `agent.e2ee_hello` -> `client.e2ee_proof` -> `agent.e2ee_result ok`, then create a fresh `RelayMobileVcStreamCodec.client(...)`.
 - Production E2EE reconnect result `device_revoked` or `device_unknown` -> connection failure using that code and no plaintext retry.
@@ -224,6 +228,7 @@ await prefs.setString('mobilevc.app_config', jsonEncode(config.toJson()));
 - Good: production E2EE handshake success is tracked separately from verified UI; encrypted forwarding must still be wired before showing verified security.
 - Good: `RelayDeviceRegisterResultEvent` marks the service's bound device ID, and only then does `SessionController` request `relay_device_list`.
 - Good: device list/revoke buttons are disabled or neutral until `hasRelayE2eeDeviceBinding` is true.
+- Good: global rotate is shown as a separate destructive action with confirmation copy, and the result clears local credentials before disconnecting.
 - Good: production relay sends `relay.forward` with `encryption=p256-ecdsa+p256-ecdh+hkdf-sha256+aes-256-gcm`, `streamId=1`, `handshakeId=<completed handshake>`, and ciphertext payloads that do not contain MobileVC plaintext.
 - Good: `MobileVcWsService` keeps relay send/decode queues so async crypto preserves nonce uniqueness and event order.
 - Good: production E2EE persisted reconnect sends device identity metadata in `client.e2ee_hello`, sends only transcript-bound device proof/signature in `client.e2ee_proof`, derives fresh keys, and then encrypts business `relay.forward` frames.
@@ -239,6 +244,7 @@ await prefs.setString('mobilevc.app_config', jsonEncode(config.toJson()));
 - Bad: constructing a new `RelayMobileVcStreamCodec` for every frame; that resets counters and replay state.
 - Bad: accepting `encryption=none` after E2EE completion because a decrypt failed or the app wants to keep the socket alive.
 - Bad: using stored `clientReconnectSecret` to reconnect in production E2EE mode and then sending MobileVC business payloads before a fresh ECDH/device proof handshake completes.
+- Bad: keeping old relay session ID, client ID, or reconnect secret after global rotate and letting auto-reconnect reuse them.
 
 #### 6. Tests Required
 - Verified state only when every condition is true.
@@ -251,6 +257,7 @@ await prefs.setString('mobilevc.app_config', jsonEncode(config.toJson()));
 - Service tests assert production E2EE persisted reconnect performs device rekey, rejects `device_revoked` / `device_unknown`, does not leak the raw device credential in control frames, and fails immediately if a `relay.forward` arrives before E2EE completion.
 - Controller tests assert `relay_device_register_result` enables management and triggers a device-list refresh, while handshake-only state does not.
 - Controller tests assert list/revoke actions require relay E2EE device binding and same-device revoke is blocked before send.
+- Controller tests assert global rotate requires relay E2EE device binding, sends `relay_device_rotate`, resets local binding on `relay_device_rotate_result`, clears persisted relay session/client reconnect state, disconnects, and shows re-pairing copy.
 - Stream tests assert duplicate counters are rejected and async counter allocation cannot reuse nonce values.
 - Config/import tests assert relay pairing URI node fingerprint is required.
 - Tunnel tests assert required fields, unexpected-field rejection, unknown stream type rejection, per-stream sequence allocation, per-stream replay rejection, and zero-window rejection.

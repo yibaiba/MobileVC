@@ -2520,6 +2520,39 @@ class SessionController extends ChangeNotifier {
     notifyListeners();
   }
 
+  void rotateRelayDevices() {
+    if (!canManageRelayDevices) {
+      _relayDeviceStatus = 'Relay E2EE 未就绪，不能执行全局轮换';
+      notifyListeners();
+      return;
+    }
+    _relayDeviceStatus = '正在全局轮换 Relay 身份...';
+    _service.send({'action': 'relay_device_rotate'});
+    notifyListeners();
+  }
+
+  Future<void> _handleRelayDeviceRotateResult(
+    RelayDeviceRotateResultEvent result,
+  ) async {
+    await _service.resetRelayDeviceBinding();
+    _relayDevices.clear();
+    _relayDeviceListLoading = false;
+    _relayDeviceStatus = 'Relay 身份已轮换，请导入新的中继链接后重新配对';
+    _config = _config.copyWith(
+      relaySessionId: '',
+      relayPairingSecret: '',
+      relayPairingExpiresAt: 0,
+      relayClientId: '',
+      relayClientReconnectSecret: '',
+      relayNodeFingerprintHex: result.nodeFingerprintHex,
+    );
+    await _persistCurrentConfig();
+    await disconnect();
+    _relayDeviceStatus = 'Relay 身份已轮换，请导入新的中继链接后重新配对';
+    _connectionMessage = 'Relay 身份已轮换，需要重新配对';
+    notifyListeners();
+  }
+
   void sendReviewDecision(String decision) {
     final normalized = decision.trim().toLowerCase();
     if (normalized.isEmpty) {
@@ -4471,6 +4504,9 @@ class SessionController extends ChangeNotifier {
         _relayDeviceStatus =
             result.status.trim().isNotEmpty ? '设备已撤销' : '设备撤销完成';
         requestRelayDeviceList();
+        break;
+      case RelayDeviceRotateResultEvent result:
+        await _handleRelayDeviceRotateResult(result);
         break;
       case PromptRequestEvent prompt:
         if (prompt.isReview && _reviewShouldAutoAccept(prompt.runtimeMeta)) {

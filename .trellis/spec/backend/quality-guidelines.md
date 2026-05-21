@@ -51,8 +51,9 @@ Questions to answer:
 - Relay E2EE capabilities: `e2ee.CapabilitySet`, `e2ee.ProductionCapabilities()`, `e2ee.PlaintextTestCapabilities()`, `ValidateProductionCapabilities`, `ValidatePlaintextTestCapabilities`
 - Relay E2EE handshake control frames: `client.e2ee_hello`, `agent.e2ee_hello`, `client.e2ee_proof`, `agent.e2ee_result`
 - Local relay E2EE handler: `newAgentE2EEHandshakeHandlerWithDeviceTrust(sessionID, pairingSecret, capabilities, nodeIdentity, deviceTrust)`, `handleClientHello`, `handleClientProof`, `trafficKeys`
-- Relay E2EE device business actions: `relay_device_register`, `relay_device_list`, `relay_device_revoke`
-- Relay E2EE device result events: `relay_device_register_result`, `relay_device_list_result`, `relay_device_revoke_result`
+- Relay E2EE device business actions: `relay_device_register`, `relay_device_list`, `relay_device_revoke`, `relay_device_rotate`
+- Relay E2EE device result events: `relay_device_register_result`, `relay_device_list_result`, `relay_device_revoke_result`, `relay_device_rotate_result`
+- Relay node identity store: `e2ee.LoadOrCreateNodeIdentityStore(path)`, `NodeIdentityStore.Current()`, `NodeIdentityStore.Rotate()`
 - Gateway relay metadata: `gateway.RelayE2EEInfo{Enabled, SessionID, ClientID, HandshakeID, DeviceID}`
 
 #### 3. Contracts
@@ -88,7 +89,7 @@ Questions to answer:
 - Agent reconnect uses `agent.reconnect` plus `agentReconnectSecret` only during the grace window. New `agent.register` must not replace an existing session ID.
 - When an agent disconnects, relay schedules cleanup at `RELAY_AGENT_GRACE_PERIOD`; if the same session is still disconnected then, remove the session and close the paired client connection. Do not wait for another reconnect attempt to discover expiry.
 - When a client pairs, relay sends `client.attached` to the agent with `sessionId` and relay-assigned `clientId`. The local relay client must consume this control frame separately from MobileVC payloads so the first local backend event can use the active `clientId`.
-- Local relay client production E2EE capabilities require a loaded node identity. The backend must pass the same node identity used for pairing-link fingerprint generation into `relayclient.Config.NodeIdentity`.
+- Local relay client production E2EE capabilities require a loaded node identity. The backend must pass one shared `NodeIdentityStore` to `gateway.Handler.NodeIdentity` and `relayclient.Config.NodeIdentityStore`, so pairing-link fingerprint generation, handshake signing, and global rotate use the same current identity.
 - Local relay client `gatewayConn` consumes E2EE control frames separately from MobileVC payloads. `client.e2ee_hello` produces `agent.e2ee_hello`; `client.e2ee_proof` produces `agent.e2ee_result`.
 - Local agent pairing E2EE uses the one-time pairing secret only as a transcript proof. It signs the transcript with the long-lived node identity, performs fresh ephemeral P-256 ECDH, and derives directional traffic keys with HKDF.
 - Local agent pairing proof validation must bind `sessionId`, `clientId`, `handshakeId`, negotiated capabilities, client/node ephemeral keys, and node identity public key. A proof for a different client or session must fail even if it uses a valid pairing secret.
@@ -100,6 +101,7 @@ Questions to answer:
 - `relay_device_list_result` returns trusted device metadata only: device ID, display name, fingerprint, created/last-seen/revoked timestamps, active session ID, connected/current/revoked flags. It must not include credentials, private keys, traffic keys, pairing secrets, or payload contents.
 - `relay_device_revoke` must reject revoking the current management device from that same relay client. Global rotate is a separate node-identity operation; do not fake it by clearing the device JSON store alone.
 - Single-device revoke must update the local trust store and close currently tracked relay gateway connections for the target device so revoke takes effect immediately, not only on the next reconnect.
+- `relay_device_rotate` must require completed relay E2EE plus a bound device, rotate the node identity through `NodeIdentityStore.Rotate()`, clear all trusted devices, emit `relay_device_rotate_result` with the new node fingerprint before closing the management connection, close every tracked relay E2EE connection, and force `relayclient.Run` to register a fresh relay session with a new pairing secret/event. It must not reconnect the old relay session after rotation.
 - `cmd/server` must load one local `DeviceTrustStore` instance for relay mode and pass that same instance to both `gateway.Handler.DeviceTrust` and `relayclient.Config.DeviceTrust` so encrypted device registration is immediately visible to reconnect proof validation.
 - MobileVC stream codecs keep per-connection send counters and replay state. Go codecs must serialize `Encode` and `Decode` internally because gateway reads and writes can run concurrently on the same relay connection.
 - Backend UI/security state still must not show "E2EE verified" until encrypted forwarding, replay protection, fingerprint validation, production plaintext rejection, and device-state checks are all active.
@@ -139,7 +141,10 @@ Questions to answer:
 - Relay E2EE management without a bound device ID -> error code `device_unknown`.
 - `relay_device_revoke` with an empty, unknown, or current management device ID -> error code `device_unknown`.
 - Successful `relay_device_revoke` -> `relay_device_revoke_result` plus refreshed device list; active target device connection is closed if currently tracked.
-- Local relay client production capabilities with missing `NodeIdentity` -> config error `relay node identity is required for e2ee mode`.
+- Direct/LAN or plaintext relay `relay_device_rotate` -> error code `e2ee_required`.
+- `relay_device_rotate` without a configured `NodeIdentityStore` -> explicit backend error; do not clear device trust without a rotatable node identity store.
+- Successful `relay_device_rotate` -> `relay_device_rotate_result` with new node fingerprint, all trusted devices cleared, active relay E2EE connections closed, and a newly registered relay session/pairing event.
+- Local relay client production capabilities with missing `NodeIdentity` or `NodeIdentityStore` -> config error `relay node identity is required for e2ee mode`.
 - Local relay client receives `relay.ping` for a different non-empty session ID -> explicit local read error; do not send `relay.pong`.
 - Post-auth raw websocket frames must be size-bounded while reading, before JSON decode. Frames above the post-auth raw frame limit -> `relay.error` with `frame_too_large`; decoded relay payloads above `MaxPayloadBytes` still -> `payload_too_large`.
 - First agent-to-client forward with an empty `clientId` after successful client pairing -> relay fills the current active `clientId`; wrong non-empty `clientId` still -> `protocol_error`.
@@ -164,6 +169,7 @@ Questions to answer:
 - Good: after local pairing handshake succeeds, the local relay agent decrypts client-to-agent `relay.forward` through `NewAgentMobileVCStreamCodec` and encrypts agent-to-client gateway writes before they leave the local backend.
 - Good: after first-pairing `relay_device_register_result`, the gateway binds the relay connection's device ID so the same phone can request `relay_device_list` without reconnecting.
 - Good: `relay_device_revoke` revokes a different bound device, clears its active state, closes any tracked active connection for that device, then emits a refreshed list.
+- Good: `relay_device_rotate` writes the rotate result to the current phone, rotates the local node fingerprint, clears all trusted devices, closes active relay E2EE connections through `RotateRelaySession()`, and the relay client registers a new `agent.register` session with a new pairing event.
 - Good: MobileVC stream codec counter/replay state is connection-local and protected against concurrent read/write access.
 - Good: local test relay agent declares `PlaintextTestCapabilities()` and production relay agent declares `ProductionCapabilities()`; never infer mode from missing fields.
 - Good: `mobilevc://relay/v1` includes `nodeFingerprint=<64 lowercase hex chars>` plus capability hints, but never includes node private keys, device private keys, or traffic keys.
@@ -179,6 +185,7 @@ Questions to answer:
 - Bad: falling back to plaintext decode after an E2EE decrypt failure, or allowing plaintext `relay.forward` after the E2EE stream has been activated.
 - Bad: accepting a duplicate `agent.register` for an existing `sessionId` after disconnect; that bypasses reconnect-secret semantics.
 - Bad: implementing global rotate as only `ClearTrustedDevicesForNodeRotation`; real rotate must also replace node identity and close/rekey active relay sessions.
+- Bad: treating global rotate as an ordinary connection close; that makes the relay client attempt `agent.reconnect` on the old session instead of publishing a fresh pairing link.
 
 #### 6. Tests Required
 - Relay pairing, one-time secret consumption, URL validation, oversized payload, and opaque unknown business payload forwarding.
@@ -197,7 +204,8 @@ Questions to answer:
 - Relay client tests must cover valid local agent pairing handshake, node signature verification, pairing proof validation, matching derived traffic keys, and mismatched proof routing failure.
 - Relay client tests must cover valid local agent reconnect handshake, unknown device, revoked device, wrong proof, bad signature, matching fresh traffic keys, and no plaintext business frame before E2EE stream activation.
 - Relay client tests must cover encrypted MobileVC `relay.forward` after local pairing handshake: client-to-agent decrypts to gateway JSON, agent-to-client `WriteJSON` emits E2EE metadata, and ciphertext does not contain plaintext business values.
-- Gateway relay device tests must cover list/revoke requiring bound relay E2EE, list result metadata/current flags, same-device revoke rejection, store update after revoke, and active target connection closure.
+- Gateway relay device tests must cover list/revoke/rotate requiring bound relay E2EE, list result metadata/current flags, same-device revoke rejection, store update after revoke, global rotate replacing node identity, clearing devices, writing a rotate result, and active relay-session rotation/closure.
+- Relay client tests must cover global rotate causing a fresh `agent.register` session and new pairing event instead of old-session `agent.reconnect`.
 - Relay client tests must cover `relay.ping` response for the current/no session and rejection of wrong-session pings.
 - Config tests for relay env validation and event-path requirement.
 - Launcher tests that pairing event files are read locally and removed.

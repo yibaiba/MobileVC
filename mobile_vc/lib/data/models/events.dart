@@ -292,6 +292,31 @@ class RelayDeviceRevokeResultEvent extends AppEvent {
   }
 }
 
+class RelayDeviceRotateResultEvent extends AppEvent {
+  const RelayDeviceRotateResultEvent({
+    required super.timestamp,
+    required super.sessionId,
+    required super.runtimeMeta,
+    required super.raw,
+    this.nodeFingerprintHex = '',
+    this.status = '',
+  }) : super(type: 'relay_device_rotate_result');
+
+  final String nodeFingerprintHex;
+  final String status;
+
+  factory RelayDeviceRotateResultEvent.fromJson(Map<String, dynamic> json) {
+    return RelayDeviceRotateResultEvent(
+      timestamp: _readTimestamp(json),
+      sessionId: (json['sessionId'] ?? '').toString(),
+      runtimeMeta: RuntimeMeta.fromJson(json),
+      raw: json,
+      nodeFingerprintHex: (json['nodeFingerprintHex'] ?? '').toString(),
+      status: (json['status'] ?? '').toString(),
+    );
+  }
+}
+
 class PromptOption {
   const PromptOption({
     required this.value,

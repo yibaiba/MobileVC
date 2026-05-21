@@ -1014,6 +1014,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
           controller: controller,
           onRefresh: controller.requestRelayDeviceList,
           onRevoke: (device) => _confirmRelayDeviceRevoke(context, device),
+          onRotate: () => _confirmRelayDeviceRotate(context),
         ),
       ),
     );
@@ -1042,6 +1043,29 @@ class _SessionHomePageState extends State<SessionHomePage> {
     );
     if (confirmed == true) {
       controller.revokeRelayDevice(device.deviceId);
+    }
+  }
+
+  Future<void> _confirmRelayDeviceRotate(BuildContext context) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('全局轮换 Relay 身份'),
+        content: const Text('轮换会撤销所有已绑定设备，并断开当前连接。之后每台手机都需要导入新的中继链接重新配对。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('轮换'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true) {
+      controller.rotateRelayDevices();
     }
   }
 
@@ -2091,11 +2115,13 @@ class _RelaySecuritySheet extends StatelessWidget {
     required this.controller,
     required this.onRefresh,
     required this.onRevoke,
+    required this.onRotate,
   });
 
   final SessionController controller;
   final VoidCallback onRefresh;
   final ValueChanged<RelayTrustedDevice> onRevoke;
+  final VoidCallback onRotate;
 
   @override
   Widget build(BuildContext context) {
@@ -2150,6 +2176,15 @@ class _RelaySecuritySheet extends StatelessWidget {
                       ),
                 ),
               ],
+              const SizedBox(height: 14),
+              SizedBox(
+                width: double.infinity,
+                child: FilledButton.tonalIcon(
+                  onPressed: controller.canManageRelayDevices ? onRotate : null,
+                  icon: const Icon(Icons.restart_alt),
+                  label: const Text('全局轮换'),
+                ),
+              ),
               const SizedBox(height: 14),
               if (devices.isEmpty && !controller.relayDeviceListLoading)
                 _EmptyRelayDeviceState(

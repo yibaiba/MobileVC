@@ -85,6 +85,28 @@ func (h *Handler) revokeRelayDevice(client ClientConn, req protocol.RelayDeviceR
 	return protocol.NewRelayDeviceRevokeResultEvent(info.SessionID, deviceID, "revoked"), nil
 }
 
+func (h *Handler) rotateRelayDevices(client ClientConn) (protocol.RelayDeviceRotateResultEvent, error) {
+	info, err := h.relayDeviceManagementInfo(client)
+	if err != nil {
+		return protocol.RelayDeviceRotateResultEvent{}, err
+	}
+	if h.NodeIdentity == nil {
+		return protocol.RelayDeviceRotateResultEvent{}, errors.New("relay node identity store is not configured")
+	}
+	identity, err := h.NodeIdentity.Rotate()
+	if err != nil {
+		return protocol.RelayDeviceRotateResultEvent{}, err
+	}
+	if err := h.DeviceTrust.ClearTrustedDevicesForNodeRotation(); err != nil {
+		return protocol.RelayDeviceRotateResultEvent{}, err
+	}
+	return protocol.NewRelayDeviceRotateResultEvent(
+		info.SessionID,
+		fmt.Sprintf("%x", identity.Fingerprint),
+		"rotated",
+	), nil
+}
+
 func (h *Handler) relayDeviceManagementInfo(client ClientConn) (RelayE2EEInfo, error) {
 	info, ok := relayE2EEInfo(client)
 	if !ok || !info.Enabled {
@@ -140,6 +162,10 @@ type relayDeviceBoundClientConn interface {
 	SetRelayE2EEDeviceID(string)
 }
 
+type relaySessionRotator interface {
+	RotateRelaySession() error
+}
+
 type relayDeviceConnectionRegistry struct {
 	mu             sync.Mutex
 	connectionByID map[string]relayDeviceConnection
@@ -189,6 +215,19 @@ func (h *Handler) closeRelayDeviceConnections(deviceID string) {
 	}
 }
 
+func (h *Handler) closeAllRelayDeviceConnections() {
+	if h.relayDeviceConns == nil {
+		return
+	}
+	for _, client := range h.relayDeviceConns.takeAll() {
+		if rotator, ok := client.(relaySessionRotator); ok {
+			_ = rotator.RotateRelaySession()
+			continue
+		}
+		_ = client.Close()
+	}
+}
+
 func (r *relayDeviceConnectionRegistry) track(connectionID string, deviceID string, client ClientConn) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -233,6 +272,23 @@ func (r *relayDeviceConnectionRegistry) takeDevice(deviceID string) []ClientConn
 		delete(r.connectionByID, connectionID)
 	}
 	delete(r.idsByDevice, trimmedDeviceID)
+	return clients
+}
+
+func (r *relayDeviceConnectionRegistry) takeAll() []ClientConn {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.connectionByID) == 0 {
+		return nil
+	}
+	clients := make([]ClientConn, 0, len(r.connectionByID))
+	for _, tracked := range r.connectionByID {
+		if tracked.client != nil {
+			clients = append(clients, tracked.client)
+		}
+	}
+	r.connectionByID = map[string]relayDeviceConnection{}
+	r.idsByDevice = map[string]map[string]struct{}{}
 	return clients
 }
 

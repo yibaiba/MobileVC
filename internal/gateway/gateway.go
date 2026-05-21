@@ -65,6 +65,7 @@ type Handler struct {
 	SessionStore     data.Store
 	PushService      push.Service
 	DeviceTrust      *e2ee.DeviceTrustStore
+	NodeIdentity     *e2ee.NodeIdentityStore
 	runtimeSessions  *runtimeSessionRegistry
 	relayDeviceConns *relayDeviceConnectionRegistry
 
@@ -121,6 +122,11 @@ type ClientConn interface {
 	Close() error
 	RemoteAddr() string
 	Origin() string
+}
+
+type gatewayWriteRequest struct {
+	event any
+	done  chan error
 }
 
 type relayE2EEClientConn interface {
@@ -244,13 +250,27 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				if !ok {
 					return
 				}
-				if err := client.WriteJSON(event); err != nil {
+				payload := event
+				var done chan error
+				if req, ok := event.(gatewayWriteRequest); ok {
+					payload = req.event
+					done = req.done
+				}
+				if err := client.WriteJSON(payload); err != nil {
+					if done != nil {
+						done <- err
+						close(done)
+					}
 					logx.Error("ws", "write websocket event failed: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
 					select {
 					case writeErrCh <- err:
 					default:
 					}
 					return
+				}
+				if done != nil {
+					done <- nil
+					close(done)
 				}
 			}
 		}
@@ -380,6 +400,22 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 
 	emit := func(event any) {
 		session.Enqueue(ctx, writeCh, event)
+	}
+	emitAndWait := func(event any) error {
+		done := make(chan error, 1)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case writeCh <- gatewayWriteRequest{event: event, done: done}:
+		}
+		select {
+		case err := <-done:
+			return err
+		case err := <-writeErrCh:
+			return err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 	ackClientAction := func(sessionID, action string, client protocol.ClientEvent) bool {
 		clientActionID := strings.TrimSpace(client.ClientActionID)
@@ -795,6 +831,18 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 					emit(list)
 				}
 			}
+		case "relay_device_rotate":
+			result, err := h.rotateRelayDevices(client)
+			if err != nil {
+				logx.Warn("ws", "relay device rotate failed: connectionID=%s remoteAddr=%s err=%v", connectionID, remoteAddr, err)
+				emit(protocol.NewErrorEventWithCode(selectedSessionID, err.Error(), "", relayDeviceRegisterErrorCode(err)))
+				continue
+			}
+			if err := emitAndWait(result); err != nil {
+				logx.Warn("ws", "relay device rotate result write failed: connectionID=%s remoteAddr=%s err=%v", connectionID, remoteAddr, err)
+				return
+			}
+			h.closeAllRelayDeviceConnections()
 		case "session_create":
 			var req protocol.SessionCreateRequestEvent
 			if err := json.Unmarshal(payloadBytes, &req); err != nil {
