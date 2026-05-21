@@ -278,6 +278,29 @@ void main() {
       );
     });
 
+    test('production E2EE relay reconnect is blocked until rekey is wired',
+        () async {
+      final service = MobileVcWsService();
+      addTearDown(service.dispose);
+
+      expect(
+        service.connectRelay(
+          relayUrl: 'ws://127.0.0.1:1',
+          sessionId: 'rs_test',
+          clientId: 'rc_test',
+          clientReconnectSecret: 'reconnect_secret',
+          relayCapabilities: RelayE2eeCapabilitySet.production(),
+        ),
+        throwsA(
+          isA<RelayPairingException>().having(
+            (error) => error.code,
+            'code',
+            'e2ee_unsupported_version',
+          ),
+        ),
+      );
+    });
+
     test(
         'relay pairing runs production E2EE handshake before connect completes',
         () async {

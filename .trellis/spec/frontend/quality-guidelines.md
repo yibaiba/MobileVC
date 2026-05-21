@@ -96,6 +96,7 @@ final wsUrl = config.wsUrlFor();
 - Persist only `connectionMode` and `relayUrl`; never persist `relaySessionId`, `relayPairingSecret`, or `relayPairingExpiresAt`.
 - Relay connect must wait for `client.paired`; pairing `relay.error` is a connection failure, not a successful connection.
 - Production E2EE relay pairing must not consider `client.paired` alone as connected. When the pairing link capabilities require E2EE and plaintext test-mode is off, Flutter must complete `client.e2ee_hello` -> `agent.e2ee_hello` -> `client.e2ee_proof` -> `agent.e2ee_result ok` before `connectRelay` returns.
+- Production E2EE relay reconnect must perform a reconnect E2EE handshake with device identity and device credential before any `relay.forward` business payload is sent. Until that reconnect rekey flow is wired, Flutter must fail persisted reconnect attempts before opening the websocket with an actionable E2EE error and require a fresh pairing scan instead of falling back to plaintext.
 - Plaintext relay test-mode must remain explicit. If capability hints are absent or `plaintextTestMode=true`, Flutter must not send E2EE handshake frames because older/local test relay agents may not have the local E2EE handler wired.
 - Pairing-link capability hints are non-secret metadata and may be persisted as `relayCapabilities`; pairing secret and expiry remain non-persistent.
 - Production E2EE pairing must verify that the node identity public key fingerprint from `agent.e2ee_hello` matches `AppConfig.relayNodeFingerprintHex` before sending `client.e2ee_proof`.
@@ -185,6 +186,7 @@ await prefs.setString('mobilevc.app_config', jsonEncode(config.toJson()));
 - Production E2EE pairing with fingerprint mismatch -> connection failure with `e2ee_fingerprint_mismatch`; do not send pairing proof.
 - Production E2EE pairing with `agent.e2ee_result ok=false` -> connection failure using the result error code.
 - Production E2EE pairing timeout before `agent.e2ee_result ok` -> `Relay E2EE 握手超时`.
+- Persisted production E2EE reconnect without a wired device rekey flow -> fail before websocket connect with `e2ee_unsupported_version`; do not send plaintext `client.reconnect` as a successful relay connection.
 - Encrypted `relay.forward` before Flutter has an active stream codec -> `e2ee_decrypt_failed`.
 - Plaintext `relay.forward` after Flutter E2EE completion -> `e2ee_decrypt_failed` / plaintext-disabled receive failure path; do not decode as plaintext.
 - Duplicate encrypted MobileVC stream counter -> `e2ee_replay_detected`.
@@ -209,6 +211,7 @@ await prefs.setString('mobilevc.app_config', jsonEncode(config.toJson()));
 - Good: production E2EE handshake success is tracked separately from verified UI; encrypted forwarding must still be wired before showing verified security.
 - Good: production relay sends `relay.forward` with `encryption=p256-ecdsa+p256-ecdh+hkdf-sha256+aes-256-gcm`, `streamId=1`, `handshakeId=<completed handshake>`, and ciphertext payloads that do not contain MobileVC plaintext.
 - Good: `MobileVcWsService` keeps relay send/decode queues so async crypto preserves nonce uniqueness and event order.
+- Good: production E2EE persisted reconnect is blocked before network connect until device-credential reconnect handshakes are implemented.
 - Base: relay test-mode remains usable for local debugging but is visually marked as non-production.
 - Bad: showing "安全", "已加密", or shield/verified styling just because `connectionMode == relay`.
 - Bad: hiding fingerprint mismatch behind a reconnect retry.
@@ -217,6 +220,7 @@ await prefs.setString('mobilevc.app_config', jsonEncode(config.toJson()));
 - Bad: marking relay as verified because handshake traffic keys were derived while business frames remain plaintext.
 - Bad: constructing a new `RelayMobileVcStreamCodec` for every frame; that resets counters and replay state.
 - Bad: accepting `encryption=none` after E2EE completion because a decrypt failed or the app wants to keep the socket alive.
+- Bad: using stored `clientReconnectSecret` to reconnect in production E2EE mode and then sending MobileVC business payloads before a fresh ECDH/device proof handshake completes.
 
 #### 6. Tests Required
 - Verified state only when every condition is true.
@@ -226,6 +230,7 @@ await prefs.setString('mobilevc.app_config', jsonEncode(config.toJson()));
 - Config/import tests assert relay capability hints persist as non-secret config while pairing secret and expiry do not.
 - Service tests assert production E2EE relay pairing waits for `agent.e2ee_result ok`, verifies node fingerprint, and rejects fingerprint mismatch.
 - Service tests assert production E2EE relay `send()` emits encrypted `relay.forward` without plaintext leakage, and inbound encrypted `relay.forward` decrypts into the expected `AppEvent`.
+- Service tests assert production E2EE persisted reconnect is blocked before websocket connect until reconnect rekey is wired; plaintext test-mode reconnect may remain available only with explicit test capabilities.
 - Stream tests assert duplicate counters are rejected and async counter allocation cannot reuse nonce values.
 - Config/import tests assert relay pairing URI node fingerprint is required.
 - Tunnel tests assert required fields, unexpected-field rejection, unknown stream type rejection, per-stream sequence allocation, per-stream replay rejection, and zero-window rejection.

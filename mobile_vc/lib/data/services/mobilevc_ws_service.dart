@@ -64,6 +64,14 @@ class MobileVcWsService {
     String relayNodeFingerprintHex = '',
     RelayE2eeCapabilitySet? relayCapabilities,
   }) async {
+    final initialRelayClientId = relayClientId.trim();
+    final initialRelayReconnectSecret = relayClientReconnectSecret.trim();
+    _validateRelayE2EEConnectMode(
+      relayPairingSecret: relayPairingSecret,
+      relayClientId: initialRelayClientId,
+      relayClientReconnectSecret: initialRelayReconnectSecret,
+      capabilities: relayCapabilities,
+    );
     final previousSubscription = _subscription;
     final previousChannel = _channel;
     _subscription = null;
@@ -84,8 +92,8 @@ class MobileVcWsService {
           );
     _channel = channel;
     final epoch = _connectionEpoch;
-    var activeRelayClientId = relayClientId.trim();
-    var activeRelayReconnectSecret = relayClientReconnectSecret.trim();
+    var activeRelayClientId = initialRelayClientId;
+    var activeRelayReconnectSecret = initialRelayReconnectSecret;
     final pairedCompleter =
         relaySessionId.isNotEmpty ? Completer<void>() : null;
     final e2eeCompleter = _requiresPairingE2EE(
@@ -705,6 +713,31 @@ bool _requiresPairingE2EE({
   }
   capabilities.validateRelayMode();
   return capabilities.requiresE2EE && !capabilities.plaintextTestMode;
+}
+
+void _validateRelayE2EEConnectMode({
+  required String relayPairingSecret,
+  required String relayClientId,
+  required String relayClientReconnectSecret,
+  required RelayE2eeCapabilitySet? capabilities,
+}) {
+  if (capabilities == null) {
+    return;
+  }
+  capabilities.validateRelayMode();
+  if (!capabilities.requiresE2EE || capabilities.plaintextTestMode) {
+    return;
+  }
+  if (relayPairingSecret.trim().isNotEmpty) {
+    return;
+  }
+  if (relayClientId.trim().isNotEmpty &&
+      relayClientReconnectSecret.trim().isNotEmpty) {
+    throw const RelayPairingException(
+      'e2ee_unsupported_version',
+      'Relay E2EE 重连暂未完成：请重新扫码配对，避免使用明文中继重连',
+    );
+  }
 }
 
 bool _isRelayE2EEFrame(Map<String, dynamic> frame) {
