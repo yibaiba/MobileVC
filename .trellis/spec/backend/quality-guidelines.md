@@ -84,6 +84,7 @@ Questions to answer:
 - Agent reconnect uses `agent.reconnect` plus `agentReconnectSecret` only during the grace window. New `agent.register` must not replace an existing session ID.
 - When an agent disconnects, relay schedules cleanup at `RELAY_AGENT_GRACE_PERIOD`; if the same session is still disconnected then, remove the session and close the paired client connection. Do not wait for another reconnect attempt to discover expiry.
 - When a client pairs, relay sends `client.attached` to the agent with `sessionId` and relay-assigned `clientId`. The local relay client must consume this control frame separately from MobileVC payloads so the first local backend event can use the active `clientId`.
+- Until the local relay client E2EE handshake state machine is wired, any E2EE handshake control frame received by `gatewayConn` must fail explicitly with an E2EE handshake error path; it must not be decoded as a MobileVC JSON payload or silently ignored.
 - Local relay client reconnect backoff is bounded and retries only within the current disconnect's `RELAY_AGENT_GRACE_PERIOD`; each later disconnect starts a new grace window.
 - Local relay client `agent.register` and `agent.reconnect` writes and response reads must use control-frame deadlines. A relay accepting the websocket but never replying must surface as an explicit error, not an infinite wait.
 
@@ -113,6 +114,7 @@ Questions to answer:
 - Post-auth raw websocket frames must be size-bounded while reading, before JSON decode. Frames above the post-auth raw frame limit -> `relay.error` with `frame_too_large`; decoded relay payloads above `MaxPayloadBytes` still -> `payload_too_large`.
 - First agent-to-client forward with an empty `clientId` after successful client pairing -> relay fills the current active `clientId`; wrong non-empty `clientId` still -> `protocol_error`.
 - Missing `client.attached` before the relay websocket closes -> local relay client write returns the underlying read/close error.
+- E2EE handshake control frame delivered to the local relay client before the handshake state machine is wired -> explicit relay client read error mentioning E2EE handshake.
 - Per-IP or role capacity exceeded before upgrade -> HTTP 429.
 - Bounded forward queue full -> `relay.error` with `queue_full`.
 - Invalid `RELAY_TRUSTED_PROXY_CIDRS` -> relay startup config error.
@@ -147,6 +149,7 @@ Questions to answer:
 - Relay per-IP caps, trusted forwarded IP positive/negative cases, ping writer shutdown, mismatched `clientId`, duplicate session register rejection, and reconnect within grace.
 - Relay agent-disconnect grace expiry must remove orphan sessions and close paired clients.
 - Relay client tests must cover consuming `client.attached` before `relay.forward`, writing with the attached `clientId`, and timing out register/reconnect response reads.
+- Relay client tests must cover that E2EE handshake control frames are not passed into gateway payload decoding before the local handshake state machine exists.
 - Config tests for relay env validation and event-path requirement.
 - Launcher tests that pairing event files are read locally and removed.
 

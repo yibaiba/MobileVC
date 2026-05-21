@@ -76,6 +76,9 @@ func (c *gatewayConn) readLoop() {
 		if c.acceptRelayPing(env) {
 			continue
 		}
+		if c.rejectE2EEControlFrame(env) {
+			return
+		}
 		c.sendReadResult(readResult{env: env})
 	}
 }
@@ -132,6 +135,19 @@ func (c *gatewayConn) acceptRelayPing(env relay.ForwardEnvelope) bool {
 		c.setReadError(err)
 		c.sendReadResult(readResult{err: err})
 	}
+	return true
+}
+
+func (c *gatewayConn) rejectE2EEControlFrame(env relay.ForwardEnvelope) bool {
+	switch env.Type {
+	case relay.TypeClientE2EEHello, relay.TypeClientE2EEProof:
+		c.setReadError(fmt.Errorf("unexpected client e2ee control frame on relay agent connection"))
+	case relay.TypeAgentE2EEHello, relay.TypeAgentE2EEResult:
+		c.setReadError(fmt.Errorf("relay e2ee handshake is not connected to the local agent yet"))
+	default:
+		return false
+	}
+	c.sendReadResult(readResult{err: c.readError()})
 	return true
 }
 

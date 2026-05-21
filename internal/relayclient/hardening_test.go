@@ -108,6 +108,25 @@ func TestGatewayConnRespondsToRelayPing(t *testing.T) {
 	}
 }
 
+func TestGatewayConnRejectsE2EEControlFramesUntilHandshakeIsWired(t *testing.T) {
+	serverConn, clientConn := newRelayClientTestConns(t)
+	defer serverConn.Close()
+	gateway := newGatewayConn(clientConn, "rs_gateway")
+	t.Cleanup(func() { _ = gateway.Close() })
+
+	if err := serverConn.WriteJSON(relay.E2EEAgentHelloFrame{
+		Type: relay.TypeAgentE2EEHello, Version: relay.Version,
+		SessionID: "rs_gateway", ClientID: "rc_attached", HandshakeID: "hs_test",
+	}); err != nil {
+		t.Fatalf("write e2ee control frame: %v", err)
+	}
+	var payload map[string]any
+	err := gateway.ReadJSON(&payload)
+	if err == nil || !strings.Contains(err.Error(), "e2ee handshake") {
+		t.Fatalf("expected explicit e2ee control rejection, got %v", err)
+	}
+}
+
 func TestGatewayConnCloseUnblocksFullReadQueueSend(t *testing.T) {
 	serverConn, clientConn := newRelayClientTestConns(t)
 	defer serverConn.Close()
