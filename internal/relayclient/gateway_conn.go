@@ -308,11 +308,12 @@ func (c *gatewayConn) forwardEnvelope(payload []byte) (relay.ForwardEnvelope, er
 		}
 		return relay.ForwardEnvelope(frame), nil
 	}
+	clientID := c.currentClientID()
 	return relay.ForwardEnvelope{
 		Type:            relay.TypeRelayForward,
 		Version:         relay.Version,
 		SessionID:       c.sessionID,
-		ClientID:        c.clientID,
+		ClientID:        clientID,
 		Direction:       relay.DirectionAgentToClient,
 		MessageID:       "msg_" + uuid.NewString(),
 		ContentType:     relay.ContentTypeMobileVC,
@@ -330,6 +331,12 @@ func (c *gatewayConn) e2eeStream() *e2ee.MobileVCStreamCodec {
 
 func (c *gatewayConn) hasE2EEStream() bool {
 	return c.e2eeStream() != nil
+}
+
+func (c *gatewayConn) currentClientID() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.clientID
 }
 
 func (c *gatewayConn) Close() error {
