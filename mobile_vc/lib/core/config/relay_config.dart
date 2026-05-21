@@ -1,3 +1,5 @@
+import '../relay_e2ee/relay_e2ee_capability.dart';
+
 enum ConnectionMode { direct, relay }
 
 class RelayPairing {
@@ -6,12 +8,14 @@ class RelayPairing {
     required this.sessionId,
     required this.pairingSecret,
     required this.expiresAt,
+    this.capabilities,
   });
 
   final String relayUrl;
   final String sessionId;
   final String pairingSecret;
   final int expiresAt;
+  final RelayE2eeCapabilitySet? capabilities;
 }
 
 String normalizeConnectionMode(Object? value) {
@@ -49,6 +53,7 @@ RelayPairing? parseRelayPairingUri(String raw) {
   final sessionId = (uri.queryParameters['session'] ?? '').trim();
   final secret = (uri.queryParameters['secret'] ?? '').trim();
   final expiresAt = int.tryParse(uri.queryParameters['exp'] ?? '');
+  final capabilities = _parseRelayCapabilities(uri);
   if (relayUrl.isEmpty || sessionId.isEmpty || secret.isEmpty) {
     throw const FormatException('relay pairing uri is missing fields');
   }
@@ -58,7 +63,80 @@ RelayPairing? parseRelayPairingUri(String raw) {
     sessionId: sessionId,
     pairingSecret: secret,
     expiresAt: expiresAt ?? 0,
+    capabilities: capabilities,
   );
+}
+
+RelayE2eeCapabilitySet? _parseRelayCapabilities(Uri uri) {
+  final hasCapabilities = _relayCapabilityQueryKeys.any(
+    uri.queryParameters.containsKey,
+  );
+  if (!hasCapabilities) {
+    return null;
+  }
+  final capabilities = RelayE2eeCapabilitySet(
+    relayProtocolVersion: _requiredInt(uri, 'relayProtocolVersion'),
+    e2eeProtocolVersion: _requiredInt(uri, 'e2eeProtocolVersion'),
+    cryptoSuite: _requiredString(uri, 'cryptoSuite'),
+    tunnelProtocolVersion: _requiredInt(uri, 'tunnelProtocolVersion'),
+    supportsMultiplexStreams: _requiredBool(
+      uri,
+      'supportsMultiplexStreams',
+    ),
+    supportsFileDownload: _requiredBool(uri, 'supportsFileDownloadStream'),
+    supportsDeviceManagement: _requiredBool(
+      uri,
+      'supportsDeviceManagement',
+    ),
+    requiresE2EE: _requiredBool(uri, 'requiresE2EE'),
+    plaintextTestMode: _requiredBool(uri, 'plaintextTestMode'),
+  );
+  if (capabilities.plaintextTestMode) {
+    capabilities.validatePlaintextTestMode();
+  } else {
+    capabilities.validateProduction();
+  }
+  return capabilities;
+}
+
+const _relayCapabilityQueryKeys = <String>{
+  'relayProtocolVersion',
+  'e2eeProtocolVersion',
+  'cryptoSuite',
+  'tunnelProtocolVersion',
+  'supportsMultiplexStreams',
+  'supportsFileDownloadStream',
+  'supportsDeviceManagement',
+  'requiresE2EE',
+  'plaintextTestMode',
+};
+
+String _requiredString(Uri uri, String key) {
+  final value = (uri.queryParameters[key] ?? '').trim();
+  if (value.isEmpty) {
+    throw FormatException('relay pairing uri is missing capability field $key');
+  }
+  return value;
+}
+
+int _requiredInt(Uri uri, String key) {
+  final value = int.tryParse(_requiredString(uri, key));
+  if (value == null) {
+    throw FormatException(
+        'relay pairing uri has invalid capability field $key');
+  }
+  return value;
+}
+
+bool _requiredBool(Uri uri, String key) {
+  final value = _requiredString(uri, key).toLowerCase();
+  return switch (value) {
+    'true' => true,
+    'false' => false,
+    _ => throw FormatException(
+        'relay pairing uri has invalid capability field $key',
+      ),
+  };
 }
 
 void _validateRelayUrlShape(Uri uri) {

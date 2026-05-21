@@ -14,6 +14,7 @@ import (
 
 	"mobilevc/internal/logx"
 	"mobilevc/internal/relay"
+	"mobilevc/internal/relay/e2ee"
 )
 
 type Config struct {
@@ -22,6 +23,7 @@ type Config struct {
 	AgentGracePeriod time.Duration
 	PairingEventPath string
 	ReconnectBackoff ReconnectBackoff
+	Capabilities     e2ee.CapabilitySet
 }
 
 type ReconnectBackoff struct {
@@ -30,11 +32,12 @@ type ReconnectBackoff struct {
 }
 
 type PairingReadyEvent struct {
-	Type          string `json:"type"`
-	RelayURL      string `json:"relayUrl"`
-	SessionID     string `json:"sessionId"`
-	PairingSecret string `json:"pairingSecret"`
-	ExpiresAt     int64  `json:"expiresAt"`
+	Type          string             `json:"type"`
+	RelayURL      string             `json:"relayUrl"`
+	SessionID     string             `json:"sessionId"`
+	PairingSecret string             `json:"pairingSecret"`
+	ExpiresAt     int64              `json:"expiresAt"`
+	Capabilities  e2ee.CapabilitySet `json:"capabilities"`
 }
 
 type LocalPairingEmitter func(string, PairingReadyEvent) error
@@ -46,6 +49,7 @@ type agentRegisterRequest struct {
 	PairSecret      string
 	ReconnectSecret string
 	ExpiresAt       time.Time
+	Capabilities    e2ee.CapabilitySet
 }
 
 type agentReconnectRequest struct {
@@ -72,6 +76,7 @@ func Run(ctx context.Context, cfg Config, handler Handler, emit LocalPairingEmit
 		PairSecret:      pairingSecret,
 		ReconnectSecret: reconnectSecret,
 		ExpiresAt:       expiresAt,
+		Capabilities:    relayClientCapabilities(cfg),
 	}
 	conn, err := connectAndRegister(ctx, cfg, req)
 	if err != nil {
@@ -83,12 +88,20 @@ func Run(ctx context.Context, cfg Config, handler Handler, emit LocalPairingEmit
 		SessionID:     sessionID,
 		PairingSecret: pairingSecret,
 		ExpiresAt:     expiresAt.Unix(),
+		Capabilities:  req.Capabilities,
 	}); err != nil {
 		_ = conn.Close()
 		return err
 	}
 	defer removePairingEventFile(cfg.PairingEventPath)
 	return serveWithReconnect(ctx, cfg, handler, conn, sessionID, reconnectSecret)
+}
+
+func relayClientCapabilities(cfg Config) e2ee.CapabilitySet {
+	if cfg.Capabilities.RelayProtocolVersion != 0 {
+		return cfg.Capabilities
+	}
+	return e2ee.PlaintextTestCapabilities()
 }
 
 func validateConfig(cfg Config) error {
@@ -147,6 +160,7 @@ func registerAgent(conn *websocket.Conn, req agentRegisterRequest) error {
 		PairingSecretHash:        relay.SecretHash(req.PairSecret),
 		AgentReconnectSecretHash: relay.SecretHash(req.ReconnectSecret),
 		PairingExpiresAt:         req.ExpiresAt.Unix(),
+		Capabilities:             &req.Capabilities,
 	}
 	if err := writeControlJSON(conn, frame); err != nil {
 		return fmt.Errorf("send relay agent registration: %w", err)

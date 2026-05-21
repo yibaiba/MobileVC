@@ -57,6 +57,8 @@ Questions to answer:
 - E2EE `relay.forward` frames use `encryption=p256-ecdsa+p256-ecdh+hkdf-sha256+aes-256-gcm`, `payloadEncoding=base64url`, non-zero `streamId`, and non-empty `handshakeId`. Counter `0` is valid because stream counters start at zero.
 - E2EE capability negotiation fields are `relayProtocolVersion`, `e2eeProtocolVersion`, `cryptoSuite`, `tunnelProtocolVersion`, `supportsMultiplexStreams`, `supportsFileDownloadStream`, `supportsDeviceManagement`, `requiresE2EE`, and `plaintextTestMode`; these fields are bound into the handshake transcript before deriving traffic keys.
 - Production capabilities must require E2EE, disable plaintext test mode, use the supported relay/e2ee/tunnel versions, use the supported crypto suite, and support multiplex streams, file download streams, and device management.
+- `agent.register` must include an explicit `capabilities` object. Production relay mode rejects plaintext-test capabilities with `e2ee_unsupported_version`; plaintext test relay mode requires explicit plaintext-test capabilities.
+- Local pairing event files must include the same capability object so QR/link import can validate version and test-mode hints before connecting.
 - E2EE tunnel frames use `stream.open`, `stream.data`, `stream.ack`, `stream.close`, `stream.reset`, `stream.error`, `ping`, and `pong`; each frame type must reject fields that do not belong to that type.
 - E2EE tunnel stream sequence allocation is per `streamId`, not global across the connection; stream `7` and stream `8` may both send sequence `1` without replay conflict.
 - `stream.open` must use a known `streamType` (`mobilevc.ws` or `file.download`) and a non-zero window.
@@ -87,6 +89,7 @@ Questions to answer:
 - `RELAY_REQUIRE_E2EE=true` together with `RELAY_PLAINTEXT_TEST_MODE=true` -> config error.
 - Capability production validation with `plaintextTestMode=true`, missing required tunnel features, unsupported versions, or unsupported crypto suite -> E2EE handshake failure / unsupported version path.
 - Plaintext-test capability validation requires `requiresE2EE=false` and `plaintextTestMode=true`; implicit plaintext is invalid.
+- Missing or incompatible `agent.register.capabilities` -> `relay.error` with `e2ee_unsupported_version` when the relay can classify the incompatibility, otherwise `unauthorized`.
 - Tunnel frames with unknown stream types, missing required fields, or unexpected fields for their frame type -> explicit tunnel validation error.
 - Oversized decoded relay payload -> `relay.error` with `payload_too_large`.
 - Plaintext `relay.forward` while E2EE is required and plaintext test mode is off -> `relay.error` with `e2ee_required`.
@@ -104,6 +107,7 @@ Questions to answer:
 - Good: backend writes pairing data to an owner-only temp file, launcher reads and deletes it, logs show only redacted URI.
 - Good: public relay starts with E2EE required and rejects plaintext before forwarding payloads.
 - Good: both Go and Flutter build handshake input from the same explicit capability set before signing/verifying the transcript.
+- Good: local test relay agent declares `PlaintextTestCapabilities()` and production relay agent declares `ProductionCapabilities()`; never infer mode from missing fields.
 - Good: relay-only backend logs `health=http://127.0.0.1:<port>/healthz` and `ws=ws://127.0.0.1:<port>/ws?token=<redacted>`; it must not concatenate `localhost` with a full host:port listen address.
 - Good: local test relay uses explicit `--require-e2ee=false --plaintext-test-mode=true` and UI/logs label it as test-only.
 - Good: relay behind a trusted reverse proxy enforces caps by forwarded client IP, while direct internet clients cannot spoof forwarded headers.
@@ -117,6 +121,7 @@ Questions to answer:
 - Relay pairing, one-time secret consumption, URL validation, oversized payload, and opaque unknown business payload forwarding.
 - Network exposure tests must cover listen address plus generated health/version/websocket URLs for LAN and relay-only modes.
 - E2EE capability tests must cover production success, plaintext-test rejection in production, missing tunnel feature rejection, explicit plaintext test-mode validation, unsupported version rejection, and applying capabilities to handshake transcript input.
+- Relay registration tests must cover explicit capability emission, production rejection of plaintext-test capabilities, and pairing event capability serialization.
 - E2EE tunnel tests must cover required fields, unexpected-field rejection, unknown stream type rejection, per-stream sequence allocation, per-stream replay rejection, and zero-window rejection.
 - Relay plaintext rejection, plaintext test-mode allowance, E2EE metadata validation, unsupported encryption rejection, config env parsing, and CLI flag parsing.
 - Relay per-IP caps, trusted forwarded IP positive/negative cases, ping writer shutdown, mismatched `clientId`, duplicate session register rejection, and reconnect within grace.

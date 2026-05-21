@@ -2,6 +2,7 @@ package relayclient
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"mobilevc/internal/relay"
+	"mobilevc/internal/relay/e2ee"
 )
 
 func TestGatewayConnConsumesClientAttachedBeforeForward(t *testing.T) {
@@ -194,6 +196,66 @@ func TestRegisterAgentClearsWriteDeadlineAfterControlWrite(t *testing.T) {
 	}
 	if next["type"] != "after_deadline" {
 		t.Fatalf("unexpected post-deadline frame: %#v", next)
+	}
+}
+
+func TestRegisterAgentSendsExplicitCapabilities(t *testing.T) {
+	serverConn, clientConn := newRelayClientTestConns(t)
+	defer serverConn.Close()
+	t.Cleanup(func() { clientConn.Close() })
+
+	done := make(chan error, 1)
+	go func() {
+		done <- registerAgent(clientConn, agentRegisterRequest{
+			SessionID:       "rs_capability",
+			PairSecret:      "pair-secret",
+			ReconnectSecret: "reconnect-secret",
+			ExpiresAt:       time.Now().Add(time.Minute),
+			Capabilities:    e2ee.PlaintextTestCapabilities(),
+		})
+	}()
+
+	var registered relay.AgentRegisterFrame
+	if err := serverConn.ReadJSON(&registered); err != nil {
+		t.Fatalf("read agent register: %v", err)
+	}
+	if registered.Capabilities == nil {
+		t.Fatal("missing agent capabilities")
+	}
+	if err := e2ee.ValidatePlaintextTestCapabilities(*registered.Capabilities); err != nil {
+		t.Fatalf("invalid plaintext capabilities: %v", err)
+	}
+	if err := serverConn.WriteJSON(relay.AgentRegisteredFrame{
+		Type: relay.TypeAgentRegistered, Version: relay.Version,
+		SessionID: "rs_capability",
+	}); err != nil {
+		t.Fatalf("write registration response: %v", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("register agent: %v", err)
+	}
+}
+
+func TestPairingEventIncludesCapabilities(t *testing.T) {
+	event := PairingReadyEvent{
+		Type:          "mobilevc.relay.pairing_ready",
+		RelayURL:      "wss://relay.example.test",
+		SessionID:     "rs_capability",
+		PairingSecret: "pair-secret",
+		ExpiresAt:     time.Now().Add(time.Minute).Unix(),
+		Capabilities:  e2ee.PlaintextTestCapabilities(),
+	}
+
+	raw, err := json.Marshal(event)
+	if err != nil {
+		t.Fatalf("marshal pairing event: %v", err)
+	}
+	var decoded PairingReadyEvent
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("decode pairing event: %v", err)
+	}
+	if err := e2ee.ValidatePlaintextTestCapabilities(decoded.Capabilities); err != nil {
+		t.Fatalf("decoded capabilities: %v", err)
 	}
 }
 

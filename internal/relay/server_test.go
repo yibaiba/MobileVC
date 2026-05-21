@@ -194,7 +194,7 @@ func TestRelayRejectsPlaintextForwardWhenE2EERequired(t *testing.T) {
 	secret := "pair-secret-128-bit-minimum"
 	agent := dialRelay(t, server.URL, "/relay/agent")
 	defer agent.Close()
-	registerAgent(t, agent, sessionID, secret, "reconnect-secret", time.Now().Add(time.Minute))
+	registerAgentWithCapabilities(t, agent, sessionID, secret, "reconnect-secret", time.Now().Add(time.Minute), productionAgentCapabilities())
 	client := dialRelay(t, server.URL, "/relay/client")
 	defer client.Close()
 	clientID := pairClient(t, client, sessionID, secret)
@@ -221,7 +221,7 @@ func TestRelayForwardsE2EEFrameWhenE2EERequired(t *testing.T) {
 	secret := "pair-secret-128-bit-minimum"
 	agent := dialRelay(t, server.URL, "/relay/agent")
 	defer agent.Close()
-	registerAgent(t, agent, sessionID, secret, "reconnect-secret", time.Now().Add(time.Minute))
+	registerAgentWithCapabilities(t, agent, sessionID, secret, "reconnect-secret", time.Now().Add(time.Minute), productionAgentCapabilities())
 	client := dialRelay(t, server.URL, "/relay/client")
 	defer client.Close()
 	clientID := pairClient(t, client, sessionID, secret)
@@ -240,6 +240,32 @@ func TestRelayForwardsE2EEFrameWhenE2EERequired(t *testing.T) {
 	}
 	if got.Encryption != EncryptionE2EEV1 || got.StreamID != 9 || got.HandshakeID != "hs_required" {
 		t.Fatalf("unexpected e2ee forward metadata: %#v", got)
+	}
+}
+
+func TestRelayRejectsPlaintextAgentCapabilitiesWhenE2EERequired(t *testing.T) {
+	server := newLimitedTestRelayServer(t, Config{RequireE2EE: true})
+	defer server.Close()
+
+	agent := dialRelay(t, server.URL, "/relay/agent")
+	defer agent.Close()
+	if err := agent.WriteJSON(AgentRegisterFrame{
+		Type:                     TypeAgentRegister,
+		Version:                  Version,
+		SessionID:                "rs_bad_capability",
+		PairingSecretHash:        SecretHash("pair-secret"),
+		AgentReconnectSecretHash: SecretHash("reconnect-secret"),
+		PairingExpiresAt:         time.Now().Add(time.Minute).Unix(),
+		Capabilities:             testAgentCapabilities(),
+	}); err != nil {
+		t.Fatalf("register plaintext-capability agent: %v", err)
+	}
+	var errFrame ErrorFrame
+	if err := agent.ReadJSON(&errFrame); err != nil {
+		t.Fatalf("read capability rejection: %v", err)
+	}
+	if errFrame.Code != CodeE2EEUnsupported {
+		t.Fatalf("unexpected error frame: %#v", errFrame)
 	}
 }
 
@@ -262,6 +288,7 @@ func TestRelayRejectsSessionIDReuseAfterAgentDisconnect(t *testing.T) {
 		PairingSecretHash:        SecretHash("pair-secret-two"),
 		AgentReconnectSecretHash: SecretHash("reconnect-secret-two"),
 		PairingExpiresAt:         time.Now().Add(time.Minute).Unix(),
+		Capabilities:             testAgentCapabilities(),
 	}); err != nil {
 		t.Fatalf("register reused session id: %v", err)
 	}

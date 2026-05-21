@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+
+	"mobilevc/internal/relay/e2ee"
 )
 
 type Server struct {
@@ -31,6 +33,7 @@ type sessionState struct {
 	client               *peerConn
 	clientID             string
 	clientReconnectHash  string
+	capabilities         e2ee.CapabilitySet
 	pairingConsumed      bool
 	pairFailuresByRemote map[string]int
 	devices              map[string]*deviceState

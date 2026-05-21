@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+
+	"mobilevc/internal/relay/e2ee"
 )
 
 func newTestRelayServer(t *testing.T) *httptest.Server {
@@ -99,6 +101,19 @@ func dialRelayWithHeader(t *testing.T, baseURL string, path string, header http.
 
 func registerAgent(t *testing.T, conn *websocket.Conn, sessionID string, pairSecret string, reconnectSecret string, expiresAt time.Time) {
 	t.Helper()
+	registerAgentWithCapabilities(t, conn, sessionID, pairSecret, reconnectSecret, expiresAt, testAgentCapabilities())
+}
+
+func registerAgentWithCapabilities(
+	t *testing.T,
+	conn *websocket.Conn,
+	sessionID string,
+	pairSecret string,
+	reconnectSecret string,
+	expiresAt time.Time,
+	capabilities *e2ee.CapabilitySet,
+) {
+	t.Helper()
 	err := conn.WriteJSON(AgentRegisterFrame{
 		Type:                     TypeAgentRegister,
 		Version:                  Version,
@@ -106,6 +121,7 @@ func registerAgent(t *testing.T, conn *websocket.Conn, sessionID string, pairSec
 		PairingSecretHash:        SecretHash(pairSecret),
 		AgentReconnectSecretHash: SecretHash(reconnectSecret),
 		PairingExpiresAt:         expiresAt.Unix(),
+		Capabilities:             capabilities,
 	})
 	if err != nil {
 		t.Fatalf("register agent: %v", err)
@@ -114,6 +130,16 @@ func registerAgent(t *testing.T, conn *websocket.Conn, sessionID string, pairSec
 	if err := conn.ReadJSON(&registered); err != nil {
 		t.Fatalf("read registered: %v", err)
 	}
+}
+
+func testAgentCapabilities() *e2ee.CapabilitySet {
+	capabilities := e2ee.PlaintextTestCapabilities()
+	return &capabilities
+}
+
+func productionAgentCapabilities() *e2ee.CapabilitySet {
+	capabilities := e2ee.ProductionCapabilities()
+	return &capabilities
 }
 
 func pairClient(t *testing.T, conn *websocket.Conn, sessionID string, secret string) string {

@@ -51,7 +51,7 @@ func (s *Server) agentLoop(peer *peerConn) {
 	go peer.StartWriter(s.cfg.PingInterval)
 	sessionID, err := s.authenticateAgent(peer)
 	if err != nil {
-		writeError(peer, CodeUnauthorized)
+		writeError(peer, errorCode(err, CodeUnauthorized))
 		return
 	}
 	logx.Info("relay", "agent connected: sessionID=%s remote=%s", sessionID, peer.remote)

@@ -3,14 +3,17 @@ package relay
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
+
+	"mobilevc/internal/relay/e2ee"
 )
 
 func (s *Server) registerAgent(peer *peerConn, raw []byte) (string, error) {
-	state, err := newSessionState(peer, raw)
+	state, err := newSessionState(peer, raw, s.cfg)
 	if err != nil {
 		return "", err
 	}
@@ -28,9 +31,16 @@ func (s *Server) registerAgent(peer *peerConn, raw []byte) (string, error) {
 	return state.id, writeRegistered(peer, state.id)
 }
 
-func newSessionState(peer *peerConn, raw []byte) (*sessionState, error) {
+func newSessionState(peer *peerConn, raw []byte, cfg Config) (*sessionState, error) {
 	var frame AgentRegisterFrame
 	if err := json.Unmarshal(raw, &frame); err != nil {
+		return nil, err
+	}
+	capabilities, err := requiredAgentCapabilities(frame.Capabilities)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateAgentCapabilities(capabilities, cfg); err != nil {
 		return nil, err
 	}
 	state := &sessionState{
@@ -39,6 +49,7 @@ func newSessionState(peer *peerConn, raw []byte) (*sessionState, error) {
 		agentReconnectHash:   strings.TrimSpace(frame.AgentReconnectSecretHash),
 		pairingExpiresAt:     time.Unix(frame.PairingExpiresAt, 0),
 		agent:                peer,
+		capabilities:         capabilities,
 		pairFailuresByRemote: map[string]int{},
 		devices:              map[string]*deviceState{},
 	}
@@ -46,6 +57,29 @@ func newSessionState(peer *peerConn, raw []byte) (*sessionState, error) {
 		return nil, errors.New("missing agent registration fields")
 	}
 	return state, nil
+}
+
+func requiredAgentCapabilities(capabilities *e2ee.CapabilitySet) (e2ee.CapabilitySet, error) {
+	if capabilities == nil {
+		return e2ee.CapabilitySet{}, errors.New("missing agent capabilities")
+	}
+	return *capabilities, nil
+}
+
+func validateAgentCapabilities(capabilities e2ee.CapabilitySet, cfg Config) error {
+	if cfg.RequireE2EE && !cfg.PlaintextTestMode {
+		if err := e2ee.ValidateProductionCapabilities(capabilities); err != nil {
+			return newCodeError(CodeE2EEUnsupported, fmt.Sprintf("agent e2ee capability rejected: %v", err))
+		}
+		return nil
+	}
+	if cfg.PlaintextTestMode {
+		if err := e2ee.ValidatePlaintextTestCapabilities(capabilities); err != nil {
+			return newCodeError(CodeE2EEUnsupported, fmt.Sprintf("agent plaintext capability rejected: %v", err))
+		}
+		return nil
+	}
+	return errors.New("invalid relay e2ee mode")
 }
 
 func (s *Server) reconnectAgent(peer *peerConn, raw []byte) (string, error) {

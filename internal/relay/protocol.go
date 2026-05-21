@@ -1,5 +1,7 @@
 package relay
 
+import "mobilevc/internal/relay/e2ee"
+
 const (
 	Version = 1
 
@@ -54,12 +56,13 @@ type ControlFrame struct {
 }
 
 type AgentRegisterFrame struct {
-	Type                     string `json:"type"`
-	Version                  int    `json:"version"`
-	SessionID                string `json:"sessionId"`
-	PairingSecretHash        string `json:"pairingSecretHash"`
-	AgentReconnectSecretHash string `json:"agentReconnectSecretHash"`
-	PairingExpiresAt         int64  `json:"pairingExpiresAt"`
+	Type                     string              `json:"type"`
+	Version                  int                 `json:"version"`
+	SessionID                string              `json:"sessionId"`
+	PairingSecretHash        string              `json:"pairingSecretHash"`
+	AgentReconnectSecretHash string              `json:"agentReconnectSecretHash"`
+	PairingExpiresAt         int64               `json:"pairingExpiresAt"`
+	Capabilities             *e2ee.CapabilitySet `json:"capabilities,omitempty"`
 }
 
 type AgentRegisteredFrame struct {

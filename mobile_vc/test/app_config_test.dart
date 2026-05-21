@@ -1,5 +1,6 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:mobile_vc/core/config/app_config.dart';
+import 'package:mobile_vc/core/config/relay_config.dart';
 
 void main() {
   group('AppConfig connection urls', () {
@@ -222,6 +223,37 @@ void main() {
           'mobilevc://relay/v1?relay=https%3A%2F%2Frelay.example.test&session=rs&secret=secret',
         ),
         throwsFormatException,
+      );
+    });
+
+    test('relay pairing uri validates capability hints', () {
+      final pairing = parseRelayPairingUri(
+        'mobilevc://relay/v1?relay=wss%3A%2F%2Frelay.example.test'
+        '&session=rs_test&secret=pair_secret&exp=1760000000'
+        '&relayProtocolVersion=1&e2eeProtocolVersion=1'
+        '&cryptoSuite=p256-ecdsa%2Bp256-ecdh%2Bhkdf-sha256%2Baes-256-gcm'
+        '&tunnelProtocolVersion=1&supportsMultiplexStreams=true'
+        '&supportsFileDownloadStream=true&supportsDeviceManagement=true'
+        '&requiresE2EE=false&plaintextTestMode=true',
+      );
+
+      expect(pairing, isNotNull);
+      expect(pairing!.capabilities, isNotNull);
+      pairing.capabilities!.validatePlaintextTestMode();
+    });
+
+    test('relay pairing uri rejects invalid capability hints', () {
+      expect(
+        () => parseRelayPairingUri(
+          'mobilevc://relay/v1?relay=wss%3A%2F%2Frelay.example.test'
+          '&session=rs_test&secret=pair_secret'
+          '&relayProtocolVersion=1&e2eeProtocolVersion=1'
+          '&cryptoSuite=p256-ecdsa%2Bp256-ecdh%2Bhkdf-sha256%2Baes-256-gcm'
+          '&tunnelProtocolVersion=1&supportsMultiplexStreams=true'
+          '&supportsFileDownloadStream=true&supportsDeviceManagement=true'
+          '&requiresE2EE=true&plaintextTestMode=true',
+        ),
+        throwsArgumentError,
       );
     });
   });
