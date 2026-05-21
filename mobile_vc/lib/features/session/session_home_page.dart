@@ -9,6 +9,7 @@ import 'package:share_plus/share_plus.dart';
 import '../../core/config/app_config.dart';
 import '../../core/config/app_connection_endpoint.dart';
 import '../../core/config/app_connection_environment.dart';
+import '../../core/relay_e2ee/relay_security_state.dart';
 import '../../data/models/events.dart';
 import '../../data/models/session_models.dart';
 import '../../features/adb/adb_debug_page.dart';
@@ -2215,40 +2216,94 @@ class _RelaySecurityStatus extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    final ready = controller.canManageRelayDevices;
-    return Container(
-      padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        color: ready
+    return FutureBuilder<RelaySecurityState>(
+      future: controller.relaySecurityState(),
+      builder: (context, snapshot) {
+        final state = snapshot.data ??
+            const RelaySecurityState(
+              mode: RelaySecurityMode.relayNotVerified,
+              title: 'Relay 未验证',
+              detail: '正在读取 Relay 安全状态。',
+              canShowVerified: false,
+            );
+        final verified = state.canShowVerified;
+        final blocking = state.isBlocking;
+        final color = verified
+            ? scheme.primary
+            : blocking
+                ? scheme.error
+                : scheme.tertiary;
+        final background = verified
             ? scheme.primaryContainer.withValues(alpha: 0.62)
-            : scheme.errorContainer.withValues(alpha: 0.42),
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(
-          color: ready
-              ? scheme.primary.withValues(alpha: 0.18)
-              : scheme.error.withValues(alpha: 0.16),
-        ),
-      ),
-      child: Row(
-        children: [
-          Icon(
-            ready ? Icons.lock_outlined : Icons.lock_open_outlined,
-            color: ready ? scheme.primary : scheme.error,
+            : blocking
+                ? scheme.errorContainer.withValues(alpha: 0.42)
+                : scheme.tertiaryContainer.withValues(alpha: 0.46);
+        return Container(
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            color: background,
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(color: color.withValues(alpha: 0.18)),
           ),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Text(
-              ready ? '当前连接已完成 Relay E2EE 设备绑定' : '需要 Relay E2EE 绑定完成后才能管理设备',
-              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                    fontWeight: FontWeight.w700,
-                    color: ready
-                        ? scheme.onPrimaryContainer
-                        : scheme.onErrorContainer,
-                  ),
-            ),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Icon(
+                verified
+                    ? Icons.verified_user_outlined
+                    : blocking
+                        ? Icons.gpp_bad_outlined
+                        : Icons.shield_outlined,
+                color: color,
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      state.title,
+                      style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                            fontWeight: FontWeight.w800,
+                            color: verified
+                                ? scheme.onPrimaryContainer
+                                : blocking
+                                    ? scheme.onErrorContainer
+                                    : scheme.onTertiaryContainer,
+                          ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      state.detail,
+                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                            color: verified
+                                ? scheme.onPrimaryContainer
+                                : blocking
+                                    ? scheme.onErrorContainer
+                                    : scheme.onTertiaryContainer,
+                          ),
+                    ),
+                    if (state.shortFingerprint.trim().isNotEmpty) ...[
+                      const SizedBox(height: 6),
+                      Text(
+                        '节点指纹：${state.shortFingerprint}',
+                        style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                          color: verified
+                              ? scheme.onPrimaryContainer
+                              : blocking
+                                  ? scheme.onErrorContainer
+                                  : scheme.onTertiaryContainer,
+                          fontFeatures: const [FontFeature.tabularFigures()],
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            ],
           ),
-        ],
-      ),
+        );
+      },
     );
   }
 }

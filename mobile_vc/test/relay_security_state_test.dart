@@ -100,6 +100,15 @@ void main() {
     expect(plaintextNotRejected.canShowVerified, isFalse);
   });
 
+  test('device binding is required for verified relay state', () async {
+    final state = await RelaySecurityStateEvaluator.evaluate(
+      _validRelayInput(deviceBound: false),
+    );
+
+    expect(state.mode, RelaySecurityMode.relayNotVerified);
+    expect(state.canShowVerified, isFalse);
+  });
+
   test('direct mode never implies E2EE verified', () async {
     final state = await RelaySecurityStateEvaluator.evaluate(
       _validRelayInput(connectionMode: 'direct'),
@@ -127,6 +136,7 @@ RelaySecurityInput _validRelayInput({
   bool deviceRevoked = false,
   bool productionPlaintextRejected = true,
   bool decryptFailed = false,
+  bool deviceBound = true,
 }) {
   return RelaySecurityInput(
     connectionMode: connectionMode,
@@ -144,6 +154,7 @@ RelaySecurityInput _validRelayInput({
     deviceRevoked: deviceRevoked,
     productionPlaintextRejected: productionPlaintextRejected,
     decryptFailed: decryptFailed,
+    deviceBound: deviceBound,
   );
 }
 

@@ -32,6 +32,7 @@ class RelaySecurityInput {
     this.productionPlaintextRejected = false,
     this.decryptFailed = false,
     this.unsupportedVersion = false,
+    this.deviceBound = false,
   });
 
   final String connectionMode;
@@ -50,6 +51,7 @@ class RelaySecurityInput {
   final bool productionPlaintextRejected;
   final bool decryptFailed;
   final bool unsupportedVersion;
+  final bool deviceBound;
 }
 
 class RelaySecurityState {
@@ -140,6 +142,7 @@ class RelaySecurityStateEvaluator {
     }
     final verified = input.nodeFingerprintConfirmed &&
         input.handshakeComplete &&
+        input.deviceBound &&
         input.requiresE2ee &&
         input.productionPlaintextRejected;
     if (!verified) {

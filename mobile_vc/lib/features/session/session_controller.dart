@@ -8,6 +8,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../../core/config/app_config.dart';
 import '../../core/config/app_connection_environment.dart';
 import '../../core/config/relay_config.dart';
+import '../../core/relay_e2ee/relay_security_state.dart';
 import '../../data/models/events.dart';
 import '../../data/models/runtime_meta.dart';
 import '../../data/models/session_models.dart';
@@ -502,6 +503,16 @@ class SessionController extends ChangeNotifier {
   String get relayDeviceStatus => _relayDeviceStatus;
   bool get canManageRelayDevices =>
       connected && _config.isRelayMode && _service.hasRelayE2eeDeviceBinding;
+  Future<RelaySecurityState> relaySecurityState() {
+    return RelaySecurityStateEvaluator.evaluate(
+      _service.relaySecurityInput(
+        connectionMode: _config.connectionMode,
+        expectedNodeFingerprintHex: _config.relayNodeFingerprintHex,
+        configuredCapabilities: _config.relayCapabilities,
+      ),
+    );
+  }
+
   List<SkillDefinition> get skills => List.unmodifiable(_skills);
   List<MemoryItem> get memoryItems => List.unmodifiable(_memoryItems);
   List<PermissionRule> get sessionPermissionRules =>

@@ -151,6 +151,7 @@ await prefs.setString('mobilevc.app_config', jsonEncode(config.toJson()));
 - Capability input: `RelayE2eeCapabilitySet`
 - Handshake frame DTOs: `RelayE2eeClientHelloFrame`, `RelayE2eeAgentHelloFrame`, `RelayE2eeClientProofFrame`, `RelayE2eeAgentResultFrame`
 - Verified gate: `RelaySecurityState.canShowVerified`
+- Verified input field: `RelaySecurityInput.deviceBound`
 - Blocking states: `fingerprintMismatch`, `deviceRevoked`, `plaintextDisabled`, `encryptionUnavailable`
 - Relay device events: `RelayDeviceRegisterResultEvent`, `RelayDeviceListResultEvent`, `RelayDeviceRevokeResultEvent`, `RelayDeviceRotateResultEvent`
 - Controller device actions: `SessionController.requestRelayDeviceList()`, `SessionController.revokeRelayDevice(deviceId)`, `SessionController.rotateRelayDevices()`
@@ -159,7 +160,7 @@ await prefs.setString('mobilevc.app_config', jsonEncode(config.toJson()));
 
 #### 3. Contracts
 - UI may show "E2EE 已验证" only when `canShowVerified == true`.
-- `canShowVerified` requires relay mode, confirmed node fingerprint, completed E2EE handshake, compatible protocol/tunnel capabilities, multiplex stream support, file download support, device management support, E2EE required, plaintext test-mode off, device not revoked, and production plaintext rejection active.
+- `canShowVerified` requires relay mode, confirmed node fingerprint, completed E2EE handshake, backend-confirmed device binding (`RelaySecurityInput.deviceBound`), compatible protocol/tunnel capabilities, multiplex stream support, file download support, device management support, E2EE required, plaintext test-mode off, device not revoked, and production plaintext rejection active.
 - Relay plaintext test-mode must be labeled as test mode and must never look verified.
 - Flutter E2EE capability fields must match the Go relay E2EE capability contract: `relayProtocolVersion`, `e2eeProtocolVersion`, `cryptoSuite`, `tunnelProtocolVersion`, `supportsMultiplexStreams`, `supportsFileDownloadStream`, `supportsDeviceManagement`, `requiresE2EE`, and `plaintextTestMode`.
 - `RelayE2eeCapabilitySet.production()` must require E2EE, disable plaintext test-mode, and require multiplex streams, file download streams, and device management before it can be used for verified security state.

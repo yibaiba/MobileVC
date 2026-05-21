@@ -13,6 +13,7 @@ import 'package:mobile_vc/core/relay_e2ee/relay_e2ee_crypto.dart';
 import 'package:mobile_vc/core/relay_e2ee/relay_e2ee_handshake.dart';
 import 'package:mobile_vc/core/relay_e2ee/relay_e2ee_handshake_frames.dart';
 import 'package:mobile_vc/core/relay_e2ee/relay_mobilevc_stream.dart';
+import 'package:mobile_vc/core/relay_e2ee/relay_security_state.dart';
 import 'package:mobile_vc/data/models/events.dart';
 import 'package:mobile_vc/data/models/runtime_meta.dart';
 import 'package:mobile_vc/data/models/session_models.dart';
@@ -289,6 +290,10 @@ String _testHex(Uint8List bytes) {
     buffer.write(byte.toRadixString(16).padLeft(2, '0'));
   }
   return buffer.toString();
+}
+
+Future<String> _testFingerprintHex(Uint8List publicKey) async {
+  return _testHex(await RelayE2eeCrypto.fingerprint(publicKey));
 }
 
 Future<Map<String, dynamic>> _waitForRelayDeviceRegistration(
@@ -1051,6 +1056,40 @@ void main() {
         '2222222222222222222222222222222222222222222222222222222222222222',
       );
       expect(controller.relayDeviceStatus, contains('重新配对'));
+    });
+
+    test('relay security state requires backend confirmed device binding',
+        () async {
+      SharedPreferences.setMockInitialValues({});
+      final service = _FakeMobileVcWsService()
+        ..relayE2eeHandshake = true
+        ..relayE2eeDeviceBinding = false;
+      final expectedFingerprint =
+          await _testFingerprintHex(service.relayNodeFingerprint);
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.saveConfig(AppConfig(
+        connectionMode: 'relay',
+        relayUrl: 'wss://relay.example.test',
+        relaySessionId: 'rs_test',
+        relayClientId: 'rc_test',
+        relayClientReconnectSecret: 'reconnect_secret',
+        relayNodeFingerprintHex: expectedFingerprint,
+        relayCapabilities: RelayE2eeCapabilitySet.production(),
+      ));
+      await controller.connect();
+
+      final waiting = await controller.relaySecurityState();
+      expect(waiting.mode, RelaySecurityMode.relayNotVerified);
+      expect(waiting.canShowVerified, isFalse);
+
+      service.relayE2eeDeviceBinding = true;
+      final verified = await controller.relaySecurityState();
+      expect(verified.mode, RelaySecurityMode.relayE2eeVerified);
+      expect(verified.canShowVerified, isTrue);
+      expect(verified.actualFingerprintHex, expectedFingerprint);
     });
 
     test('relay connect rejects public ws url before service connect',
@@ -8927,6 +8966,8 @@ class _FakeMobileVcWsService extends MobileVcWsService {
   int resetRelayBindingCalls = 0;
   bool relayE2eeHandshake = false;
   bool relayE2eeDeviceBinding = false;
+  Uint8List relayNodeFingerprint =
+      Uint8List.fromList(List<int>.filled(32, 0x11));
   String markedRelayDeviceId = '';
 
   @override
@@ -8937,6 +8978,32 @@ class _FakeMobileVcWsService extends MobileVcWsService {
 
   @override
   bool get hasRelayE2eeDeviceBinding => relayE2eeDeviceBinding;
+
+  @override
+  RelaySecurityInput relaySecurityInput({
+    required String connectionMode,
+    String expectedNodeFingerprintHex = '',
+    RelayE2eeCapabilitySet? configuredCapabilities,
+  }) {
+    final capabilities = configuredCapabilities;
+    return RelaySecurityInput(
+      connectionMode: connectionMode,
+      expectedNodeFingerprintHex: expectedNodeFingerprintHex,
+      actualNodePublicKey: relayNodeFingerprint,
+      nodeFingerprintConfirmed: relayE2eeHandshake,
+      handshakeComplete: relayE2eeHandshake,
+      protocolSupportsE2ee: capabilities?.requiresE2EE == true,
+      protocolSupportsTunnel: capabilities != null,
+      supportsMultiplexStreams: capabilities?.supportsMultiplexStreams == true,
+      supportsFileDownload: capabilities?.supportsFileDownload == true,
+      supportsDeviceManagement: capabilities?.supportsDeviceManagement == true,
+      requiresE2ee: capabilities?.requiresE2EE == true,
+      plaintextTestMode: capabilities?.plaintextTestMode == true,
+      productionPlaintextRejected: capabilities?.requiresE2EE == true &&
+          capabilities?.plaintextTestMode == false,
+      deviceBound: relayE2eeDeviceBinding,
+    );
+  }
 
   @override
   void markRelayDeviceRegistered(RelayDeviceRegisterResultEvent event) {

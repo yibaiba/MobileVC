@@ -11,6 +11,7 @@ import '../../core/relay_e2ee/relay_device_identity.dart';
 import '../../core/relay_e2ee/relay_e2ee_handshake.dart';
 import '../../core/relay_e2ee/relay_e2ee_handshake_frames.dart';
 import '../../core/relay_e2ee/relay_mobilevc_stream.dart';
+import '../../core/relay_e2ee/relay_security_state.dart';
 import '../models/events.dart';
 import '../models/runtime_meta.dart';
 import 'mobilevc_mapper.dart';
@@ -45,6 +46,41 @@ class MobileVcWsService {
   bool get hasRelayE2eeDeviceBinding =>
       hasRelayE2eeHandshake &&
       _relayE2eeState?.boundDeviceId.trim().isNotEmpty == true;
+  RelaySecurityInput relaySecurityInput({
+    required String connectionMode,
+    String expectedNodeFingerprintHex = '',
+    RelayE2eeCapabilitySet? configuredCapabilities,
+  }) {
+    final state = _relayE2eeState;
+    final input = state?.input;
+    final capabilities = state?.capabilities ?? configuredCapabilities;
+    final activeRelaySession = _relayContext.sessionId.trim().isNotEmpty;
+    final expectsProduction = _relayContext.requiresE2EE ||
+        (activeRelaySession &&
+            capabilities?.requiresE2EE == true &&
+            capabilities?.plaintextTestMode == false);
+    final plaintextTestMode = capabilities?.plaintextTestMode ??
+        (connectionMode == 'relay' && activeRelaySession && !expectsProduction);
+    return RelaySecurityInput(
+      connectionMode: connectionMode,
+      expectedNodeFingerprintHex: state?.expectedNodeFingerprintHex ??
+          expectedNodeFingerprintHex.trim().toLowerCase(),
+      actualNodePublicKey: input?.nodeIdentityPublicKey ?? const <int>[],
+      nodeFingerprintConfirmed:
+          state?.expectedNodeFingerprintHex.trim().isNotEmpty == true &&
+              state?.complete == true,
+      handshakeComplete: state?.complete == true,
+      protocolSupportsE2ee: capabilities?.requiresE2EE == true,
+      protocolSupportsTunnel: capabilities != null,
+      supportsMultiplexStreams: capabilities?.supportsMultiplexStreams == true,
+      supportsFileDownload: capabilities?.supportsFileDownload == true,
+      supportsDeviceManagement: capabilities?.supportsDeviceManagement == true,
+      requiresE2ee: capabilities?.requiresE2EE == true,
+      plaintextTestMode: plaintextTestMode,
+      productionPlaintextRejected: expectsProduction && activeRelaySession,
+      deviceBound: state?.boundDeviceId.trim().isNotEmpty == true,
+    );
+  }
 
   Future<void> connect(String url) async {
     await _connectChannel(Uri.parse(url));
