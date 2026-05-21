@@ -40,6 +40,7 @@ func newSessionState(peer *peerConn, raw []byte) (*sessionState, error) {
 		pairingExpiresAt:     time.Unix(frame.PairingExpiresAt, 0),
 		agent:                peer,
 		pairFailuresByRemote: map[string]int{},
+		devices:              map[string]*deviceState{},
 	}
 	if state.id == "" || state.pairingHash == "" || state.agentReconnectHash == "" {
 		return nil, errors.New("missing agent registration fields")
@@ -58,11 +59,27 @@ func (s *Server) reconnectAgent(peer *peerConn, raw []byte) (string, error) {
 		s.mu.Unlock()
 		return "", errors.New("agent reconnect rejected")
 	}
+	disconnectedAt := state.agentDisconnectedAt
+	clientID := ""
+	if state.client != nil {
+		clientID = state.clientID
+	}
 	state.agent = peer
 	state.agentDisconnectedAt = time.Time{}
 	sessionID := state.id
 	s.mu.Unlock()
-	return sessionID, writeRegistered(peer, sessionID)
+	if err := writeRegistered(peer, sessionID); err != nil {
+		s.rollbackAgentReconnect(sessionID, peer, disconnectedAt)
+		return "", err
+	}
+	if strings.TrimSpace(clientID) == "" {
+		return sessionID, nil
+	}
+	if err := notifyClientAttached(peer, sessionID, clientID); err != nil {
+		s.rollbackAgentReconnect(sessionID, peer, disconnectedAt)
+		return "", err
+	}
+	return sessionID, nil
 }
 
 func (s *Server) canReconnectAgent(state *sessionState, secret string) bool {
@@ -89,20 +106,61 @@ func (s *Server) pairClient(peer *peerConn, raw []byte, remote string) (string, 
 		return "", "", errors.New("pairing rejected")
 	}
 	clientID := "rc_" + uuid.NewString()
+	clientReconnectSecret, err := NewSecret()
+	if err != nil {
+		s.mu.Unlock()
+		return "", "", err
+	}
 	sessionID := state.id
 	agent := state.agent
 	pairingHash := state.pairingHash
 	state.client = peer
 	state.clientID = clientID
+	state.clientReconnectHash = SecretHash(clientReconnectSecret)
 	state.pairingHash = ""
 	state.pairingConsumed = true
+	s.rememberDeviceLocked(state, clientID, frame.DeviceName, state.clientReconnectHash)
 	s.mu.Unlock()
-	if err := writePaired(peer, sessionID, clientID); err != nil {
+	if err := writePaired(peer, sessionID, clientID, clientReconnectSecret); err != nil {
 		s.rollbackPairing(sessionID, peer, pairingHash)
 		return "", "", err
 	}
 	if err := notifyClientAttached(agent, sessionID, clientID); err != nil {
 		s.rollbackPairing(sessionID, peer, pairingHash)
+		return "", "", err
+	}
+	return sessionID, clientID, nil
+}
+
+func (s *Server) reconnectClient(peer *peerConn, raw []byte) (string, string, error) {
+	var frame ClientReconnectFrame
+	if err := json.Unmarshal(raw, &frame); err != nil {
+		return "", "", err
+	}
+	s.mu.Lock()
+	state := s.sessions[strings.TrimSpace(frame.SessionID)]
+	device := s.reconnectableDevice(state, frame.ClientID, frame.ClientReconnectSecret)
+	if device == nil {
+		s.mu.Unlock()
+		return "", "", errors.New("client reconnect rejected")
+	}
+	previousClient := state.client
+	state.client = peer
+	state.clientID = device.ClientID
+	device.LastSeenAt = time.Now().UTC()
+	sessionID := state.id
+	clientID := device.ClientID
+	agent := state.agent
+	s.mu.Unlock()
+	if previousClient != nil && previousClient != peer {
+		_ = previousClient.Close()
+	}
+	if err := writePaired(peer, sessionID, clientID, ""); err != nil {
+		s.rollbackClientReconnect(sessionID, peer)
+		return "", "", err
+	}
+	if err := notifyClientAttached(agent, sessionID, clientID); err != nil {
+		s.rollbackClientReconnect(sessionID, peer)
 		return "", "", err
 	}
 	return sessionID, clientID, nil
@@ -118,6 +176,28 @@ func (s *Server) canPair(state *sessionState, remote string) bool {
 	return state.pairFailuresByRemote[remote] < s.cfg.MaxPairingFailuresPerIP
 }
 
+func (s *Server) canReconnectClient(state *sessionState, clientID string, secret string) bool {
+	return s.reconnectableDevice(state, clientID, secret) != nil
+}
+
+func (s *Server) reconnectableDevice(state *sessionState, clientID string, secret string) *deviceState {
+	if state == nil || state.agent == nil {
+		return nil
+	}
+	normalizedID := strings.TrimSpace(clientID)
+	if normalizedID == "" {
+		return nil
+	}
+	device := state.devices[normalizedID]
+	if device == nil || device.Revoked {
+		return nil
+	}
+	if !SecretHashMatches(device.ReconnectHash, secret) {
+		return nil
+	}
+	return device
+}
+
 func (s *Server) recordPairingFailure(state *sessionState, remote string) {
 	if state != nil {
 		state.pairFailuresByRemote[remote]++
@@ -131,10 +211,33 @@ func (s *Server) rollbackPairing(sessionID string, peer *peerConn, pairingHash s
 	if state == nil || state.client != peer {
 		return
 	}
+	delete(state.devices, state.clientID)
 	state.client = nil
 	state.clientID = ""
+	state.clientReconnectHash = ""
 	state.pairingHash = pairingHash
 	state.pairingConsumed = false
+}
+
+func (s *Server) rollbackClientReconnect(sessionID string, peer *peerConn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state := s.sessions[sessionID]
+	if state == nil || state.client != peer {
+		return
+	}
+	state.client = nil
+}
+
+func (s *Server) rollbackAgentReconnect(sessionID string, peer *peerConn, disconnectedAt time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state := s.sessions[sessionID]
+	if state == nil || state.agent != peer {
+		return
+	}
+	state.agent = nil
+	state.agentDisconnectedAt = disconnectedAt
 }
 
 func writeRegistered(peer *peerConn, sessionID string) error {
@@ -143,9 +246,13 @@ func writeRegistered(peer *peerConn, sessionID string) error {
 	})
 }
 
-func writePaired(peer *peerConn, sessionID string, clientID string) error {
+func writePaired(peer *peerConn, sessionID string, clientID string, clientReconnectSecret string) error {
 	return peer.WriteJSON(ClientPairedFrame{
-		Type: TypeClientPaired, Version: Version, SessionID: sessionID, ClientID: clientID,
+		Type:                  TypeClientPaired,
+		Version:               Version,
+		SessionID:             sessionID,
+		ClientID:              clientID,
+		ClientReconnectSecret: clientReconnectSecret,
 	})
 }
 

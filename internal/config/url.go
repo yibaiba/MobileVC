@@ -7,25 +7,6 @@ import (
 	"strings"
 )
 
-const (
-	defaultHTTPPort  = "80"
-	defaultHTTPSPort = "443"
-)
-
-func NormalizeOrigin(origin string) (string, error) {
-	parsed, err := url.Parse(origin)
-	if err != nil {
-		return "", fmt.Errorf("invalid origin %q: %w", origin, err)
-	}
-	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return "", fmt.Errorf("invalid origin %q: scheme must be http or https", origin)
-	}
-	if parsed.Host == "" || parsed.User != nil || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
-		return "", fmt.Errorf("invalid origin %q: expected scheme://host[:port]", origin)
-	}
-	return canonicalOrigin(parsed), nil
-}
-
 func ValidateRelayURL(raw string) error {
 	parsed, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil {
@@ -76,25 +57,4 @@ func isInsecureRelayHostAllowed(host string) bool {
 	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
 		strings.HasPrefix(strings.ToLower(ip.String()), "fc") ||
 		strings.HasPrefix(strings.ToLower(ip.String()), "fd")
-}
-
-func canonicalOrigin(parsed *url.URL) string {
-	scheme := strings.ToLower(parsed.Scheme)
-	host := strings.ToLower(parsed.Hostname())
-	port := parsed.Port()
-	if port == "" || isDefaultOriginPort(scheme, port) {
-		return scheme + "://" + formatOriginHost(host)
-	}
-	return scheme + "://" + net.JoinHostPort(host, port)
-}
-
-func isDefaultOriginPort(scheme string, port string) bool {
-	return (scheme == "http" && port == defaultHTTPPort) || (scheme == "https" && port == defaultHTTPSPort)
-}
-
-func formatOriginHost(host string) string {
-	if strings.Contains(host, ":") {
-		return "[" + host + "]"
-	}
-	return host
 }

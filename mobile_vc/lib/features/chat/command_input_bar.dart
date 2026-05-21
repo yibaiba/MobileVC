@@ -10,6 +10,7 @@ class CommandInputBar extends StatefulWidget {
     required this.fastMode,
     required this.permissionMode,
     required this.onSubmit,
+    required this.onAttachImage,
     required this.onStop,
     required this.onOpenSessions,
     required this.onOpenRuntimeInfo,
@@ -39,6 +40,7 @@ class CommandInputBar extends StatefulWidget {
   final bool fastMode;
   final String permissionMode;
   final ValueChanged<String> onSubmit;
+  final VoidCallback onAttachImage;
   final VoidCallback onStop;
   final VoidCallback onOpenSessions;
   final VoidCallback onOpenRuntimeInfo;
@@ -80,7 +82,7 @@ class _CommandInputBarState extends State<CommandInputBar> {
           widget.isBusy);
 
   bool get _showStopAction =>
-      !_inputLocked && widget.canStop;
+      !_inputLocked && widget.canStop && !widget.awaitInput;
 
   String get _lockedHintText {
     if (widget.isExternallyLocked) {
@@ -343,6 +345,19 @@ class _CommandInputBarState extends State<CommandInputBar> {
                             enabledBorder: InputBorder.none,
                             focusedBorder: InputBorder.none,
                             disabledBorder: InputBorder.none,
+                          ),
+                        ),
+                      ),
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(0, 0, 4, 7),
+                        child: SizedBox(
+                          width: 42,
+                          height: 42,
+                          child: IconButton.filledTonal(
+                            onPressed:
+                                _inputLocked ? null : widget.onAttachImage,
+                            tooltip: '发送图片',
+                            icon: const Icon(Icons.image_outlined, size: 20),
                           ),
                         ),
                       ),

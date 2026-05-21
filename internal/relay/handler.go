@@ -47,7 +47,7 @@ func (s *Server) handleClient(w http.ResponseWriter, r *http.Request) {
 func (s *Server) agentLoop(peer *peerConn) {
 	defer s.releaseConn(peer.role, peer.remote)
 	defer peer.Stop()
-	peer.ConfigurePong(s.cfg.PongTimeout)
+	peer.ConfigurePong(s.cfg.PingInterval + s.cfg.PongTimeout)
 	go peer.StartWriter(s.cfg.PingInterval)
 	sessionID, err := s.authenticateAgent(peer)
 	if err != nil {
@@ -62,7 +62,7 @@ func (s *Server) agentLoop(peer *peerConn) {
 func (s *Server) clientLoop(peer *peerConn) {
 	defer s.releaseConn(peer.role, peer.remote)
 	defer peer.Stop()
-	peer.ConfigurePong(s.cfg.PongTimeout)
+	peer.ConfigurePong(s.cfg.PingInterval + s.cfg.PongTimeout)
 	go peer.StartWriter(s.cfg.PingInterval)
 	sessionID, clientID, err := s.authenticateClient(peer, peer.remote)
 	if err != nil {
@@ -84,7 +84,7 @@ func (s *Server) authenticateAgent(peer *peerConn) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	_ = peer.conn.SetReadDeadline(time.Now().Add(s.cfg.PongTimeout))
+	_ = peer.conn.SetReadDeadline(time.Now().Add(s.cfg.PingInterval + s.cfg.PongTimeout))
 	return sessionID, nil
 }
 
@@ -101,15 +101,25 @@ func (s *Server) applyAgentAuthFrame(peer *peerConn, frame ControlFrame, raw []b
 func (s *Server) authenticateClient(peer *peerConn, remote string) (string, string, error) {
 	_ = peer.conn.SetReadDeadline(time.Now().Add(s.cfg.PairingHandshakeTimeout))
 	frame, raw, err := readControl(peer.conn, s.cfg.MaxControlFrameBytes)
-	if err != nil || frame.Type != TypeClientPair {
-		return "", "", errors.New("first client frame must pair")
-	}
-	sessionID, clientID, err := s.pairClient(peer, raw, remote)
 	if err != nil {
 		return "", "", err
 	}
-	_ = peer.conn.SetReadDeadline(time.Now().Add(s.cfg.PongTimeout))
+	sessionID, clientID, err := s.applyClientAuthFrame(peer, frame, raw, remote)
+	if err != nil {
+		return "", "", err
+	}
+	_ = peer.conn.SetReadDeadline(time.Now().Add(s.cfg.PingInterval + s.cfg.PongTimeout))
 	return sessionID, clientID, nil
+}
+
+func (s *Server) applyClientAuthFrame(peer *peerConn, frame ControlFrame, raw []byte, remote string) (string, string, error) {
+	if frame.Type == TypeClientPair {
+		return s.pairClient(peer, raw, remote)
+	}
+	if frame.Type == TypeClientReconnect {
+		return s.reconnectClient(peer, raw)
+	}
+	return "", "", errors.New("first client frame must pair or reconnect")
 }
 
 func readControl(conn *websocket.Conn, limit int64) (ControlFrame, []byte, error) {

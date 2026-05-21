@@ -111,6 +111,24 @@ class _DeferredFirstInput {
   final String text;
 }
 
+class ChatImageAttachment {
+  const ChatImageAttachment({
+    required this.name,
+    required this.mimeType,
+    required this.bytes,
+  });
+
+  final String name;
+  final String mimeType;
+  final Uint8List bytes;
+
+  Map<String, dynamic> toJson() => {
+        'name': name,
+        'mimeType': mimeType,
+        'data': base64Encode(bytes),
+      };
+}
+
 class _PendingOutboundAction {
   const _PendingOutboundAction({
     required this.payload,
@@ -257,6 +275,8 @@ class SessionController extends ChangeNotifier {
   final List<FSItem> _currentDirectoryItems = [];
   final List<HistoryContext> _recentDiffs = [];
   final List<SessionSummary> _sessions = [];
+  final Map<String, SessionSummary> _pendingDeletedSessions =
+      <String, SessionSummary>{};
   final List<SkillDefinition> _skills = [];
   final List<MemoryItem> _memoryItems = [];
   final List<PermissionRule> _sessionPermissionRules = [];
@@ -1247,7 +1267,6 @@ class SessionController extends ChangeNotifier {
       );
       _pushSystem('error', '保存连接配置失败：$error');
     }
-    _sendFileAccessConfig();
     notifyListeners();
   }
 
@@ -1553,6 +1572,7 @@ class SessionController extends ChangeNotifier {
     required RuntimeMeta meta,
     required String permissionMode,
     String data = '',
+    List<ChatImageAttachment> imageAttachments = const [],
   }) {
     final normalizedEngine = engine.trim().toLowerCase();
     final payload = <String, dynamic>{
@@ -1578,6 +1598,10 @@ class SessionController extends ChangeNotifier {
     }
     if (data.trim().isNotEmpty) {
       payload['data'] = data;
+    }
+    if (imageAttachments.isNotEmpty) {
+      payload['imageAttachments'] =
+          imageAttachments.map((attachment) => attachment.toJson()).toList();
     }
     return payload;
   }
@@ -1730,7 +1754,6 @@ class SessionController extends ChangeNotifier {
       _claudeModelCatalogUnavailable = false;
       _claudeModelCatalog.clear();
       await switchWorkingDirectory(_config.cwd);
-      _sendFileAccessConfig();
       requestRuntimeInfo('context');
       requestSkillCatalog();
       requestMemoryList();
@@ -1787,7 +1810,12 @@ class SessionController extends ChangeNotifier {
     final relayUrl = _config.relayUrl.trim();
     final sessionId = _config.relaySessionId.trim();
     final pairingSecret = _config.relayPairingSecret.trim();
-    if (relayUrl.isEmpty || sessionId.isEmpty || pairingSecret.isEmpty) {
+    final clientId = _config.relayClientId.trim();
+    final clientReconnectSecret = _config.relayClientReconnectSecret.trim();
+    if (relayUrl.isEmpty ||
+        sessionId.isEmpty ||
+        (pairingSecret.isEmpty &&
+            (clientId.isEmpty || clientReconnectSecret.isEmpty))) {
       throw const FormatException('Relay 配对信息不完整，请重新扫码');
     }
     validateRelayUrl(relayUrl);
@@ -1795,11 +1823,17 @@ class SessionController extends ChangeNotifier {
       relayUrl: relayUrl,
       sessionId: sessionId,
       pairingSecret: pairingSecret,
+      clientId: clientId,
+      clientReconnectSecret: clientReconnectSecret,
     );
+    final relaySession = _service.takeRelaySession();
     _config = _config.copyWith(
-      relaySessionId: '',
+      relaySessionId: relaySession?.sessionId ?? sessionId,
       relayPairingSecret: '',
       relayPairingExpiresAt: 0,
+      relayClientId: relaySession?.clientId ?? clientId,
+      relayClientReconnectSecret:
+          relaySession?.clientReconnectSecret ?? clientReconnectSecret,
     );
     unawaited(_persistCurrentConfig());
   }
@@ -1901,16 +1935,6 @@ class SessionController extends ChangeNotifier {
     _resetActionNeededTracking();
     _syncDerivedState();
     notifyListeners();
-  }
-
-  void _sendFileAccessConfig() {
-    if (!_connected) {
-      return;
-    }
-    _service.send({
-      'action': 'file_access_config',
-      'trustedRoots': _config.trustedFileRoots,
-    });
   }
 
   void _handleUnexpectedSocketDisconnect(String message) {
@@ -2183,8 +2207,14 @@ class SessionController extends ChangeNotifier {
     if (targetId.isEmpty) {
       return;
     }
+    final target = _removeSessionLocally(targetId);
     if (targetId == _selectedSessionId) {
       _beginSessionLoading();
+    }
+    if (target != null) {
+      _pendingDeletedSessions[targetId] = target;
+      _pushSystem('system', '正在删除会话：${sessionDisplayTitle(target)}');
+      notifyListeners();
     }
     _service.send({'action': 'session_delete', 'sessionId': targetId});
   }
@@ -3030,6 +3060,7 @@ class SessionController extends ChangeNotifier {
     RuntimeMeta? meta,
     String label = '命令',
     String? targetEngine,
+    List<ChatImageAttachment> imageAttachments = const [],
   }) {
     final value = prompt.trim();
     final resolvedEngine = (targetEngine ??
@@ -3046,6 +3077,7 @@ class SessionController extends ChangeNotifier {
       meta: meta ?? currentMeta,
       permissionMode: _config.permissionMode,
       data: value.isNotEmpty ? '$value\n' : '',
+      imageAttachments: imageAttachments,
     );
     final launchSent = _sendUserVisibleAction(
       launchPayload,
@@ -3062,9 +3094,10 @@ class SessionController extends ChangeNotifier {
     String prompt, {
     RuntimeMeta? meta,
     String label = '回复',
+    List<ChatImageAttachment> imageAttachments = const [],
   }) {
     final value = prompt.trim();
-    if (value.isEmpty) {
+    if (value.isEmpty && imageAttachments.isEmpty) {
       return;
     }
     final continuationEngine = _resolvedAiEngine(
@@ -3077,6 +3110,7 @@ class SessionController extends ChangeNotifier {
       meta: meta ?? currentMeta,
       permissionMode: _config.permissionMode,
       data: '$value\n',
+      imageAttachments: imageAttachments,
     );
     final sent = _sendUserVisibleAction(
       payload,
@@ -3169,8 +3203,15 @@ class SessionController extends ChangeNotifier {
   }
 
   void sendInputText(String text) {
+    sendInputTextWithImages(text, const []);
+  }
+
+  void sendInputTextWithImages(
+    String text,
+    List<ChatImageAttachment> imageAttachments,
+  ) {
     final value = text.trim();
-    if (value.isEmpty) {
+    if (value.isEmpty && imageAttachments.isEmpty) {
       return;
     }
     if (_isLoadingSession) {
@@ -3197,15 +3238,19 @@ class SessionController extends ChangeNotifier {
     }
     if (canSendToContinuedSameSession) {
       _resetActionNeededTracking();
-      _submitClaudeContinuation(value, label: '回复');
+      _submitClaudeContinuation(
+        value,
+        label: '回复',
+        imageAttachments: imageAttachments,
+      );
       return;
     }
     if (awaitInput) {
       _markActionNeededHandled();
-      _submitAwaitingPrompt(value);
+      _submitAwaitingPrompt(value, imageAttachments: imageAttachments);
       return;
     }
-    if (value.startsWith('/')) {
+    if (value.startsWith('/') && imageAttachments.isEmpty) {
       _handleSlashCommand(value);
       return;
     }
@@ -3231,6 +3276,7 @@ class SessionController extends ChangeNotifier {
         meta: currentMeta,
         label: '命令',
         targetEngine: aiHead,
+        imageAttachments: imageAttachments,
       );
       return;
     }
@@ -3243,7 +3289,33 @@ class SessionController extends ChangeNotifier {
         return;
       }
       _resetActionNeededTracking();
-      _submitClaudeContinuation(value, label: '回复');
+      _submitClaudeContinuation(
+        value,
+        label: '回复',
+        imageAttachments: imageAttachments,
+      );
+      return;
+    }
+    if (!_looksLikeShellCommand(value)) {
+      if (isSessionBusy) {
+        if (hasPendingReview) {
+          _pushSystem('session', '当前会话仍在运行，请先完成待审核 diff，再继续处理。');
+        } else {
+          _pushSystem('session', '当前会话仍在运行，暂时不能发起新的请求。');
+        }
+        return;
+      }
+      _resetActionNeededTracking();
+      _startClaudeTurn(
+        value,
+        meta: currentMeta,
+        label: '命令',
+        imageAttachments: imageAttachments,
+      );
+      return;
+    }
+    if (imageAttachments.isNotEmpty) {
+      _pushSystem('session', '图片只能发送给 AI 助手，请输入 codex、claude 或自然语言请求。');
       return;
     }
     _beginUserSubmission();
@@ -3303,6 +3375,7 @@ class SessionController extends ChangeNotifier {
     String value, {
     String promptLabel = '回复',
     bool fallbackToInput = false,
+    List<ChatImageAttachment> imageAttachments = const [],
   }) {
     if (_isLoadingSession) {
       _pushSystem('session', '会话切换中，请等待加载完成');
@@ -3310,8 +3383,12 @@ class SessionController extends ChangeNotifier {
     }
     final interaction = pendingInteraction;
     if (interaction != null) {
-      _submitInteractionActionValue(interaction, value,
-          promptLabel: promptLabel);
+      _submitInteractionActionValue(
+        interaction,
+        value,
+        promptLabel: promptLabel,
+        imageAttachments: imageAttachments,
+      );
       return;
     }
     final prompt = _pendingPrompt;
@@ -3325,13 +3402,18 @@ class SessionController extends ChangeNotifier {
     if (!fallbackToInput && !awaitInput) {
       return;
     }
-    _submitAwaitingInput(value, promptLabel: promptLabel);
+    _submitAwaitingInput(
+      value,
+      promptLabel: promptLabel,
+      imageAttachments: imageAttachments,
+    );
   }
 
   void _submitInteractionActionValue(
     InteractionRequestEvent interaction,
     String value, {
     String promptLabel = '回复',
+    List<ChatImageAttachment> imageAttachments = const [],
   }) {
     final normalized = value.trim();
     if (normalized.isEmpty) {
@@ -3350,7 +3432,11 @@ class SessionController extends ChangeNotifier {
       _sendPlanDecision(interaction, normalized, promptLabel: promptLabel);
       return;
     }
-    _submitAwaitingInput(normalized, promptLabel: promptLabel);
+    _submitAwaitingInput(
+      normalized,
+      promptLabel: promptLabel,
+      imageAttachments: imageAttachments,
+    );
   }
 
   void _sendPlanDecision(
@@ -3533,13 +3619,21 @@ class SessionController extends ChangeNotifier {
     _submitAwaitingInput(decision, promptLabel: promptLabel);
   }
 
-  void _submitAwaitingInput(String value, {String promptLabel = '回复'}) {
+  void _submitAwaitingInput(
+    String value, {
+    String promptLabel = '回复',
+    List<ChatImageAttachment> imageAttachments = const [],
+  }) {
     _beginUserSubmission();
-    final payload = {
+    final payload = <String, dynamic>{
       'action': 'input',
       'data': '$value\n',
       'permissionMode': _config.permissionMode,
     };
+    if (imageAttachments.isNotEmpty) {
+      payload['imageAttachments'] =
+          imageAttachments.map((attachment) => attachment.toJson()).toList();
+    }
     if (!_sendUserVisibleAction(payload, userText: value, label: promptLabel)) {
       return;
     }
@@ -3735,7 +3829,7 @@ class SessionController extends ChangeNotifier {
   }
 
   void stopCurrentRun() {
-    if (!canStopCurrentRun) {
+    if (!connected || _isStopping) {
       return;
     }
     _canResumeCurrentSession = false;
@@ -3886,7 +3980,14 @@ class SessionController extends ChangeNotifier {
         _flushDeferredFirstInputIfNeeded();
         break;
       case SessionListResultEvent list:
+        final confirmedIds = _pendingDeletedSessions.keys
+            .where((id) => !list.items.any((item) => item.id == id))
+            .toList();
+        for (final id in confirmedIds) {
+          _pendingDeletedSessions.remove(id);
+        }
         final mergedItems = list.items
+            .where((item) => !_pendingDeletedSessions.containsKey(item.id))
             .map((item) => _mergedSessionSummary(
                   _sessions.cast<SessionSummary?>().firstWhere(
                         (existing) => existing?.id == item.id,
@@ -4093,8 +4194,7 @@ class SessionController extends ChangeNotifier {
         _maybeAutoSyncAiModel(state.runtimeMeta);
         _syncRuntimePermissionMode();
 
-        // 收到 stopped 事件后，清除停止中标记
-        if (state.state.trim().toLowerCase() == 'stopped') {
+        if (_isIdleLikeState(state.state)) {
           _isStopping = false;
         }
 
@@ -4286,7 +4386,7 @@ class SessionController extends ChangeNotifier {
             context: _latestError,
           ),
         );
-        _handleMutationFailure(error.message);
+        _handleMutationFailure(error);
         break;
       case PromptRequestEvent prompt:
         if (prompt.isReview && _reviewShouldAutoAccept(prompt.runtimeMeta)) {
@@ -4769,7 +4869,22 @@ class SessionController extends ChangeNotifier {
     return changed;
   }
 
-  void _handleMutationFailure(String message) {
+  void _handleMutationFailure(ErrorEvent error) {
+    final message = error.message;
+    if (error.code == 'session_delete_failed' &&
+        _pendingDeletedSessions.isNotEmpty) {
+      final restored = _pendingDeletedSessions.values.toList();
+      _pendingDeletedSessions.clear();
+      for (final summary in restored.reversed) {
+        _upsertSession(summary);
+      }
+      if (message.trim().isNotEmpty) {
+        _pushSystem('error', '删除会话失败：$message');
+      }
+      if (_isLoadingSession) {
+        _finishSessionLoading();
+      }
+    }
     if (_autoSessionCreating) {
       _clearDeferredFirstInput();
     }
@@ -4801,6 +4916,10 @@ class SessionController extends ChangeNotifier {
         normalized == 'IDLE' ||
         normalized == 'DONE' ||
         normalized == 'COMPLETED' ||
+        normalized == 'FAILED' ||
+        normalized == 'ERROR' ||
+        normalized == 'SYSTEMERROR' ||
+        normalized == 'STOPPED' ||
         normalized == 'DISCONNECTED';
   }
 
@@ -5212,6 +5331,14 @@ class SessionController extends ChangeNotifier {
     } else {
       _sessions[index] = next;
     }
+  }
+
+  SessionSummary? _removeSessionLocally(String sessionId) {
+    final index = _sessions.indexWhere((item) => item.id == sessionId);
+    if (index == -1) {
+      return null;
+    }
+    return _sessions.removeAt(index);
   }
 
   bool _isExternalNativeSession(SessionSummary summary) {
@@ -7768,12 +7895,12 @@ class SessionController extends ChangeNotifier {
         nextModel = parsed.$1.isNotEmpty ? parsed.$1 : nextModel;
         nextEffort = parsed.$2.isNotEmpty ? parsed.$2 : nextEffort;
       }
-    }
-
-    if (rawText.trim().isNotEmpty) {
+    } else if (rawText.trim().isNotEmpty) {
       final parsed = _parseAiModelFromText(engine, rawText);
       nextModel = parsed.$1.isNotEmpty ? parsed.$1 : nextModel;
       nextEffort = parsed.$2.isNotEmpty ? parsed.$2 : nextEffort;
+    } else {
+      return;
     }
 
     if (nextModel.isEmpty) {
@@ -7905,7 +8032,6 @@ class SessionController extends ChangeNotifier {
   if (normalized.isEmpty) {
     return ('', '');
   }
-  final lower = normalized.toLowerCase();
   if (engine == 'claude') {
     final parsed = parseClaudeModelFromText(normalized);
     if (parsed != null && parsed.isNotEmpty) {
@@ -7919,8 +8045,6 @@ class SessionController extends ChangeNotifier {
       .firstMatch(normalized);
   if (modelMatch != null) {
     model = modelMatch.group(1)!.toLowerCase().replaceAll(' ', '-');
-  } else if (lower.contains('codex')) {
-    model = 'gpt-5-codex';
   }
   String effort = '';
   final effortMatch = RegExp(
@@ -7931,6 +8055,74 @@ class SessionController extends ChangeNotifier {
     effort = (effortMatch.group(1) ?? '').toLowerCase();
   }
   return (model, effort);
+}
+
+bool _looksLikeShellCommand(String value) {
+  final trimmed = value.trim();
+  if (trimmed.isEmpty) {
+    return false;
+  }
+  if (RegExp(r'[^\x00-\x7F]').hasMatch(trimmed)) {
+    return false;
+  }
+  if (trimmed.startsWith('./') ||
+      trimmed.startsWith('../') ||
+      trimmed.startsWith('~/')) {
+    return true;
+  }
+  if (RegExp(r'^[A-Za-z_][A-Za-z0-9_]*=').hasMatch(trimmed)) {
+    return true;
+  }
+  if (RegExp(r'[|&;<>(){}*$`\\]').hasMatch(trimmed)) {
+    return true;
+  }
+  final head = trimmed.split(RegExp(r'\s+')).first.toLowerCase();
+  const shellHeads = <String>{
+    'adb',
+    'bash',
+    'cat',
+    'cd',
+    'chmod',
+    'chown',
+    'cp',
+    'curl',
+    'dart',
+    'docker',
+    'echo',
+    'find',
+    'flutter',
+    'git',
+    'go',
+    'grep',
+    'head',
+    'kill',
+    'less',
+    'ls',
+    'make',
+    'mkdir',
+    'mv',
+    'node',
+    'npm',
+    'npx',
+    'pnpm',
+    'ps',
+    'pwd',
+    'python',
+    'python3',
+    'rm',
+    'rg',
+    'sed',
+    'sh',
+    'tail',
+    'tar',
+    'touch',
+    'tree',
+    'uname',
+    'which',
+    'yarn',
+    'zsh',
+  };
+  return shellHeads.contains(head);
 }
 
 String _resolvedAiEngine({

@@ -14,9 +14,8 @@ const os = require('os');
 
 const ROOT_DIR = path.resolve(__dirname, '..');
 const FLUTTER_DIR = path.join(ROOT_DIR, 'mobile_vc');
-const WEB_OUTPUT_TMP = path.join(os.tmpdir(), 'mobilevc-web-build');
-const WEB_TARGET = path.join(ROOT_DIR, 'cmd', 'server', 'web');
 const BACKEND_BINARY = path.join(ROOT_DIR, 'server');
+const FVM_FLUTTER = path.join(FLUTTER_DIR, '.fvm', 'flutter_sdk', 'bin', 'flutter');
 const DEFAULT_PORT = process.env.PORT || '8001';
 const AUTH_TOKEN = process.env.AUTH_TOKEN || 'test-token-12345';
 
@@ -33,24 +32,6 @@ function run(cmd, args, opts) {
     });
     child.on('error', reject);
   });
-}
-
-function rmdir(dir) {
-  if (!fs.existsSync(dir)) return;
-  fs.rmSync(dir, { recursive: true, force: true });
-}
-
-function copyDir(src, dst) {
-  fs.mkdirSync(dst, { recursive: true });
-  for (const entry of fs.readdirSync(src, { withFileTypes: true })) {
-    const srcPath = path.join(src, entry.name);
-    const dstPath = path.join(dst, entry.name);
-    if (entry.isDirectory()) {
-      copyDir(srcPath, dstPath);
-    } else {
-      fs.copyFileSync(srcPath, dstPath);
-    }
-  }
 }
 
 async function checkHealth(port, timeoutMs = 10000) {
@@ -77,16 +58,12 @@ async function checkHealth(port, timeoutMs = 10000) {
 async function main() {
   // 1. Build Flutter web
   log('Building Flutter web...');
-  if (fs.existsSync(WEB_OUTPUT_TMP)) {
-    rmdir(WEB_OUTPUT_TMP);
-  }
-  await run('/Users/wust_lh/flutter_sdk/flutter/bin/flutter', ['build', 'web', '--output-dir=' + WEB_OUTPUT_TMP], { cwd: FLUTTER_DIR });
+  const flutterBin = fs.existsSync(FVM_FLUTTER) ? FVM_FLUTTER : 'flutter';
+  await run(flutterBin, ['build', 'web', '--release', '--pwa-strategy=none'], { cwd: FLUTTER_DIR });
 
   // 2. Sync to cmd/server/web/
   log('Replacing cmd/server/web/...');
-  rmdir(WEB_TARGET);
-  copyDir(WEB_OUTPUT_TMP, WEB_TARGET);
-  rmdir(WEB_OUTPUT_TMP);
+  await run('node', ['scripts/sync-embedded-web.js'], { cwd: ROOT_DIR });
   log('Flutter web synced to cmd/server/web/');
 
   // 3. Compile backend

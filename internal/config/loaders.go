@@ -6,17 +6,33 @@ import (
 	"time"
 )
 
+func loadNetworkConfig() NetworkConfig {
+	return NetworkConfig{
+		ExposureMode: normalizeExposureMode(os.Getenv("NETWORK_EXPOSURE_MODE")),
+	}
+}
+
 func loadRuntimeConfig() RuntimeConfig {
 	return RuntimeConfig{
 		DefaultCommand:         getEnv("RUNTIME_DEFAULT_COMMAND", "claude"),
 		DefaultMode:            getEnv("RUNTIME_DEFAULT_MODE", "pty"),
 		Debug:                  getEnvBool("RUNTIME_DEBUG", false),
 		WorkspaceRoot:          strings.TrimSpace(os.Getenv("RUNTIME_WORKSPACE_ROOT")),
-		TrustedFileRoots:       getEnvList("RUNTIME_TRUSTED_FILE_ROOTS"),
 		EnhancedProjection:     getEnvBool("RUNTIME_ENHANCED_PROJECTION", true),
 		EnableStepProjection:   getEnvBool("RUNTIME_ENABLE_STEP_PROJECTION", true),
 		EnableDiffProjection:   getEnvBool("RUNTIME_ENABLE_DIFF_PROJECTION", true),
 		EnablePromptProjection: getEnvBool("RUNTIME_ENABLE_PROMPT_PROJECTION", true),
+	}
+}
+
+func normalizeExposureMode(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", "lan", "lan-enabled":
+		return ExposureModeLAN
+	case "relay-only", "relay":
+		return ExposureModeRelayOnly
+	default:
+		return strings.ToLower(strings.TrimSpace(raw))
 	}
 }
 
@@ -28,13 +44,6 @@ func loadTTSConfig() TTSConfig {
 		RequestTimeoutSeconds: getEnvInt("TTS_REQUEST_TIMEOUT_SECONDS", 30),
 		MaxTextLength:         getEnvInt("TTS_MAX_TEXT_LENGTH", 200),
 		DefaultFormat:         strings.TrimSpace(getEnv("TTS_DEFAULT_FORMAT", "wav")),
-	}
-}
-
-func loadSecurityConfig() SecurityConfig {
-	return SecurityConfig{
-		PublicExposureMode: getEnvBool("PUBLIC_EXPOSURE_MODE", false),
-		AllowedOrigins:     getEnvCommaList("ALLOWED_ORIGINS"),
 	}
 }
 

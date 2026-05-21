@@ -150,7 +150,7 @@ class _MobileVcAppState extends State<MobileVcApp> with WidgetsBindingObserver {
 
     try {
       _pushNotificationService.onTokenRefresh((token) {
-        debugPrint('[push] token refreshed: $token');
+        debugPrint('[push] token refreshed');
         _controller.setDevicePushToken(token);
       });
 
@@ -171,7 +171,7 @@ class _MobileVcAppState extends State<MobileVcApp> with WidgetsBindingObserver {
       await _pushNotificationService.initialize();
       final token = await _pushNotificationService.getDeviceToken();
       if (token != null && token.isNotEmpty) {
-        debugPrint('[push] device token: $token');
+        debugPrint('[push] device token available');
         _controller.setDevicePushToken(token);
       }
     } catch (error, stack) {

@@ -163,24 +163,6 @@ void main() {
       );
     });
 
-    test('trusted file roots round trip and drop blanks', () {
-      final config = AppConfig.fromJson(const {
-        'host': 'example.com',
-        'trustedFileRoots': [' /Users/me/project ', '', '/Users/me/project'],
-      });
-
-      expect(config.trustedFileRoots, ['/Users/me/project']);
-      expect(
-        AppConfig.fromJson(config.toJson()).trustedFileRoots,
-        ['/Users/me/project'],
-      );
-      expect(
-        config
-            .copyWith(trustedFileRoots: [' /tmp/shared ', '']).trustedFileRoots,
-        ['/tmp/shared'],
-      );
-    });
-
     test('relay pairing uri selects relay mode without changing direct fields',
         () {
       final config = AppConfig.fromLaunchUri(
@@ -203,20 +185,29 @@ void main() {
       expect(config.relayPairingExpiresAt, 1760000000);
     });
 
-    test('relay config persists url only', () {
+    test('relay config persists reconnect fields but not pairing secret', () {
       const config = AppConfig(
         connectionMode: 'relay',
         relayUrl: 'wss://relay.example.test',
         relaySessionId: 'rs_test',
         relayPairingSecret: 'pair_secret',
         relayPairingExpiresAt: 1760000000,
+        relayClientId: 'rc_test',
+        relayClientReconnectSecret: 'reconnect_secret',
       );
 
       final json = config.toJson();
       expect(json['relayUrl'], 'wss://relay.example.test');
-      expect(json.containsKey('relaySessionId'), isFalse);
+      expect(json['relaySessionId'], 'rs_test');
       expect(json.containsKey('relayPairingSecret'), isFalse);
       expect(json.containsKey('relayPairingExpiresAt'), isFalse);
+      expect(json['relayClientId'], 'rc_test');
+      expect(json['relayClientReconnectSecret'], 'reconnect_secret');
+
+      final restored = AppConfig.fromJson(json);
+      expect(restored.relaySessionId, 'rs_test');
+      expect(restored.relayClientId, 'rc_test');
+      expect(restored.relayClientReconnectSecret, 'reconnect_secret');
     });
 
     test('relay url validation rejects public ws and http schemes', () {

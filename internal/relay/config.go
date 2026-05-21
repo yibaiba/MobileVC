@@ -2,6 +2,7 @@ package relay
 
 import (
 	"fmt"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -23,9 +24,16 @@ const (
 	defaultPingInterval            = 30 * time.Second
 	defaultPongTimeout             = 10 * time.Second
 	defaultMaxControlFrameBytes    = 16 * 1024
+	defaultMaxPayloadBytes         = 8 * 1024 * 1024
 	defaultForwardQueueSize        = 64
-	MaxPayloadBytes                = 1024 * 1024
+	defaultHTTPAllowedRoutes       = "GET:/healthz,GET:/version,GET:/download"
+	defaultWSAllowedRoutes         = "GET:/ws"
 )
+
+type RouteRule struct {
+	Method string
+	Path   string
+}
 
 type Config struct {
 	Addr                    string
@@ -42,19 +50,128 @@ type Config struct {
 	PingInterval            time.Duration
 	PongTimeout             time.Duration
 	MaxControlFrameBytes    int64
+	MaxPayloadBytes         int
 	ForwardQueueSize        int
 	TrustedProxyCIDRs       string
+	HTTPAllowedRoutes       []RouteRule
+	WSAllowedRoutes         []RouteRule
+}
+
+type Overrides struct {
+	Addr                    string
+	PublicURL               string
+	PairingTTL              time.Duration
+	AgentGracePeriod        time.Duration
+	PairingHandshakeTimeout time.Duration
+	AgentRegisterTimeout    time.Duration
+	MaxPairingFailuresPerIP int
+	MaxSessions             int
+	MaxAgentConns           int
+	MaxClientConns          int
+	MaxConnsPerIP           int
+	PingInterval            time.Duration
+	PongTimeout             time.Duration
+	MaxControlFrameBytes    int64
+	MaxPayloadBytes         int
+	ForwardQueueSize        int
+	TrustedProxyCIDRs       string
+	HTTPAllowlist           string
+	WSAllowlist             string
 }
 
 func LoadConfigFromEnv() (Config, error) {
+	return LoadConfig(Overrides{})
+}
+
+func LoadConfig(overrides Overrides) (Config, error) {
 	cfg, err := loadConfigFromEnv()
 	if err != nil {
+		return Config{}, err
+	}
+	if err := applyOverrides(&cfg, overrides); err != nil {
 		return Config{}, err
 	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+func applyOverrides(cfg *Config, overrides Overrides) error {
+	if strings.TrimSpace(overrides.Addr) != "" {
+		cfg.Addr = strings.TrimSpace(overrides.Addr)
+	}
+	if strings.TrimSpace(overrides.PublicURL) != "" {
+		cfg.PublicURL = strings.TrimSpace(overrides.PublicURL)
+	}
+	applyDurationOverrides(cfg, overrides)
+	applyIntegerOverrides(cfg, overrides)
+	if strings.TrimSpace(overrides.TrustedProxyCIDRs) != "" {
+		cfg.TrustedProxyCIDRs = strings.TrimSpace(overrides.TrustedProxyCIDRs)
+	}
+	if strings.TrimSpace(overrides.HTTPAllowlist) != "" {
+		rules, err := parseRouteRules(overrides.HTTPAllowlist)
+		if err != nil {
+			return fmt.Errorf("--http-allowlist: %w", err)
+		}
+		cfg.HTTPAllowedRoutes = rules
+	}
+	if strings.TrimSpace(overrides.WSAllowlist) != "" {
+		rules, err := parseRouteRules(overrides.WSAllowlist)
+		if err != nil {
+			return fmt.Errorf("--ws-allowlist: %w", err)
+		}
+		cfg.WSAllowedRoutes = rules
+	}
+	return nil
+}
+
+func applyDurationOverrides(cfg *Config, overrides Overrides) {
+	if overrides.PairingTTL > 0 {
+		cfg.PairingTTL = overrides.PairingTTL
+	}
+	if overrides.AgentGracePeriod > 0 {
+		cfg.AgentGracePeriod = overrides.AgentGracePeriod
+	}
+	if overrides.PairingHandshakeTimeout > 0 {
+		cfg.PairingHandshakeTimeout = overrides.PairingHandshakeTimeout
+	}
+	if overrides.AgentRegisterTimeout > 0 {
+		cfg.AgentRegisterTimeout = overrides.AgentRegisterTimeout
+	}
+	if overrides.PingInterval > 0 {
+		cfg.PingInterval = overrides.PingInterval
+	}
+	if overrides.PongTimeout > 0 {
+		cfg.PongTimeout = overrides.PongTimeout
+	}
+}
+
+func applyIntegerOverrides(cfg *Config, overrides Overrides) {
+	if overrides.MaxPairingFailuresPerIP > 0 {
+		cfg.MaxPairingFailuresPerIP = overrides.MaxPairingFailuresPerIP
+	}
+	if overrides.MaxSessions > 0 {
+		cfg.MaxSessions = overrides.MaxSessions
+	}
+	if overrides.MaxAgentConns > 0 {
+		cfg.MaxAgentConns = overrides.MaxAgentConns
+	}
+	if overrides.MaxClientConns > 0 {
+		cfg.MaxClientConns = overrides.MaxClientConns
+	}
+	if overrides.MaxConnsPerIP > 0 {
+		cfg.MaxConnsPerIP = overrides.MaxConnsPerIP
+	}
+	if overrides.MaxControlFrameBytes > 0 {
+		cfg.MaxControlFrameBytes = overrides.MaxControlFrameBytes
+	}
+	if overrides.MaxPayloadBytes > 0 {
+		cfg.MaxPayloadBytes = overrides.MaxPayloadBytes
+	}
+	if overrides.ForwardQueueSize > 0 {
+		cfg.ForwardQueueSize = overrides.ForwardQueueSize
+	}
 }
 
 func loadConfigFromEnv() (Config, error) {
@@ -77,6 +194,14 @@ func loadConfigFromEnv() (Config, error) {
 		AgentGracePeriod:  grace,
 		TrustedProxyCIDRs: strings.TrimSpace(os.Getenv("RELAY_TRUSTED_PROXY_CIDRS")),
 	}
+	cfg.HTTPAllowedRoutes, err = parseRouteRules(getEnv("RELAY_HTTP_ALLOWLIST", defaultHTTPAllowedRoutes))
+	if err != nil {
+		return Config{}, fmt.Errorf("RELAY_HTTP_ALLOWLIST: %w", err)
+	}
+	cfg.WSAllowedRoutes, err = parseRouteRules(getEnv("RELAY_WS_ALLOWLIST", defaultWSAllowedRoutes))
+	if err != nil {
+		return Config{}, fmt.Errorf("RELAY_WS_ALLOWLIST: %w", err)
+	}
 	applyLimitConfig(&cfg, limits)
 	return cfg, nil
 }
@@ -92,6 +217,7 @@ type limitConfig struct {
 	PingInterval            time.Duration
 	PongTimeout             time.Duration
 	MaxControlFrameBytes    int64
+	MaxPayloadBytes         int
 	ForwardQueueSize        int
 }
 
@@ -131,6 +257,7 @@ func applyLimitConfig(cfg *Config, limits limitConfig) {
 	cfg.PingInterval = limits.PingInterval
 	cfg.PongTimeout = limits.PongTimeout
 	cfg.MaxControlFrameBytes = limits.MaxControlFrameBytes
+	cfg.MaxPayloadBytes = limits.MaxPayloadBytes
 	cfg.ForwardQueueSize = limits.ForwardQueueSize
 }
 
@@ -144,7 +271,7 @@ func (c Config) Validate() error {
 	if c.PairingTTL <= 0 || c.AgentGracePeriod <= 0 {
 		return fmt.Errorf("relay ttl and grace period must be positive")
 	}
-	if c.ForwardQueueSize <= 0 || c.MaxControlFrameBytes <= 0 {
+	if c.ForwardQueueSize <= 0 || c.MaxControlFrameBytes <= 0 || c.MaxPayloadBytes <= 0 {
 		return fmt.Errorf("relay frame limits must be positive")
 	}
 	if c.MaxSessions <= 0 || c.MaxAgentConns <= 0 || c.MaxClientConns <= 0 || c.MaxConnsPerIP <= 0 {
@@ -153,7 +280,43 @@ func (c Config) Validate() error {
 	if c.PingInterval <= 0 || c.PongTimeout <= 0 {
 		return fmt.Errorf("relay ping settings must be positive")
 	}
+	if len(c.HTTPAllowedRoutes) == 0 && len(c.WSAllowedRoutes) == 0 {
+		return fmt.Errorf("relay route allowlist cannot be empty")
+	}
 	return nil
+}
+
+func parseRouteRules(raw string) ([]RouteRule, error) {
+	parts := strings.Split(raw, ",")
+	rules := make([]RouteRule, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		rule, err := parseRouteRule(part)
+		if err != nil {
+			return nil, err
+		}
+		rules = append(rules, rule)
+	}
+	return rules, nil
+}
+
+func parseRouteRule(raw string) (RouteRule, error) {
+	method, path, ok := strings.Cut(strings.TrimSpace(raw), ":")
+	if !ok {
+		return RouteRule{}, fmt.Errorf("route %q must use METHOD:/path", raw)
+	}
+	method = strings.ToUpper(strings.TrimSpace(method))
+	path = strings.TrimSpace(path)
+	if method == "" || path == "" || !strings.HasPrefix(path, "/") {
+		return RouteRule{}, fmt.Errorf("route %q must use METHOD:/path", raw)
+	}
+	if method != http.MethodGet && method != http.MethodPost {
+		return RouteRule{}, fmt.Errorf("route %q uses unsupported method %s", raw, method)
+	}
+	return RouteRule{Method: method, Path: path}, nil
 }
 
 func getEnv(key string, fallback string) string {

@@ -18,13 +18,11 @@ import (
 	"github.com/gorilla/websocket"
 
 	"mobilevc/internal/adb"
-	"mobilevc/internal/config"
 	"mobilevc/internal/data"
 	"mobilevc/internal/data/claudesync"
 	"mobilevc/internal/data/codexsync"
 	"mobilevc/internal/data/skills"
 	"mobilevc/internal/engine"
-	"mobilevc/internal/fileaccess"
 	"mobilevc/internal/logx"
 	"mobilevc/internal/protocol"
 	"mobilevc/internal/push"
@@ -59,20 +57,16 @@ func normalizePermissionModeForClaude(mode string) string {
 
 type Handler struct {
 	AuthToken       string
-	PublicMode      bool
-	AllowedOrigins  map[string]struct{}
 	NewExecRunner   func() engine.Runner
 	NewPtyRunner    func() engine.Runner
 	Upgrader        websocket.Upgrader
 	SkillLauncher   *skills.Launcher
 	SessionStore    data.Store
 	PushService     push.Service
-	FilePolicy      fileaccess.Policy
 	runtimeSessions *runtimeSessionRegistry
 
 	muProgressPush   sync.Mutex
 	lastProgressPush map[string]time.Time
-	muFilePolicy     sync.RWMutex
 }
 
 func NewHandler(authToken string, sessionStore data.Store) *Handler {
@@ -87,14 +81,15 @@ func NewHandler(authToken string, sessionStore data.Store) *Handler {
 		SkillLauncher:    skills.NewLauncher(sessionStore),
 		SessionStore:     sessionStore,
 		PushService:      &push.NoopService{},
-		FilePolicy:       mustDefaultFilePolicy(),
 		lastProgressPush: make(map[string]time.Time),
 		Upgrader: websocket.Upgrader{
 			ReadBufferSize:  1024,
 			WriteBufferSize: 1024,
+			CheckOrigin: func(r *http.Request) bool {
+				return true
+			},
 		},
 	}
-	handler.Upgrader.CheckOrigin = handler.checkOrigin
 	handler.runtimeSessions = newRuntimeSessionRegistry(func(sessionID string) *session.Service {
 		return session.NewService(sessionID, session.Dependencies{
 			NewExecRunner: handler.NewExecRunner,
@@ -114,80 +109,6 @@ func NewHandler(authToken string, sessionStore data.Store) *Handler {
 		sessionStore.UpsertSession(ctx, record)
 	})
 	return handler
-}
-
-func (h *Handler) ConfigurePublicAccess(publicMode bool, allowedOrigins []string) error {
-	origins, err := makeAllowedOrigins(allowedOrigins)
-	if err != nil {
-		return err
-	}
-	if publicMode && len(origins) == 0 {
-		return fmt.Errorf("allowed origins are required in public mode")
-	}
-	h.PublicMode = publicMode
-	h.AllowedOrigins = origins
-	h.Upgrader.CheckOrigin = h.checkOrigin
-	return nil
-}
-
-func makeAllowedOrigins(origins []string) (map[string]struct{}, error) {
-	if len(origins) == 0 {
-		return nil, nil
-	}
-	allowed := make(map[string]struct{}, len(origins))
-	for _, origin := range origins {
-		normalized, err := config.NormalizeOrigin(strings.TrimSpace(origin))
-		if err != nil {
-			return nil, err
-		}
-		allowed[normalized] = struct{}{}
-	}
-	return allowed, nil
-}
-
-func (h *Handler) checkOrigin(r *http.Request) bool {
-	origin := strings.TrimSpace(r.Header.Get("Origin"))
-	if origin == "" {
-		return true
-	}
-	if !h.PublicMode {
-		return true
-	}
-	normalized, err := config.NormalizeOrigin(origin)
-	if err != nil {
-		logx.Warn("ws", "reject websocket origin: remoteAddr=%s origin=%q err=%v", r.RemoteAddr, origin, err)
-		return false
-	}
-	if _, ok := h.AllowedOrigins[normalized]; ok {
-		return true
-	}
-	logx.Warn("ws", "reject websocket origin: remoteAddr=%s origin=%q", r.RemoteAddr, normalized)
-	return false
-}
-
-func mustDefaultFilePolicy() fileaccess.Policy {
-	policy, err := fileaccess.NewPolicy("", nil)
-	if err != nil {
-		panic(err)
-	}
-	return policy
-}
-
-func (h *Handler) currentFilePolicy() fileaccess.Policy {
-	h.muFilePolicy.RLock()
-	defer h.muFilePolicy.RUnlock()
-	return h.FilePolicy
-}
-
-func (h *Handler) applyClientTrustedFileRoots(roots []string) ([]string, error) {
-	h.muFilePolicy.Lock()
-	defer h.muFilePolicy.Unlock()
-	nextPolicy, err := h.FilePolicy.WithClientTrustedRoots(roots)
-	if err != nil {
-		return nil, err
-	}
-	h.FilePolicy = nextPolicy
-	return nextPolicy.Roots(), nil
 }
 
 type ClientConn interface {
@@ -1130,16 +1051,16 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			record, err := h.SessionStore.GetSession(ctx, req.SessionID)
 			if err != nil {
 				logx.Warn("ws", "delete session lookup failed: connectionID=%s sessionID=%s requestedSessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, req.SessionID, remoteAddr, err)
-				emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
+				emit(protocol.NewErrorEventWithCode(selectedSessionID, err.Error(), "", "session_delete_failed"))
 				continue
 			}
 			if record.Summary.External || strings.EqualFold(strings.TrimSpace(record.Summary.Source), "codex-native") {
-				emit(protocol.NewErrorEvent(selectedSessionID, "Codex 原生会话仅支持恢复，不支持在 MobileVC 内删除", ""))
+				emit(protocol.NewErrorEventWithCode(selectedSessionID, "Codex 原生会话仅支持恢复，不支持在 MobileVC 内删除", "", "session_delete_failed"))
 				continue
 			}
 			if err := h.SessionStore.DeleteSession(ctx, req.SessionID); err != nil {
 				logx.Warn("ws", "delete session failed: connectionID=%s sessionID=%s requestedSessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, req.SessionID, remoteAddr, err)
-				emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
+				emit(protocol.NewErrorEventWithCode(selectedSessionID, err.Error(), "", "session_delete_failed"))
 				continue
 			}
 			deletingCurrent := req.SessionID == selectedSessionID
@@ -1484,6 +1405,13 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				projection.Runtime.PermissionMode,
 			))
 			inputData := aiReq.Data
+			attachmentPaths, err := persistImageAttachments(ctx, sessionID, aiReq.ImageAttachments)
+			if err != nil {
+				logx.Warn("ws", "persist ai_turn image attachments failed: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, sessionID, remoteAddr, err)
+				emit(protocol.NewErrorEvent(sessionID, err.Error(), ""))
+				continue
+			}
+			inputData = appendAttachmentPathPrompt(inputData, attachmentPaths)
 			if strings.TrimSpace(inputData) != "" {
 				service.RecordUserInput(inputData)
 				skillPrefix, err := skills.BuildEnabledSkillsPrefix(h.SessionStore, projection.SessionContext)
@@ -1511,7 +1439,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				PermissionMode: permissionMode,
 				RuntimeMeta:    reqMeta,
 			}
-			rawUserText := strings.TrimRight(aiReq.Data, "\n")
+			rawUserText := strings.TrimRight(inputData, "\n")
 			if rawUserText == "" {
 				appendUserProjectionEntry(h.SessionStore, ctx, sessionID, command, "命令", connectionID, remoteAddr)
 				logx.Info("ws", "dispatch ai_turn execute: connectionID=%s sessionID=%s remoteAddr=%s command=%q cwd=%q permissionMode=%q", connectionID, sessionID, remoteAddr, command, cwd, permissionMode)
@@ -1551,7 +1479,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 					}),
 				))
 			}
-			err := service.SendInputOrResume(ctx, sessionID, execReq, inputReq, emitAndPersist)
+			err = service.SendInputOrResume(ctx, sessionID, execReq, inputReq, emitAndPersist)
 			if err != nil {
 				if errors.Is(err, session.ErrNoActiveRunner) || errors.Is(err, session.ErrResumeSessionUnavailable) {
 					execReq.InitialInput = inputData
@@ -1716,11 +1644,18 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				}
 				continue
 			}
-			service.RecordUserInput(inputEvent.Data)
 			controller := service.ControllerSnapshot()
 			projection := buildProjectionSnapshotFor(sessionID)
 			snapshot := service.RuntimeSnapshot()
 			inputData := inputEvent.Data
+			attachmentPaths, err := persistImageAttachments(ctx, sessionID, inputEvent.ImageAttachments)
+			if err != nil {
+				logx.Warn("ws", "persist input image attachments failed: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, sessionID, remoteAddr, err)
+				emit(protocol.NewErrorEvent(sessionID, err.Error(), ""))
+				continue
+			}
+			inputData = appendAttachmentPathPrompt(inputData, attachmentPaths)
+			service.RecordUserInput(inputData)
 			if shouldInjectEnabledSkillsForInput(
 				firstNonEmptyString(snapshot.ActiveMeta.Command, controller.CurrentCommand, projection.Runtime.Command),
 				snapshot.ActiveMeta.Engine,
@@ -2379,7 +2314,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid fs_list request: %v", err), ""))
 				continue
 			}
-			result, err := listDirectory(selectedSessionID, fsListReq.Path, h.currentFilePolicy())
+			result, err := listDirectory(selectedSessionID, fsListReq.Path)
 			if err != nil {
 				logx.Warn("ws", "list directory failed: connectionID=%s sessionID=%s remoteAddr=%s path=%q err=%v", connectionID, selectedSessionID, remoteAddr, fsListReq.Path, err)
 				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("list directory: %v", err), ""))
@@ -2393,27 +2328,13 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid fs_read request: %v", err), ""))
 				continue
 			}
-			result, err := readFile(selectedSessionID, fsReadReq.Path, h.currentFilePolicy())
+			result, err := readFile(selectedSessionID, fsReadReq.Path)
 			if err != nil {
 				logx.Warn("ws", "read file failed: connectionID=%s sessionID=%s remoteAddr=%s path=%q err=%v", connectionID, selectedSessionID, remoteAddr, fsReadReq.Path, err)
 				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("read file: %v", err), ""))
 				continue
 			}
 			emit(result)
-		case "file_access_config":
-			var configReq protocol.FileAccessConfigRequestEvent
-			if err := json.Unmarshal(payloadBytes, &configReq); err != nil {
-				logx.Warn("ws", "invalid file access config request: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
-				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid file access config request: %v", err), ""))
-				continue
-			}
-			roots, err := h.applyClientTrustedFileRoots(configReq.TrustedRoots)
-			if err != nil {
-				logx.Warn("ws", "apply file access config failed: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
-				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("file access config: %v", err), ""))
-				continue
-			}
-			emit(protocol.NewFileAccessConfigResultEvent(selectedSessionID, roots))
 		default:
 			logx.Warn("ws", "unknown action: connectionID=%s sessionID=%s remoteAddr=%s action=%s", connectionID, selectedSessionID, remoteAddr, clientEvent.Action)
 			emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("unknown action: %s", clientEvent.Action), ""))
@@ -3387,17 +3308,56 @@ func applyAICommandPreferences(command, engine, model, reasoningEffort string) s
 	case "codex":
 		parts := append([]string(nil), fields...)
 		model = strings.TrimSpace(model)
-		if model != "" && !commandHasFlag(parts, "-m", "--model") {
-			parts = append(parts, "-m", model)
+		if model != "" {
+			parts = upsertCommandFlagValue(parts, model, "-m", "--model")
 		}
 		effort := strings.TrimSpace(strings.ToLower(reasoningEffort))
-		if effort != "" && !commandHasCodexReasoningEffort(parts) {
-			parts = append(parts, "--config", "model_reasoning_effort="+effort)
+		if effort != "" {
+			parts = upsertCodexReasoningEffort(parts, effort)
 		}
 		return strings.Join(parts, " ")
 	default:
 		return trimmed
 	}
+}
+
+func upsertCommandFlagValue(fields []string, value string, flags ...string) []string {
+	for i, field := range fields {
+		for _, flag := range flags {
+			if field == flag {
+				if i+1 < len(fields) {
+					fields[i+1] = value
+					return fields
+				}
+				return append(fields, value)
+			}
+			if strings.HasPrefix(field, flag+"=") {
+				fields[i] = flag + "=" + value
+				return fields
+			}
+		}
+	}
+	return append(fields, flags[0], value)
+}
+
+func upsertCodexReasoningEffort(fields []string, effort string) []string {
+	configValue := "model_reasoning_effort=" + effort
+	for i, field := range fields {
+		lower := strings.ToLower(field)
+		if field == "--config" && i+1 < len(fields) && strings.Contains(strings.ToLower(fields[i+1]), "model_reasoning_effort=") {
+			fields[i+1] = configValue
+			return fields
+		}
+		if strings.HasPrefix(lower, "--config=model_reasoning_effort=") {
+			fields[i] = "--config=" + configValue
+			return fields
+		}
+		if strings.Contains(lower, "model_reasoning_effort=") {
+			fields[i] = configValue
+			return fields
+		}
+	}
+	return append(fields, "--config", configValue)
 }
 
 func commandHasFlag(fields []string, flags ...string) bool {
@@ -3535,8 +3495,13 @@ func parseMode(raw string) (engine.Mode, error) {
 	return session.ParseMode(raw)
 }
 
-func listDirectory(sessionID, rawPath string, policy fileaccess.Policy) (protocol.FSListResultEvent, error) {
-	absPath, err := policy.Resolve(rawPath)
+func listDirectory(sessionID, rawPath string) (protocol.FSListResultEvent, error) {
+	target := strings.TrimSpace(rawPath)
+	if target == "" {
+		target = "."
+	}
+	cleanTarget := filepath.Clean(target)
+	absPath, err := filepath.Abs(cleanTarget)
 	if err != nil {
 		return protocol.FSListResultEvent{}, err
 	}
@@ -3568,13 +3533,14 @@ func listDirectory(sessionID, rawPath string, policy fileaccess.Policy) (protoco
 	return protocol.NewFSListResultEvent(sessionID, absPath, items), nil
 }
 
-func readFile(sessionID, rawPath string, policy fileaccess.Policy) (protocol.FSReadResultEvent, error) {
+func readFile(sessionID, rawPath string) (protocol.FSReadResultEvent, error) {
 	target := strings.TrimSpace(rawPath)
 	if target == "" {
 		return protocol.FSReadResultEvent{}, fmt.Errorf("path is required")
 	}
 
-	absPath, err := policy.Resolve(target)
+	cleanTarget := filepath.Clean(target)
+	absPath, err := filepath.Abs(cleanTarget)
 	if err != nil {
 		return protocol.FSReadResultEvent{}, err
 	}

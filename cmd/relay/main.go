@@ -1,9 +1,12 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"net"
 	"net/http"
+	"os"
+	"time"
 
 	"mobilevc/internal/logx"
 	"mobilevc/internal/relay"
@@ -13,7 +16,15 @@ var version = "dev"
 
 func main() {
 	logx.Info("relay", "starting MobileVC relay")
-	cfg, err := relay.LoadConfigFromEnv()
+	overrides, showHelp, err := parseRelayFlags(os.Args[1:])
+	if err != nil {
+		logx.Error("relay", "parse flags failed: %v", err)
+		panic(err)
+	}
+	if showHelp {
+		return
+	}
+	cfg, err := relay.LoadConfig(overrides)
 	if err != nil {
 		logx.Error("relay", "load relay config failed: %v", err)
 		panic(err)
@@ -33,4 +44,62 @@ func main() {
 		logx.Error("relay", "server stopped unexpectedly: %v", err)
 		panic(err)
 	}
+}
+
+func parseRelayFlags(args []string) (relay.Overrides, bool, error) {
+	fs := flag.NewFlagSet("relay-server", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	var overrides relay.Overrides
+	var showHelp bool
+	var pairingTTL, gracePeriod, handshakeTimeout, registerTimeout, pingInterval, pongTimeout string
+	fs.StringVar(&overrides.Addr, "addr", "", "listen address, e.g. :9000")
+	fs.StringVar(&overrides.PublicURL, "public-url", "", "public relay ws:// or wss:// URL")
+	fs.StringVar(&pairingTTL, "pairing-ttl", "", "pairing TTL, e.g. 5m")
+	fs.StringVar(&gracePeriod, "agent-grace-period", "", "agent reconnect grace period, e.g. 60s")
+	fs.StringVar(&handshakeTimeout, "pairing-handshake-timeout", "", "client pairing handshake timeout, e.g. 10s")
+	fs.StringVar(&registerTimeout, "agent-register-timeout", "", "agent register timeout, e.g. 10s")
+	fs.IntVar(&overrides.MaxPairingFailuresPerIP, "max-pairing-failures-per-ip", 0, "max pairing failures per remote IP")
+	fs.IntVar(&overrides.MaxSessions, "max-sessions", 0, "max relay sessions")
+	fs.IntVar(&overrides.MaxAgentConns, "max-agent-conns", 0, "max agent websocket connections")
+	fs.IntVar(&overrides.MaxClientConns, "max-client-conns", 0, "max client websocket connections")
+	fs.IntVar(&overrides.MaxConnsPerIP, "max-conns-per-ip", 0, "max websocket connections per IP")
+	fs.StringVar(&pingInterval, "ping-interval", "", "websocket ping interval, e.g. 30s")
+	fs.StringVar(&pongTimeout, "pong-timeout", "", "websocket pong timeout, e.g. 10s")
+	fs.Int64Var(&overrides.MaxControlFrameBytes, "max-control-frame-bytes", 0, "max control frame bytes")
+	fs.IntVar(&overrides.MaxPayloadBytes, "max-payload-bytes", 0, "max decoded forward payload bytes")
+	fs.IntVar(&overrides.ForwardQueueSize, "forward-queue-size", 0, "bounded forward queue size per peer")
+	fs.StringVar(&overrides.TrustedProxyCIDRs, "trusted-proxy-cidrs", "", "comma-separated trusted proxy CIDRs")
+	fs.StringVar(&overrides.HTTPAllowlist, "http-allowlist", "", "comma-separated METHOD:/path HTTP allowlist")
+	fs.StringVar(&overrides.WSAllowlist, "ws-allowlist", "", "comma-separated METHOD:/path websocket allowlist")
+	fs.BoolVar(&showHelp, "help", false, "show help")
+	if err := fs.Parse(args); err != nil {
+		return relay.Overrides{}, false, err
+	}
+	if showHelp {
+		fs.Usage()
+		return overrides, true, nil
+	}
+	durations := []struct {
+		raw string
+		set func(time.Duration)
+		key string
+	}{
+		{pairingTTL, func(v time.Duration) { overrides.PairingTTL = v }, "--pairing-ttl"},
+		{gracePeriod, func(v time.Duration) { overrides.AgentGracePeriod = v }, "--agent-grace-period"},
+		{handshakeTimeout, func(v time.Duration) { overrides.PairingHandshakeTimeout = v }, "--pairing-handshake-timeout"},
+		{registerTimeout, func(v time.Duration) { overrides.AgentRegisterTimeout = v }, "--agent-register-timeout"},
+		{pingInterval, func(v time.Duration) { overrides.PingInterval = v }, "--ping-interval"},
+		{pongTimeout, func(v time.Duration) { overrides.PongTimeout = v }, "--pong-timeout"},
+	}
+	for _, duration := range durations {
+		if duration.raw == "" {
+			continue
+		}
+		parsed, err := time.ParseDuration(duration.raw)
+		if err != nil {
+			return relay.Overrides{}, false, fmt.Errorf("%s must be a valid duration: %w", duration.key, err)
+		}
+		duration.set(parsed)
+	}
+	return overrides, false, nil
 }

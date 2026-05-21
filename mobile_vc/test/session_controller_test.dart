@@ -59,6 +59,81 @@ void main() {
   });
 
   group('MobileVcWsService reconnect semantics', () {
+    test('relay pairing rejected message is actionable', () {
+      final error = RelayPairingException.fromFrame(const <String, dynamic>{
+        'type': 'relay.error',
+        'code': 'pairing_rejected',
+        'message': 'pairing rejected',
+      });
+
+      expect(error.code, 'pairing_rejected');
+      expect(error.toString(), contains('Relay 认证被拒绝'));
+      expect(error.toString(), isNot(contains('Bad state')));
+    });
+
+    test('relay payload too large message is actionable', () {
+      final message = relayErrorMessage(const <String, dynamic>{
+        'type': 'relay.error',
+        'code': 'payload_too_large',
+        'message': 'payload too large',
+      });
+
+      expect(message, contains('Relay 数据包过大'));
+      expect(message, contains('ADB 截屏流'));
+      expect(message, isNot(contains('payload too large')));
+    });
+
+    test('relay auth error is pending for reconnect attempts', () {
+      expect(
+        isRelayAuthError(
+          const <String, dynamic>{
+            'type': 'relay.error',
+            'code': 'pairing_rejected',
+          },
+          true,
+        ),
+        isTrue,
+      );
+      expect(
+        isRelayAuthError(
+          const <String, dynamic>{
+            'type': 'relay.error',
+            'code': 'payload_too_large',
+          },
+          false,
+        ),
+        isFalse,
+      );
+    });
+
+    test('relay reconnect rejection surfaces before timeout', () async {
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(server.close);
+      server.transform(WebSocketTransformer()).listen((socket) {
+        socket.listen((_) {
+          socket.add(jsonEncode(const <String, dynamic>{
+            'type': 'relay.error',
+            'version': 1,
+            'code': 'pairing_rejected',
+            'message': 'pairing rejected',
+          }));
+        });
+        addTearDown(socket.close);
+      });
+      final service = MobileVcWsService();
+      addTearDown(service.dispose);
+
+      expect(
+        service.connectRelay(
+          relayUrl: 'ws://127.0.0.1:${server.port}',
+          sessionId: 'rs_test',
+          clientId: 'rc_test',
+          clientReconnectSecret: 'bad_secret',
+        ),
+        throwsA(isA<RelayPairingException>()),
+      );
+    });
+
     test('replacing connection does not emit stale disconnect event', () async {
       final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
       addTearDown(server.close);
@@ -148,30 +223,7 @@ void main() {
       expect(service.disconnectCalls, 1);
     });
 
-    test('connect sends trusted file roots config to backend', () async {
-      SharedPreferences.setMockInitialValues({
-        'mobilevc.app_config': jsonEncode(const AppConfig(
-          trustedFileRoots: ['/Users/me/project', '/Users/me/Downloads'],
-        ).toJson()),
-      });
-      final service = _FakeMobileVcWsService();
-      final controller = SessionController(service: service);
-      await controller.initialize();
-      addTearDown(controller.disposeController);
-
-      await controller.connect();
-
-      final payload = service.sentPayloads.firstWhere(
-        (item) => item['action'] == 'file_access_config',
-      );
-      expect(payload['trustedRoots'], [
-        '/Users/me/project',
-        '/Users/me/Downloads',
-      ]);
-    });
-
-    test('relay connect validates url and clears one-time pairing fields',
-        () async {
+    test('relay connect validates url and persists reconnect fields', () async {
       SharedPreferences.setMockInitialValues({
         'mobilevc.app_config': jsonEncode(const AppConfig(
           connectionMode: 'relay',
@@ -198,14 +250,45 @@ void main() {
       expect(
           service.connectedRelays.single.relayUrl, 'wss://relay.example.test');
       expect(controller.config.relayUrl, 'wss://relay.example.test');
-      expect(controller.config.relaySessionId, isEmpty);
+      expect(controller.config.relaySessionId, 'rs_test');
       expect(controller.config.relayPairingSecret, isEmpty);
+      expect(controller.config.relayClientId, 'rc_test');
+      expect(controller.config.relayClientReconnectSecret, 'reconnect_secret');
       final prefs = await SharedPreferences.getInstance();
       final persisted = jsonDecode(prefs.getString('mobilevc.app_config')!)
           as Map<String, dynamic>;
       expect(persisted['relayUrl'], 'wss://relay.example.test');
-      expect(persisted.containsKey('relaySessionId'), isFalse);
+      expect(persisted['relaySessionId'], 'rs_test');
       expect(persisted.containsKey('relayPairingSecret'), isFalse);
+      expect(persisted['relayClientId'], 'rc_test');
+      expect(persisted['relayClientReconnectSecret'], 'reconnect_secret');
+    });
+
+    test('relay reconnect uses persisted client credentials', () async {
+      SharedPreferences.setMockInitialValues({
+        'mobilevc.app_config': jsonEncode(const AppConfig(
+          connectionMode: 'relay',
+          relayUrl: 'wss://relay.example.test',
+          relaySessionId: 'rs_test',
+          relayClientId: 'rc_test',
+          relayClientReconnectSecret: 'reconnect_secret',
+        ).toJson()),
+      });
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+
+      expect(service.connectedRelays.single.sessionId, 'rs_test');
+      expect(service.connectedRelays.single.pairingSecret, isEmpty);
+      expect(service.connectedRelays.single.clientId, 'rc_test');
+      expect(
+        service.connectedRelays.single.clientReconnectSecret,
+        'reconnect_secret',
+      );
+      expect(controller.connected, isTrue);
     });
 
     test('relay connect rejects public ws url before service connect',
@@ -226,23 +309,6 @@ void main() {
       expect(service.connectedRelays, isEmpty);
       expect(controller.connected, isFalse);
       expect(controller.connectionStage, SessionConnectionStage.failed);
-    });
-
-    test('save config while connected resends trusted file roots', () async {
-      final service = _FakeMobileVcWsService();
-      final controller = SessionController(service: service);
-      await controller.initialize();
-      addTearDown(controller.disposeController);
-      await controller.connect();
-      service.sentPayloads.clear();
-
-      await controller.saveConfig(
-        controller.config.copyWith(trustedFileRoots: ['/tmp/shared']),
-      );
-
-      expect(service.sentPayloads, hasLength(1));
-      expect(service.sentPayloads.single['action'], 'file_access_config');
-      expect(service.sentPayloads.single['trustedRoots'], ['/tmp/shared']);
     });
 
     test('notification restore immediately loads target session when connected',
@@ -400,7 +466,8 @@ void main() {
       controller.sendInputText('你好');
 
       expect(service.sentPayloads, isNotEmpty);
-      expect(service.sentPayloads.last['action'], 'exec');
+      expect(service.sentPayloads.last['action'], 'ai_turn');
+      expect(service.sentPayloads.last['data'], '你好\n');
       expect(controller.timeline.any((item) => item.body.contains('请先在上方完成授权')),
           isFalse);
     });
@@ -968,7 +1035,7 @@ void main() {
   });
 
   group('SessionController Claude turn dispatch', () {
-    test('sendInputText 非等待态输入普通文本时仍按 shell 命令执行', () async {
+    test('sendInputText 非等待态输入 shell 命令时按 shell 执行', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);
       await controller.initialize();
@@ -983,6 +1050,59 @@ void main() {
       expect(service.sentPayloads, hasLength(1));
       expect(service.sentPayloads[0]['action'], 'exec');
       expect(service.sentPayloads[0]['cmd'], 'pwd');
+    });
+
+    test('sendInputText 非等待态输入自然语言时启动 AI turn', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.saveConfig(const AppConfig(host: '192.168.0.2'));
+      await controller.connect();
+      service.sentPayloads.clear();
+
+      controller.sendInputText('你好');
+
+      expect(service.sentPayloads, hasLength(1));
+      expect(service.sentPayloads[0]['action'], 'ai_turn');
+      expect(service.sentPayloads[0]['engine'], 'claude');
+      expect(service.sentPayloads[0]['data'], '你好\n');
+      expect(service.sentPayloads[0].containsKey('cmd'), isFalse);
+    });
+
+    test('sendInputTextWithImages sends image attachments to AI turn',
+        () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.saveConfig(const AppConfig(host: '192.168.0.2'));
+      await controller.connect();
+      service.sentPayloads.clear();
+
+      controller.sendInputTextWithImages(
+        '看图',
+        [
+          ChatImageAttachment(
+            name: 'screen.png',
+            mimeType: 'image/png',
+            bytes: utf8.encode('png-bytes'),
+          ),
+        ],
+      );
+
+      expect(service.sentPayloads, hasLength(1));
+      final payload = service.sentPayloads.single;
+      expect(payload['action'], 'ai_turn');
+      expect(payload['data'], '看图\n');
+      final attachments = payload['imageAttachments'] as List<dynamic>;
+      expect(attachments, hasLength(1));
+      final attachment = attachments.single as Map<String, dynamic>;
+      expect(attachment['name'], 'screen.png');
+      expect(attachment['mimeType'], 'image/png');
+      expect(attachment['data'], base64Encode(utf8.encode('png-bytes')));
     });
 
     test('sendInputText 非等待态输入 claude 时只启动 Claude 不发送空 input', () async {
@@ -1091,6 +1211,47 @@ void main() {
       expect(service.sentPayloads[0]['engine'], 'codex');
       expect(service.sentPayloads[0]['model'], 'gpt-5-codex');
       expect(service.sentPayloads[0]['reasoningEffort'], 'high');
+    });
+
+    test('Codex 已选择 gpt-5.5 时不会从旧 runtime command 回退到 gpt-5-codex', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.saveConfig(
+        const AppConfig(
+          engine: 'codex',
+          codexModel: 'gpt-5.5',
+          codexReasoningEffort: 'high',
+        ),
+      );
+      await controller.connect();
+      service.emit(
+        SessionStateEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-1',
+          runtimeMeta: const RuntimeMeta(
+            command: 'codex -m gpt-5-codex',
+            engine: 'codex',
+            model: 'gpt-5-codex',
+          ),
+          raw: const {'type': 'session_state'},
+          state: 'IDLE',
+          message: 'old codex session',
+        ),
+      );
+      await _flushEvents();
+      service.sentPayloads.clear();
+
+      controller.sendInputText('codex 你好');
+
+      expect(service.sentPayloads, hasLength(1));
+      expect(service.sentPayloads[0]['action'], 'ai_turn');
+      expect(service.sentPayloads[0]['engine'], 'codex');
+      expect(service.sentPayloads[0]['model'], 'gpt-5.5');
+      expect(service.sentPayloads[0]['reasoningEffort'], 'high');
+      expect(service.sentPayloads[0].containsKey('command'), isFalse);
     });
 
     test('Codex 启动时不会把残留的 Claude 模型配置发给后端', () async {
@@ -2022,6 +2183,54 @@ void main() {
 
       expect(service.sentPayloads, isNotEmpty);
       expect(service.sentPayloads.last['action'], 'stop');
+    });
+
+    test('提交后未收到运行态时点击 stop 也会发送 stop action', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.sentPayloads.clear();
+
+      controller.sendInputText('codex 你好');
+      expect(service.sentPayloads.single['action'], 'ai_turn');
+
+      controller.stopCurrentRun();
+
+      expect(service.sentPayloads.last['action'], 'stop');
+      expect(controller.activityBannerTitle, '正在停止');
+    });
+
+    test('Codex failed session state 会解除 busy 和 stop 状态', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.sentPayloads.clear();
+
+      controller.sendInputText('codex 你好');
+      controller.stopCurrentRun();
+      expect(controller.activityBannerTitle, '正在停止');
+
+      service.emit(
+        SessionStateEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-1',
+          runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+          raw: const {'type': 'session_state'},
+          state: 'FAILED',
+          message: 'unexpected status 503 Service Unavailable',
+        ),
+      );
+      await _flushEvents();
+
+      expect(controller.isSessionBusy, isFalse);
+      expect(controller.canStopCurrentRun, isFalse);
+      expect(controller.activityBannerVisible, isFalse);
     });
 
     test('运行中点击 stop 后只发送停止请求并显示停止中', () async {
@@ -3616,6 +3825,103 @@ void main() {
         ['session-current', 'session-other'],
       );
       expect(controller.selectedSessionId, 'session-current');
+    });
+
+    test('deleteSession 立即移除本地会话并发送删除请求', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      service.emit(
+        SessionListResultEvent(
+          timestamp: _timestamp,
+          sessionId: '',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_list_result'},
+          items: const [
+            SessionSummary(id: 'session-a', title: 'Session A'),
+            SessionSummary(id: 'session-b', title: 'Session B'),
+          ],
+        ),
+      );
+      await _flushEvents();
+      service.sentPayloads.clear();
+
+      controller.deleteSession('session-a');
+      await _flushEvents();
+
+      expect(controller.sessions.map((item) => item.id).toList(), [
+        'session-b',
+      ]);
+      expect(service.sentPayloads, hasLength(1));
+      expect(service.sentPayloads.single, {
+        'action': 'session_delete',
+        'sessionId': 'session-a',
+      });
+
+      service.emit(
+        SessionListResultEvent(
+          timestamp: _timestamp.add(const Duration(seconds: 1)),
+          sessionId: '',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_list_result'},
+          items: const [
+            SessionSummary(id: 'session-b', title: 'Session B'),
+          ],
+        ),
+      );
+      await _flushEvents();
+
+      expect(controller.sessions.map((item) => item.id).toList(), [
+        'session-b',
+      ]);
+    });
+
+    test('deleteSession 失败时恢复本地会话并显示错误', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      service.emit(
+        SessionListResultEvent(
+          timestamp: _timestamp,
+          sessionId: '',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_list_result'},
+          items: const [
+            SessionSummary(id: 'session-a', title: 'Session A'),
+            SessionSummary(id: 'session-b', title: 'Session B'),
+          ],
+        ),
+      );
+      await _flushEvents();
+
+      controller.deleteSession('session-a');
+      await _flushEvents();
+      expect(controller.sessions.map((item) => item.id).toList(), [
+        'session-b',
+      ]);
+
+      service.emit(
+        ErrorEvent(
+          timestamp: _timestamp.add(const Duration(seconds: 1)),
+          sessionId: '',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'error'},
+          message: 'store write failed',
+          code: 'session_delete_failed',
+        ),
+      );
+      await _flushEvents();
+
+      expect(controller.sessions.map((item) => item.id).toList(), [
+        'session-a',
+        'session-b',
+      ]);
+      expect(controller.timeline.last.kind, 'error');
+      expect(controller.timeline.last.body, contains('删除会话失败'));
     });
 
     test('历史 terminal entry 优先用 text，并可恢复成 markdown', () async {
@@ -7870,14 +8176,34 @@ class _FakeMobileVcWsService extends MobileVcWsService {
   Future<void> connectRelay({
     required String relayUrl,
     required String sessionId,
-    required String pairingSecret,
+    String pairingSecret = '',
+    String clientId = '',
+    String clientReconnectSecret = '',
   }) async {
     connectCalls++;
+    _relaySession = RelaySession(
+      sessionId: sessionId,
+      clientId: clientId.trim().isNotEmpty ? clientId : 'rc_test',
+      clientReconnectSecret: clientReconnectSecret.trim().isNotEmpty
+          ? clientReconnectSecret
+          : 'reconnect_secret',
+    );
     connectedRelays.add(_RelayConnectCall(
       relayUrl: relayUrl,
       sessionId: sessionId,
       pairingSecret: pairingSecret,
+      clientId: clientId,
+      clientReconnectSecret: clientReconnectSecret,
     ));
+  }
+
+  RelaySession? _relaySession;
+
+  @override
+  RelaySession? takeRelaySession() {
+    final session = _relaySession;
+    _relaySession = null;
+    return session;
   }
 
   @override
@@ -7906,9 +8232,13 @@ class _RelayConnectCall {
     required this.relayUrl,
     required this.sessionId,
     required this.pairingSecret,
+    required this.clientId,
+    required this.clientReconnectSecret,
   });
 
   final String relayUrl;
   final String sessionId;
   final String pairingSecret;
+  final String clientId;
+  final String clientReconnectSecret;
 }

@@ -23,6 +23,8 @@ type gatewayConn struct {
 	readCh     chan readResult
 	readDone   chan struct{}
 	readErr    error
+	closeCh    chan struct{}
+	closeOnce  sync.Once
 }
 
 type readResult struct {
@@ -36,7 +38,7 @@ func newGatewayConn(conn *websocket.Conn, sessionID string) *gatewayConn {
 	gateway := &gatewayConn{
 		conn: conn, sessionID: sessionID,
 		attachCh: make(chan struct{}), readCh: make(chan readResult, relayReadQueueSize),
-		readDone: make(chan struct{}),
+		readDone: make(chan struct{}), closeCh: make(chan struct{}),
 	}
 	go gateway.readLoop()
 	return gateway
@@ -71,12 +73,18 @@ func (c *gatewayConn) readLoop() {
 		if c.acceptClientAttached(env) {
 			continue
 		}
+		if c.acceptRelayPing(env) {
+			continue
+		}
 		c.sendReadResult(readResult{env: env})
 	}
 }
 
 func (c *gatewayConn) sendReadResult(result readResult) {
-	c.readCh <- result
+	select {
+	case c.readCh <- result:
+	case <-c.closeCh:
+	}
 }
 
 func (c *gatewayConn) decodeForward(env relay.ForwardEnvelope, v any) error {
@@ -87,7 +95,7 @@ func (c *gatewayConn) decodeForward(env relay.ForwardEnvelope, v any) error {
 		return fmt.Errorf("invalid relay forward routing")
 	}
 	c.setClientID(env.ClientID)
-	payload, err := base64.RawURLEncoding.DecodeString(env.Payload)
+	payload, err := relay.DecodePayloadBase64URL(env.Payload)
 	if err != nil {
 		return fmt.Errorf("decode relay payload: %w", err)
 	}
@@ -113,6 +121,20 @@ func (c *gatewayConn) acceptClientAttached(env relay.ForwardEnvelope) bool {
 	return true
 }
 
+func (c *gatewayConn) acceptRelayPing(env relay.ForwardEnvelope) bool {
+	if env.Type != relay.TypeRelayPing {
+		return false
+	}
+	if strings.TrimSpace(env.SessionID) != "" && env.SessionID != c.sessionID {
+		return false
+	}
+	if err := c.writeControl(relay.ControlFrame{Type: relay.TypeRelayPong, Version: relay.Version}); err != nil {
+		c.setReadError(err)
+		c.sendReadResult(readResult{err: err})
+	}
+	return true
+}
+
 func (c *gatewayConn) setClientID(clientID string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -127,6 +149,8 @@ func (c *gatewayConn) waitAttached() error {
 	case <-c.attachCh:
 		return nil
 	case <-c.readDone:
+		return c.readError()
+	case <-c.closeCh:
 		return c.readError()
 	}
 }
@@ -147,9 +171,13 @@ func (c *gatewayConn) readError() error {
 }
 
 func (c *gatewayConn) writeForward(payload []byte) error {
+	return c.writeControl(c.forwardEnvelope(payload))
+}
+
+func (c *gatewayConn) writeControl(frame any) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.conn.WriteJSON(c.forwardEnvelope(payload))
+	return c.conn.WriteJSON(frame)
 }
 
 func (c *gatewayConn) forwardEnvelope(payload []byte) relay.ForwardEnvelope {
@@ -168,6 +196,7 @@ func (c *gatewayConn) forwardEnvelope(payload []byte) relay.ForwardEnvelope {
 }
 
 func (c *gatewayConn) Close() error {
+	c.closeOnce.Do(func() { close(c.closeCh) })
 	return c.conn.Close()
 }
 

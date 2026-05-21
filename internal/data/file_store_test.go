@@ -63,6 +63,25 @@ func TestFileStoreDeleteSessionRejectsMissingSession(t *testing.T) {
 	}
 }
 
+func TestFileStoreSavePushTokenUsesOwnerOnlyPermissions(t *testing.T) {
+	fs, err := NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new file store: %v", err)
+	}
+
+	if err := fs.SavePushToken(context.Background(), "session-1", "tok", "ios"); err != nil {
+		t.Fatalf("SavePushToken failed: %v", err)
+	}
+
+	info, err := os.Stat(fs.pushTokensPath)
+	if err != nil {
+		t.Fatalf("stat push tokens: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("push token file mode: got %v, want 0600", got)
+	}
+}
+
 func TestFileStorePersistsSessionContext(t *testing.T) {
 	fs, err := NewFileStore(t.TempDir())
 	if err != nil {

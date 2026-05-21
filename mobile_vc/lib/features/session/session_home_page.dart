@@ -45,6 +45,8 @@ class SessionHomePage extends StatefulWidget {
 }
 
 class _SessionHomePageState extends State<SessionHomePage> {
+  static const int _maxImageAttachmentBytes = 4 * 1024 * 1024;
+
   final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
 
   SessionController get controller => widget.controller;
@@ -226,6 +228,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
         shouldShowReviewChoices: controller.shouldShowReviewChoices,
         shouldShowPlanChoices: controller.shouldShowPlanChoices,
         onSubmit: controller.sendInputText,
+        onAttachImage: () => _sendImageAttachment(context),
         onStop: controller.stopCurrentRun,
         onOpenSessions: () => _openSessions(context),
         onOpenRuntimeInfo: () => _openRuntimeInfo(context),
@@ -252,6 +255,84 @@ class _SessionHomePageState extends State<SessionHomePage> {
     _scaffoldKey.currentState?.openDrawer();
   }
 
+  Future<void> _sendImageAttachment(BuildContext context) async {
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      final result = await FilePicker.platform.pickFiles(
+        type: FileType.custom,
+        allowedExtensions: const ['jpg', 'jpeg', 'png', 'webp', 'gif'],
+        allowMultiple: false,
+        withData: true,
+      );
+      if (!context.mounted || result == null || result.files.isEmpty) {
+        return;
+      }
+      final file = result.files.single;
+      final bytes = file.bytes ?? await _readPickedFileBytes(file);
+      if (bytes == null || bytes.isEmpty) {
+        messenger
+          ..hideCurrentSnackBar()
+          ..showSnackBar(const SnackBar(content: Text('无法读取图片内容')));
+        return;
+      }
+      if (bytes.length > _maxImageAttachmentBytes) {
+        messenger
+          ..hideCurrentSnackBar()
+          ..showSnackBar(const SnackBar(content: Text('图片不能超过 4 MiB')));
+        return;
+      }
+      final mimeType = _imageMimeType(file.name);
+      if (mimeType.isEmpty) {
+        messenger
+          ..hideCurrentSnackBar()
+          ..showSnackBar(const SnackBar(content: Text('仅支持 JPG、PNG、WebP、GIF')));
+        return;
+      }
+      controller.sendInputTextWithImages(
+        '请查看这张图片。',
+        [
+          ChatImageAttachment(
+            name: file.name,
+            mimeType: mimeType,
+            bytes: bytes,
+          ),
+        ],
+      );
+    } catch (error) {
+      if (!context.mounted) {
+        return;
+      }
+      messenger
+        ..hideCurrentSnackBar()
+        ..showSnackBar(SnackBar(content: Text('发送图片失败：$error')));
+    }
+  }
+
+  Future<Uint8List?> _readPickedFileBytes(PlatformFile file) async {
+    final path = file.path;
+    if (path == null || path.trim().isEmpty) {
+      return null;
+    }
+    return File(path).readAsBytes();
+  }
+
+  String _imageMimeType(String name) {
+    final lower = name.toLowerCase();
+    if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) {
+      return 'image/jpeg';
+    }
+    if (lower.endsWith('.png')) {
+      return 'image/png';
+    }
+    if (lower.endsWith('.webp')) {
+      return 'image/webp';
+    }
+    if (lower.endsWith('.gif')) {
+      return 'image/gif';
+    }
+    return '';
+  }
+
   Future<void> _openConnectionConfig(BuildContext context) async {
     final hostController =
         TextEditingController(text: controller.config.displayHost);
@@ -259,9 +340,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
     final tokenController =
         TextEditingController(text: controller.config.token);
     final cwdController = TextEditingController(text: controller.config.cwd);
-    final trustedRootsController = TextEditingController(
-      text: controller.config.trustedFileRoots.join('\n'),
-    );
+    final linkController = TextEditingController();
     final permissionController =
         TextEditingController(text: controller.config.permissionMode);
     final iceHostController = TextEditingController(
@@ -280,6 +359,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
     var selectedEngine = controller.config.engine.trim().isEmpty
         ? 'claude'
         : controller.config.engine.trim();
+    var pendingConfig = controller.config;
 
     await showModalBottomSheet<void>(
       context: context,
@@ -303,6 +383,45 @@ class _SessionHomePageState extends State<SessionHomePage> {
                       : hostController.text.trim()),
             );
 
+            void applyScannedConfig(AppConfig scanned) {
+              pendingConfig = scanned;
+              hostController.text = scanned.displayHost;
+              portController.text = scanned.port;
+              tokenController.text = scanned.token;
+              cwdController.text = scanned.cwd;
+              iceHostController.text = scanned.adbIceHostOverride;
+              iceUsernameController.text = scanned.adbIceUsername;
+              iceCredentialController.text = scanned.adbIceCredential;
+              selectedEngine = scanned.engine.trim().isEmpty
+                  ? selectedEngine
+                  : scanned.engine.trim();
+              scanHint = scanned.isRelayMode
+                  ? '已导入 Relay 配对，点击连接完成配对'
+                  : '已回填 ${scanned.displayHost}:${scanned.port}${scanned.token.isNotEmpty ? ' 与 token' : ''}';
+            }
+
+            void showImportSnackBar(String message) {
+              ScaffoldMessenger.of(context)
+                ..hideCurrentSnackBar()
+                ..showSnackBar(SnackBar(content: Text(message)));
+            }
+
+            AppConfig? parseConnectionLink(String raw) {
+              return AppConfig.fromLaunchUri(
+                raw,
+                fallback: pendingConfig.copyWith(
+                  host: hostController.text.trim(),
+                  port: portController.text.trim(),
+                  token: tokenController.text.trim(),
+                  cwd: cwdController.text.trim(),
+                  engine: selectedEngine,
+                  permissionMode: permissionController.text.trim(),
+                  fastMode: controller.fastMode,
+                  adbIceServersJson: encodedIceConfig(),
+                ),
+              );
+            }
+
             Future<void> handleScan() async {
               final scannedRaw = await showModalBottomSheet<String>(
                 context: context,
@@ -312,50 +431,36 @@ class _SessionHomePageState extends State<SessionHomePage> {
               if (!context.mounted || scannedRaw == null) {
                 return;
               }
-              final scanned = AppConfig.fromLaunchUri(
-                scannedRaw,
-                fallback: AppConfig(
-                  host: hostController.text.trim(),
-                  port: portController.text.trim(),
-                  token: tokenController.text.trim(),
-                  cwd: cwdController.text.trim(),
-                  engine: selectedEngine,
-                  claudeModel: controller.config.claudeModel,
-                  codexModel: controller.config.codexModel,
-                  codexReasoningEffort: controller.config.codexReasoningEffort,
-                  permissionMode: permissionController.text.trim(),
-                  fastMode: controller.fastMode,
-                  adbIceServersJson: encodedIceConfig(),
-                  trustedFileRoots:
-                      _trustedRootsFromText(trustedRootsController.text),
-                ),
-              );
+              final scanned = parseConnectionLink(scannedRaw);
               if (scanned == null) {
                 setSheetState(() {
                   scanHint = '扫码内容无法识别，请确认二维码来自 MobileVC 启动器。';
                 });
                 return;
               }
-              hostController.text = scanned.displayHost;
-              portController.text = scanned.port;
-              tokenController.text = scanned.token;
-              cwdController.text = scanned.cwd;
-              trustedRootsController.text = scanned.trustedFileRoots.join('\n');
-              iceHostController.text = scanned.adbIceHostOverride;
-              iceUsernameController.text = scanned.adbIceUsername;
-              iceCredentialController.text = scanned.adbIceCredential;
               setSheetState(() {
-                selectedEngine = scanned.engine.trim().isEmpty
-                    ? selectedEngine
-                    : scanned.engine.trim();
-                scanHint =
-                    '已回填 ${scanned.displayHost}:${scanned.port}${scanned.token.isNotEmpty ? ' 与 token' : ''}';
+                linkController.text = scannedRaw.trim();
+                applyScannedConfig(scanned);
+              });
+              showImportSnackBar(scanHint);
+            }
+
+            void handlePasteLink() {
+              final scanned = parseConnectionLink(linkController.text);
+              setSheetState(() {
+                if (scanned == null) {
+                  scanHint = '链接无法识别，请粘贴 mobilevc://relay/v1 或启动器二维码内容。';
+                  showImportSnackBar(scanHint);
+                  return;
+                }
+                applyScannedConfig(scanned);
+                showImportSnackBar(scanHint);
               });
             }
 
             Future<void> persistConfig({bool connect = false}) async {
               final hostText = hostController.text.trim();
-              final nextConfig = controller.config.copyWith(
+              final nextConfig = pendingConfig.copyWith(
                 host: hostText,
                 port: _portForHostInput(hostText, portController.text),
                 token: tokenController.text.trim(),
@@ -364,8 +469,6 @@ class _SessionHomePageState extends State<SessionHomePage> {
                 permissionMode: permissionController.text.trim(),
                 fastMode: controller.fastMode,
                 adbIceServersJson: encodedIceConfig(),
-                trustedFileRoots:
-                    _trustedRootsFromText(trustedRootsController.text),
               );
               await controller.saveConfig(nextConfig);
               if (connect) {
@@ -402,6 +505,25 @@ class _SessionHomePageState extends State<SessionHomePage> {
                         label: const Text('扫码连接'),
                       ),
                     ),
+                    const SizedBox(height: 10),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: TextField(
+                            controller: linkController,
+                            decoration: const InputDecoration(
+                              labelText: '连接链接',
+                              hintText: 'mobilevc://relay/v1?...',
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        FilledButton.tonal(
+                          onPressed: handlePasteLink,
+                          child: const Text('导入'),
+                        ),
+                      ],
+                    ),
                     if (scanHint.isNotEmpty) ...[
                       const SizedBox(height: 8),
                       Text(
@@ -430,21 +552,6 @@ class _SessionHomePageState extends State<SessionHomePage> {
                     TextField(
                         controller: cwdController,
                         decoration: const InputDecoration(labelText: 'CWD')),
-                    const SizedBox(height: 10),
-                    TextField(
-                      controller: trustedRootsController,
-                      minLines: 2,
-                      maxLines: 4,
-                      decoration: const InputDecoration(
-                        labelText: '可信文件目录',
-                        hintText: '/Users/me/project\n/Users/me/Downloads',
-                      ),
-                    ),
-                    const SizedBox(height: 6),
-                    Text(
-                      '每行一个目录；后端会校验目录存在后才允许文件浏览和下载访问。',
-                      style: Theme.of(context).textTheme.bodySmall,
-                    ),
                     const SizedBox(height: 10),
                     DropdownButtonFormField<String>(
                       initialValue: selectedEngine,
@@ -1964,18 +2071,4 @@ String _portForHostInput(String rawHost, String rawPort) {
     return rawPort.trim();
   }
   return uri.hasPort && uri.port > 0 ? uri.port.toString() : '';
-}
-
-List<String> _trustedRootsFromText(String text) {
-  final seen = <String>{};
-  final roots = <String>[];
-  for (final line in text.split('\n')) {
-    final item = line.trim();
-    if (item.isEmpty || seen.contains(item)) {
-      continue;
-    }
-    seen.add(item);
-    roots.add(item);
-  }
-  return roots;
 }

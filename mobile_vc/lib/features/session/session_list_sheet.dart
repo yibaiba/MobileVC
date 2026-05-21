@@ -138,8 +138,16 @@ class SessionListSheet extends StatelessWidget {
                               child: Icon(Icons.check_circle, size: 18),
                             ),
                           IconButton(
-                            onPressed:
-                                item.external ? null : () => onDelete(item.id),
+                            tooltip: _canDeleteSession(item)
+                                ? '删除会话'
+                                : '不能删除电脑端原生会话',
+                            onPressed: () {
+                              if (!_canDeleteSession(item)) {
+                                _showDeleteUnavailable(context, item);
+                                return;
+                              }
+                              onDelete(item.id);
+                            },
                             icon: const Icon(Icons.delete_outline),
                           ),
                         ],
@@ -155,6 +163,31 @@ class SessionListSheet extends StatelessWidget {
       ),
     );
   }
+}
+
+bool _canDeleteSession(SessionSummary item) {
+  final ownership = item.ownership.trim().toLowerCase();
+  if (ownership == 'mobilevc') {
+    return true;
+  }
+  if (ownership == 'codex-native' || ownership == 'claude-native') {
+    return false;
+  }
+  final source = item.source.trim().toLowerCase();
+  final runtimeSource = item.runtime.source.trim().toLowerCase();
+  return !item.external &&
+      source != 'codex-native' &&
+      source != 'claude-native' &&
+      runtimeSource != 'codex-native' &&
+      runtimeSource != 'claude-native';
+}
+
+void _showDeleteUnavailable(BuildContext context, SessionSummary item) {
+  final sourceLabel = _sourceLabel(item);
+  final prefix = sourceLabel.isEmpty ? '电脑端原生会话' : sourceLabel;
+  ScaffoldMessenger.of(context).showSnackBar(
+    SnackBar(content: Text('$prefix 只能恢复，不能在 MobileVC 内删除')),
+  );
 }
 
 String _sourceLabel(SessionSummary item) {

@@ -6,18 +6,11 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-
-	"mobilevc/internal/fileaccess"
 )
 
-func TestServeDownloadAllowsWorkspaceFile(t *testing.T) {
-	workspace := t.TempDir()
-	filePath := filepath.Join(workspace, "session.log")
-	if err := os.WriteFile(filePath, []byte("ok"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	policy := newDownloadTestPolicy(t, workspace, nil)
-	resp := requestDownload(t, policy, filePath)
+func TestServeDownloadAllowsExistingFile(t *testing.T) {
+	filePath := writeDownloadTestFile(t)
+	resp := requestDownload(t, filePath, "test")
 
 	if resp.Code != http.StatusOK {
 		t.Fatalf("status: got %d, want %d body=%q", resp.Code, http.StatusOK, resp.Body.String())
@@ -27,48 +20,35 @@ func TestServeDownloadAllowsWorkspaceFile(t *testing.T) {
 	}
 }
 
-func TestServeDownloadRejectsOutsidePath(t *testing.T) {
-	workspace := t.TempDir()
-	outside := filepath.Join(t.TempDir(), "secret.txt")
-	if err := os.WriteFile(outside, []byte("secret"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	policy := newDownloadTestPolicy(t, workspace, nil)
-	resp := requestDownload(t, policy, outside)
+func TestServeDownloadRejectsMissingToken(t *testing.T) {
+	resp := requestDownload(t, writeDownloadTestFile(t), "wrong")
 
-	if resp.Code != http.StatusForbidden {
-		t.Fatalf("status: got %d, want %d body=%q", resp.Code, http.StatusForbidden, resp.Body.String())
+	if resp.Code != http.StatusUnauthorized {
+		t.Fatalf("status: got %d, want %d body=%q", resp.Code, http.StatusUnauthorized, resp.Body.String())
 	}
 }
 
-func TestServeDownloadAllowsTrustedAdditionalRoot(t *testing.T) {
-	workspace := t.TempDir()
-	trusted := t.TempDir()
-	filePath := filepath.Join(trusted, "shared.txt")
+func TestServeDownloadRejectsDirectory(t *testing.T) {
+	resp := requestDownload(t, t.TempDir(), "test")
+
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("status: got %d, want %d body=%q", resp.Code, http.StatusBadRequest, resp.Body.String())
+	}
+}
+
+func writeDownloadTestFile(t *testing.T) string {
+	t.Helper()
+	filePath := filepath.Join(t.TempDir(), "session.log")
 	if err := os.WriteFile(filePath, []byte("ok"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	policy := newDownloadTestPolicy(t, workspace, []string{trusted})
-	resp := requestDownload(t, policy, filePath)
-
-	if resp.Code != http.StatusOK {
-		t.Fatalf("status: got %d, want %d body=%q", resp.Code, http.StatusOK, resp.Body.String())
-	}
+	return filePath
 }
 
-func newDownloadTestPolicy(t *testing.T, workspace string, trusted []string) fileaccess.Policy {
+func requestDownload(t *testing.T, path string, token string) *httptest.ResponseRecorder {
 	t.Helper()
-	policy, err := fileaccess.NewPolicy(workspace, trusted)
-	if err != nil {
-		t.Fatalf("NewPolicy failed: %v", err)
-	}
-	return policy
-}
-
-func requestDownload(t *testing.T, policy fileaccess.Policy, path string) *httptest.ResponseRecorder {
-	t.Helper()
-	req := httptest.NewRequest(http.MethodGet, "/download?token=test&path="+path, nil)
+	req := httptest.NewRequest(http.MethodGet, "/download?token="+token+"&path="+path, nil)
 	resp := httptest.NewRecorder()
-	serveDownload(resp, req, "test", policy)
+	serveDownload(resp, req, "test")
 	return resp
 }

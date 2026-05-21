@@ -58,7 +58,10 @@ func (p *peerConn) WriteJSON(v any) error {
 	if err := p.conn.SetWriteDeadline(time.Now().Add(peerWriteTimeout)); err != nil {
 		return err
 	}
-	return p.conn.WriteJSON(v)
+	if err := p.conn.WriteJSON(v); err != nil {
+		return err
+	}
+	return p.conn.SetWriteDeadline(time.Time{})
 }
 
 func (p *peerConn) Close() error {

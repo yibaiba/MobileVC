@@ -31,13 +31,17 @@ class MobileVcWsService {
   Future<void> connectRelay({
     required String relayUrl,
     required String sessionId,
-    required String pairingSecret,
+    String pairingSecret = '',
+    String clientId = '',
+    String clientReconnectSecret = '',
   }) async {
     final uri = Uri.parse(relayUrl).replace(path: '/relay/client');
     await _connectChannel(
       uri,
       relaySessionId: sessionId,
       relayPairingSecret: pairingSecret,
+      relayClientId: clientId,
+      relayClientReconnectSecret: clientReconnectSecret,
     );
   }
 
@@ -45,6 +49,8 @@ class MobileVcWsService {
     Uri uri, {
     String relaySessionId = '',
     String relayPairingSecret = '',
+    String relayClientId = '',
+    String relayClientReconnectSecret = '',
   }) async {
     final previousSubscription = _subscription;
     final previousChannel = _channel;
@@ -63,16 +69,17 @@ class MobileVcWsService {
           );
     _channel = channel;
     final epoch = _connectionEpoch;
-    String relayClientId = '';
+    var activeRelayClientId = relayClientId.trim();
+    var activeRelayReconnectSecret = relayClientReconnectSecret.trim();
     final pairedCompleter =
         relaySessionId.isNotEmpty ? Completer<void>() : null;
     if (relaySessionId.isNotEmpty) {
-      channel.sink.add(jsonEncode(<String, dynamic>{
-        'type': 'client.pair',
-        'version': 1,
-        'sessionId': relaySessionId,
-        'pairingSecret': relayPairingSecret,
-      }));
+      channel.sink.add(jsonEncode(_relayAuthFrame(
+        relaySessionId: relaySessionId,
+        relayPairingSecret: relayPairingSecret,
+        relayClientId: activeRelayClientId,
+        relayClientReconnectSecret: relayClientReconnectSecret,
+      )));
     }
     var disconnectEmitted = false;
     void emitDisconnect({
@@ -125,11 +132,16 @@ class MobileVcWsService {
           _events.add(_mapper.mapEvent(decoded));
           return;
         }
-        if (isRelayPairingError(decoded, relayClientId)) {
-          completePairingError(StateError(relayErrorMessage(decoded)));
+        if (isRelayAuthError(decoded, pairedCompleter?.isCompleted != true)) {
+          completePairingError(RelayPairingException.fromFrame(decoded));
+          return;
         }
-        final relayEvent = _decodeRelayFrame(decoded, (clientId) {
-          relayClientId = clientId;
+        final relayEvent =
+            _decodeRelayFrame(decoded, (clientId, reconnectSecret) {
+          activeRelayClientId = clientId;
+          if (reconnectSecret.trim().isNotEmpty) {
+            activeRelayReconnectSecret = reconnectSecret;
+          }
           final completer = pairedCompleter;
           if (completer != null && !completer.isCompleted) {
             completer.complete();
@@ -171,7 +183,7 @@ class MobileVcWsService {
     );
     _relayContext = _RelayContext(
       sessionId: relaySessionId,
-      clientIdProvider: () => relayClientId,
+      clientIdProvider: () => activeRelayClientId,
     );
     if (pairedCompleter != null) {
       try {
@@ -185,6 +197,13 @@ class MobileVcWsService {
         await disconnect();
         rethrow;
       }
+    }
+    if (relaySessionId.isNotEmpty) {
+      _relaySession = RelaySession(
+        sessionId: relaySessionId,
+        clientId: activeRelayClientId,
+        clientReconnectSecret: activeRelayReconnectSecret,
+      );
     }
   }
 
@@ -253,21 +272,31 @@ class MobileVcWsService {
   }
 
   _RelayContext _relayContext = const _RelayContext();
+  RelaySession? _relaySession;
+
+  RelaySession? takeRelaySession() {
+    final session = _relaySession;
+    _relaySession = null;
+    return session;
+  }
 
   Map<String, dynamic>? _decodeRelayFrame(
     Map<String, dynamic> frame,
-    void Function(String clientId) setClientId,
+    void Function(String clientId, String clientReconnectSecret) setClientId,
   ) {
     final type = (frame['type'] ?? '').toString();
     if (type == 'client.paired') {
-      setClientId((frame['clientId'] ?? '').toString());
+      setClientId(
+        (frame['clientId'] ?? '').toString(),
+        (frame['clientReconnectSecret'] ?? '').toString(),
+      );
       return null;
     }
     if (type == 'relay.error') {
       return <String, dynamic>{
         'type': 'error',
         'code': frame['code'] ?? 'relay_error',
-        'msg': frame['message'] ?? 'Relay error',
+        'msg': relayErrorMessage(frame),
       };
     }
     if (type != 'relay.forward') {
@@ -277,6 +306,30 @@ class MobileVcWsService {
         base64Url.decode(base64Url.normalize(frame['payload'].toString()));
     final decoded = jsonDecode(utf8.decode(raw));
     return decoded is Map<String, dynamic> ? decoded : null;
+  }
+
+  Map<String, dynamic> _relayAuthFrame({
+    required String relaySessionId,
+    required String relayPairingSecret,
+    required String relayClientId,
+    required String relayClientReconnectSecret,
+  }) {
+    if (relayClientId.trim().isNotEmpty &&
+        relayClientReconnectSecret.trim().isNotEmpty) {
+      return <String, dynamic>{
+        'type': 'client.reconnect',
+        'version': 1,
+        'sessionId': relaySessionId,
+        'clientId': relayClientId,
+        'clientReconnectSecret': relayClientReconnectSecret,
+      };
+    }
+    return <String, dynamic>{
+      'type': 'client.pair',
+      'version': 1,
+      'sessionId': relaySessionId,
+      'pairingSecret': relayPairingSecret,
+    };
   }
 
   Map<String, dynamic> _encodeRelayFrame(
@@ -298,6 +351,18 @@ class MobileVcWsService {
   }
 }
 
+class RelaySession {
+  const RelaySession({
+    required this.sessionId,
+    required this.clientId,
+    required this.clientReconnectSecret,
+  });
+
+  final String sessionId;
+  final String clientId;
+  final String clientReconnectSecret;
+}
+
 class _RelayContext {
   const _RelayContext({
     this.sessionId = '',
@@ -314,5 +379,33 @@ String _emptyClientId() => '';
 bool isRelayPairingError(Map<String, dynamic> frame, String clientId) =>
     (frame['type'] ?? '').toString() == 'relay.error' && clientId.isEmpty;
 
+@visibleForTesting
+bool isRelayAuthError(Map<String, dynamic> frame, bool authPending) =>
+    authPending && (frame['type'] ?? '').toString() == 'relay.error';
+
 String relayErrorMessage(Map<String, dynamic> frame) =>
-    (frame['message'] ?? 'Relay error').toString();
+    switch ((frame['code'] ?? '').toString()) {
+      'payload_too_large' => 'Relay 数据包过大：当前消息超过中继限制，请关闭 ADB 截屏流或减少单次同步内容后重试',
+      _ => (frame['message'] ?? 'Relay error').toString(),
+    };
+
+class RelayPairingException implements Exception {
+  const RelayPairingException(this.code, this.message);
+
+  factory RelayPairingException.fromFrame(Map<String, dynamic> frame) {
+    final code = (frame['code'] ?? 'relay_error').toString();
+    if (code == 'pairing_rejected') {
+      return const RelayPairingException(
+        'pairing_rejected',
+        'Relay 认证被拒绝：链接可能已过期，或本机服务已重启，请导入最新中继链接',
+      );
+    }
+    return RelayPairingException(code, relayErrorMessage(frame));
+  }
+
+  final String code;
+  final String message;
+
+  @override
+  String toString() => message;
+}

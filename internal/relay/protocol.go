@@ -7,6 +7,7 @@ const (
 	TypeAgentRegistered = "agent.registered"
 	TypeAgentReconnect  = "agent.reconnect"
 	TypeClientPair      = "client.pair"
+	TypeClientReconnect = "client.reconnect"
 	TypeClientPaired    = "client.paired"
 	TypeClientAttached  = "client.attached"
 	TypeRelayForward    = "relay.forward"
@@ -67,13 +68,23 @@ type ClientPairFrame struct {
 	Version       int    `json:"version"`
 	SessionID     string `json:"sessionId"`
 	PairingSecret string `json:"pairingSecret"`
+	DeviceName    string `json:"deviceName,omitempty"`
+}
+
+type ClientReconnectFrame struct {
+	Type                  string `json:"type"`
+	Version               int    `json:"version"`
+	SessionID             string `json:"sessionId"`
+	ClientID              string `json:"clientId"`
+	ClientReconnectSecret string `json:"clientReconnectSecret"`
 }
 
 type ClientPairedFrame struct {
-	Type      string `json:"type"`
-	Version   int    `json:"version"`
-	SessionID string `json:"sessionId"`
-	ClientID  string `json:"clientId"`
+	Type                  string `json:"type"`
+	Version               int    `json:"version"`
+	SessionID             string `json:"sessionId"`
+	ClientID              string `json:"clientId"`
+	ClientReconnectSecret string `json:"clientReconnectSecret,omitempty"`
 }
 
 type ClientAttachedFrame struct {
@@ -97,10 +108,12 @@ type ForwardEnvelope struct {
 }
 
 type ErrorFrame struct {
-	Type    string `json:"type"`
-	Version int    `json:"version"`
-	Code    string `json:"code"`
-	Message string `json:"message"`
+	Type         string `json:"type"`
+	Version      int    `json:"version"`
+	Code         string `json:"code"`
+	Message      string `json:"message"`
+	DecodedBytes int    `json:"decodedBytes,omitempty"`
+	MaxBytes     int    `json:"maxBytes,omitempty"`
 }
 
 func NewErrorFrame(code string) ErrorFrame {

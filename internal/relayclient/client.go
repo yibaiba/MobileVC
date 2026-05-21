@@ -185,14 +185,20 @@ func writeControlJSON(conn *websocket.Conn, frame any) error {
 	if err := conn.SetWriteDeadline(time.Now().Add(relayControlTimeout)); err != nil {
 		return err
 	}
-	return conn.WriteJSON(frame)
+	if err := conn.WriteJSON(frame); err != nil {
+		return err
+	}
+	return conn.SetWriteDeadline(time.Time{})
 }
 
 func readControlJSON(conn *websocket.Conn, frame any) error {
 	if err := conn.SetReadDeadline(time.Now().Add(relayControlTimeout)); err != nil {
 		return err
 	}
-	return conn.ReadJSON(frame)
+	if err := conn.ReadJSON(frame); err != nil {
+		return err
+	}
+	return conn.SetReadDeadline(time.Time{})
 }
 
 func EmitPairingFile(path string, event PairingReadyEvent) error {

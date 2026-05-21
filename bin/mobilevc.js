@@ -35,7 +35,6 @@ const MESSAGES = {
       '用法：',
       '  mobilevc           交互式配置并启动 MobileVC 后端',
       '  mobilevc start     启动 MobileVC 后端（默认）',
-      '  mobilevc start --public --origin https://example.com  启用公网安全模式',
       '  mobilevc public --relay wss://relay.example.com  保存并启动 Relay 公网模式',
       '  mobilevc public    使用已保存 Relay，或本地开发 Relay',
       '  mobilevc restart   重启 MobileVC 后端',
@@ -74,7 +73,6 @@ const MESSAGES = {
     statusPreflight: 'preflight',
     qrTitle: 'Flutter 扫码连接局域网后端',
     qrHint: '用 Flutter 客户端扫码，可自动回填局域网地址、端口和 token',
-    qrSuppressed: '公网模式已隐藏 token 二维码；如确需扫码，设置 MOBILEVC_SHOW_TOKEN_QR=true',
     localAccess: '本机访问',
     lanAccess: '局域网访问',
     qrUnavailable: '未检测到可用的局域网 IPv4 地址，暂时无法生成二维码',
@@ -87,7 +85,6 @@ const MESSAGES = {
     binaryNotExecutable: (filePath) => `server binary 不可执行：${filePath}`,
     homeNotWritable: (homePath) => `HOME 不可写：${homePath}`,
     authTokenMissing: '未配置 AUTH_TOKEN，请先运行 mobilevc config',
-    publicOriginMissing: '公网模式需要 --origin <https://域名[:端口]> 或 ALLOWED_ORIGINS',
     relayURLInvalid: (detail) => `Relay URL 无效：${detail}`,
     relayPairingTimedOut: (filePath) => `Relay 配对信息未就绪，请检查日志：${filePath}`,
     relayQrTitle: '扫码连接 MobileVC Relay',
@@ -106,7 +103,6 @@ const MESSAGES = {
       'Usage:',
       '  mobilevc           Configure interactively and start the MobileVC backend',
       '  mobilevc start     Start the MobileVC backend (default)',
-      '  mobilevc start --public --origin https://example.com  Enable public-safe mode',
       '  mobilevc public --relay wss://relay.example.com  Save and start Relay public mode',
       '  mobilevc public    Start with the saved Relay, or the local development Relay',
       '  mobilevc restart   Restart the MobileVC backend',
@@ -145,7 +141,6 @@ const MESSAGES = {
     statusPreflight: 'preflight',
     qrTitle: 'Flutter scan-to-connect over LAN',
     qrHint: 'Scan with the Flutter client to autofill host, port, and token',
-    qrSuppressed: 'Public mode hid the token QR. Set MOBILEVC_SHOW_TOKEN_QR=true if scanning is required.',
     localAccess: 'Local access',
     lanAccess: 'LAN access',
     qrUnavailable: 'No available LAN IPv4 address was detected, so no QR code was generated',
@@ -158,7 +153,6 @@ const MESSAGES = {
     binaryNotExecutable: (filePath) => `Server binary is not executable: ${filePath}`,
     homeNotWritable: (homePath) => `HOME is not writable: ${homePath}`,
     authTokenMissing: 'AUTH_TOKEN is missing. Run mobilevc config first.',
-    publicOriginMissing: 'Public mode requires --origin <https://host[:port]> or ALLOWED_ORIGINS.',
     relayURLInvalid: (detail) => `Invalid relay URL: ${detail}`,
     relayPairingTimedOut: (filePath) => `Relay pairing data was not ready. Check the log: ${filePath}`,
     relayQrTitle: 'Scan to connect MobileVC Relay',
@@ -235,12 +229,11 @@ function parseInvocation(args) {
 }
 
 function parseOptions(args) {
-  const options = { help: false, follow: false, guided: false, public: false, origins: [], relay: '' };
+  const options = { help: false, follow: false, guided: false, public: false, relay: '' };
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];
     if (arg === '--help' || arg === '-h') options.help = true;
     else if (arg === '--follow' || arg === '-f') options.follow = true;
-    else if (arg === '--public') options.public = true;
     else if (arg === '--relay') {
       i += 1;
       if (!args[i]) {
@@ -249,14 +242,6 @@ function parseOptions(args) {
       options.relay = args[i];
     } else if (arg.startsWith('--relay=')) {
       options.relay = arg.slice('--relay='.length);
-    } else if (arg === '--origin') {
-      i += 1;
-      if (!args[i]) {
-        throw new Error('--origin requires a value');
-      }
-      options.origins.push(args[i]);
-    } else if (arg.startsWith('--origin=')) {
-      options.origins.push(arg.slice('--origin='.length));
     }
   }
   return options;
@@ -295,21 +280,13 @@ async function runStart(options = {}) {
   }
 
   const language = config?.language || DEFAULT_LANGUAGE;
-  if (options.public && options.origins?.length > 0) {
-    const origins = normalizeOriginList([...(config.publicOrigins || []), ...options.origins]);
-    config = { ...config, publicOrigins: origins };
-    writeJson(CONFIG_PATH, config);
-  }
   const relayAccess = buildRelayAccessConfig(config, options);
-  const publicAccess = relayAccess.enabled
-    ? { enabled: false, ok: true, env: {}, origins: [] }
-    : await buildPublicAccessConfig(options, config.port);
   const existingState = readJson(STATE_PATH, null);
   if (existingState?.pid && isPidAlive(existingState.pid)) {
-    if (isStateConfigMatch(existingState, config, publicAccess, relayAccess)) {
+    if (isStateConfigMatch(existingState, config, relayAccess)) {
       console.log(message(language, 'alreadyRunning', existingState.pid, existingState.port));
       if (options.guided) {
-        await printLanQr(language, existingState.port, existingState.authToken, process.cwd(), publicAccess.enabled);
+        await printLanQr(language, existingState.port, existingState.authToken, process.cwd());
       }
       return;
     }
@@ -318,7 +295,7 @@ async function runStart(options = {}) {
 
   const platformTarget = getPlatformTarget();
   const binaryInfo = resolveBinaryInfo(platformTarget);
-  const preflight = await runPreflightChecks({ config, language, platformTarget, binaryInfo, publicAccess });
+  const preflight = await runPreflightChecks({ config, language, platformTarget, binaryInfo });
   printPreflight(language, preflight);
 
   if (preflight.blocking.length > 0) {
@@ -339,7 +316,6 @@ async function runStart(options = {}) {
     PORT: String(config.port),
     AUTH_TOKEN: String(config.authToken),
     RUNTIME_WORKSPACE_ROOT: process.cwd(),
-    ...publicAccess.env,
     ...relayAccess.env,
   };
   if (relayAccess.enabled) {
@@ -382,7 +358,7 @@ async function runStart(options = {}) {
   }
 
   const state = {
-    ...buildStateSkeleton(config, language, binaryInfo, platformTarget, preflight, logPath, publicAccess),
+    ...buildStateSkeleton(config, language, binaryInfo, platformTarget, preflight, logPath),
     pid: child.pid,
     startedAt: new Date().toISOString(),
     serverVersion: formatVersionInfo(startup.versionInfo),
@@ -402,7 +378,7 @@ async function runStart(options = {}) {
   if (relayAccess.enabled) {
     printRelayQr(language, pairing);
   } else {
-    await printLanQr(language, state.port, state.authToken, state.cwd || process.cwd(), publicAccess.enabled);
+    await printLanQr(language, state.port, state.authToken, state.cwd || process.cwd());
   }
 }
 
@@ -589,7 +565,7 @@ function getPlatformTarget() {
   return `${process.platform}-${process.arch}`;
 }
 
-async function runPreflightChecks({ config, language, platformTarget, binaryInfo, publicAccess = { ok: true } }) {
+async function runPreflightChecks({ config, language, platformTarget, binaryInfo }) {
   const blocking = [];
   const warnings = [];
 
@@ -603,9 +579,6 @@ async function runPreflightChecks({ config, language, platformTarget, binaryInfo
 
   if (!String(config?.authToken || '').trim()) {
     blocking.push(message(language, 'authTokenMissing'));
-  }
-  if (!publicAccess.ok) {
-    blocking.push(message(language, 'publicOriginMissing'));
   }
 
   if (!isHomeWritable()) {
@@ -635,32 +608,6 @@ function formatList(items, language) {
     return message(language, 'preflightOk');
   }
   return items.join(' | ');
-}
-
-async function buildPublicAccessConfig(options, port) {
-  const existingAllowed = String(process.env.ALLOWED_ORIGINS || '').trim();
-  const config = readJson(CONFIG_PATH, null) || {};
-  const savedOrigins = options.public ? (config.publicOrigins || []) : [];
-  const enabled = Boolean(options.public || envFlag('PUBLIC_EXPOSURE_MODE') || existingAllowed);
-  if (!enabled) {
-    return { enabled: false, ok: true, env: {} };
-  }
-
-  const origins = normalizeOriginList([
-    ...String(existingAllowed || '').split(','),
-    ...savedOrigins,
-    ...(options.origins || []),
-    ...await localBrowserOrigins(port),
-  ]);
-  return {
-    enabled: true,
-    ok: origins.length > 0,
-    env: {
-      PUBLIC_EXPOSURE_MODE: 'true',
-      ALLOWED_ORIGINS: origins.join(','),
-    },
-    origins,
-  };
 }
 
 function buildRelayAccessConfig(config, options) {
@@ -806,56 +753,7 @@ function redactRelaySecret(rawUri) {
   return uri.toString();
 }
 
-async function localBrowserOrigins(port) {
-  const origins = [
-    `http://localhost:${port}`,
-    `http://127.0.0.1:${port}`,
-  ];
-  const host = await detectLanHost();
-  if (host) {
-    origins.push(`http://${host}:${port}`);
-  }
-  return origins;
-}
-
-function normalizeOriginList(values) {
-  const origins = [];
-  const seen = new Set();
-  for (const value of values) {
-    const origin = normalizeOrigin(value);
-    if (!origin || seen.has(origin)) {
-      continue;
-    }
-    seen.add(origin);
-    origins.push(origin);
-  }
-  return origins;
-}
-
-function normalizeOrigin(value) {
-  const raw = String(value || '').trim().replace(/\/+$/, '');
-  if (!raw) {
-    return '';
-  }
-  const url = new URL(raw);
-  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-    throw new Error(`invalid origin scheme: ${raw}`);
-  }
-  if (url.pathname !== '/' || url.search || url.hash || url.username || url.password) {
-    throw new Error(`invalid origin: ${raw}`);
-  }
-  const port = defaultOriginPort(url.protocol, url.port);
-  return `${url.protocol}//${url.hostname}${port}`;
-}
-
-function defaultOriginPort(protocol, port) {
-  if (!port || (protocol === 'http:' && port === '80') || (protocol === 'https:' && port === '443')) {
-    return '';
-  }
-  return `:${port}`;
-}
-
-function buildStateSkeleton(config, language, binaryInfo, platformTarget, preflight, logPath, publicAccess = { enabled: false, origins: [] }) {
+function buildStateSkeleton(config, language, binaryInfo, platformTarget, preflight, logPath) {
   return {
     pid: null,
     port: String(config.port),
@@ -867,8 +765,6 @@ function buildStateSkeleton(config, language, binaryInfo, platformTarget, prefli
     binaryPath: binaryInfo.binaryPath,
     platformTarget,
     serverVersion: null,
-    publicExposureMode: Boolean(publicAccess.enabled),
-    allowedOrigins: publicAccess.origins || [],
     preflight,
   };
 }
@@ -1161,11 +1057,9 @@ function message(language, key, ...args) {
 
 async function printLanQr(language, port, authToken = '', cwd = process.cwd()) {
   const host = await detectLanHost();
-  const publicMode = isPublicExposureMode();
-  const showTokenQr = shouldShowTokenQr();
   const localUrl = buildLaunchUrl('127.0.0.1', port, authToken, cwd);
   console.log('');
-  console.log(`${message(language, 'localAccess')}: ${formatLaunchUrlForDisplay(localUrl, publicMode)}`);
+  console.log(`${message(language, 'localAccess')}: ${localUrl}`);
 
   if (!host) {
     console.log(message(language, 'qrUnavailable'));
@@ -1173,39 +1067,11 @@ async function printLanQr(language, port, authToken = '', cwd = process.cwd()) {
   }
 
   const url = buildLaunchUrl(host, port, authToken, cwd);
-  console.log(`${message(language, 'lanAccess')}: ${formatLaunchUrlForDisplay(url, publicMode)}`);
-  if (publicMode && !showTokenQr) {
-    console.log(message(language, 'qrSuppressed'));
-    return;
-  }
+  console.log(`${message(language, 'lanAccess')}: ${url}`);
   console.log('');
   console.log(message(language, 'qrTitle'));
   renderTerminalQr(url);
   console.log(message(language, 'qrHint'));
-}
-
-function isPublicExposureMode() {
-  return envFlag('PUBLIC_EXPOSURE_MODE');
-}
-
-function shouldShowTokenQr() {
-  return envFlag('MOBILEVC_SHOW_TOKEN_QR');
-}
-
-function envFlag(key) {
-  const value = String(process.env[key] || '').trim().toLowerCase();
-  return value === '1' || value === 'true' || value === 'yes' || value === 'on';
-}
-
-function formatLaunchUrlForDisplay(rawUrl, redactToken) {
-  if (!redactToken) {
-    return rawUrl;
-  }
-  const url = new URL(rawUrl);
-  if (url.searchParams.has('token')) {
-    url.searchParams.set('token', '<redacted>');
-  }
-  return url.toString();
 }
 
 function renderTerminalQr(text) {
@@ -1237,22 +1103,12 @@ function buildLaunchUrl(host, port, authToken = '', cwd = '') {
 function isStateConfigMatch(
   state,
   config,
-  publicAccess = { enabled: false, origins: [] },
   relayAccess = { enabled: false, url: '' },
 ) {
   return String(state?.port || '') === String(config?.port || '') &&
     String(state?.authToken || '') === String(config?.authToken || '') &&
-    Boolean(state?.publicExposureMode) === Boolean(publicAccess.enabled) &&
-    sameStringList(state?.allowedOrigins || [], publicAccess.origins || []) &&
     Boolean(state?.relayMode) === Boolean(relayAccess.enabled) &&
     String(state?.relayUrl || '') === String(relayAccess.url || '');
-}
-
-function sameStringList(left, right) {
-  if (left.length !== right.length) {
-    return false;
-  }
-  return left.every((item, index) => item === right[index]);
 }
 
 function formatStartupFailure(language, startup, logPath) {
@@ -1450,13 +1306,10 @@ if (require.main === module) {
 } else {
   module.exports = {
     buildLaunchUrl,
-    buildPublicAccessConfig,
     assertValidRelayURL,
     buildRelayPairingUri,
     readRelayPairingEventFile,
-    formatLaunchUrlForDisplay,
     isPortOccupied,
-    normalizeOrigin,
     removeRelayPairingEventFile,
     parseInvocation,
     resolveBinaryInfo,

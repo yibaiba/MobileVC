@@ -57,11 +57,16 @@ func loadFrameLimits(cfg *limitConfig) error {
 	if err != nil {
 		return err
 	}
+	payloadBytes, err := getEnvBytes("RELAY_MAX_PAYLOAD_BYTES", defaultMaxPayloadBytes)
+	if err != nil {
+		return err
+	}
 	queueSize, err := getEnvInt("RELAY_FORWARD_QUEUE_SIZE", defaultForwardQueueSize)
 	if err != nil {
 		return err
 	}
 	cfg.MaxControlFrameBytes = int64(controlBytes)
+	cfg.MaxPayloadBytes = payloadBytes
 	cfg.ForwardQueueSize = queueSize
 	return nil
 }

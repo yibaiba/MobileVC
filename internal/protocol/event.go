@@ -19,7 +19,6 @@ const (
 	EventTypeAIStatus                 = "ai_status"
 	EventTypeRuntimePhase             = "runtime_phase"
 	EventTypeTaskSnapshot             = "task_snapshot"
-	EventTypeFileAccessConfigResult   = "file_access_config_result"
 	EventTypeFSListResult             = "fs_list_result"
 	EventTypeFSReadResult             = "fs_read_result"
 	EventTypeStepUpdate               = "step_update"
@@ -100,18 +99,26 @@ type ExecRequestEvent struct {
 
 type InputRequestEvent struct {
 	ClientEvent
-	Data           string `json:"data"`
-	PermissionMode string `json:"permissionMode,omitempty"`
+	Data             string            `json:"data"`
+	PermissionMode   string            `json:"permissionMode,omitempty"`
+	ImageAttachments []ImageAttachment `json:"imageAttachments,omitempty"`
 	RuntimeMeta
 }
 
 type AITurnRequestEvent struct {
 	ClientEvent
-	Engine         string `json:"engine,omitempty"`
-	Data           string `json:"data,omitempty"`
-	CWD            string `json:"cwd,omitempty"`
-	PermissionMode string `json:"permissionMode,omitempty"`
+	Engine           string            `json:"engine,omitempty"`
+	Data             string            `json:"data,omitempty"`
+	CWD              string            `json:"cwd,omitempty"`
+	PermissionMode   string            `json:"permissionMode,omitempty"`
+	ImageAttachments []ImageAttachment `json:"imageAttachments,omitempty"`
 	RuntimeMeta
+}
+
+type ImageAttachment struct {
+	Name     string `json:"name,omitempty"`
+	MIMEType string `json:"mimeType,omitempty"`
+	Data     string `json:"data"`
 }
 
 type ReviewDecisionRequestEvent struct {
@@ -286,11 +293,6 @@ type FSListRequestEvent struct {
 type FSReadRequestEvent struct {
 	ClientEvent
 	Path string `json:"path,omitempty"`
-}
-
-type FileAccessConfigRequestEvent struct {
-	ClientEvent
-	TrustedRoots []string `json:"trustedRoots,omitempty"`
 }
 
 type ADBDevicesRequestEvent struct {
@@ -859,11 +861,6 @@ type FSReadResultEvent struct {
 	IsText   bool   `json:"isText"`
 }
 
-type FileAccessConfigResultEvent struct {
-	Event
-	TrustedRoots []string `json:"trustedRoots"`
-}
-
 type RuntimeInfoResultEvent struct {
 	Event
 	Query       string            `json:"query,omitempty"`
@@ -981,6 +978,12 @@ func NewErrorEvent(sessionID, message, stack string) ErrorEvent {
 		Message: message,
 		Stack:   stack,
 	}
+}
+
+func NewErrorEventWithCode(sessionID, message, stack, code string) ErrorEvent {
+	event := NewErrorEvent(sessionID, message, stack)
+	event.Code = code
+	return event
 }
 
 func NewClientActionAckEvent(sessionID, action, clientActionID, status string, duplicate bool) ClientActionAckEvent {
@@ -1106,13 +1109,6 @@ func NewFSReadResultEvent(sessionID, path, content string, size int64, lang, enc
 		Lang:     lang,
 		Encoding: encoding,
 		IsText:   isText,
-	}
-}
-
-func NewFileAccessConfigResultEvent(sessionID string, trustedRoots []string) FileAccessConfigResultEvent {
-	return FileAccessConfigResultEvent{
-		Event:        NewBaseEvent(EventTypeFileAccessConfigResult, sessionID),
-		TrustedRoots: append([]string(nil), trustedRoots...),
 	}
 }
 

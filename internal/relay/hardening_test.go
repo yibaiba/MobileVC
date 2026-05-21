@@ -65,6 +65,26 @@ func TestRelayNotifiesAgentWhenClientAttaches(t *testing.T) {
 	}
 }
 
+func TestRelayNotifiesReconnectedAgentWhenClientIsAttached(t *testing.T) {
+	server := newTestRelayServer(t)
+	defer server.Close()
+
+	sessionID := "rs_reconnect_attached"
+	secret := "pair-secret-128-bit-minimum"
+	reconnectSecret := "reconnect-secret-128-bit-minimum"
+	agent := dialRelay(t, server.URL, "/relay/agent")
+	registerAgent(t, agent, sessionID, secret, reconnectSecret, time.Now().Add(time.Minute))
+	client := dialRelay(t, server.URL, "/relay/client")
+	defer client.Close()
+	clientID := pairClient(t, client, sessionID, secret)
+	readAttached(t, agent, clientID)
+	_ = agent.Close()
+
+	reconnected := reconnectAgentEventually(t, server.URL, sessionID, reconnectSecret)
+	defer reconnected.Close()
+	readAttached(t, reconnected, clientID)
+}
+
 func TestRelayAllowsFirstAgentForwardWithEmptyClientID(t *testing.T) {
 	server := newTestRelayServer(t)
 	defer server.Close()
@@ -101,4 +121,34 @@ func readAttached(t *testing.T, conn *websocket.Conn, clientID string) {
 	if attached.ClientID != clientID {
 		t.Fatalf("attached client id: got %q want %q", attached.ClientID, clientID)
 	}
+}
+
+func reconnectAgentEventually(t *testing.T, baseURL string, sessionID string, secret string) *websocket.Conn {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		conn := dialRelay(t, baseURL, "/relay/agent")
+		if tryReconnectAgent(t, conn, sessionID, secret) {
+			return conn
+		}
+		_ = conn.Close()
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("agent reconnect did not succeed before timeout")
+	return nil
+}
+
+func tryReconnectAgent(t *testing.T, conn *websocket.Conn, sessionID string, secret string) bool {
+	t.Helper()
+	if err := conn.WriteJSON(AgentReconnectFrame{
+		Type: TypeAgentReconnect, Version: Version,
+		SessionID: sessionID, AgentReconnectSecret: secret,
+	}); err != nil {
+		t.Fatalf("write reconnect frame: %v", err)
+	}
+	var registered AgentRegisteredFrame
+	if err := conn.ReadJSON(&registered); err != nil {
+		t.Fatalf("read reconnect response: %v", err)
+	}
+	return registered.Type == TypeAgentRegistered && registered.SessionID == sessionID
 }

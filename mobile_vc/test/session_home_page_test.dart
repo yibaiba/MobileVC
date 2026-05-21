@@ -22,7 +22,6 @@ void main() {
     final service = _FakeMobileVcWsService();
     final controller = SessionController(service: service);
     await controller.initialize();
-    addTearDown(controller.disposeController);
 
     await controller.saveConfig(
       const AppConfig(
@@ -160,6 +159,15 @@ class _FakeMobileVcWsService extends MobileVcWsService {
 
   @override
   Future<void> connect(String url) async {}
+
+  @override
+  Future<void> connectRelay({
+    required String relayUrl,
+    required String sessionId,
+    String pairingSecret = '',
+    String clientId = '',
+    String clientReconnectSecret = '',
+  }) async {}
 
   @override
   Future<void> disconnect() async {}

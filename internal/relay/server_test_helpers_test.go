@@ -18,13 +18,19 @@ func newTestRelayServer(t *testing.T) *httptest.Server {
 
 func newLimitedTestRelayServer(t *testing.T, overrides Config) *httptest.Server {
 	t.Helper()
+	_, server := newInspectableRelayServer(t, overrides)
+	return server
+}
+
+func newInspectableRelayServer(t *testing.T, overrides Config) (*Server, *httptest.Server) {
+	t.Helper()
 	cfg := baseTestRelayConfig()
 	applyTestOverrides(&cfg, overrides)
-	srv, err := NewServer(cfg)
+	relayServer, err := NewServer(cfg)
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
-	return httptest.NewServer(srv.Handler("test"))
+	return relayServer, httptest.NewServer(relayServer.Handler("test"))
 }
 
 func baseTestRelayConfig() Config {
@@ -43,7 +49,16 @@ func baseTestRelayConfig() Config {
 		PingInterval:            time.Minute,
 		PongTimeout:             time.Minute,
 		MaxControlFrameBytes:    16 * 1024,
+		MaxPayloadBytes:         defaultMaxPayloadBytes,
 		ForwardQueueSize:        4,
+		HTTPAllowedRoutes: []RouteRule{
+			{Method: http.MethodGet, Path: "/healthz"},
+			{Method: http.MethodGet, Path: "/version"},
+			{Method: http.MethodGet, Path: "/download"},
+		},
+		WSAllowedRoutes: []RouteRule{
+			{Method: http.MethodGet, Path: "/ws"},
+		},
 	}
 }
 
@@ -53,6 +68,9 @@ func applyTestOverrides(cfg *Config, overrides Config) {
 	}
 	if overrides.AgentGracePeriod > 0 {
 		cfg.AgentGracePeriod = overrides.AgentGracePeriod
+	}
+	if overrides.MaxPayloadBytes > 0 {
+		cfg.MaxPayloadBytes = overrides.MaxPayloadBytes
 	}
 	if overrides.TrustedProxyCIDRs != "" {
 		cfg.TrustedProxyCIDRs = overrides.TrustedProxyCIDRs
@@ -95,6 +113,21 @@ func registerAgent(t *testing.T, conn *websocket.Conn, sessionID string, pairSec
 
 func pairClient(t *testing.T, conn *websocket.Conn, sessionID string, secret string) string {
 	t.Helper()
+	paired := pairClientWithFrame(t, conn, sessionID, secret)
+	return paired.ClientID
+}
+
+func pairClientWithReconnectSecret(t *testing.T, conn *websocket.Conn, sessionID string, secret string) (string, string) {
+	t.Helper()
+	paired := pairClientWithFrame(t, conn, sessionID, secret)
+	if paired.ClientReconnectSecret == "" {
+		t.Fatal("missing client reconnect secret")
+	}
+	return paired.ClientID, paired.ClientReconnectSecret
+}
+
+func pairClientWithFrame(t *testing.T, conn *websocket.Conn, sessionID string, secret string) ClientPairedFrame {
+	t.Helper()
 	if err := conn.WriteJSON(ClientPairFrame{
 		Type: TypeClientPair, Version: Version, SessionID: sessionID, PairingSecret: secret,
 	}); err != nil {
@@ -104,7 +137,7 @@ func pairClient(t *testing.T, conn *websocket.Conn, sessionID string, secret str
 	if err := conn.ReadJSON(&paired); err != nil {
 		t.Fatalf("read paired: %v", err)
 	}
-	return paired.ClientID
+	return paired
 }
 
 func testEnvelope(sessionID string, clientID string, direction string, payload []byte) ForwardEnvelope {

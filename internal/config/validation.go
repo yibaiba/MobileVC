@@ -5,18 +5,6 @@ import (
 	"strings"
 )
 
-func (c Config) validateSecurity() error {
-	if c.Security.PublicExposureMode && len(c.Security.AllowedOrigins) == 0 {
-		return fmt.Errorf("ALLOWED_ORIGINS is required when PUBLIC_EXPOSURE_MODE is true")
-	}
-	for _, origin := range c.Security.AllowedOrigins {
-		if _, err := NormalizeOrigin(origin); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func (c Config) validateRelay() error {
 	if !c.Relay.Enabled {
 		return nil
@@ -34,6 +22,15 @@ func (c Config) validateRelay() error {
 		return fmt.Errorf("relay durations must be positive")
 	}
 	return nil
+}
+
+func (c Config) validateNetwork() error {
+	switch c.Network.ExposureMode {
+	case ExposureModeLAN, ExposureModeRelayOnly:
+		return nil
+	default:
+		return fmt.Errorf("NETWORK_EXPOSURE_MODE must be lan or relay-only")
+	}
 }
 
 func (c Config) validateTTS() error {

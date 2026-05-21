@@ -1,18 +1,15 @@
 package main
 
 import (
-	"errors"
 	"fmt"
 	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
-
-	"mobilevc/internal/fileaccess"
 )
 
-func serveDownload(w http.ResponseWriter, r *http.Request, authToken string, policy fileaccess.Policy) {
+func serveDownload(w http.ResponseWriter, r *http.Request, authToken string) {
 	if r.URL.Query().Get("token") != authToken {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
@@ -22,9 +19,9 @@ func serveDownload(w http.ResponseWriter, r *http.Request, authToken string, pol
 		http.Error(w, "path is required", http.StatusBadRequest)
 		return
 	}
-	absPath, err := policy.Resolve(target)
+	absPath, err := filepath.Abs(filepath.Clean(target))
 	if err != nil {
-		writeResolveError(w, err)
+		http.Error(w, "invalid path", http.StatusBadRequest)
 		return
 	}
 	if err := validateDownloadTarget(absPath); err != nil {
@@ -34,14 +31,6 @@ func serveDownload(w http.ResponseWriter, r *http.Request, authToken string, pol
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filepath.Base(absPath)))
 	w.Header().Set("Content-Type", downloadContentType(absPath))
 	http.ServeFile(w, r, absPath)
-}
-
-func writeResolveError(w http.ResponseWriter, err error) {
-	status := http.StatusBadRequest
-	if errors.Is(err, fileaccess.ErrOutsideRoot) {
-		status = http.StatusForbidden
-	}
-	http.Error(w, err.Error(), status)
 }
 
 func validateDownloadTarget(path string) error {

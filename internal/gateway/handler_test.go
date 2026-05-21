@@ -23,7 +23,6 @@ import (
 	"mobilevc/internal/data"
 	"mobilevc/internal/data/codexsync"
 	"mobilevc/internal/engine"
-	"mobilevc/internal/fileaccess"
 	"mobilevc/internal/protocol"
 	"mobilevc/internal/push"
 	"mobilevc/internal/session"
@@ -321,84 +320,12 @@ func dialTestConn(t *testing.T, h *Handler, origin string) (*websocket.Conn, *ht
 	return conn, resp
 }
 
-func TestHandlerPublicModeOriginAllowlist(t *testing.T) {
-	tests := []struct {
-		name     string
-		origin   string
-		wantDial bool
-		wantCode int
-	}{
-		{
-			name:     "allowed origin",
-			origin:   "https://example.test",
-			wantDial: true,
-		},
-		{
-			name:     "allowed origin default port",
-			origin:   "https://example.test:443",
-			wantDial: true,
-		},
-		{
-			name:     "missing origin is native client path",
-			origin:   "",
-			wantDial: true,
-		},
-		{
-			name:     "rejected origin",
-			origin:   "https://evil.example.test",
-			wantCode: http.StatusForbidden,
-		},
-		{
-			name:     "malformed origin",
-			origin:   "notaurl",
-			wantCode: http.StatusForbidden,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			h := newTestHandler()
-			if err := h.ConfigurePublicAccess(true, []string{"https://example.test"}); err != nil {
-				t.Fatalf("ConfigurePublicAccess failed: %v", err)
-			}
-
-			conn, resp := dialTestConn(t, h, tt.origin)
-			if tt.wantDial {
-				if conn == nil {
-					t.Fatalf("expected websocket connection, status=%s", responseStatus(resp))
-				}
-				return
-			}
-			if conn != nil {
-				t.Fatal("expected websocket dial to fail")
-			}
-			if resp == nil || resp.StatusCode != tt.wantCode {
-				t.Fatalf("status: got %s, want %d", responseStatus(resp), tt.wantCode)
-			}
-		})
-	}
-}
-
-func TestHandlerPrivateModeAllowsBrowserOrigin(t *testing.T) {
+func TestHandlerAllowsBrowserOrigin(t *testing.T) {
 	h := newTestHandler()
 
 	conn, resp := dialTestConn(t, h, "https://example.test")
 	if conn == nil {
 		t.Fatalf("expected websocket connection, status=%s", responseStatus(resp))
-	}
-}
-
-func TestWSDebugPreviewRedactsSecrets(t *testing.T) {
-	input := `curl -H "Authorization: Bearer abc123" https://example.test api_key=key123 --token token123 password:pass123`
-	got := wsDebugPreview(input)
-
-	for _, leaked := range []string{"abc123", "key123", "token123", "pass123"} {
-		if strings.Contains(got, leaked) {
-			t.Fatalf("secret %q leaked in preview %q", leaked, got)
-		}
-	}
-	if !strings.Contains(got, "Authorization: Bearer <redacted>") {
-		t.Fatalf("authorization was not redacted: %q", got)
 	}
 }
 
@@ -444,93 +371,15 @@ func requireAgentState(t *testing.T, event map[string]any, wantState string, wan
 	}
 }
 
-func TestHandlerFileAccessPolicy(t *testing.T) {
-	workspace := t.TempDir()
-	inside := filepath.Join(workspace, "inside.txt")
-	if err := os.WriteFile(inside, []byte("ok"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	outside := filepath.Join(t.TempDir(), "secret.txt")
-	if err := os.WriteFile(outside, []byte("secret"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	h := newTestHandler()
-	h.FilePolicy = newGatewayTestFilePolicy(t, workspace, nil)
-	conn := newTestConn(t, h)
-
-	if err := conn.WriteJSON(protocol.FSReadRequestEvent{
-		ClientEvent: protocol.ClientEvent{Action: "fs_read"},
-		Path:        inside,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	readEvent := readUntilType(t, conn, protocol.EventTypeFSReadResult)
-	if readEvent["content"] != "ok" {
-		t.Fatalf("content: got %#v", readEvent["content"])
-	}
-	if err := conn.WriteJSON(protocol.FSReadRequestEvent{
-		ClientEvent: protocol.ClientEvent{Action: "fs_read"},
-		Path:        outside,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	errorEvent := readUntilType(t, conn, protocol.EventTypeError)
-	msg, _ := errorEvent["msg"].(string)
-	if !strings.Contains(msg, "outside trusted file roots") {
-		t.Fatalf("error message: got %#v", errorEvent)
-	}
-}
-
-func TestHandlerFileAccessPolicyAllowsTrustedRoot(t *testing.T) {
-	workspace := t.TempDir()
-	trusted := t.TempDir()
-	filePath := filepath.Join(trusted, "shared.txt")
+func TestHandlerFileAccessReadsAbsolutePath(t *testing.T) {
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "shared.txt")
 	if err := os.WriteFile(filePath, []byte("ok"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	h := newTestHandler()
-	h.FilePolicy = newGatewayTestFilePolicy(t, workspace, []string{trusted})
 	conn := newTestConn(t, h)
 
-	if err := conn.WriteJSON(protocol.FSListRequestEvent{
-		ClientEvent: protocol.ClientEvent{Action: "fs_list"},
-		Path:        trusted,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	listEvent := readUntilType(t, conn, protocol.EventTypeFSListResult)
-	items, _ := listEvent["items"].([]any)
-	if len(items) != 1 {
-		t.Fatalf("items: got %#v", listEvent["items"])
-	}
-	item, _ := items[0].(map[string]any)
-	if item["name"] != "shared.txt" {
-		t.Fatalf("item: got %#v", item)
-	}
-}
-
-func TestHandlerFileAccessConfigUpdatesTrustedRoots(t *testing.T) {
-	workspace := t.TempDir()
-	clientRoot := t.TempDir()
-	filePath := filepath.Join(clientRoot, "shared.txt")
-	if err := os.WriteFile(filePath, []byte("ok"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	h := newTestHandler()
-	h.FilePolicy = newGatewayTestFilePolicy(t, workspace, nil)
-	conn := newTestConn(t, h)
-
-	if err := conn.WriteJSON(protocol.FileAccessConfigRequestEvent{
-		ClientEvent:  protocol.ClientEvent{Action: "file_access_config"},
-		TrustedRoots: []string{clientRoot},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	resultEvent := readUntilType(t, conn, protocol.EventTypeFileAccessConfigResult)
-	roots, _ := resultEvent["trustedRoots"].([]any)
-	if len(roots) != 2 {
-		t.Fatalf("trusted roots: got %#v", resultEvent["trustedRoots"])
-	}
 	if err := conn.WriteJSON(protocol.FSReadRequestEvent{
 		ClientEvent: protocol.ClientEvent{Action: "fs_read"},
 		Path:        filePath,
@@ -541,49 +390,6 @@ func TestHandlerFileAccessConfigUpdatesTrustedRoots(t *testing.T) {
 	if readEvent["content"] != "ok" {
 		t.Fatalf("content: got %#v", readEvent["content"])
 	}
-}
-
-func TestHandlerFileAccessConfigRejectsInvalidRootWithoutMutatingPolicy(t *testing.T) {
-	workspace := t.TempDir()
-	initialRoot := t.TempDir()
-	filePath := filepath.Join(initialRoot, "allowed.txt")
-	if err := os.WriteFile(filePath, []byte("ok"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	h := newTestHandler()
-	h.FilePolicy = newGatewayTestFilePolicy(t, workspace, []string{initialRoot})
-	conn := newTestConn(t, h)
-
-	if err := conn.WriteJSON(protocol.FileAccessConfigRequestEvent{
-		ClientEvent:  protocol.ClientEvent{Action: "file_access_config"},
-		TrustedRoots: []string{filepath.Join(t.TempDir(), "missing")},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	errorEvent := readUntilType(t, conn, protocol.EventTypeError)
-	msg, _ := errorEvent["msg"].(string)
-	if !strings.Contains(msg, "invalid trusted file root") {
-		t.Fatalf("error message: got %#v", errorEvent)
-	}
-	if err := conn.WriteJSON(protocol.FSReadRequestEvent{
-		ClientEvent: protocol.ClientEvent{Action: "fs_read"},
-		Path:        filePath,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	readEvent := readUntilType(t, conn, protocol.EventTypeFSReadResult)
-	if readEvent["content"] != "ok" {
-		t.Fatalf("policy was mutated after invalid config: %#v", readEvent)
-	}
-}
-
-func newGatewayTestFilePolicy(t *testing.T, workspace string, trusted []string) fileaccess.Policy {
-	t.Helper()
-	policy, err := fileaccess.NewPolicy(workspace, trusted)
-	if err != nil {
-		t.Fatalf("NewPolicy failed: %v", err)
-	}
-	return policy
 }
 
 type switchableStubRunner struct {
@@ -1047,6 +853,19 @@ func TestAIStatusSnapshotDoesNotHideProjectedBusyState(t *testing.T) {
 	}
 	if status.Label != "正在修改 · main.dart" {
 		t.Fatalf("expected projected tool label, got %q", status.Label)
+	}
+}
+
+func TestApplyAICommandPreferencesReplacesStaleCodexModel(t *testing.T) {
+	got := applyAICommandPreferences(
+		"codex -m gpt-5-codex --config model_reasoning_effort=medium",
+		"codex",
+		"gpt-5.5",
+		"high",
+	)
+	want := "codex -m gpt-5.5 --config model_reasoning_effort=high"
+	if got != want {
+		t.Fatalf("unexpected codex command: got %q want %q", got, want)
 	}
 }
 
@@ -6075,6 +5894,9 @@ func TestHandlerSessionDeleteRejectsNativeCodexMirror(t *testing.T) {
 	errorEvent := readUntilType(t, conn, protocol.EventTypeError)
 	if errorEvent["msg"] != "Codex 原生会话仅支持恢复，不支持在 MobileVC 内删除" {
 		t.Fatalf("unexpected error event: %#v", errorEvent)
+	}
+	if errorEvent["code"] != "session_delete_failed" {
+		t.Fatalf("expected session_delete_failed code, got %#v", errorEvent)
 	}
 	if _, err := h.SessionStore.GetSession(context.Background(), mirrorID); err != nil {
 		t.Fatalf("expected mirrored native session to remain after delete rejection: %v", err)

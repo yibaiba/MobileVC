@@ -23,12 +23,13 @@ class AppConfig {
     this.fastMode = false,
     this.adbIceServersJson = '',
     this.secureTransport,
-    this.trustedFileRoots = const <String>[],
     this.connectionMode = 'direct',
     this.relayUrl = '',
     this.relaySessionId = '',
     this.relayPairingSecret = '',
     this.relayPairingExpiresAt = 0,
+    this.relayClientId = '',
+    this.relayClientReconnectSecret = '',
   });
 
   final String host;
@@ -45,12 +46,13 @@ class AppConfig {
   final bool fastMode;
   final String adbIceServersJson;
   final bool? secureTransport;
-  final List<String> trustedFileRoots;
   final String connectionMode;
   final String relayUrl;
   final String relaySessionId;
   final String relayPairingSecret;
   final int relayPairingExpiresAt;
+  final String relayClientId;
+  final String relayClientReconnectSecret;
 
   bool get isRelayMode => connectionMode == ConnectionMode.relay.name;
 
@@ -112,12 +114,13 @@ class AppConfig {
     bool? fastMode,
     String? adbIceServersJson,
     bool? secureTransport,
-    List<String>? trustedFileRoots,
     String? connectionMode,
     String? relayUrl,
     String? relaySessionId,
     String? relayPairingSecret,
     int? relayPairingExpiresAt,
+    String? relayClientId,
+    String? relayClientReconnectSecret,
   }) {
     final nextEngine = engine ?? this.engine;
     final nextModels = AppConfigEngineModels.resolve(
@@ -153,8 +156,6 @@ class AppConfig {
       adbIceServersJson: adbIceServersJson ?? this.adbIceServersJson,
       secureTransport:
           secureTransport ?? endpoint.secureTransport ?? this.secureTransport,
-      trustedFileRoots:
-          _normalizeTrustedFileRoots(trustedFileRoots ?? this.trustedFileRoots),
       connectionMode:
           normalizeConnectionMode(connectionMode ?? this.connectionMode),
       relayUrl: relayUrl ?? this.relayUrl,
@@ -162,6 +163,9 @@ class AppConfig {
       relayPairingSecret: relayPairingSecret ?? this.relayPairingSecret,
       relayPairingExpiresAt:
           relayPairingExpiresAt ?? this.relayPairingExpiresAt,
+      relayClientId: relayClientId ?? this.relayClientId,
+      relayClientReconnectSecret:
+          relayClientReconnectSecret ?? this.relayClientReconnectSecret,
     );
   }
 
@@ -215,9 +219,12 @@ class AppConfig {
         'permissionMode': permissionMode,
         'fastMode': fastMode,
         'adbIceServersJson': adbIceServersJson,
-        'trustedFileRoots': trustedFileRoots,
         'connectionMode': connectionMode,
         if (relayUrl.trim().isNotEmpty) 'relayUrl': relayUrl,
+        if (relaySessionId.trim().isNotEmpty) 'relaySessionId': relaySessionId,
+        if (relayClientId.trim().isNotEmpty) 'relayClientId': relayClientId,
+        if (relayClientReconnectSecret.trim().isNotEmpty)
+          'relayClientReconnectSecret': relayClientReconnectSecret,
         if (secureTransport != null) 'secureTransport': secureTransport!,
       };
 
@@ -255,9 +262,12 @@ class AppConfig {
       adbIceServersJson: (json['adbIceServersJson'] ?? '').toString(),
       secureTransport: endpoint.secureTransport ??
           parseSecureTransport(json['secureTransport']),
-      trustedFileRoots: _parseTrustedFileRoots(json['trustedFileRoots']),
       connectionMode: normalizeConnectionMode(json['connectionMode']),
       relayUrl: (json['relayUrl'] ?? '').toString(),
+      relaySessionId: (json['relaySessionId'] ?? '').toString(),
+      relayClientId: (json['relayClientId'] ?? '').toString(),
+      relayClientReconnectSecret:
+          (json['relayClientReconnectSecret'] ?? '').toString(),
     );
   }
 
@@ -270,30 +280,6 @@ class AppConfig {
       default:
         return 'auto';
     }
-  }
-
-  static List<String> _parseTrustedFileRoots(Object? value) {
-    if (value is List) {
-      return _normalizeTrustedFileRoots(value.map((item) => item.toString()));
-    }
-    if (value is String) {
-      return _normalizeTrustedFileRoots(value.split('\n'));
-    }
-    return const <String>[];
-  }
-
-  static List<String> _normalizeTrustedFileRoots(Iterable<String> roots) {
-    final seen = <String>{};
-    final normalized = <String>[];
-    for (final root in roots) {
-      final item = root.trim();
-      if (item.isEmpty || seen.contains(item)) {
-        continue;
-      }
-      seen.add(item);
-      normalized.add(item);
-    }
-    return List.unmodifiable(normalized);
   }
 
   static AppConfig? fromLaunchUri(
@@ -312,6 +298,8 @@ class AppConfig {
         relaySessionId: relayPairing.sessionId,
         relayPairingSecret: relayPairing.pairingSecret,
         relayPairingExpiresAt: relayPairing.expiresAt,
+        relayClientId: '',
+        relayClientReconnectSecret: '',
       );
     }
     final uri = Uri.tryParse(trimmed);

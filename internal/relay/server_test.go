@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"encoding/base64"
 	"net/http"
 	"strings"
 	"testing"
@@ -30,6 +31,9 @@ func TestRelayPairingAndOpaqueForwarding(t *testing.T) {
 	var paired ClientPairedFrame
 	if err := client.ReadJSON(&paired); err != nil {
 		t.Fatalf("read paired: %v", err)
+	}
+	if paired.ClientReconnectSecret == "" {
+		t.Fatal("missing client reconnect secret")
 	}
 
 	payload := []byte(`{"action":"unknown_business_action","secret":"opaque"}`)
@@ -91,6 +95,71 @@ func TestRelayPairingSecretConsumed(t *testing.T) {
 	}
 }
 
+func TestRelayClientReconnectsWithReconnectSecret(t *testing.T) {
+	server := newTestRelayServer(t)
+	defer server.Close()
+
+	sessionID := "rs_client_reconnect"
+	secret := "pair-secret-128-bit-minimum"
+	agent := dialRelay(t, server.URL, "/relay/agent")
+	defer agent.Close()
+	registerAgent(t, agent, sessionID, secret, "reconnect-secret", time.Now().Add(time.Minute))
+	client := dialRelay(t, server.URL, "/relay/client")
+	clientID, reconnectSecret := pairClientWithReconnectSecret(t, client, sessionID, secret)
+	readAttached(t, agent, clientID)
+	_ = client.Close()
+
+	reconnected := dialRelay(t, server.URL, "/relay/client")
+	defer reconnected.Close()
+	if err := reconnected.WriteJSON(ClientReconnectFrame{
+		Type: TypeClientReconnect, Version: Version,
+		SessionID: sessionID, ClientID: clientID,
+		ClientReconnectSecret: reconnectSecret,
+	}); err != nil {
+		t.Fatalf("client reconnect: %v", err)
+	}
+	var paired ClientPairedFrame
+	if err := reconnected.ReadJSON(&paired); err != nil {
+		t.Fatalf("read reconnect paired: %v", err)
+	}
+	if paired.ClientID != clientID || paired.ClientReconnectSecret != "" {
+		t.Fatalf("unexpected reconnect paired frame: %#v", paired)
+	}
+	readAttached(t, agent, clientID)
+}
+
+func TestRelayRejectsClientReconnectWithWrongSecret(t *testing.T) {
+	server := newTestRelayServer(t)
+	defer server.Close()
+
+	sessionID := "rs_bad_client_reconnect"
+	secret := "pair-secret-128-bit-minimum"
+	agent := dialRelay(t, server.URL, "/relay/agent")
+	defer agent.Close()
+	registerAgent(t, agent, sessionID, secret, "reconnect-secret", time.Now().Add(time.Minute))
+	client := dialRelay(t, server.URL, "/relay/client")
+	defer client.Close()
+	clientID := pairClient(t, client, sessionID, secret)
+	readAttached(t, agent, clientID)
+
+	bad := dialRelay(t, server.URL, "/relay/client")
+	defer bad.Close()
+	if err := bad.WriteJSON(ClientReconnectFrame{
+		Type: TypeClientReconnect, Version: Version,
+		SessionID: sessionID, ClientID: clientID,
+		ClientReconnectSecret: "wrong-secret",
+	}); err != nil {
+		t.Fatalf("bad client reconnect: %v", err)
+	}
+	var errFrame ErrorFrame
+	if err := bad.ReadJSON(&errFrame); err != nil {
+		t.Fatalf("read reconnect error: %v", err)
+	}
+	if errFrame.Code != CodePairingRejected {
+		t.Fatalf("unexpected reconnect error: %#v", errFrame)
+	}
+}
+
 func TestRelayRejectsForwardWithWrongClientID(t *testing.T) {
 	server := newTestRelayServer(t)
 	defer server.Close()
@@ -149,7 +218,8 @@ func TestRelayRejectsSessionIDReuseAfterAgentDisconnect(t *testing.T) {
 }
 
 func TestRelayRejectsOversizedDecodedPayload(t *testing.T) {
-	server := newTestRelayServer(t)
+	const maxPayloadBytes = 1024
+	server := newLimitedTestRelayServer(t, Config{MaxPayloadBytes: maxPayloadBytes})
 	defer server.Close()
 
 	sessionID := "rs_large"
@@ -160,8 +230,9 @@ func TestRelayRejectsOversizedDecodedPayload(t *testing.T) {
 	client := dialRelay(t, server.URL, "/relay/client")
 	defer client.Close()
 	clientID := pairClient(t, client, sessionID, secret)
+	readAttached(t, agent, clientID)
 
-	payload := strings.Repeat("x", MaxPayloadBytes+1)
+	payload := strings.Repeat("x", maxPayloadBytes+1)
 	if err := client.WriteJSON(testEnvelope(sessionID, clientID, DirectionClientToAgent, []byte(payload))); err != nil {
 		t.Fatalf("send oversized forward: %v", err)
 	}
@@ -170,6 +241,77 @@ func TestRelayRejectsOversizedDecodedPayload(t *testing.T) {
 		t.Fatalf("read oversized error: %v", err)
 	}
 	if errFrame.Code != CodePayloadTooLarge {
+		t.Fatalf("unexpected error frame: %#v", errFrame)
+	}
+	if errFrame.DecodedBytes != maxPayloadBytes+1 || errFrame.MaxBytes != maxPayloadBytes {
+		t.Fatalf("unexpected payload size metadata: %#v", errFrame)
+	}
+
+	env := testEnvelope(sessionID, clientID, DirectionClientToAgent, []byte(`{"action":"after_oversized"}`))
+	if err := client.WriteJSON(env); err != nil {
+		t.Fatalf("send valid forward after oversized payload: %v", err)
+	}
+	var got ForwardEnvelope
+	if err := agent.ReadJSON(&got); err != nil {
+		t.Fatalf("agent read valid forward after oversized payload: %v", err)
+	}
+	if got.Payload != env.Payload {
+		t.Fatalf("payload after oversized changed: got %q want %q", got.Payload, env.Payload)
+	}
+}
+
+func TestRelayAcceptsPaddedBase64URLPayload(t *testing.T) {
+	server := newTestRelayServer(t)
+	defer server.Close()
+
+	sessionID := "rs_padded_payload"
+	secret := "pair-secret-128-bit-minimum"
+	agent := dialRelay(t, server.URL, "/relay/agent")
+	defer agent.Close()
+	registerAgent(t, agent, sessionID, secret, "reconnect-secret", time.Now().Add(time.Minute))
+	client := dialRelay(t, server.URL, "/relay/client")
+	defer client.Close()
+	clientID := pairClient(t, client, sessionID, secret)
+	readAttached(t, agent, clientID)
+
+	env := testEnvelope(sessionID, clientID, DirectionClientToAgent, []byte(`{"action":"ping"}`))
+	env.Payload = base64.URLEncoding.EncodeToString([]byte(`{"action":"ping"}`))
+	if err := client.WriteJSON(env); err != nil {
+		t.Fatalf("send padded forward: %v", err)
+	}
+	var got ForwardEnvelope
+	if err := agent.ReadJSON(&got); err != nil {
+		t.Fatalf("agent read padded forward: %v", err)
+	}
+	if got.Payload != env.Payload {
+		t.Fatalf("payload changed: got %q want %q", got.Payload, env.Payload)
+	}
+}
+
+func TestRelayRejectsInvalidPayloadEncodingAsProtocolError(t *testing.T) {
+	server := newTestRelayServer(t)
+	defer server.Close()
+
+	sessionID := "rs_invalid_payload"
+	secret := "pair-secret-128-bit-minimum"
+	agent := dialRelay(t, server.URL, "/relay/agent")
+	defer agent.Close()
+	registerAgent(t, agent, sessionID, secret, "reconnect-secret", time.Now().Add(time.Minute))
+	client := dialRelay(t, server.URL, "/relay/client")
+	defer client.Close()
+	clientID := pairClient(t, client, sessionID, secret)
+	readAttached(t, agent, clientID)
+
+	env := testEnvelope(sessionID, clientID, DirectionClientToAgent, []byte(`{"action":"ping"}`))
+	env.Payload = "not base64url payload"
+	if err := client.WriteJSON(env); err != nil {
+		t.Fatalf("send invalid payload forward: %v", err)
+	}
+	var errFrame ErrorFrame
+	if err := client.ReadJSON(&errFrame); err != nil {
+		t.Fatalf("read invalid payload error: %v", err)
+	}
+	if errFrame.Code != CodeProtocolError {
 		t.Fatalf("unexpected error frame: %#v", errFrame)
 	}
 }

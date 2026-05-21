@@ -1,6 +1,8 @@
 # 编译产物
-server
+/server
 packages/
+cmd/server/web/*
+!cmd/server/web/.gitkeep
 
 # 依赖
 node_modules/
@@ -20,3 +22,8 @@ Thumbs.db
 
 # Claude 工作区
 .claude/worktrees/
+.agents/
+.claude/
+.codex/
+.tmp/
+.trellis/

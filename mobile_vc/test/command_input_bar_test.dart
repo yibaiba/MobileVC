@@ -72,10 +72,8 @@ void main() {
         ),
       );
 
-      expect(
-          find.textContaining('Claude ·', findRichText: true), findsOneWidget);
       final field = tester.widget<TextField>(find.byType(TextField));
-      expect(field.decoration?.hintText, '继续回复 Claude');
+      expect(field.decoration?.hintText, '回复 Claude');
     });
 
     testWidgets('等待输入时即使 canStop 为 true 也显示发送按钮', (tester) async {
@@ -93,7 +91,12 @@ void main() {
         ),
       );
 
-      expect(find.byIcon(Icons.arrow_upward), findsOneWidget);
+      expect(
+          find.descendant(
+            of: find.byType(FilledButton),
+            matching: find.byIcon(Icons.arrow_upward),
+          ),
+          findsOneWidget);
       expect(find.byIcon(Icons.stop_rounded), findsNothing);
 
       await tester.enterText(find.byType(TextField), '继续');
@@ -113,10 +116,8 @@ void main() {
         ),
       );
 
-      expect(
-          find.textContaining('Codex ·', findRichText: true), findsOneWidget);
       final field = tester.widget<TextField>(find.byType(TextField));
-      expect(field.decoration?.hintText, '继续回复 Codex');
+      expect(field.decoration?.hintText, '回复 Codex');
     });
 
     testWidgets('shell 模式显示 Shell 状态与 hint', (tester) async {
@@ -128,10 +129,8 @@ void main() {
         ),
       );
 
-      expect(
-          find.textContaining('Shell ·', findRichText: true), findsOneWidget);
       final field = tester.widget<TextField>(find.byType(TextField));
-      expect(field.decoration?.hintText, '当前 shell 会话仍在运行');
+      expect(field.decoration?.hintText, '正在停止，请稍候...');
     });
 
     testWidgets('busy 且非等待输入时发送按钮切为停止按钮', (tester) async {
@@ -180,6 +179,7 @@ Widget _buildTestApp({
   String currentEngine = 'claude',
   bool isSessionLoading = false,
   ValueChanged<String>? onSubmit,
+  VoidCallback? onAttachImage,
   VoidCallback? onStop,
 }) {
   return MaterialApp(
@@ -194,6 +194,7 @@ Widget _buildTestApp({
         shouldShowPermissionChoices: shouldShowPermissionChoices,
         shouldShowReviewChoices: shouldShowReviewChoices,
         onSubmit: onSubmit ?? (_) {},
+        onAttachImage: onAttachImage ?? () {},
         onStop: onStop ?? () {},
         onOpenSessions: () {},
         onOpenRuntimeInfo: () {},

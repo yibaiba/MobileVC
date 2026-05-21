@@ -5,6 +5,8 @@ import (
 	"errors"
 	"strings"
 	"time"
+
+	"mobilevc/internal/logx"
 )
 
 func (s *Server) forwardLoop(peer *peerConn, sessionID string, direction string) {
@@ -14,6 +16,9 @@ func (s *Server) forwardLoop(peer *peerConn, sessionID string, direction string)
 			return
 		}
 		if err := s.forwardEnvelope(peer, sessionID, direction, env); err != nil {
+			if errors.Is(err, errPayloadTooLarge) {
+				continue
+			}
 			return
 		}
 	}
@@ -30,8 +35,14 @@ func (s *Server) forwardEnvelope(peer *peerConn, sessionID string, direction str
 		writeError(peer, CodeProtocolError)
 		return err
 	}
-	if err := validatePayloadSize(env.Payload); err != nil {
-		writeError(peer, CodePayloadTooLarge)
+	if size, err := s.validatePayloadSize(env.Payload); err != nil {
+		if errors.Is(err, errInvalidPayloadEncoding) {
+			logx.Warn("relay", "invalid payload encoding: sessionID=%s clientID=%s direction=%s remote=%s err=%v", sessionID, env.ClientID, direction, peer.remote, err)
+			writeError(peer, CodeProtocolError)
+			return err
+		}
+		logx.Warn("relay", "payload too large: sessionID=%s clientID=%s direction=%s decodedBytes=%d maxBytes=%d remote=%s", sessionID, env.ClientID, direction, size, s.cfg.MaxPayloadBytes, peer.remote)
+		writeErrorFrame(peer, payloadTooLargeFrame(size, s.cfg.MaxPayloadBytes))
 		return err
 	}
 	target := s.targetConn(sessionID, direction)
@@ -107,15 +118,29 @@ func (s *Server) forwardClientIDMatches(peer *peerConn, sessionID string, client
 	return state.agent == peer && state.clientID == clientID
 }
 
-func validatePayloadSize(payload string) error {
-	decoded, err := base64.RawURLEncoding.DecodeString(payload)
+var (
+	errInvalidPayloadEncoding = errors.New("invalid payload encoding")
+	errPayloadTooLarge        = errors.New("payload too large")
+)
+
+func (s *Server) validatePayloadSize(payload string) (int, error) {
+	decoded, err := DecodePayloadBase64URL(payload)
 	if err != nil {
-		return err
+		return 0, errInvalidPayloadEncoding
 	}
-	if len(decoded) > MaxPayloadBytes {
-		return errors.New("payload too large")
+	if len(decoded) > s.cfg.MaxPayloadBytes {
+		return len(decoded), errPayloadTooLarge
 	}
-	return nil
+	return len(decoded), nil
+}
+
+// DecodePayloadBase64URL accepts both padded and unpadded base64url payloads.
+func DecodePayloadBase64URL(payload string) ([]byte, error) {
+	decoded, err := base64.RawURLEncoding.DecodeString(payload)
+	if err == nil {
+		return decoded, nil
+	}
+	return base64.URLEncoding.DecodeString(payload)
 }
 
 func (s *Server) targetConn(sessionID string, direction string) *peerConn {
@@ -176,4 +201,15 @@ func (s *Server) markClientDisconnected(sessionID string, peer *peerConn) {
 
 func writeError(peer *peerConn, code string) {
 	_ = peer.WriteJSON(NewErrorFrame(code))
+}
+
+func writeErrorFrame(peer *peerConn, frame ErrorFrame) {
+	_ = peer.WriteJSON(frame)
+}
+
+func payloadTooLargeFrame(decodedBytes int, maxBytes int) ErrorFrame {
+	frame := NewErrorFrame(CodePayloadTooLarge)
+	frame.DecodedBytes = decodedBytes
+	frame.MaxBytes = maxBytes
+	return frame
 }

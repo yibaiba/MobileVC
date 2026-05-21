@@ -47,14 +47,13 @@ func preserveConfigEnv(t *testing.T) {
 	t.Helper()
 	keys := []string{
 		"AUTH_TOKEN",
+		"NETWORK_EXPOSURE_MODE",
 		"TTS_ENABLED",
 		"TTS_PROVIDER",
 		"TTS_PYTHON_SERVICE_URL",
 		"TTS_REQUEST_TIMEOUT_SECONDS",
 		"TTS_MAX_TEXT_LENGTH",
 		"TTS_DEFAULT_FORMAT",
-		"PUBLIC_EXPOSURE_MODE",
-		"ALLOWED_ORIGINS",
 		"RELAY_MODE",
 		"RELAY_URL",
 		"RELAY_PAIRING_TTL",
@@ -76,78 +75,76 @@ func preserveEnv(t *testing.T, key string) {
 	t.Cleanup(func() { os.Unsetenv(key) })
 }
 
-func TestLoadTrustedFileRoots(t *testing.T) {
-	withEnv(t, map[string]string{
-		"AUTH_TOKEN":                 "test",
-		"RUNTIME_TRUSTED_FILE_ROOTS": "/tmp/shared" + string(os.PathListSeparator) + "/var/log",
-	})
+func TestLoadNetworkExposureMode(t *testing.T) {
+	tests := []struct {
+		name     string
+		raw      string
+		wantMode string
+		wantAddr string
+	}{
+		{name: "default lan", wantMode: ExposureModeLAN, wantAddr: ":8001"},
+		{name: "lan alias", raw: "lan-enabled", wantMode: ExposureModeLAN, wantAddr: ":8001"},
+		{name: "relay only", raw: "relay-only", wantMode: ExposureModeRelayOnly, wantAddr: "127.0.0.1:8001"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			values := map[string]string{"AUTH_TOKEN": "test"}
+			if tt.raw != "" {
+				values["NETWORK_EXPOSURE_MODE"] = tt.raw
+			}
+			withEnv(t, values)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load failed: %v", err)
+			}
+			if cfg.Network.ExposureMode != tt.wantMode {
+				t.Fatalf("exposure mode: got %q want %q", cfg.Network.ExposureMode, tt.wantMode)
+			}
+			if cfg.ListenAddress() != tt.wantAddr {
+				t.Fatalf("listen address: got %q want %q", cfg.ListenAddress(), tt.wantAddr)
+			}
+		})
+	}
+}
 
-	cfg, err := Load()
+func TestLoadRejectsInvalidNetworkExposureMode(t *testing.T) {
+	withEnv(t, map[string]string{
+		"AUTH_TOKEN":            "test",
+		"NETWORK_EXPOSURE_MODE": "public",
+	})
+	if _, err := Load(); err == nil {
+		t.Fatal("expected invalid network exposure mode error")
+	}
+}
+
+func TestLoadWithOverridesUsesCLIValues(t *testing.T) {
+	withEnv(t, map[string]string{
+		"AUTH_TOKEN":               "env-token",
+		"NETWORK_EXPOSURE_MODE":    "lan",
+		"RELAY_MODE":               "false",
+		"RELAY_URL":                "",
+		"RELAY_PAIRING_EVENT_PATH": "",
+	})
+	relayMode := true
+	cfg, err := LoadWithOverrides(Overrides{
+		Port:                "9001",
+		AuthToken:           "cli-token",
+		NetworkExposureMode: "relay-only",
+		RelayMode:           &relayMode,
+		RelayURL:            "wss://relay.example.test",
+		RelayPairingPath:    "/tmp/mobilevc-pairing.json",
+	})
 	if err != nil {
-		t.Fatalf("Load failed: %v", err)
+		t.Fatalf("LoadWithOverrides failed: %v", err)
 	}
-	if len(cfg.Runtime.TrustedFileRoots) != 2 {
-		t.Fatalf("TrustedFileRoots: got %#v", cfg.Runtime.TrustedFileRoots)
-	}
-	if cfg.Runtime.TrustedFileRoots[0] != "/tmp/shared" {
-		t.Fatalf("first trusted root: got %q", cfg.Runtime.TrustedFileRoots[0])
-	}
-	if cfg.Runtime.TrustedFileRoots[1] != "/var/log" {
-		t.Fatalf("second trusted root: got %q", cfg.Runtime.TrustedFileRoots[1])
-	}
-}
-
-func TestLoadPublicExposureModeRequiresAllowedOrigins(t *testing.T) {
-	withEnv(t, map[string]string{
-		"AUTH_TOKEN":           "test",
-		"PUBLIC_EXPOSURE_MODE": "true",
-		"ALLOWED_ORIGINS":      "",
-	})
-
-	_, err := Load()
-	if err == nil {
-		t.Fatal("expected validation error")
-	}
-	if err.Error() != "ALLOWED_ORIGINS is required when PUBLIC_EXPOSURE_MODE is true" {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
-func TestLoadPublicExposureModeAllowedOrigins(t *testing.T) {
-	withEnv(t, map[string]string{
-		"AUTH_TOKEN":           "test",
-		"PUBLIC_EXPOSURE_MODE": "true",
-		"ALLOWED_ORIGINS":      "https://example.test:443, http://127.0.0.1:80",
-	})
-
-	cfg, err := Load()
-	if err != nil {
-		t.Fatalf("Load failed: %v", err)
-	}
-	if !cfg.Security.PublicExposureMode {
-		t.Fatal("PublicExposureMode should be true")
-	}
-	want := []string{"https://example.test", "http://127.0.0.1"}
-	if len(cfg.Security.AllowedOrigins) != len(want) {
-		t.Fatalf("AllowedOrigins: got %#v", cfg.Security.AllowedOrigins)
-	}
-	for i, origin := range want {
-		if cfg.Security.AllowedOrigins[i] != origin {
-			t.Fatalf("AllowedOrigins[%d]: got %q, want %q", i, cfg.Security.AllowedOrigins[i], origin)
-		}
-	}
-}
-
-func TestLoadRejectsInvalidAllowedOrigin(t *testing.T) {
-	withEnv(t, map[string]string{
-		"AUTH_TOKEN":           "test",
-		"PUBLIC_EXPOSURE_MODE": "true",
-		"ALLOWED_ORIGINS":      "https://example.test/path",
-	})
-
-	_, err := Load()
-	if err == nil {
-		t.Fatal("expected validation error")
+	if cfg.Port != "9001" ||
+		cfg.AuthToken != "cli-token" ||
+		cfg.Network.ExposureMode != ExposureModeRelayOnly ||
+		cfg.ListenAddress() != "127.0.0.1:9001" ||
+		!cfg.Relay.Enabled ||
+		cfg.Relay.URL != "wss://relay.example.test" ||
+		cfg.Relay.PairingEventPath != "/tmp/mobilevc-pairing.json" {
+		t.Fatalf("unexpected config: %#v", cfg)
 	}
 }
 

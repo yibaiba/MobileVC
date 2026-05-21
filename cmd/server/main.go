@@ -13,7 +13,6 @@ import (
 
 	"mobilevc/internal/config"
 	"mobilevc/internal/data"
-	"mobilevc/internal/fileaccess"
 	"mobilevc/internal/gateway"
 	"mobilevc/internal/logx"
 	"mobilevc/internal/push"
@@ -37,20 +36,27 @@ var (
 func main() {
 	startedAt := time.Now()
 	defer logx.Recover("bootstrap", "server startup panic")
-	cfg, filePolicy, sessionStore := bootstrap()
+	flags, err := parseServerFlags(os.Args[1:])
+	if err != nil {
+		panic(err)
+	}
+	if flags.showHelp {
+		return
+	}
+	cfg, sessionStore := bootstrap(flags.overrides)
 	summary := cfg.Summary()
-	addr := ":" + cfg.Port
+	addr := cfg.ListenAddress()
 
 	logConfigSummary(summary, cfg.AuthToken)
 	pushService := initPushService()
-	wsHandler := initWebSocketHandler(cfg, sessionStore, filePolicy, pushService)
+	wsHandler := initWebSocketHandler(cfg, sessionStore, pushService)
 	startRelayClient(cfg, wsHandler)
 	ttsHandler := initTTSHandler(cfg)
-	mux := buildMux(cfg, wsHandler, ttsHandler, filePolicy)
+	mux := buildMux(cfg, wsHandler, ttsHandler)
 	startHTTPServer(addr, mux, startedAt)
 }
 
-func bootstrap() (config.Config, fileaccess.Policy, *data.FileStore) {
+func bootstrap(overrides config.Overrides) (config.Config, *data.FileStore) {
 	logx.Info("bootstrap", "========================================")
 	logx.Info("bootstrap", "%s backend %s", appName, version)
 	logx.Info("bootstrap", "build metadata: commit=%s buildDate=%s", commit, buildDate)
@@ -58,14 +64,9 @@ func bootstrap() (config.Config, fileaccess.Policy, *data.FileStore) {
 	logx.Info("bootstrap", "Starting %s", appName)
 
 	logx.Info("bootstrap", "Loading configuration")
-	cfg, err := config.Load()
+	cfg, err := config.LoadWithOverrides(overrides)
 	if err != nil {
 		logx.Error("bootstrap", "load configuration failed: %v", err)
-		panic(err)
-	}
-	filePolicy, err := fileaccess.NewPolicy(cfg.Runtime.WorkspaceRoot, cfg.Runtime.TrustedFileRoots)
-	if err != nil {
-		logx.Error("bootstrap", "initialize file access policy failed: %v", err)
 		panic(err)
 	}
 
@@ -76,15 +77,15 @@ func bootstrap() (config.Config, fileaccess.Policy, *data.FileStore) {
 		panic(err)
 	}
 	logx.Info("bootstrap", "Session store ready: driver=file dir=%s", sessionStore.BaseDir())
-	return cfg, filePolicy, sessionStore
+	return cfg, sessionStore
 }
 
 func logConfigSummary(summary config.Summary, authToken string) {
-	logx.Info("bootstrap", "Configuration summary: port=%s authToken=%s publicExposureMode=%v allowedOrigins=%d relayMode=%v relayURL=%s runtime.defaultCommand=%s runtime.defaultMode=%s runtime.debug=%v workspaceRoot=%s projection.enhanced=%v projection.step=%v projection.diff=%v projection.prompt=%v tts.enabled=%v tts.provider=%s tts.url=%s tts.timeout=%ds tts.maxTextLength=%d tts.format=%s",
+	logx.Info("bootstrap", "Configuration summary: port=%s listen=%s exposureMode=%s authToken=%s relayMode=%v relayURL=%s runtime.defaultCommand=%s runtime.defaultMode=%s runtime.debug=%v workspaceRoot=%s projection.enhanced=%v projection.step=%v projection.diff=%v projection.prompt=%v tts.enabled=%v tts.provider=%s tts.url=%s tts.timeout=%ds tts.maxTextLength=%d tts.format=%s",
 		summary.Port,
+		summary.ListenAddress,
+		summary.ExposureMode,
 		logx.AuthTokenSummary(authToken),
-		summary.PublicExposureMode,
-		len(summary.AllowedOrigins),
 		summary.RelayMode,
 		fallback(summary.RelayURL, "-"),
 		summary.DefaultCommand,
@@ -135,14 +136,9 @@ func initPushService() push.Service {
 	return pushService
 }
 
-func initWebSocketHandler(cfg config.Config, sessionStore *data.FileStore, filePolicy fileaccess.Policy, pushService push.Service) *gateway.Handler {
+func initWebSocketHandler(cfg config.Config, sessionStore *data.FileStore, pushService push.Service) *gateway.Handler {
 	logx.Info("bootstrap", "Preparing websocket handler")
 	wsHandler := gateway.NewHandler(cfg.AuthToken, sessionStore)
-	if err := wsHandler.ConfigurePublicAccess(cfg.Security.PublicExposureMode, cfg.Security.AllowedOrigins); err != nil {
-		logx.Error("bootstrap", "configure public access failed: %v", err)
-		panic(err)
-	}
-	wsHandler.FilePolicy = filePolicy
 	wsHandler.PushService = pushService
 	logx.Info("bootstrap", "WebSocket handler ready")
 	return wsHandler
@@ -183,7 +179,7 @@ func initTTSHandler(cfg config.Config) *tts.HTTPHandler {
 	return ttsHandler
 }
 
-func buildMux(cfg config.Config, wsHandler *gateway.Handler, ttsHandler *tts.HTTPHandler, filePolicy fileaccess.Policy) *http.ServeMux {
+func buildMux(cfg config.Config, wsHandler *gateway.Handler, ttsHandler *tts.HTTPHandler) *http.ServeMux {
 	staticFS, err := fs.Sub(webAssets, "web")
 	if err != nil {
 		logx.Error("bootstrap", "prepare embedded web assets failed: %v", err)
@@ -202,7 +198,7 @@ func buildMux(cfg config.Config, wsHandler *gateway.Handler, ttsHandler *tts.HTT
 		_, _ = fmt.Fprintf(w, "{\"version\":%q,\"commit\":%q,\"buildDate\":%q}", version, commit, buildDate)
 	})
 	mux.HandleFunc("/download", func(w http.ResponseWriter, r *http.Request) {
-		serveDownload(w, r, cfg.AuthToken, filePolicy)
+		serveDownload(w, r, cfg.AuthToken)
 	})
 	if ttsHandler != nil {
 		mux.HandleFunc("/api/tts/synthesize", ttsHandler.HandleSynthesize)

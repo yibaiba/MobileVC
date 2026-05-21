@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -21,6 +22,19 @@ func TestPeerStopDoesNotWaitForPingInterval(t *testing.T) {
 	peer.Stop()
 	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
 		t.Fatalf("peer stop took %s", elapsed)
+	}
+}
+
+func TestPeerConfigurePongAllowsFirstPingInterval(t *testing.T) {
+	serverConn, clientConn := newPeerTestConns(t)
+	defer clientConn.Close()
+	peer := newPeerConn(serverConn, roleAgent, "127.0.0.1", 1)
+
+	peer.ConfigurePong(40 * time.Millisecond)
+	if err := peer.ReadJSON(&ControlFrame{}); err == nil {
+		t.Fatal("expected read timeout")
+	} else if !isTimeoutError(err) {
+		t.Fatalf("expected timeout error, got %v", err)
 	}
 }
 
@@ -49,4 +63,9 @@ func newPeerTestConns(t *testing.T) (*websocket.Conn, *websocket.Conn) {
 		t.Fatal("server websocket was not accepted")
 	}
 	return nil, nil
+}
+
+func isTimeoutError(err error) bool {
+	netErr, ok := err.(net.Error)
+	return ok && netErr.Timeout()
 }

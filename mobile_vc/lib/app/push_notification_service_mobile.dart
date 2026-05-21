@@ -26,7 +26,7 @@ class APNsPushNotificationService implements PushNotificationService {
     _channel.setMethodCallHandler(_handleMethodCall);
     await _channel.invokeMethod<void>('requestPermissionAndRegister');
     _cachedToken = await getDeviceToken();
-    debugPrint('[push] APNs initialized token=$_cachedToken');
+    debugPrint('[push] APNs initialized tokenPresent=${_cachedToken != null}');
   }
 
   @override
@@ -72,7 +72,8 @@ class APNsPushNotificationService implements PushNotificationService {
         _tokenRefreshCallback?.call(token);
         return;
       case 'onRegistrationError':
-        final message = (call.arguments as String?)?.trim() ?? 'APNs registration failed';
+        final message =
+            (call.arguments as String?)?.trim() ?? 'APNs registration failed';
         _registrationErrorCallback?.call(message);
         return;
       case 'onMessageReceived':

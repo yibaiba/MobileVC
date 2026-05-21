@@ -2,17 +2,26 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"strings"
 	"time"
 )
+
+const (
+	ExposureModeLAN       = "lan"
+	ExposureModeRelayOnly = "relay-only"
+)
+
+type NetworkConfig struct {
+	ExposureMode string
+}
 
 type RuntimeConfig struct {
 	DefaultCommand         string
 	DefaultMode            string
 	Debug                  bool
 	WorkspaceRoot          string
-	TrustedFileRoots       []string
 	EnhancedProjection     bool
 	EnableStepProjection   bool
 	EnableDiffProjection   bool
@@ -28,11 +37,6 @@ type TTSConfig struct {
 	DefaultFormat         string
 }
 
-type SecurityConfig struct {
-	PublicExposureMode bool
-	AllowedOrigins     []string
-}
-
 type RelayConfig struct {
 	Enabled          bool
 	URL              string
@@ -41,12 +45,23 @@ type RelayConfig struct {
 	PairingEventPath string
 }
 
+type Overrides struct {
+	Port                string
+	AuthToken           string
+	NetworkExposureMode string
+	RelayMode           *bool
+	RelayURL            string
+	RelayPairingTTL     time.Duration
+	RelayAgentGrace     time.Duration
+	RelayPairingPath    string
+}
+
 type Config struct {
 	Port      string
 	AuthToken string
+	Network   NetworkConfig
 	Runtime   RuntimeConfig
 	TTS       TTSConfig
-	Security  SecurityConfig
 	Relay     RelayConfig
 }
 
@@ -57,7 +72,6 @@ type Summary struct {
 	DefaultMode            string
 	Debug                  bool
 	WorkspaceRoot          string
-	TrustedFileRoots       []string
 	EnhancedProjection     bool
 	EnableStepProjection   bool
 	EnableDiffProjection   bool
@@ -68,13 +82,17 @@ type Summary struct {
 	TTSRequestTimeout      int
 	TTSMaxTextLength       int
 	TTSDefaultFormat       string
-	PublicExposureMode     bool
-	AllowedOrigins         []string
 	RelayMode              bool
 	RelayURL               string
+	ExposureMode           string
+	ListenAddress          string
 }
 
 func Load() (Config, error) {
+	return LoadWithOverrides(Overrides{})
+}
+
+func LoadWithOverrides(overrides Overrides) (Config, error) {
 	relayCfg, err := loadRelayConfig()
 	if err != nil {
 		return Config{}, err
@@ -82,11 +100,12 @@ func Load() (Config, error) {
 	cfg := Config{
 		Port:      getEnv("PORT", "8001"),
 		AuthToken: os.Getenv("AUTH_TOKEN"),
+		Network:   loadNetworkConfig(),
 		Runtime:   loadRuntimeConfig(),
 		TTS:       loadTTSConfig(),
-		Security:  loadSecurityConfig(),
 		Relay:     relayCfg,
 	}
+	applyOverrides(&cfg, overrides)
 
 	if cfg.AuthToken == "" {
 		return Config{}, fmt.Errorf("AUTH_TOKEN is required")
@@ -94,14 +113,49 @@ func Load() (Config, error) {
 	if err := cfg.validateTTS(); err != nil {
 		return Config{}, err
 	}
-	if err := cfg.validateSecurity(); err != nil {
+	if err := cfg.validateRelay(); err != nil {
 		return Config{}, err
 	}
-	if err := cfg.validateRelay(); err != nil {
+	if err := cfg.validateNetwork(); err != nil {
 		return Config{}, err
 	}
 
 	return cfg, nil
+}
+
+func applyOverrides(cfg *Config, overrides Overrides) {
+	if strings.TrimSpace(overrides.Port) != "" {
+		cfg.Port = strings.TrimSpace(overrides.Port)
+	}
+	if strings.TrimSpace(overrides.AuthToken) != "" {
+		cfg.AuthToken = overrides.AuthToken
+	}
+	if strings.TrimSpace(overrides.NetworkExposureMode) != "" {
+		cfg.Network.ExposureMode = normalizeExposureMode(overrides.NetworkExposureMode)
+	}
+	if overrides.RelayMode != nil {
+		cfg.Relay.Enabled = *overrides.RelayMode
+	}
+	if strings.TrimSpace(overrides.RelayURL) != "" {
+		cfg.Relay.URL = strings.TrimSpace(overrides.RelayURL)
+	}
+	if overrides.RelayPairingTTL > 0 {
+		cfg.Relay.PairingTTL = overrides.RelayPairingTTL
+	}
+	if overrides.RelayAgentGrace > 0 {
+		cfg.Relay.AgentGracePeriod = overrides.RelayAgentGrace
+	}
+	if strings.TrimSpace(overrides.RelayPairingPath) != "" {
+		cfg.Relay.PairingEventPath = strings.TrimSpace(overrides.RelayPairingPath)
+	}
+}
+
+func (c Config) ListenAddress() string {
+	host := ""
+	if c.Network.ExposureMode == ExposureModeRelayOnly {
+		host = "127.0.0.1"
+	}
+	return net.JoinHostPort(host, c.Port)
 }
 
 func (c Config) Summary() Summary {
@@ -112,7 +166,6 @@ func (c Config) Summary() Summary {
 		DefaultMode:            c.Runtime.DefaultMode,
 		Debug:                  c.Runtime.Debug,
 		WorkspaceRoot:          c.Runtime.WorkspaceRoot,
-		TrustedFileRoots:       append([]string(nil), c.Runtime.TrustedFileRoots...),
 		EnhancedProjection:     c.Runtime.EnhancedProjection,
 		EnableStepProjection:   c.Runtime.EnableStepProjection,
 		EnableDiffProjection:   c.Runtime.EnableDiffProjection,
@@ -123,9 +176,9 @@ func (c Config) Summary() Summary {
 		TTSRequestTimeout:      c.TTS.RequestTimeoutSeconds,
 		TTSMaxTextLength:       c.TTS.MaxTextLength,
 		TTSDefaultFormat:       c.TTS.DefaultFormat,
-		PublicExposureMode:     c.Security.PublicExposureMode,
-		AllowedOrigins:         append([]string(nil), c.Security.AllowedOrigins...),
 		RelayMode:              c.Relay.Enabled,
 		RelayURL:               c.Relay.URL,
+		ExposureMode:           c.Network.ExposureMode,
+		ListenAddress:          c.ListenAddress(),
 	}
 }

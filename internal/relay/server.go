@@ -30,8 +30,19 @@ type sessionState struct {
 	agent                *peerConn
 	client               *peerConn
 	clientID             string
+	clientReconnectHash  string
 	pairingConsumed      bool
 	pairFailuresByRemote map[string]int
+	devices              map[string]*deviceState
+}
+
+type deviceState struct {
+	ClientID      string
+	Name          string
+	ReconnectHash string
+	CreatedAt     time.Time
+	LastSeenAt    time.Time
+	Revoked       bool
 }
 
 func NewServer(cfg Config) (*Server, error) {
