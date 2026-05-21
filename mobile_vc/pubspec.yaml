@@ -47,6 +47,7 @@ dependencies:
   uuid: ^4.5.1
   cryptography: ^2.9.0
   pointycastle: ^4.0.0
+  flutter_secure_storage: ^10.2.0
 
 dev_dependencies:
   flutter_test:
