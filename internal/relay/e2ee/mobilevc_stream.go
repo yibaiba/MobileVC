@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 )
 
 const (
@@ -37,6 +38,7 @@ type MobileVCStreamCodec struct {
 	ReceiveKey  []byte
 	SendDir     string
 	ReceiveDir  string
+	mu          sync.Mutex
 	sendCounter uint64
 	seen        map[uint64]struct{}
 }
@@ -80,6 +82,9 @@ func NewAgentMobileVCStreamCodec(sessionID, clientID, handshakeID string, keys *
 }
 
 func (c *MobileVCStreamCodec) Encode(messageID string, plaintext []byte) (RelayForwardFrame, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	if strings.TrimSpace(messageID) == "" {
 		return RelayForwardFrame{}, errors.New("mobilevc e2ee stream message id is required")
 	}
@@ -100,6 +105,9 @@ func (c *MobileVCStreamCodec) Encode(messageID string, plaintext []byte) (RelayF
 }
 
 func (c *MobileVCStreamCodec) Decode(frame RelayForwardFrame) ([]byte, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	if err := c.validateFrame(frame); err != nil {
 		return nil, err
 	}

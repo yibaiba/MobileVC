@@ -15,12 +15,17 @@ type agentE2EEHandshakeHandler struct {
 	capabilities  e2ee.CapabilitySet
 	nodeIdentity  *e2ee.NodeIdentity
 	pending       map[string]pendingPairingHandshake
-	completed     map[string]*e2ee.TrafficKeys
+	completed     map[string]completedPairingHandshake
 }
 
 type pendingPairingHandshake struct {
 	input         e2ee.HandshakeInput
 	nodeEphemeral *e2ee.EphemeralKeyPair
+}
+
+type completedPairingHandshake struct {
+	clientID string
+	keys     *e2ee.TrafficKeys
 }
 
 func newAgentE2EEHandshakeHandler(sessionID string, pairingSecret string, capabilities e2ee.CapabilitySet, nodeIdentity *e2ee.NodeIdentity) *agentE2EEHandshakeHandler {
@@ -34,7 +39,7 @@ func newAgentE2EEHandshakeHandler(sessionID string, pairingSecret string, capabi
 		sessionID: sessionID, pairingSecret: pairingSecret,
 		capabilities: capabilities, nodeIdentity: nodeIdentity,
 		pending:   map[string]pendingPairingHandshake{},
-		completed: map[string]*e2ee.TrafficKeys{},
+		completed: map[string]completedPairingHandshake{},
 	}
 }
 
@@ -122,7 +127,10 @@ func (h *agentE2EEHandshakeHandler) handleClientProof(frame relay.E2EEClientProo
 		return e2eeAgentResult(frame, false, relay.CodeE2EEHandshakeFailed), err
 	}
 	delete(h.pending, frame.HandshakeID)
-	h.completed[frame.HandshakeID] = keys
+	h.completed[frame.HandshakeID] = completedPairingHandshake{
+		clientID: pending.input.ClientID,
+		keys:     keys,
+	}
 	return e2eeAgentResult(frame, true, ""), nil
 }
 
@@ -133,8 +141,31 @@ func (h *agentE2EEHandshakeHandler) trafficKeys(handshakeID string) (*e2ee.Traff
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	keys, ok := h.completed[handshakeID]
-	return keys, ok
+	completed, ok := h.completed[handshakeID]
+	return completed.keys, ok
+}
+
+func (h *agentE2EEHandshakeHandler) completedCodec(handshakeID string) (*e2ee.MobileVCStreamCodec, bool, error) {
+	if h == nil {
+		return nil, false, nil
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	completed, ok := h.completed[handshakeID]
+	if !ok {
+		return nil, false, nil
+	}
+	codec, err := e2ee.NewAgentMobileVCStreamCodec(
+		h.sessionID,
+		completed.clientID,
+		handshakeID,
+		completed.keys,
+	)
+	if err != nil {
+		return nil, false, err
+	}
+	return codec, true, nil
 }
 
 func sameHandshakeRoute(frame relay.E2EEClientProofFrame, input e2ee.HandshakeInput) bool {

@@ -89,7 +89,9 @@ Questions to answer:
 - Local relay client `gatewayConn` consumes E2EE control frames separately from MobileVC payloads. `client.e2ee_hello` produces `agent.e2ee_hello`; `client.e2ee_proof` produces `agent.e2ee_result`.
 - Local agent pairing E2EE uses the one-time pairing secret only as a transcript proof. It signs the transcript with the long-lived node identity, performs fresh ephemeral P-256 ECDH, and derives directional traffic keys with HKDF.
 - Local agent pairing proof validation must bind `sessionId`, `clientId`, `handshakeId`, negotiated capabilities, client/node ephemeral keys, and node identity public key. A proof for a different client or session must fail even if it uses a valid pairing secret.
-- A completed local agent pairing handshake may store derived traffic keys in memory for the next encrypted-forwarding slice, but this does not mean MobileVC business payloads are encrypted yet. Flutter/backend UI must not show "E2EE verified" until encrypted forwarding, replay protection, fingerprint validation, and production plaintext rejection are all active.
+- A completed local agent pairing handshake must create an agent-side MobileVC stream codec before MobileVC business frames are accepted as E2EE. After that point, inbound `relay.forward` frames with `encryption=p256-ecdsa+p256-ecdh+hkdf-sha256+aes-256-gcm` are decrypted through the codec, outbound gateway `WriteJSON` payloads are encrypted through the same codec, and plaintext `encryption=none` business frames are rejected explicitly with an E2EE-required error path. Test-mode plaintext remains available only when no E2EE stream has been activated.
+- MobileVC stream codecs keep per-connection send counters and replay state. Go codecs must serialize `Encode` and `Decode` internally because gateway reads and writes can run concurrently on the same relay connection.
+- Backend UI/security state still must not show "E2EE verified" until encrypted forwarding, replay protection, fingerprint validation, production plaintext rejection, and device-state checks are all active.
 - If a local relay client is created without a handshake handler, any E2EE handshake control frame received by `gatewayConn` must fail explicitly with an E2EE handshake error path; it must not be decoded as a MobileVC JSON payload or silently ignored.
 - Relay application `relay.ping` frames may include an optional `sessionId`; local relay client must only answer pings with an empty session or the current session. Wrong-session pings are protocol errors.
 - Local relay client reconnect backoff is bounded and retries only within the current disconnect's `RELAY_AGENT_GRACE_PERIOD`; each later disconnect starts a new grace window.
@@ -125,6 +127,10 @@ Questions to answer:
 - First agent-to-client forward with an empty `clientId` after successful client pairing -> relay fills the current active `clientId`; wrong non-empty `clientId` still -> `protocol_error`.
 - Missing `client.attached` before the relay websocket closes -> local relay client write returns the underlying read/close error.
 - E2EE handshake control frame delivered to the local relay client before the handshake state machine is wired -> explicit relay client read error mentioning E2EE handshake.
+- Encrypted `relay.forward` before local E2EE stream activation -> `e2ee_handshake_failed`.
+- Plaintext `relay.forward` after local E2EE stream activation -> `e2ee_required`.
+- Encrypted MobileVC stream decrypt/authentication failure -> `e2ee_decrypt_failed`.
+- Duplicate encrypted MobileVC stream counter -> `e2ee_replay_detected`.
 - Per-IP or role capacity exceeded before upgrade -> HTTP 429.
 - Bounded forward queue full -> `relay.error` with `queue_full`.
 - Invalid `RELAY_TRUSTED_PROXY_CIDRS` -> relay startup config error.
@@ -136,7 +142,8 @@ Questions to answer:
 - Good: both Go and Flutter build handshake input from the same explicit capability set before signing/verifying the transcript.
 - Good: handshake control frames carry key/proof/signature bytes as base64url strings and validate before building a `HandshakeInput`.
 - Good: local relay agent answers a valid pairing handshake, verifies the pairing proof against the transcript, and derives the same traffic keys that Flutter derives from its ephemeral key.
-- Good: after local pairing handshake succeeds, code still treats business `relay.forward` encryption as a separate unfinished slice and keeps user-visible verified security disabled.
+- Good: after local pairing handshake succeeds, the local relay agent decrypts client-to-agent `relay.forward` through `NewAgentMobileVCStreamCodec` and encrypts agent-to-client gateway writes before they leave the local backend.
+- Good: MobileVC stream codec counter/replay state is connection-local and protected against concurrent read/write access.
 - Good: local test relay agent declares `PlaintextTestCapabilities()` and production relay agent declares `ProductionCapabilities()`; never infer mode from missing fields.
 - Good: `mobilevc://relay/v1` includes `nodeFingerprint=<64 lowercase hex chars>` plus capability hints, but never includes node private keys, device private keys, or traffic keys.
 - Good: relay-only backend logs `health=http://127.0.0.1:<port>/healthz` and `ws=ws://127.0.0.1:<port>/ws?token=<redacted>`; it must not concatenate `localhost` with a full host:port listen address.
@@ -148,6 +155,7 @@ Questions to answer:
 - Bad: deriving UI security state from local config only while ignoring negotiated E2EE/tunnel capabilities.
 - Bad: returning `agent.e2ee_result ok=true` for a proof whose `clientId` differs from the pending hello's `clientId`.
 - Bad: showing "E2EE verified" after handshake-only traffic keys exist while `relay.forward` still carries plaintext MobileVC payloads.
+- Bad: falling back to plaintext decode after an E2EE decrypt failure, or allowing plaintext `relay.forward` after the E2EE stream has been activated.
 - Bad: accepting a duplicate `agent.register` for an existing `sessionId` after disconnect; that bypasses reconnect-secret semantics.
 
 #### 6. Tests Required
@@ -165,6 +173,7 @@ Questions to answer:
 - Relay client tests must cover consuming `client.attached` before `relay.forward`, writing with the attached `clientId`, and timing out register/reconnect response reads.
 - Relay client tests must cover that E2EE handshake control frames are not passed into gateway payload decoding when no handshake handler exists.
 - Relay client tests must cover valid local agent pairing handshake, node signature verification, pairing proof validation, matching derived traffic keys, and mismatched proof routing failure.
+- Relay client tests must cover encrypted MobileVC `relay.forward` after local pairing handshake: client-to-agent decrypts to gateway JSON, agent-to-client `WriteJSON` emits E2EE metadata, and ciphertext does not contain plaintext business values.
 - Relay client tests must cover `relay.ping` response for the current/no session and rejection of wrong-session pings.
 - Config tests for relay env validation and event-path requirement.
 - Launcher tests that pairing event files are read locally and removed.

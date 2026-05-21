@@ -11,6 +11,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"mobilevc/internal/relay"
+	"mobilevc/internal/relay/e2ee"
 )
 
 type gatewayConn struct {
@@ -26,6 +27,7 @@ type gatewayConn struct {
 	closeCh    chan struct{}
 	closeOnce  sync.Once
 	e2ee       *agentE2EEHandshakeHandler
+	stream     *e2ee.MobileVCStreamCodec
 }
 
 type readResult struct {
@@ -167,7 +169,29 @@ func (c *gatewayConn) handleClientE2EEProof(raw map[string]any) error {
 	if writeErr := c.writeControl(response); writeErr != nil {
 		return writeErr
 	}
+	if response.OK {
+		if err := c.activateE2EEStream(frame.HandshakeID); err != nil {
+			return err
+		}
+	}
 	return err
+}
+
+func (c *gatewayConn) activateE2EEStream(handshakeID string) error {
+	if c.e2ee == nil {
+		return fmt.Errorf("relay e2ee handshake is not configured")
+	}
+	codec, ok, err := c.e2ee.completedCodec(handshakeID)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("relay e2ee traffic keys missing for completed handshake")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.stream = codec
+	return nil
 }
 
 func (c *gatewayConn) sendReadResult(result readResult) {
@@ -185,11 +209,35 @@ func (c *gatewayConn) decodeForward(env relay.ForwardEnvelope, v any) error {
 		return fmt.Errorf("invalid relay forward routing")
 	}
 	c.setClientID(env.ClientID)
+	if env.Encryption == relay.EncryptionE2EEV1 {
+		return c.decodeEncryptedForward(env, v)
+	}
+	if c.hasE2EEStream() {
+		return fmt.Errorf("%s: plaintext relay forward after e2ee activation", relay.CodeE2EERequired)
+	}
+	if env.Encryption != relay.EncryptionNone {
+		return fmt.Errorf("%s: unsupported relay forward encryption", relay.CodeE2EEUnsupported)
+	}
 	payload, err := relay.DecodePayloadBase64URL(env.Payload)
 	if err != nil {
 		return fmt.Errorf("decode relay payload: %w", err)
 	}
 	return json.Unmarshal(payload, v)
+}
+
+func (c *gatewayConn) decodeEncryptedForward(env relay.ForwardEnvelope, v any) error {
+	codec := c.e2eeStream()
+	if codec == nil {
+		return fmt.Errorf("%s: encrypted relay forward before e2ee activation", relay.CodeE2EEHandshakeFailed)
+	}
+	frame := e2ee.RelayForwardFrame(env)
+	if err := codec.DecodeJSON(frame, v); err != nil {
+		if strings.Contains(err.Error(), "replay") {
+			return fmt.Errorf("%s: %w", relay.CodeE2EEReplayDetected, err)
+		}
+		return fmt.Errorf("%s: %w", relay.CodeE2EEDecryptFailed, err)
+	}
+	return nil
 }
 
 func (c *gatewayConn) WriteJSON(v any) error {
@@ -239,7 +287,11 @@ func (c *gatewayConn) readError() error {
 }
 
 func (c *gatewayConn) writeForward(payload []byte) error {
-	return c.writeControl(c.forwardEnvelope(payload))
+	env, err := c.forwardEnvelope(payload)
+	if err != nil {
+		return err
+	}
+	return c.writeControl(env)
 }
 
 func (c *gatewayConn) writeControl(frame any) error {
@@ -248,7 +300,14 @@ func (c *gatewayConn) writeControl(frame any) error {
 	return c.conn.WriteJSON(frame)
 }
 
-func (c *gatewayConn) forwardEnvelope(payload []byte) relay.ForwardEnvelope {
+func (c *gatewayConn) forwardEnvelope(payload []byte) (relay.ForwardEnvelope, error) {
+	if codec := c.e2eeStream(); codec != nil {
+		frame, err := codec.Encode("msg_"+uuid.NewString(), payload)
+		if err != nil {
+			return relay.ForwardEnvelope{}, fmt.Errorf("%s: %w", relay.CodeE2EEDecryptFailed, err)
+		}
+		return relay.ForwardEnvelope(frame), nil
+	}
 	return relay.ForwardEnvelope{
 		Type:            relay.TypeRelayForward,
 		Version:         relay.Version,
@@ -260,7 +319,17 @@ func (c *gatewayConn) forwardEnvelope(payload []byte) relay.ForwardEnvelope {
 		Encryption:      relay.EncryptionNone,
 		PayloadEncoding: relay.PayloadBase64URL,
 		Payload:         base64.RawURLEncoding.EncodeToString(payload),
-	}
+	}, nil
+}
+
+func (c *gatewayConn) e2eeStream() *e2ee.MobileVCStreamCodec {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.stream
+}
+
+func (c *gatewayConn) hasE2EEStream() bool {
+	return c.e2eeStream() != nil
 }
 
 func (c *gatewayConn) Close() error {

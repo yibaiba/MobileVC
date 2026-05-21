@@ -247,6 +247,58 @@ func TestGatewayConnHandlesPairingE2EEHandshake(t *testing.T) {
 	}
 }
 
+func TestGatewayConnEncryptsRelayForwardAfterPairingE2EEHandshake(t *testing.T) {
+	serverConn, clientConn := newRelayClientTestConns(t)
+	defer serverConn.Close()
+	handshake, clientEphemeral := testPairingHandshakeHandler(t)
+	gateway := newGatewayConnWithE2EE(clientConn, "rs_gateway", handshake)
+	t.Cleanup(func() { _ = gateway.Close() })
+
+	if err := serverConn.WriteJSON(relay.ClientAttachedFrame{
+		Type: relay.TypeClientAttached, Version: relay.Version,
+		SessionID: "rs_gateway", ClientID: "rc_attached",
+	}); err != nil {
+		t.Fatalf("write attached: %v", err)
+	}
+	clientKeys := driveGatewayE2EEHandshake(t, serverConn, clientEphemeral)
+	clientCodec, err := e2ee.NewClientMobileVCStreamCodec("rs_gateway", "rc_attached", "hs_pairing", clientKeys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inbound, err := clientCodec.EncodeJSON("msg_in", map[string]string{"action": "ping"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := serverConn.WriteJSON(relay.ForwardEnvelope(inbound)); err != nil {
+		t.Fatalf("write encrypted inbound: %v", err)
+	}
+	var decoded map[string]any
+	if err := gateway.ReadJSON(&decoded); err != nil {
+		t.Fatalf("read encrypted inbound: %v", err)
+	}
+	if decoded["action"] != "ping" {
+		t.Fatalf("unexpected decrypted inbound: %#v", decoded)
+	}
+
+	if err := gateway.WriteJSON(map[string]string{"event": "ready"}); err != nil {
+		t.Fatalf("write encrypted outbound: %v", err)
+	}
+	var outbound relay.ForwardEnvelope
+	if err := serverConn.ReadJSON(&outbound); err != nil {
+		t.Fatalf("read encrypted outbound: %v", err)
+	}
+	if outbound.Encryption != relay.EncryptionE2EEV1 || strings.Contains(outbound.Payload, "ready") {
+		t.Fatalf("outbound was not encrypted: %#v", outbound)
+	}
+	var plaintext map[string]any
+	if err := clientCodec.DecodeJSON(e2ee.RelayForwardFrame(outbound), &plaintext); err != nil {
+		t.Fatalf("decrypt outbound: %v", err)
+	}
+	if plaintext["event"] != "ready" {
+		t.Fatalf("unexpected decrypted outbound: %#v", plaintext)
+	}
+}
+
 func TestGatewayConnRejectsMismatchedPairingE2EEProofRoute(t *testing.T) {
 	serverConn, clientConn := newRelayClientTestConns(t)
 	defer serverConn.Close()
@@ -492,6 +544,66 @@ func testPairingHandshakeHandler(t *testing.T) (*agentE2EEHandshakeHandler, *e2e
 		e2ee.ProductionCapabilities(),
 		nodeIdentity,
 	), clientEphemeral
+}
+
+func driveGatewayE2EEHandshake(t *testing.T, serverConn *websocket.Conn, clientEphemeral *e2ee.EphemeralKeyPair) *e2ee.TrafficKeys {
+	t.Helper()
+	capabilities := e2ee.ProductionCapabilities()
+	clientHello := relay.E2EEClientHelloFrame{
+		Type: relay.TypeClientE2EEHello, Version: relay.Version,
+		SessionID: "rs_gateway", ClientID: "rc_attached", HandshakeID: "hs_pairing",
+		Kind: e2ee.HandshakeKindPairing, Capabilities: &capabilities,
+		ClientEphemeralPublicKey: e2ee.EncodeFrameBytes(clientEphemeral.PublicKey),
+	}
+	if err := serverConn.WriteJSON(clientHello); err != nil {
+		t.Fatalf("write client hello: %v", err)
+	}
+	var agentHello relay.E2EEAgentHelloFrame
+	if err := serverConn.ReadJSON(&agentHello); err != nil {
+		t.Fatalf("read agent hello: %v", err)
+	}
+	agentMaterial, err := e2ee.ValidateAgentHelloFrame(agentHello)
+	if err != nil {
+		t.Fatalf("validate agent hello: %v", err)
+	}
+	input := capabilities.ApplyToHandshake(e2ee.HandshakeInput{
+		Kind:                     e2ee.HandshakeKindPairing,
+		SessionID:                "rs_gateway",
+		ClientID:                 "rc_attached",
+		HandshakeID:              "hs_pairing",
+		ClientEphemeralPublicKey: clientEphemeral.PublicKey,
+		NodeEphemeralPublicKey:   agentMaterial.NodeEphemeralPublicKey,
+		NodeIdentityPublicKey:    agentMaterial.NodeIdentityPublicKey,
+	})
+	transcript, err := e2ee.HandshakeTranscript(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof := relay.E2EEClientProofFrame{
+		Type: relay.TypeClientE2EEProof, Version: relay.Version,
+		SessionID: "rs_gateway", ClientID: "rc_attached", HandshakeID: "hs_pairing",
+		Kind:         e2ee.HandshakeKindPairing,
+		PairingProof: e2ee.EncodeFrameBytes(e2ee.PairingProof("pair-secret-128-bit-minimum", transcript)),
+	}
+	if err := serverConn.WriteJSON(proof); err != nil {
+		t.Fatalf("write client proof: %v", err)
+	}
+	var result relay.E2EEAgentResultFrame
+	if err := serverConn.ReadJSON(&result); err != nil {
+		t.Fatalf("read agent result: %v", err)
+	}
+	if !result.OK {
+		t.Fatalf("unexpected handshake failure: %#v", result)
+	}
+	keys, err := e2ee.DeriveHandshakeTrafficKeys(
+		clientEphemeral.PrivateScalar,
+		agentMaterial.NodeEphemeralPublicKey,
+		input,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return keys
 }
 
 func newRelayClientTestConns(t *testing.T) (*websocket.Conn, *websocket.Conn) {

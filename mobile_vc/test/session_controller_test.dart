@@ -11,6 +11,7 @@ import 'package:mobile_vc/core/relay_e2ee/relay_device_identity.dart';
 import 'package:mobile_vc/core/relay_e2ee/relay_e2ee_crypto.dart';
 import 'package:mobile_vc/core/relay_e2ee/relay_e2ee_handshake.dart';
 import 'package:mobile_vc/core/relay_e2ee/relay_e2ee_handshake_frames.dart';
+import 'package:mobile_vc/core/relay_e2ee/relay_mobilevc_stream.dart';
 import 'package:mobile_vc/data/models/events.dart';
 import 'package:mobile_vc/data/models/runtime_meta.dart';
 import 'package:mobile_vc/data/models/session_models.dart';
@@ -25,8 +26,12 @@ Future<void> _flushEvents() async {
 Future<void> _servePairingE2eeRelay(
   WebSocket socket,
   RelayE2eeEphemeralKeyPair nodeIdentity,
+  List<Map<String, dynamic>>? observedForwards,
 ) async {
   final capabilities = RelayE2eeCapabilitySet.production();
+  RelayMobileVcStreamCodec? codec;
+  RelayE2eeHandshakeInput? handshakeInput;
+  RelayE2eeEphemeralKeyPair? nodeEphemeralKey;
   await for (final raw in socket) {
     final frame = jsonDecode(raw as String) as Map<String, dynamic>;
     switch ((frame['type'] ?? '').toString()) {
@@ -41,6 +46,7 @@ Future<void> _servePairingE2eeRelay(
       case relayFrameClientE2eeHello:
         final hello = RelayE2eeClientHelloFrame.fromJson(frame);
         final nodeEphemeral = await RelayE2eeHandshake.newEphemeralKeyPair();
+        nodeEphemeralKey = nodeEphemeral;
         final input = capabilities.applyToHandshake(
           RelayE2eeHandshakeInput(
             kind: relayE2eeHandshakeKindPairing,
@@ -61,6 +67,7 @@ Future<void> _servePairingE2eeRelay(
             supportsDeviceManagement: false,
           ),
         );
+        handshakeInput = input;
         final transcript = RelayE2eeHandshake.transcript(input);
         final signature = await RelayDeviceIdentityStore.signWithPrivateScalar(
           privateScalar: nodeIdentity.privateScalar,
@@ -77,12 +84,43 @@ Future<void> _servePairingE2eeRelay(
         ).toJson()));
       case relayFrameClientE2eeProof:
         final proof = RelayE2eeClientProofFrame.fromJson(frame);
+        final input = handshakeInput;
+        final nodeEphemeral = nodeEphemeralKey;
+        if (input == null || nodeEphemeral == null) {
+          throw StateError('test relay handshake input missing');
+        }
+        codec = RelayMobileVcStreamCodec.agent(
+          sessionId: proof.sessionId,
+          clientId: proof.clientId,
+          handshakeId: proof.handshakeId,
+          keys: await RelayE2eeHandshake.deriveTrafficKeys(
+            privateScalar: nodeEphemeral.privateScalar,
+            remotePublicKey: Uint8List.fromList(input.clientEphemeralPublicKey),
+            input: input,
+          ),
+        );
         socket.add(jsonEncode(RelayE2eeAgentResultFrame(
           sessionId: proof.sessionId,
           clientId: proof.clientId,
           handshakeId: proof.handshakeId,
           ok: true,
         ).toJson()));
+      case relayForwardType:
+        observedForwards?.add(Map<String, dynamic>.from(frame));
+        final relayCodec = codec;
+        if (relayCodec == null) {
+          throw StateError('test relay e2ee codec missing');
+        }
+        final decoded = await relayCodec.decodeJson(frame);
+        if (decoded['type'] == 'ping') {
+          socket.add(jsonEncode(await relayCodec.encodeJson(
+            messageId: 'msg_server_ack',
+            payload: const <String, dynamic>{
+              'type': 'pong',
+              'sessionId': 'session-test',
+            },
+          )));
+        }
     }
   }
 }
@@ -250,7 +288,7 @@ void main() {
       final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
       addTearDown(server.close);
       server.transform(WebSocketTransformer()).listen((socket) {
-        _servePairingE2eeRelay(socket, nodeIdentity);
+        _servePairingE2eeRelay(socket, nodeIdentity, null);
       });
       final service = MobileVcWsService();
       addTearDown(service.dispose);
@@ -267,12 +305,47 @@ void main() {
       expect(service.takeRelaySession()?.clientId, 'rc_test');
     });
 
+    test('relay E2EE encrypts forward payloads after handshake', () async {
+      final nodeIdentity = await RelayE2eeHandshake.newEphemeralKeyPair();
+      final nodeFingerprint = await RelayE2eeCrypto.fingerprint(
+        nodeIdentity.publicKey,
+      );
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(server.close);
+      final observedForwards = <Map<String, dynamic>>[];
+      server.transform(WebSocketTransformer()).listen((socket) {
+        _servePairingE2eeRelay(socket, nodeIdentity, observedForwards);
+      });
+      final service = MobileVcWsService();
+      addTearDown(service.dispose);
+      final events = <AppEvent>[];
+      final subscription = service.events.listen(events.add);
+      addTearDown(subscription.cancel);
+
+      await service.connectRelay(
+        relayUrl: 'ws://127.0.0.1:${server.port}',
+        sessionId: 'rs_test',
+        pairingSecret: 'pair-secret-128-bit-minimum',
+        nodeFingerprintHex: _testHex(nodeFingerprint),
+        relayCapabilities: RelayE2eeCapabilitySet.production(),
+      );
+
+      expect(service.send(const <String, dynamic>{'type': 'ping'}), isTrue);
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+
+      expect(observedForwards.single['encryption'], relayE2eeSuite);
+      expect(observedForwards.single['payload'].toString(),
+          isNot(contains('ping')));
+      expect(events.whereType<PongEvent>().single.sessionId, 'session-test');
+      expect(events.whereType<ErrorEvent>(), isEmpty);
+    });
+
     test('relay pairing rejects E2EE node fingerprint mismatch', () async {
       final nodeIdentity = await RelayE2eeHandshake.newEphemeralKeyPair();
       final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
       addTearDown(server.close);
       server.transform(WebSocketTransformer()).listen((socket) {
-        _servePairingE2eeRelay(socket, nodeIdentity);
+        _servePairingE2eeRelay(socket, nodeIdentity, null);
       });
       final service = MobileVcWsService();
       addTearDown(service.dispose);

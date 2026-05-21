@@ -100,7 +100,9 @@ final wsUrl = config.wsUrlFor();
 - Pairing-link capability hints are non-secret metadata and may be persisted as `relayCapabilities`; pairing secret and expiry remain non-persistent.
 - Production E2EE pairing must verify that the node identity public key fingerprint from `agent.e2ee_hello` matches `AppConfig.relayNodeFingerprintHex` before sending `client.e2ee_proof`.
 - `client.e2ee_proof` must be sent only after node signature verification and transcript-bound pairing proof generation. Do not complete pairing on `agent.e2ee_hello`; wait for `agent.e2ee_result ok`.
-- A completed Flutter pairing handshake may keep derived traffic keys in memory for the next encrypted-forwarding slice, but this is not enough to show verified UI while `relay.forward` still uses plaintext.
+- A completed Flutter pairing handshake must create and retain one `RelayMobileVcStreamCodec.client(...)` for the active relay connection. Relay `send()` must encrypt MobileVC business JSON through that codec after E2EE completion; inbound encrypted `relay.forward` must decrypt through the same codec before mapping to `AppEvent`.
+- Flutter relay send and receive paths must serialize async E2EE stream operations per connection. AES-GCM counters and replay state are part of the codec state; do not create a fresh codec per frame, and do not run inbound decrypts concurrently when MobileVC event ordering matters.
+- After E2EE completion, Flutter must reject plaintext `relay.forward` frames explicitly and must not retry/decode them as plaintext. Decrypt failure and replay detection must surface as E2EE errors and disconnect the relay channel instead of silently falling back.
 - Relay mode must not send direct backend `AUTH_TOKEN` in relay envelopes or control frames.
 - HTTP `/download` is disabled in relay mode and must show `Relay 模式暂不支持下载`.
 
@@ -183,6 +185,10 @@ await prefs.setString('mobilevc.app_config', jsonEncode(config.toJson()));
 - Production E2EE pairing with fingerprint mismatch -> connection failure with `e2ee_fingerprint_mismatch`; do not send pairing proof.
 - Production E2EE pairing with `agent.e2ee_result ok=false` -> connection failure using the result error code.
 - Production E2EE pairing timeout before `agent.e2ee_result ok` -> `Relay E2EE 握手超时`.
+- Encrypted `relay.forward` before Flutter has an active stream codec -> `e2ee_decrypt_failed`.
+- Plaintext `relay.forward` after Flutter E2EE completion -> `e2ee_decrypt_failed` / plaintext-disabled receive failure path; do not decode as plaintext.
+- Duplicate encrypted MobileVC stream counter -> `e2ee_replay_detected`.
+- MobileVC encrypted payload authentication failure, malformed ciphertext, or bad metadata -> `e2ee_decrypt_failed`.
 - E2EE handshake frame with missing capabilities, malformed base64url material, invalid P-256 public key, invalid kind, or pairing/reconnect field mixup -> `FormatException` / explicit connection failure.
 - E2EE handshake frame with plaintext-test capabilities where production handshake is required -> validation error; do not silently continue as plaintext.
 - `agent.e2ee_result` with `ok=false` and no `errorCode`, or `ok=true` and an `errorCode` -> `FormatException`.
@@ -201,12 +207,16 @@ await prefs.setString('mobilevc.app_config', jsonEncode(config.toJson()));
 - Good: `connectRelay` stores pending E2EE state before sending `client.e2ee_hello`, so a fast `agent.e2ee_hello` cannot arrive before state exists.
 - Good: capability hints from QR/import survive config persistence, but pairing secret and expiry do not.
 - Good: production E2EE handshake success is tracked separately from verified UI; encrypted forwarding must still be wired before showing verified security.
+- Good: production relay sends `relay.forward` with `encryption=p256-ecdsa+p256-ecdh+hkdf-sha256+aes-256-gcm`, `streamId=1`, `handshakeId=<completed handshake>`, and ciphertext payloads that do not contain MobileVC plaintext.
+- Good: `MobileVcWsService` keeps relay send/decode queues so async crypto preserves nonce uniqueness and event order.
 - Base: relay test-mode remains usable for local debugging but is visually marked as non-production.
 - Bad: showing "安全", "已加密", or shield/verified styling just because `connectionMode == relay`.
 - Bad: hiding fingerprint mismatch behind a reconnect retry.
 - Bad: completing relay connect immediately after `client.paired` in production E2EE mode.
 - Bad: sending `client.e2ee_hello` in plaintext test-mode where the local agent may intentionally have no E2EE handler.
 - Bad: marking relay as verified because handshake traffic keys were derived while business frames remain plaintext.
+- Bad: constructing a new `RelayMobileVcStreamCodec` for every frame; that resets counters and replay state.
+- Bad: accepting `encryption=none` after E2EE completion because a decrypt failed or the app wants to keep the socket alive.
 
 #### 6. Tests Required
 - Verified state only when every condition is true.
@@ -215,6 +225,8 @@ await prefs.setString('mobilevc.app_config', jsonEncode(config.toJson()));
 - Config/import tests assert relay pairing URI capability hints validate and invalid hints fail explicitly.
 - Config/import tests assert relay capability hints persist as non-secret config while pairing secret and expiry do not.
 - Service tests assert production E2EE relay pairing waits for `agent.e2ee_result ok`, verifies node fingerprint, and rejects fingerprint mismatch.
+- Service tests assert production E2EE relay `send()` emits encrypted `relay.forward` without plaintext leakage, and inbound encrypted `relay.forward` decrypts into the expected `AppEvent`.
+- Stream tests assert duplicate counters are rejected and async counter allocation cannot reuse nonce values.
 - Config/import tests assert relay pairing URI node fingerprint is required.
 - Tunnel tests assert required fields, unexpected-field rejection, unknown stream type rejection, per-stream sequence allocation, per-stream replay rejection, and zero-window rejection.
 - Test-mode, fingerprint mismatch, revoked device, decrypt failure, unsupported capability, and plaintext-not-rejected states cannot show verified.

@@ -10,6 +10,7 @@ import '../../core/relay_e2ee/relay_e2ee_crypto.dart';
 import '../../core/relay_e2ee/relay_device_identity.dart';
 import '../../core/relay_e2ee/relay_e2ee_handshake.dart';
 import '../../core/relay_e2ee/relay_e2ee_handshake_frames.dart';
+import '../../core/relay_e2ee/relay_mobilevc_stream.dart';
 import '../models/events.dart';
 import '../models/runtime_meta.dart';
 import 'mobilevc_mapper.dart';
@@ -69,6 +70,8 @@ class MobileVcWsService {
     _channel = null;
     _relayContext = const _RelayContext();
     _relayE2eeState = null;
+    _relaySendQueue = Future<void>.value();
+    _relayReceiveQueue = Future<void>.value();
     _connectionEpoch++;
     await previousSubscription?.cancel();
     await previousChannel?.sink.close();
@@ -131,10 +134,13 @@ class MobileVcWsService {
       );
     }
 
-    void completePairingError(Object error) {
+    void completeRelayConnectError(Object error) {
       final completer = pairedCompleter;
       if (completer != null && !completer.isCompleted) {
         completer.completeError(error);
+      }
+      if (e2eeCompleter != null && !e2eeCompleter.isCompleted) {
+        e2eeCompleter.completeError(error);
       }
     }
 
@@ -152,7 +158,7 @@ class MobileVcWsService {
           return;
         }
         if (isRelayAuthError(decoded, pairedCompleter?.isCompleted != true)) {
-          completePairingError(RelayPairingException.fromFrame(decoded));
+          completeRelayConnectError(RelayPairingException.fromFrame(decoded));
           return;
         }
         if (e2eeCompleter != null &&
@@ -167,46 +173,47 @@ class MobileVcWsService {
             )) {
           return;
         }
-        final relayEvent =
-            _decodeRelayFrame(decoded, (clientId, reconnectSecret) {
-          activeRelayClientId = clientId;
-          if (reconnectSecret.trim().isNotEmpty) {
-            activeRelayReconnectSecret = reconnectSecret;
-          }
-          if (e2eeCompleter != null &&
-              !e2eeCompleter.isCompleted &&
-              e2eeState == null) {
-            unawaited(() async {
-              try {
-                e2eeState = await _startPairingE2EEHandshake(
-                  channel: channel,
-                  sessionId: relaySessionId,
-                  clientId: clientId,
-                  pairingSecret: relayPairingSecret,
-                  expectedNodeFingerprintHex: relayNodeFingerprintHex,
-                  capabilities: relayCapabilities!,
-                  updateState: (next) => e2eeState = next,
-                );
-              } catch (error, stackTrace) {
-                if (!e2eeCompleter.isCompleted) {
-                  e2eeCompleter.completeError(error, stackTrace);
+        _queueRelayReceive(
+          channel: channel,
+          frame: decoded,
+          epoch: epoch,
+          setClientId: (clientId, reconnectSecret) {
+            activeRelayClientId = clientId;
+            if (reconnectSecret.trim().isNotEmpty) {
+              activeRelayReconnectSecret = reconnectSecret;
+            }
+            if (e2eeCompleter != null &&
+                !e2eeCompleter.isCompleted &&
+                e2eeState == null) {
+              unawaited(() async {
+                try {
+                  e2eeState = await _startPairingE2EEHandshake(
+                    channel: channel,
+                    sessionId: relaySessionId,
+                    clientId: clientId,
+                    pairingSecret: relayPairingSecret,
+                    expectedNodeFingerprintHex: relayNodeFingerprintHex,
+                    capabilities: relayCapabilities!,
+                    updateState: (next) => e2eeState = next,
+                  );
+                } catch (error, stackTrace) {
+                  if (!e2eeCompleter.isCompleted) {
+                    e2eeCompleter.completeError(error, stackTrace);
+                  }
                 }
-              }
-            }());
-          }
-          final completer = pairedCompleter;
-          if (completer != null &&
-              !completer.isCompleted &&
-              e2eeCompleter == null) {
-            completer.complete();
-          }
-        });
-        if (relayEvent != null) {
-          _events.add(_mapper.mapEvent(relayEvent));
-        }
+              }());
+            }
+            final completer = pairedCompleter;
+            if (completer != null &&
+                !completer.isCompleted &&
+                e2eeCompleter == null) {
+              completer.complete();
+            }
+          },
+        );
       },
       onError: (Object error, StackTrace stackTrace) {
-        completePairingError(error);
+        completeRelayConnectError(error);
         emitDisconnect(
           code: 'ws_stream_error',
           message: 'WebSocket 连接异常：$error',
@@ -223,7 +230,7 @@ class MobileVcWsService {
             : closeReason == null || closeReason.isEmpty
                 ? 'WebSocket 连接已断开（$closeCode）'
                 : 'WebSocket 连接已断开（$closeCode: $closeReason）';
-        completePairingError(StateError(message));
+        completeRelayConnectError(StateError(message));
         emitDisconnect(
           code: 'ws_closed',
           message: message,
@@ -269,6 +276,8 @@ class MobileVcWsService {
     _subscription = null;
     _channel = null;
     _relayE2eeState = null;
+    _relaySendQueue = Future<void>.value();
+    _relayReceiveQueue = Future<void>.value();
     _connectionEpoch++;
     await previousSubscription?.cancel();
     await previousChannel?.sink.close();
@@ -296,7 +305,12 @@ class MobileVcWsService {
     try {
       final relayContext = _relayContext;
       if (relayContext.sessionId.isNotEmpty) {
-        channel.sink.add(jsonEncode(_encodeRelayFrame(payload, relayContext)));
+        _queueRelaySend(
+          channel: channel,
+          payload: payload,
+          relayContext: relayContext,
+          epoch: _connectionEpoch,
+        );
         return true;
       }
       channel.sink.add(jsonEncode(payload));
@@ -331,6 +345,8 @@ class MobileVcWsService {
   _RelayContext _relayContext = const _RelayContext();
   RelaySession? _relaySession;
   _RelayE2eeHandshakeState? _relayE2eeState;
+  Future<void> _relaySendQueue = Future<void>.value();
+  Future<void> _relayReceiveQueue = Future<void>.value();
 
   RelaySession? takeRelaySession() {
     final session = _relaySession;
@@ -338,10 +354,10 @@ class MobileVcWsService {
     return session;
   }
 
-  Map<String, dynamic>? _decodeRelayFrame(
+  Future<Map<String, dynamic>?> _decodeRelayFrame(
     Map<String, dynamic> frame,
     void Function(String clientId, String clientReconnectSecret) setClientId,
-  ) {
+  ) async {
     final type = (frame['type'] ?? '').toString();
     if (type == 'client.paired') {
       setClientId(
@@ -359,6 +375,19 @@ class MobileVcWsService {
     }
     if (type != 'relay.forward') {
       return null;
+    }
+    final e2eeState = _relayE2eeState;
+    if (frame['encryption'] == relayE2eeSuite) {
+      final codec = e2eeState?.streamCodec;
+      if (codec == null) {
+        throw StateError(
+            'Relay E2EE frame received before encrypted stream is ready');
+      }
+      return codec.decodeJson(frame);
+    }
+    if (e2eeState?.complete == true) {
+      throw const FormatException(
+          'plaintext relay.forward received after E2EE activation');
     }
     final raw =
         base64Url.decode(base64Url.normalize(frame['payload'].toString()));
@@ -567,10 +596,91 @@ class MobileVcWsService {
     };
   }
 
-  Map<String, dynamic> _encodeRelayFrame(
+  void _queueRelayReceive({
+    required WebSocketChannel channel,
+    required Map<String, dynamic> frame,
+    required int epoch,
+    required void Function(String clientId, String clientReconnectSecret)
+        setClientId,
+  }) {
+    _relayReceiveQueue = _relayReceiveQueue.then((_) async {
+      if (epoch != _connectionEpoch || _channel != channel) {
+        return;
+      }
+      final relayEvent = await _decodeRelayFrame(frame, setClientId);
+      if (relayEvent != null &&
+          epoch == _connectionEpoch &&
+          _channel == channel) {
+        _events.add(_mapper.mapEvent(relayEvent));
+      }
+    }).catchError((Object error, StackTrace stackTrace) {
+      final code = error is StateError && error.message.contains('replay')
+          ? 'e2ee_replay_detected'
+          : 'e2ee_decrypt_failed';
+      _events.add(ErrorEvent(
+        timestamp: DateTime.now(),
+        sessionId: '',
+        runtimeMeta: const RuntimeMeta(),
+        raw: <String, dynamic>{
+          'type': 'error',
+          'code': code,
+          'msg': 'Relay E2EE receive failed: $error',
+          'stack': stackTrace.toString(),
+        },
+        code: code,
+        message: relayErrorMessage(<String, dynamic>{
+          'type': 'relay.error',
+          'code': code,
+        }),
+      ));
+      unawaited(disconnect());
+    });
+  }
+
+  void _queueRelaySend({
+    required WebSocketChannel channel,
+    required Map<String, dynamic> payload,
+    required _RelayContext relayContext,
+    required int epoch,
+  }) {
+    _relaySendQueue = _relaySendQueue.then((_) async {
+      if (epoch != _connectionEpoch || _channel != channel) {
+        return;
+      }
+      final frame = await _encodeRelayFrame(payload, relayContext);
+      if (epoch != _connectionEpoch || _channel != channel) {
+        return;
+      }
+      channel.sink.add(jsonEncode(frame));
+    }).catchError((Object error, StackTrace stackTrace) {
+      _events.add(ErrorEvent(
+        timestamp: DateTime.now(),
+        sessionId: (payload['sessionId'] ?? '').toString(),
+        runtimeMeta: const RuntimeMeta(),
+        raw: <String, dynamic>{
+          'type': 'error',
+          'code': 'ws_send_error',
+          'msg': 'WebSocket send failed: $error',
+          'stack': stackTrace.toString(),
+        },
+        code: 'ws_send_error',
+        message: 'WebSocket send failed: $error',
+      ));
+      unawaited(disconnect());
+    });
+  }
+
+  Future<Map<String, dynamic>> _encodeRelayFrame(
     Map<String, dynamic> payload,
     _RelayContext relayContext,
-  ) {
+  ) async {
+    final codec = _relayE2eeState?.streamCodec;
+    if (codec != null) {
+      return codec.encodeJson(
+        messageId: 'msg_${const Uuid().v4()}',
+        payload: payload,
+      );
+    }
     return <String, dynamic>{
       'type': 'relay.forward',
       'version': 1,
@@ -621,6 +731,7 @@ class _RelayE2eeHandshakeState {
     required this.clientEphemeral,
     this.input,
     this.trafficKeys,
+    this.streamCodec,
     this.complete = false,
   });
 
@@ -633,6 +744,7 @@ class _RelayE2eeHandshakeState {
   final RelayE2eeEphemeralKeyPair clientEphemeral;
   final RelayE2eeHandshakeInput? input;
   final RelayE2eeTrafficKeys? trafficKeys;
+  final RelayMobileVcStreamCodec? streamCodec;
   final bool complete;
 
   bool matches(String sessionId, String clientId, String handshakeId) {
@@ -655,11 +767,16 @@ class _RelayE2eeHandshakeState {
       clientEphemeral: clientEphemeral,
       input: input ?? this.input,
       trafficKeys: trafficKeys ?? this.trafficKeys,
+      streamCodec: streamCodec,
       complete: complete,
     );
   }
 
   _RelayE2eeHandshakeState markComplete() {
+    final keys = trafficKeys;
+    if (keys == null) {
+      throw StateError('Relay E2EE traffic keys missing');
+    }
     return _RelayE2eeHandshakeState(
       sessionId: sessionId,
       clientId: clientId,
@@ -669,7 +786,13 @@ class _RelayE2eeHandshakeState {
       capabilities: capabilities,
       clientEphemeral: clientEphemeral,
       input: input,
-      trafficKeys: trafficKeys,
+      trafficKeys: keys,
+      streamCodec: RelayMobileVcStreamCodec.client(
+        sessionId: sessionId,
+        clientId: clientId,
+        handshakeId: handshakeId,
+        keys: keys,
+      ),
       complete: true,
     );
   }

@@ -72,6 +72,7 @@ class RelayMobileVcStreamCodec {
   final String receiveDirection;
   var _sendCounter = 0;
   final Set<int> _seenCounters = <int>{};
+  final Set<int> _pendingCounters = <int>{};
 
   Future<Map<String, dynamic>> encodeJson({
     required String messageId,
@@ -91,12 +92,12 @@ class RelayMobileVcStreamCodec {
       throw ArgumentError('message id is required');
     }
     final counter = _sendCounter;
+    _sendCounter++;
     final sealed = await RelayE2eeCrypto.encrypt(
       key: sendKey,
       plaintext: plaintext,
       context: _frameContext(sendDirection, counter),
     );
-    _sendCounter++;
     return <String, dynamic>{
       'type': relayForwardType,
       'version': 1,
@@ -127,19 +128,24 @@ class RelayMobileVcStreamCodec {
   Future<Uint8List> decode(Map<String, dynamic> frame) async {
     _validateFrame(frame);
     final counter = _intField(frame, 'counter');
-    if (_seenCounters.contains(counter)) {
+    if (_seenCounters.contains(counter) || _pendingCounters.contains(counter)) {
       throw StateError('e2ee replay detected');
     }
+    _pendingCounters.add(counter);
     final sealed = Uint8List.fromList(
       base64Url.decode(base64Url.normalize(frame['payload'].toString())),
     );
-    final plaintext = await RelayE2eeCrypto.decrypt(
-      key: receiveKey,
-      sealed: sealed,
-      context: _frameContext(receiveDirection, counter),
-    );
-    _seenCounters.add(counter);
-    return plaintext;
+    try {
+      final plaintext = await RelayE2eeCrypto.decrypt(
+        key: receiveKey,
+        sealed: sealed,
+        context: _frameContext(receiveDirection, counter),
+      );
+      _seenCounters.add(counter);
+      return plaintext;
+    } finally {
+      _pendingCounters.remove(counter);
+    }
   }
 
   RelayE2eeFrameContext _frameContext(String direction, int counter) {
