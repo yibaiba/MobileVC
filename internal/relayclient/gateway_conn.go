@@ -364,11 +364,15 @@ func (c *gatewayConn) serveEncryptedFileDownload(openFrame e2ee.TunnelFrame) {
 		if strings.Contains(err.Error(), relay.CodeDownloadDenied) || strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "directory") {
 			code = relay.CodeDownloadDenied
 		}
+		c.auditFileDownload(openFrame.StreamID, openFrame.Metadata["path"], "failed", code)
 		_ = c.writeEncryptedFileDownloadError(openFrame.StreamID, code, err.Error())
 	}
 }
 
 func (c *gatewayConn) sendEncryptedFile(openFrame e2ee.TunnelFrame, stream *fileDownloadStream) error {
+	if strings.TrimSpace(c.currentRelayDeviceID()) == "" {
+		return fmt.Errorf("%s: relay e2ee device is not bound", relay.CodeDownloadDenied)
+	}
 	path, file, info, err := openDownloadTarget(openFrame.Metadata["path"], c.downloadRoots)
 	if err != nil {
 		return err
@@ -402,7 +406,11 @@ func (c *gatewayConn) sendEncryptedFile(openFrame e2ee.TunnelFrame, stream *file
 	for {
 		chunk, err := chunker.Next()
 		if err == io.EOF {
-			return c.writeEncryptedFileDownloadClose(codec, openFrame.StreamID)
+			if err := c.writeEncryptedFileDownloadClose(codec, openFrame.StreamID); err != nil {
+				return err
+			}
+			c.auditFileDownload(openFrame.StreamID, path, "ok", "")
+			return nil
 		}
 		if err != nil {
 			return fmt.Errorf("%s: read file chunk: %w", relay.CodeDownloadFailed, err)
@@ -554,6 +562,15 @@ func (c *gatewayConn) waitFileDownloadAck(stream *fileDownloadStream, window *e2
 	case <-c.closeCh:
 		return c.readError()
 	}
+}
+
+func (c *gatewayConn) auditFileDownload(streamID uint64, path string, result string, errorCode string) {
+	info := c.RelayE2EEInfo()
+	relay.LogAuditEvent(relay.AuditEvent{
+		Action: "file.download", Result: result,
+		SessionID: info.SessionID, ClientID: info.ClientID, DeviceID: info.DeviceID,
+		StreamID: streamID, Path: path, ErrorCode: errorCode,
+	})
 }
 
 func (c *gatewayConn) writeEncryptedFileDownloadClose(codec *e2ee.MobileVCStreamCodec, streamID uint64) error {
@@ -739,6 +756,20 @@ func (c *gatewayConn) currentClientID() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.clientID
+}
+
+func (c *gatewayConn) currentRelayDeviceID() string {
+	c.mu.Lock()
+	handshakeID := c.streamHS
+	deviceID := c.deviceID
+	c.mu.Unlock()
+
+	if c.e2ee != nil && handshakeID != "" {
+		if completedDeviceID := c.e2ee.completedDeviceID(handshakeID); completedDeviceID != "" {
+			return completedDeviceID
+		}
+	}
+	return strings.TrimSpace(deviceID)
 }
 
 func (c *gatewayConn) Close() error {

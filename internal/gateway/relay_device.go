@@ -38,11 +38,20 @@ func (h *Handler) registerRelayDevice(client ClientConn, req protocol.RelayDevic
 		Now:              time.Now().UTC(),
 	})
 	if err != nil {
+		relay.LogAuditEvent(relay.AuditEvent{
+			Action: "relay_device_register", Result: "failed",
+			SessionID: info.SessionID, ClientID: info.ClientID, DeviceID: req.DeviceID,
+			ErrorCode: relayDeviceRegisterErrorCode(err),
+		})
 		return protocol.RelayDeviceRegisterResultEvent{}, err
 	}
 	if bound, ok := client.(relayDeviceBoundClientConn); ok {
 		bound.SetRelayE2EEDeviceID(device.ID)
 	}
+	relay.LogAuditEvent(relay.AuditEvent{
+		Action: "relay_device_register", Result: "ok",
+		SessionID: info.SessionID, ClientID: info.ClientID, DeviceID: device.ID,
+	})
 	return protocol.NewRelayDeviceRegisterResultEvent(
 		info.SessionID,
 		device.ID,
@@ -58,8 +67,17 @@ func (h *Handler) listRelayDevices(client ClientConn) (protocol.RelayDeviceListR
 	}
 	devices, err := h.DeviceTrust.ListDevices()
 	if err != nil {
+		relay.LogAuditEvent(relay.AuditEvent{
+			Action: "relay_device_list", Result: "failed",
+			SessionID: info.SessionID, ClientID: info.ClientID, DeviceID: info.DeviceID,
+			ErrorCode: relayDeviceRegisterErrorCode(err),
+		})
 		return protocol.RelayDeviceListResultEvent{}, err
 	}
+	relay.LogAuditEvent(relay.AuditEvent{
+		Action: "relay_device_list", Result: "ok",
+		SessionID: info.SessionID, ClientID: info.ClientID, DeviceID: info.DeviceID,
+	})
 	return protocol.NewRelayDeviceListResultEvent(
 		info.SessionID,
 		relayTrustedDevices(devices, info.HandshakeID, info.DeviceID),
@@ -79,9 +97,18 @@ func (h *Handler) revokeRelayDevice(client ClientConn, req protocol.RelayDeviceR
 		return protocol.RelayDeviceRevokeResultEvent{}, fmt.Errorf("%s: cannot revoke the active management device", relay.CodeDeviceUnknown)
 	}
 	if _, err := h.DeviceTrust.RevokeDevice(deviceID, time.Now().UTC()); err != nil {
+		relay.LogAuditEvent(relay.AuditEvent{
+			Action: "relay_device_revoke", Result: "failed",
+			SessionID: info.SessionID, ClientID: info.ClientID, DeviceID: deviceID,
+			ErrorCode: relayDeviceRegisterErrorCode(err),
+		})
 		return protocol.RelayDeviceRevokeResultEvent{}, err
 	}
 	h.closeRelayDeviceConnections(deviceID)
+	relay.LogAuditEvent(relay.AuditEvent{
+		Action: "relay_device_revoke", Result: "ok",
+		SessionID: info.SessionID, ClientID: info.ClientID, DeviceID: deviceID,
+	})
 	return protocol.NewRelayDeviceRevokeResultEvent(info.SessionID, deviceID, "revoked"), nil
 }
 
@@ -95,11 +122,25 @@ func (h *Handler) rotateRelayDevices(client ClientConn) (protocol.RelayDeviceRot
 	}
 	identity, err := h.NodeIdentity.Rotate()
 	if err != nil {
+		relay.LogAuditEvent(relay.AuditEvent{
+			Action: "relay_device_rotate", Result: "failed",
+			SessionID: info.SessionID, ClientID: info.ClientID, DeviceID: info.DeviceID,
+			ErrorCode: relayDeviceRegisterErrorCode(err),
+		})
 		return protocol.RelayDeviceRotateResultEvent{}, err
 	}
 	if err := h.DeviceTrust.ClearTrustedDevicesForNodeRotation(); err != nil {
+		relay.LogAuditEvent(relay.AuditEvent{
+			Action: "relay_device_rotate", Result: "failed",
+			SessionID: info.SessionID, ClientID: info.ClientID, DeviceID: info.DeviceID,
+			ErrorCode: relayDeviceRegisterErrorCode(err),
+		})
 		return protocol.RelayDeviceRotateResultEvent{}, err
 	}
+	relay.LogAuditEvent(relay.AuditEvent{
+		Action: "relay_device_rotate", Result: "ok",
+		SessionID: info.SessionID, ClientID: info.ClientID, DeviceID: info.DeviceID,
+	})
 	return protocol.NewRelayDeviceRotateResultEvent(
 		info.SessionID,
 		fmt.Sprintf("%x", identity.Fingerprint),

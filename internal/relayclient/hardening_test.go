@@ -373,6 +373,7 @@ func TestGatewayConnServesEncryptedFileDownloadTunnel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	gateway.SetRelayE2EEDeviceID("dev_bound")
 
 	openFrame, err := e2ee.NewFileDownloadOpenFrame(42, e2ee.FileDownloadMetadata{Path: filePath}, 4)
 	if err != nil {
@@ -446,6 +447,58 @@ func TestGatewayConnServesEncryptedFileDownloadTunnel(t *testing.T) {
 		default:
 			t.Fatalf("unexpected tunnel frame: %#v", tunnelFrame)
 		}
+	}
+}
+
+func TestGatewayConnRejectsEncryptedFileDownloadBeforeDeviceBinding(t *testing.T) {
+	serverConn, clientConn := newRelayClientTestConns(t)
+	defer serverConn.Close()
+	handshake, clientEphemeral := testPairingHandshakeHandler(t)
+	root := t.TempDir()
+	gateway := newGatewayConnWithE2EE(clientConn, "rs_gateway", handshake, []string{root})
+	t.Cleanup(func() { _ = gateway.Close() })
+
+	filePath := filepath.Join(root, "relay-download.txt")
+	if err := os.WriteFile(filePath, []byte("secret-data"), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	if err := serverConn.WriteJSON(relay.ClientAttachedFrame{
+		Type: relay.TypeClientAttached, Version: relay.Version,
+		SessionID: "rs_gateway", ClientID: "rc_attached",
+	}); err != nil {
+		t.Fatalf("write attached: %v", err)
+	}
+	clientKeys := driveGatewayE2EEHandshake(t, serverConn, clientEphemeral)
+	clientCodec, err := e2ee.NewClientMobileVCStreamCodec("rs_gateway", "rc_attached", "hs_pairing", clientKeys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	openFrame, err := e2ee.NewFileDownloadOpenFrame(42, e2ee.FileDownloadMetadata{Path: filePath}, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	openForward, err := clientCodec.EncodeTunnelFrame("msg_download_open", openFrame)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := serverConn.WriteJSON(relay.ForwardEnvelope(openForward)); err != nil {
+		t.Fatalf("write encrypted open: %v", err)
+	}
+	go func() {
+		var payload map[string]any
+		_ = gateway.ReadJSON(&payload)
+	}()
+
+	var env relay.ForwardEnvelope
+	if err := serverConn.ReadJSON(&env); err != nil {
+		t.Fatalf("read encrypted download error: %v", err)
+	}
+	tunnelFrame, err := clientCodec.DecodeTunnelFrame(e2ee.RelayForwardFrame(env))
+	if err != nil {
+		t.Fatalf("decode encrypted tunnel frame: %v", err)
+	}
+	if tunnelFrame.Type != e2ee.TunnelFrameStreamError || tunnelFrame.ErrorCode != relay.CodeDownloadDenied {
+		t.Fatalf("expected download_denied stream error, got %#v", tunnelFrame)
 	}
 }
 
