@@ -471,6 +471,7 @@ class MobileVcWsService {
     String path, {
     void Function(int receivedBytes, int? totalBytes)? onProgress,
     FutureOr<void> Function(Uint8List chunk)? onChunk,
+    RelayFileDownloadCancelToken? cancelToken,
   }) async {
     final channel = _channel;
     final state = _relayE2eeState;
@@ -491,6 +492,9 @@ class MobileVcWsService {
     if (!state.capabilities.supportsFileDownload) {
       throw StateError('Relay E2EE file download is unsupported');
     }
+    if (cancelToken?.isCancelled == true) {
+      throw StateError(relayFileDownloadErrorCancelled);
+    }
 
     final streamId = _nextRelayDownloadStreamId();
     final pending = _RelayFileDownloadState(
@@ -500,6 +504,14 @@ class MobileVcWsService {
       onChunk: onChunk,
     );
     _relayDownloads[streamId] = pending;
+    cancelToken?._bind(() async {
+      await _cancelRelayDownload(
+        channel: channel,
+        state: state,
+        streamId: streamId,
+        reason: 'user cancelled',
+      );
+    });
     try {
       final openFrame = relayFileDownloadOpenFrame(
         streamId: streamId,
@@ -510,6 +522,9 @@ class MobileVcWsService {
         messageId: 'msg_${const Uuid().v4()}',
         frame: openFrame,
       );
+      if (cancelToken?.isCancelled == true) {
+        throw StateError(relayFileDownloadErrorCancelled);
+      }
       if (_channel != channel) {
         throw StateError('Relay connection changed during download');
       }
@@ -521,6 +536,8 @@ class MobileVcWsService {
         pending.result.completeError(error);
       }
       rethrow;
+    } finally {
+      cancelToken?._unbind();
     }
   }
 
@@ -652,6 +669,30 @@ class MobileVcWsService {
     final forward = await state.streamCodec!.encodeTunnelFrame(
       messageId: 'msg_${const Uuid().v4()}',
       frame: ack,
+    );
+    if (_channel == channel) {
+      channel.sink.add(jsonEncode(forward));
+    }
+  }
+
+  Future<void> _cancelRelayDownload({
+    required WebSocketChannel channel,
+    required _RelayE2eeHandshakeState state,
+    required int streamId,
+    required String reason,
+  }) async {
+    final pending = _relayDownloads.remove(streamId);
+    if (pending == null) {
+      return;
+    }
+    pending.completeError(StateError(relayFileDownloadErrorCancelled));
+    final reset = relayFileDownloadCancelFrame(
+      streamId: streamId,
+      reason: reason,
+    );
+    final forward = await state.streamCodec!.encodeTunnelFrame(
+      messageId: 'msg_${const Uuid().v4()}',
+      frame: reset,
     );
     if (_channel == channel) {
       channel.sink.add(jsonEncode(forward));
@@ -1270,6 +1311,35 @@ class RelayFileDownloadResult {
   final String fileName;
   final String contentType;
   final int? totalBytes;
+}
+
+class RelayFileDownloadCancelToken {
+  bool _cancelled = false;
+  Future<void> Function()? _onCancel;
+
+  bool get isCancelled => _cancelled;
+
+  void cancel() {
+    if (_cancelled) {
+      return;
+    }
+    _cancelled = true;
+    final callback = _onCancel;
+    if (callback != null) {
+      unawaited(callback());
+    }
+  }
+
+  void _bind(Future<void> Function() onCancel) {
+    _onCancel = onCancel;
+    if (_cancelled) {
+      unawaited(onCancel());
+    }
+  }
+
+  void _unbind() {
+    _onCancel = null;
+  }
 }
 
 class _RelayFileDownloadState {

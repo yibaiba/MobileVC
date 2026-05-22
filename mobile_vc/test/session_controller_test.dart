@@ -31,8 +31,9 @@ Future<void> _servePairingE2eeRelay(
   WebSocket socket,
   RelayE2eeEphemeralKeyPair nodeIdentity,
   List<Map<String, dynamic>>? observedForwards,
-  List<Map<String, dynamic>>? observedPlaintexts,
-) async {
+  List<Map<String, dynamic>>? observedPlaintexts, {
+  bool keepDownloadOpen = false,
+}) async {
   final capabilities = RelayE2eeCapabilitySet.production();
   RelayMobileVcStreamCodec? codec;
   RelayE2eeHandshakeInput? handshakeInput;
@@ -120,6 +121,9 @@ Future<void> _servePairingE2eeRelay(
         if (streamId != relayMobileVcStreamId) {
           final tunnelFrame = await relayCodec.decodeTunnelFrame(frame);
           observedPlaintexts?.add(tunnelFrame.toJson());
+          if (tunnelFrame.type == tunnelFrameStreamReset) {
+            break;
+          }
           if (tunnelFrame.type == tunnelFrameStreamOpen &&
               tunnelFrame.streamType == tunnelStreamFileDownload) {
             socket.add(jsonEncode(await relayCodec.encodeTunnelFrame(
@@ -135,6 +139,9 @@ Future<void> _servePairingE2eeRelay(
                 window: 4,
               ),
             )));
+            if (keepDownloadOpen) {
+              continue;
+            }
             socket.add(jsonEncode(await relayCodec.encodeTunnelFrame(
               messageId: 'msg_download_data',
               frame: relayFileDownloadDataFrame(
@@ -845,6 +852,66 @@ void main() {
             (frame['streamId'] as num?)?.toInt() != 1),
         isTrue,
       );
+    });
+
+    test('relay E2EE download cancellation sends encrypted reset', () async {
+      final nodeIdentity = await RelayE2eeHandshake.newEphemeralKeyPair();
+      final nodeFingerprint = await RelayE2eeCrypto.fingerprint(
+        nodeIdentity.publicKey,
+      );
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(server.close);
+      final observedForwards = <Map<String, dynamic>>[];
+      final observedPlaintexts = <Map<String, dynamic>>[];
+      server.transform(WebSocketTransformer()).listen((socket) {
+        _servePairingE2eeRelay(
+          socket,
+          nodeIdentity,
+          observedForwards,
+          observedPlaintexts,
+          keepDownloadOpen: true,
+        );
+      });
+      final service = _testRelayService();
+      addTearDown(service.dispose);
+
+      await service.connectRelay(
+        relayUrl: 'ws://127.0.0.1:${server.port}',
+        sessionId: 'rs_test',
+        pairingSecret: 'pair-secret-128-bit-minimum',
+        nodeFingerprintHex: _testHex(nodeFingerprint),
+        relayCapabilities: RelayE2eeCapabilitySet.production(),
+      );
+      service.markRelayDeviceRegistered(RelayDeviceRegisterResultEvent(
+        timestamp: DateTime.now(),
+        sessionId: 'rs_test',
+        runtimeMeta: const RuntimeMeta(),
+        raw: const <String, dynamic>{'type': 'relay_device_register_result'},
+        deviceId: 'device-bound',
+      ));
+
+      final cancelToken = RelayFileDownloadCancelToken();
+      final download = service.downloadRelayFile(
+        '/workspace/secret.txt',
+        cancelToken: cancelToken,
+      );
+      await _waitForObservedFrame(
+        observedPlaintexts,
+        (frame) =>
+            frame['type'] == tunnelFrameStreamOpen &&
+            frame['streamType'] == tunnelStreamFileDownload,
+      );
+      cancelToken.cancel();
+
+      await expectLater(download, throwsStateError);
+      await _waitForObservedFrame(
+        observedPlaintexts,
+        (frame) =>
+            frame['type'] == tunnelFrameStreamReset &&
+            (frame['streamId'] as num?)?.toInt() != 1,
+      );
+      final resetForward = observedForwards.last;
+      expect(resetForward['payload'].toString(), isNot(contains('cancelled')));
     });
 
     test('relay pairing rejects E2EE node fingerprint mismatch', () async {
@@ -9204,7 +9271,11 @@ class _FakeMobileVcWsService extends MobileVcWsService {
     String path, {
     void Function(int receivedBytes, int? totalBytes)? onProgress,
     FutureOr<void> Function(Uint8List chunk)? onChunk,
+    RelayFileDownloadCancelToken? cancelToken,
   }) async {
+    if (cancelToken?.isCancelled == true) {
+      throw StateError(relayFileDownloadErrorCancelled);
+    }
     await onChunk?.call(relayDownloadResult.bytes ?? Uint8List(0));
     onProgress?.call(
         relayDownloadResult.bytes?.length ?? 0, relayDownloadResult.totalBytes);

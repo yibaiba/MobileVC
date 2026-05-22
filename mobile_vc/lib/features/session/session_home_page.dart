@@ -10,6 +10,7 @@ import '../../core/config/app_config.dart';
 import '../../core/config/app_connection_endpoint.dart';
 import '../../core/config/app_connection_environment.dart';
 import '../../core/relay_e2ee/relay_security_state.dart';
+import '../../data/services/mobilevc_ws_service.dart';
 import '../../data/models/events.dart';
 import '../../data/models/session_models.dart';
 import '../../features/adb/adb_debug_page.dart';
@@ -1171,12 +1172,26 @@ class _SessionHomePageState extends State<SessionHomePage> {
       return null;
     }
     final targetFile = File(selectedPath);
+    final cancelToken = RelayFileDownloadCancelToken();
     final parent = targetFile.parent;
     if (!await parent.exists()) {
       await parent.create(recursive: true);
     }
+    void showProgressSnackBar(String text) {
+      messenger
+        ..hideCurrentSnackBar()
+        ..showSnackBar(SnackBar(
+          content: Text(text),
+          action: SnackBarAction(
+            label: '取消',
+            onPressed: cancelToken.cancel,
+          ),
+        ));
+    }
+
     final sink = targetFile.openWrite();
     try {
+      showProgressSnackBar('Relay 加密下载中：准备传输');
       await controller.downloadRelayFile(
         path,
         onChunk: (chunk) async {
@@ -1187,13 +1202,11 @@ class _SessionHomePageState extends State<SessionHomePage> {
           if (!mounted || total == null || total <= 0) {
             return;
           }
-          messenger
-            ..hideCurrentSnackBar()
-            ..showSnackBar(SnackBar(
-              content: Text(
-                  'Relay 加密下载中：${_formatBytes(received)} / ${_formatBytes(total)}'),
-            ));
+          showProgressSnackBar(
+            'Relay 加密下载中：${_formatBytes(received)} / ${_formatBytes(total)}',
+          );
         },
+        cancelToken: cancelToken,
       );
       await sink.close();
       return targetFile;
@@ -1202,6 +1215,11 @@ class _SessionHomePageState extends State<SessionHomePage> {
         await sink.close();
       } catch (closeError) {
         Error.throwWithStackTrace(closeError, StackTrace.current);
+      }
+      if (cancelToken.isCancelled) {
+        if (await targetFile.exists()) {
+          await targetFile.delete();
+        }
       }
       Error.throwWithStackTrace(error, StackTrace.current);
     }

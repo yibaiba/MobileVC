@@ -89,6 +89,7 @@ final wsUrl = config.wsUrlFor();
 - `MobileVcWsService.connectRelay({required relayUrl, required sessionId, required pairingSecret})`
 - `MobileVcWsService.downloadRelayFile(String path, {onProgress, onChunk})`
 - `SessionController.downloadRelayFile(String path, {onProgress, onChunk})`
+- Relay download cancel token: `RelayFileDownloadCancelToken.cancel()`
 - Relay E2EE connect metadata: `nodeFingerprintHex`, `relayCapabilities`
 - Relay QR: `mobilevc://relay/v1?relay=<url>&session=<id>&secret=<secret>&exp=<unix-seconds>`
 
@@ -112,6 +113,7 @@ final wsUrl = config.wsUrlFor();
 - Relay mode must never fall back to direct HTTP `/download`. Production relay file downloads require completed E2EE, backend-confirmed device binding, and `supportsFileDownloadStream=true`.
 - Relay mode downloads use `MobileVcWsService.downloadRelayFile`, sending an encrypted tunnel `file.download stream.open` on a non-`relayMobileVcStreamId` stream. The requested path, response metadata, file chunks, ACKs, close, reset, and errors are encrypted tunnel payloads.
 - Relay file download UI must stream chunks to disk through `onChunk` when saving files, then send ACK only after the chunk callback completes. It must not require buffering the whole file in memory for normal save-to-disk UX.
+- Relay file download UI must expose a cancel action while a download is active. Cancellation sends encrypted tunnel `stream.reset`, removes the pending download, fails the local Future with an explicit cancel error, and deletes the partial save target if the UI already opened one.
 - If `onChunk` is omitted, `RelayFileDownloadResult.bytes` may contain the complete bytes for tests/small utility callers. UI save paths should prefer `onChunk` streaming.
 - Pending relay downloads must fail explicitly if the relay connection is replaced or closed.
 - Relay download errors must use actionable copy from `relayErrorMessage` for `download_denied`, `download_failed`, `stream_cancelled`, and `stream_window_exceeded`.
@@ -128,11 +130,13 @@ final wsUrl = config.wsUrlFor();
 - Relay download when capability lacks `supportsFileDownloadStream` -> `StateError('Relay E2EE file download is unsupported')`.
 - Relay download receives plaintext `relay.forward` after E2EE -> connection failure; do not decode or retry as plaintext.
 - Relay download tunnel `stream.error` -> complete the pending download with mapped actionable error copy.
+- Relay download cancel token fired after stream open -> encrypted `stream.reset` sent and local pending download completes with `stream_cancelled` / `StateError`.
 - Relay connection replacement/close while downloads are pending -> complete each pending download with explicit error.
 
 #### 5. Good/Base/Bad Cases
 - Good: scan relay QR, connect through `/relay/client`, clear one-time fields after successful pairing, persist only URL.
 - Good: relay save-to-disk path opens the destination first, writes encrypted chunks through `onChunk`, flushes each chunk before ACK, and reports progress from encrypted stream metadata.
+- Good: relay download progress snackbar has a cancel action that drives `RelayFileDownloadCancelToken.cancel()` and sends encrypted reset.
 - Base: direct LAN config remains default and continues using `AppConfig.wsUrlFor()`.
 - Bad: storing the pairing secret in `SharedPreferences`, falling back to direct `/download` in relay mode, or showing the old "Relay mode does not support download" copy after E2EE file download is negotiated.
 
@@ -142,6 +146,7 @@ final wsUrl = config.wsUrlFor();
 - Relay URL validation rejects `http(s)://` and public `ws://`.
 - Controller relay connect validates URL and clears one-time fields after success.
 - Service tests assert relay E2EE file downloads send encrypted non-1 stream frames, do not leak the path or file contents in relay payloads, process encrypted open/data/close, send ACKs, and surface progress.
+- Service tests assert relay E2EE download cancellation emits encrypted `stream.reset` and does not expose cancel reason as relay-visible plaintext.
 - UI/controller tests for relay download must cover streaming `onChunk` save behavior, unsupported capability/device-not-bound errors, and connection-close failure.
 
 #### 7. Wrong vs Correct

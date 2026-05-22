@@ -2498,11 +2498,13 @@ class SessionController extends ChangeNotifier {
     String path, {
     void Function(int receivedBytes, int? totalBytes)? onProgress,
     FutureOr<void> Function(Uint8List chunk)? onChunk,
+    RelayFileDownloadCancelToken? cancelToken,
   }) {
     return _service.downloadRelayFile(
       path,
       onProgress: onProgress,
       onChunk: onChunk,
+      cancelToken: cancelToken,
     );
   }
 
