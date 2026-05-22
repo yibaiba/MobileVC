@@ -33,6 +33,7 @@ Future<void> _servePairingE2eeRelay(
   List<Map<String, dynamic>>? observedForwards,
   List<Map<String, dynamic>>? observedPlaintexts, {
   bool keepDownloadOpen = false,
+  String downloadErrorCode = '',
 }) async {
   final capabilities = RelayE2eeCapabilitySet.production();
   RelayMobileVcStreamCodec? codec;
@@ -126,6 +127,20 @@ Future<void> _servePairingE2eeRelay(
           }
           if (tunnelFrame.type == tunnelFrameStreamOpen &&
               tunnelFrame.streamType == tunnelStreamFileDownload) {
+            if (downloadErrorCode.isNotEmpty) {
+              socket.add(jsonEncode(await relayCodec.encodeTunnelFrame(
+                messageId: 'msg_download_error',
+                frame: RelayTunnelFrame(
+                  type: tunnelFrameStreamError,
+                  streamId: tunnelFrame.streamId,
+                  errorCode: downloadErrorCode,
+                  metadata: const <String, String>{
+                    'message': 'selected route rejected',
+                  },
+                ),
+              )));
+              continue;
+            }
             socket.add(jsonEncode(await relayCodec.encodeTunnelFrame(
               messageId: 'msg_download_open',
               frame: relayFileDownloadOpenFrame(
@@ -912,6 +927,52 @@ void main() {
       );
       final resetForward = observedForwards.last;
       expect(resetForward['payload'].toString(), isNot(contains('cancelled')));
+    });
+
+    test('relay E2EE download surfaces generic tunnel stream errors', () async {
+      final nodeIdentity = await RelayE2eeHandshake.newEphemeralKeyPair();
+      final nodeFingerprint = await RelayE2eeCrypto.fingerprint(
+        nodeIdentity.publicKey,
+      );
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(server.close);
+      server.transform(WebSocketTransformer()).listen((socket) {
+        _servePairingE2eeRelay(
+          socket,
+          nodeIdentity,
+          null,
+          null,
+          downloadErrorCode: 'protocol_error',
+        );
+      });
+      final service = _testRelayService();
+      addTearDown(service.dispose);
+
+      await service.connectRelay(
+        relayUrl: 'ws://127.0.0.1:${server.port}',
+        sessionId: 'rs_test',
+        pairingSecret: 'pair-secret-128-bit-minimum',
+        nodeFingerprintHex: _testHex(nodeFingerprint),
+        relayCapabilities: RelayE2eeCapabilitySet.production(),
+      );
+      service.markRelayDeviceRegistered(RelayDeviceRegisterResultEvent(
+        timestamp: DateTime.now(),
+        sessionId: 'rs_test',
+        runtimeMeta: const RuntimeMeta(),
+        raw: const <String, dynamic>{'type': 'relay_device_register_result'},
+        deviceId: 'device-bound',
+      ));
+
+      await expectLater(
+        service.downloadRelayFile('/workspace/secret.txt'),
+        throwsA(
+          isA<RelayPairingException>().having(
+            (error) => error.code,
+            'code',
+            'protocol_error',
+          ),
+        ),
+      );
     });
 
     test('relay pairing rejects E2EE node fingerprint mismatch', () async {

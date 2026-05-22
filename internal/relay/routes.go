@@ -37,8 +37,8 @@ func (c Config) SelectedRoutePolicy() SelectedRoutePolicy {
 
 func NewSelectedRoutePolicy(httpRoutes []RouteRule, wsRoutes []RouteRule) SelectedRoutePolicy {
 	return SelectedRoutePolicy{
-		HTTPAllowedRoutes: cloneRouteRules(httpRoutes),
-		WSAllowedRoutes:   cloneRouteRules(wsRoutes),
+		HTTPAllowedRoutes: normalizeRouteRules(httpRoutes),
+		WSAllowedRoutes:   normalizeRouteRules(wsRoutes),
 	}
 }
 
@@ -147,11 +147,26 @@ func methodPathFromRequest(r *http.Request) (string, string) {
 	return r.Method, r.URL.Path
 }
 
-func cloneRouteRules(rules []RouteRule) []RouteRule {
+func normalizeRouteRules(rules []RouteRule) []RouteRule {
 	if rules == nil {
 		return nil
 	}
-	return append([]RouteRule(nil), rules...)
+	out := make([]RouteRule, 0, len(rules))
+	for _, rule := range rules {
+		out = append(out, normalizeRouteRule(rule))
+	}
+	return out
+}
+
+func normalizeRouteRule(rule RouteRule) RouteRule {
+	path := strings.TrimSpace(rule.Path)
+	if path != "" {
+		path = cleanRoutePath(path)
+	}
+	return RouteRule{
+		Method: strings.ToUpper(strings.TrimSpace(rule.Method)),
+		Path:   path,
+	}
 }
 
 func defaultString(value string, fallback string) string {

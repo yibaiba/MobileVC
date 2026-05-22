@@ -607,6 +607,31 @@ class MobileVcWsService {
     required _RelayE2eeHandshakeState state,
   }) async {
     final tunnelFrame = await state.streamCodec!.decodeTunnelFrame(frame);
+    if (tunnelFrame.type == tunnelFrameStreamError) {
+      _handleRelayTunnelError(tunnelFrame);
+      return;
+    }
+    if (tunnelFrame.type == tunnelFramePing ||
+        tunnelFrame.type == tunnelFramePong) {
+      return;
+    }
+    if (tunnelFrame.streamType.isNotEmpty &&
+        tunnelFrame.streamType != tunnelStreamFileDownload) {
+      throw FormatException(
+          'unsupported relay tunnel stream ${tunnelFrame.streamType}');
+    }
+    await _handleRelayFileDownloadFrame(
+      channel: channel,
+      tunnelFrame: tunnelFrame,
+      state: state,
+    );
+  }
+
+  Future<void> _handleRelayFileDownloadFrame({
+    required WebSocketChannel channel,
+    required RelayTunnelFrame tunnelFrame,
+    required _RelayE2eeHandshakeState state,
+  }) async {
     validateRelayFileDownloadFrame(tunnelFrame);
     final pending = _relayDownloads[tunnelFrame.streamId];
     if (pending == null) {
@@ -636,14 +661,7 @@ class MobileVcWsService {
         pending.complete();
       case tunnelFrameStreamError:
         _relayDownloads.remove(tunnelFrame.streamId);
-        pending.completeError(RelayPairingException(
-          tunnelFrame.errorCode,
-          relayErrorMessage(<String, dynamic>{
-            'type': 'relay.error',
-            'code': tunnelFrame.errorCode,
-            'message': tunnelFrame.metadata['message'] ?? '',
-          }),
-        ));
+        pending.completeError(_relayTunnelException(tunnelFrame));
       case tunnelFrameStreamReset:
         _relayDownloads.remove(tunnelFrame.streamId);
         pending.completeError(StateError(
@@ -653,6 +671,27 @@ class MobileVcWsService {
         throw FormatException(
             'unexpected file download frame ${tunnelFrame.type}');
     }
+  }
+
+  void _handleRelayTunnelError(RelayTunnelFrame frame) {
+    final pending = _relayDownloads.remove(frame.streamId);
+    final error = _relayTunnelException(frame);
+    if (pending != null) {
+      pending.completeError(error);
+      return;
+    }
+    throw error;
+  }
+
+  RelayPairingException _relayTunnelException(RelayTunnelFrame frame) {
+    return RelayPairingException(
+      frame.errorCode,
+      relayErrorMessage(<String, dynamic>{
+        'type': 'relay.error',
+        'code': frame.errorCode,
+        'message': frame.metadata['message'] ?? '',
+      }),
+    );
   }
 
   Future<void> _sendRelayDownloadAck({

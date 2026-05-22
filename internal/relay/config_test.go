@@ -104,6 +104,16 @@ func TestSelectedRoutePolicyValidatesEncryptedRoutes(t *testing.T) {
 	if policy.HTTPRouteAllowed("POST", "/download") {
 		t.Fatal("selected route policy accepted wrong method")
 	}
+	trailingSlashPolicy := NewSelectedRoutePolicy(
+		[]RouteRule{{Method: " get ", Path: "/download/"}},
+		[]RouteRule{{Method: " get ", Path: "/ws/"}},
+	)
+	if err := trailingSlashPolicy.ValidateStream("file.download"); err != nil {
+		t.Fatalf("file.download selected route should accept normalized allowlist path: %v", err)
+	}
+	if err := trailingSlashPolicy.ValidateStream("mobilevc.ws"); err != nil {
+		t.Fatalf("mobilevc.ws selected route should accept normalized allowlist path: %v", err)
+	}
 	if err := policy.ValidateStream("shell.exec"); err == nil {
 		t.Fatal("selected route policy accepted unsupported stream type")
 	}

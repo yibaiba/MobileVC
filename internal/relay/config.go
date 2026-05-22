@@ -339,7 +339,7 @@ func parseRouteRule(raw string) (RouteRule, error) {
 	if method != http.MethodGet && method != http.MethodPost {
 		return RouteRule{}, fmt.Errorf("route %q uses unsupported method %s", raw, method)
 	}
-	return RouteRule{Method: method, Path: path}, nil
+	return normalizeRouteRule(RouteRule{Method: method, Path: path}), nil
 }
 
 func getEnv(key string, fallback string) string {
