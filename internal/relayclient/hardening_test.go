@@ -299,6 +299,77 @@ func TestGatewayConnEncryptsRelayForwardAfterPairingE2EEHandshake(t *testing.T) 
 	}
 }
 
+func TestGatewayConnWaitsForE2EEBeforeWritingProductionForward(t *testing.T) {
+	serverConn, clientConn := newRelayClientTestConns(t)
+	defer serverConn.Close()
+	handshake, clientEphemeral := testPairingHandshakeHandler(t)
+	gateway := newGatewayConnWithE2EE(clientConn, "rs_gateway", handshake)
+	t.Cleanup(func() { _ = gateway.Close() })
+
+	if err := serverConn.WriteJSON(relay.ClientAttachedFrame{
+		Type: relay.TypeClientAttached, Version: relay.Version,
+		SessionID: "rs_gateway", ClientID: "rc_attached",
+	}); err != nil {
+		t.Fatalf("write attached: %v", err)
+	}
+	writeDone := make(chan error, 1)
+	go func() {
+		writeDone <- gateway.WriteJSON(map[string]string{"event": "ready"})
+	}()
+
+	select {
+	case err := <-writeDone:
+		t.Fatalf("write completed before e2ee activation: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	clientKeys := driveGatewayE2EEHandshake(t, serverConn, clientEphemeral)
+	if err := <-writeDone; err != nil {
+		t.Fatalf("write after e2ee activation: %v", err)
+	}
+	var outbound relay.ForwardEnvelope
+	if err := serverConn.ReadJSON(&outbound); err != nil {
+		t.Fatalf("read encrypted outbound: %v", err)
+	}
+	if outbound.Encryption != relay.EncryptionE2EEV1 || strings.Contains(outbound.Payload, "ready") {
+		t.Fatalf("outbound was not encrypted: %#v", outbound)
+	}
+	clientCodec, err := e2ee.NewClientMobileVCStreamCodec("rs_gateway", "rc_attached", "hs_pairing", clientKeys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var plaintext map[string]any
+	if err := clientCodec.DecodeJSON(e2ee.RelayForwardFrame(outbound), &plaintext); err != nil {
+		t.Fatalf("decrypt outbound: %v", err)
+	}
+	if plaintext["event"] != "ready" {
+		t.Fatalf("unexpected decrypted outbound: %#v", plaintext)
+	}
+}
+
+func TestGatewayConnRejectsPlaintextForwardBeforeProductionE2EE(t *testing.T) {
+	serverConn, clientConn := newRelayClientTestConns(t)
+	defer serverConn.Close()
+	handshake, _ := testPairingHandshakeHandler(t)
+	gateway := newGatewayConnWithE2EE(clientConn, "rs_gateway", handshake)
+	t.Cleanup(func() { _ = gateway.Close() })
+
+	if err := serverConn.WriteJSON(relay.ClientAttachedFrame{
+		Type: relay.TypeClientAttached, Version: relay.Version,
+		SessionID: "rs_gateway", ClientID: "rc_attached",
+	}); err != nil {
+		t.Fatalf("write attached: %v", err)
+	}
+	if err := serverConn.WriteJSON(testRelayForward("rc_attached")); err != nil {
+		t.Fatalf("write plaintext forward: %v", err)
+	}
+	var payload map[string]any
+	err := gateway.ReadJSON(&payload)
+	if err == nil || !strings.Contains(err.Error(), relay.CodeE2EERequired) {
+		t.Fatalf("expected plaintext e2ee rejection, got payload=%#v err=%v", payload, err)
+	}
+}
+
 func TestGatewayConnRejectsMismatchedPairingE2EEProofRoute(t *testing.T) {
 	serverConn, clientConn := newRelayClientTestConns(t)
 	defer serverConn.Close()
