@@ -36,6 +36,8 @@ func parseServerFlags(args []string) (serverFlags, error) {
 	})
 	fs.StringVar(&flags.overrides.RelayURL, "relay-url", "", "relay ws:// or wss:// URL")
 	fs.StringVar(&flags.overrides.RelayPairingPath, "relay-pairing-event-path", "", "owner-only relay pairing event JSON path")
+	fs.StringVar(&flags.overrides.RelayHTTPAllowlist, "relay-http-allowlist", "", "comma-separated METHOD:/path selected HTTP routes")
+	fs.StringVar(&flags.overrides.RelayWSAllowlist, "relay-ws-allowlist", "", "comma-separated METHOD:/path selected websocket routes")
 	fs.StringVar(&relayTTL, "relay-pairing-ttl", "", "relay pairing TTL, e.g. 30m")
 	fs.StringVar(&relayGrace, "relay-agent-grace-period", "", "relay agent reconnect grace period, e.g. 60s")
 	fs.BoolVar(&flags.showHelp, "help", false, "show help")

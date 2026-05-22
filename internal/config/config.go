@@ -43,6 +43,8 @@ type RelayConfig struct {
 	PairingTTL       time.Duration
 	AgentGracePeriod time.Duration
 	PairingEventPath string
+	HTTPAllowlist    string
+	WSAllowlist      string
 }
 
 type Overrides struct {
@@ -54,6 +56,8 @@ type Overrides struct {
 	RelayPairingTTL     time.Duration
 	RelayAgentGrace     time.Duration
 	RelayPairingPath    string
+	RelayHTTPAllowlist  string
+	RelayWSAllowlist    string
 }
 
 type Config struct {
@@ -150,6 +154,12 @@ func applyOverrides(cfg *Config, overrides Overrides) {
 	}
 	if strings.TrimSpace(overrides.RelayPairingPath) != "" {
 		cfg.Relay.PairingEventPath = strings.TrimSpace(overrides.RelayPairingPath)
+	}
+	if strings.TrimSpace(overrides.RelayHTTPAllowlist) != "" {
+		cfg.Relay.HTTPAllowlist = strings.TrimSpace(overrides.RelayHTTPAllowlist)
+	}
+	if strings.TrimSpace(overrides.RelayWSAllowlist) != "" {
+		cfg.Relay.WSAllowlist = strings.TrimSpace(overrides.RelayWSAllowlist)
 	}
 }
 

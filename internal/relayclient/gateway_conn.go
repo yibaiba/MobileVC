@@ -26,6 +26,7 @@ type gatewayConn struct {
 	conn          *websocket.Conn
 	sessionID     string
 	downloadRoots []string
+	routePolicy   relay.SelectedRoutePolicy
 	clientID      string
 	mu            sync.Mutex
 	attachCh      chan struct{}
@@ -62,8 +63,12 @@ func newGatewayConnWithE2EE(conn *websocket.Conn, sessionID string, e2eeHandler 
 	if len(downloadRoots) > 0 {
 		roots = downloadRoots[0]
 	}
+	return newGatewayConnWithPolicy(conn, sessionID, e2eeHandler, roots, relay.DefaultSelectedRoutePolicy())
+}
+
+func newGatewayConnWithPolicy(conn *websocket.Conn, sessionID string, e2eeHandler *agentE2EEHandshakeHandler, roots []string, policy relay.SelectedRoutePolicy) *gatewayConn {
 	gateway := &gatewayConn{
-		conn: conn, sessionID: sessionID, downloadRoots: append([]string(nil), roots...),
+		conn: conn, sessionID: sessionID, downloadRoots: append([]string(nil), roots...), routePolicy: policy,
 		attachCh: make(chan struct{}), readCh: make(chan readResult, relayReadQueueSize),
 		readDone: make(chan struct{}), closeCh: make(chan struct{}), e2ee: e2eeHandler,
 		tunnelSend: e2ee.NewTunnelCounterState(),
@@ -268,6 +273,9 @@ func (c *gatewayConn) decodeEncryptedForward(env relay.ForwardEnvelope, v any) e
 	if frame.StreamID != e2ee.MobileVCStreamID {
 		return c.handleEncryptedTunnelForward(codec, frame)
 	}
+	if err := c.authorizeMobileVCStream(); err != nil {
+		return err
+	}
 	if err := codec.DecodeJSON(frame, v); err != nil {
 		if strings.Contains(err.Error(), "replay") {
 			return fmt.Errorf("%s: %w", relay.CodeE2EEReplayDetected, err)
@@ -278,7 +286,7 @@ func (c *gatewayConn) decodeEncryptedForward(env relay.ForwardEnvelope, v any) e
 }
 
 func (c *gatewayConn) handleEncryptedTunnelForward(codec *e2ee.MobileVCStreamCodec, frame e2ee.RelayForwardFrame) error {
-	tunnelFrame, err := codec.DecodeTunnelFrame(frame)
+	tunnelFrame, err := codec.DecodeTunnelFrameForRouting(frame)
 	if err != nil {
 		if strings.Contains(err.Error(), "replay") {
 			return fmt.Errorf("%s: %w", relay.CodeE2EEReplayDetected, err)
@@ -286,7 +294,24 @@ func (c *gatewayConn) handleEncryptedTunnelForward(codec *e2ee.MobileVCStreamCod
 		return fmt.Errorf("%s: %w", relay.CodeE2EEDecryptFailed, err)
 	}
 	if tunnelFrame.Type == e2ee.TunnelFrameStreamOpen && tunnelFrame.StreamType == e2ee.TunnelStreamFileDownload {
+		if err := c.authorizeFileDownloadOpen(tunnelFrame); err != nil {
+			_ = c.writeEncryptedFileDownloadError(tunnelFrame.StreamID, errorCodeFromSelectedRouteError(err), err.Error())
+			return errRelayTunnelFrameConsumed
+		}
 		go c.serveEncryptedFileDownload(tunnelFrame)
+		return errRelayTunnelFrameConsumed
+	}
+	if tunnelFrame.Type == e2ee.TunnelFrameStreamOpen && tunnelFrame.StreamType == e2ee.TunnelStreamMobileVCWS {
+		if err := c.authorizeMobileVCStream(); err != nil {
+			_ = c.writeEncryptedFileDownloadError(tunnelFrame.StreamID, errorCodeFromSelectedRouteError(err), err.Error())
+			return errRelayTunnelFrameConsumed
+		}
+		_ = c.writeEncryptedFileDownloadError(tunnelFrame.StreamID, relay.CodeStreamCancelled, "mobilevc.ws uses the primary encrypted relay stream")
+		return errRelayTunnelFrameConsumed
+	}
+	if tunnelFrame.Type == e2ee.TunnelFrameStreamOpen {
+		err := c.routePolicy.ValidateStream(tunnelFrame.StreamType)
+		_ = c.writeEncryptedFileDownloadError(tunnelFrame.StreamID, errorCodeFromSelectedRouteError(err), err.Error())
 		return errRelayTunnelFrameConsumed
 	}
 	if c.routeFileDownloadControl(tunnelFrame) {
@@ -297,6 +322,35 @@ func (c *gatewayConn) handleEncryptedTunnelForward(codec *e2ee.MobileVCStreamCod
 		return errRelayTunnelFrameConsumed
 	}
 	return fmt.Errorf("%s: unsupported encrypted tunnel frame", relay.CodeProtocolError)
+}
+
+func (c *gatewayConn) authorizeFileDownloadOpen(openFrame e2ee.TunnelFrame) error {
+	if err := c.authorizeSelectedRoute(e2ee.TunnelStreamFileDownload); err != nil {
+		c.auditFileDownload(openFrame.StreamID, openFrame.Metadata["path"], "failed", errorCodeFromSelectedRouteError(err))
+		return err
+	}
+	return nil
+}
+
+func (c *gatewayConn) authorizeMobileVCStream() error {
+	return c.authorizeSelectedRoute(e2ee.TunnelStreamMobileVCWS)
+}
+
+func (c *gatewayConn) authorizeSelectedRoute(streamType string) error {
+	if c.e2eeStream() == nil {
+		return fmt.Errorf("%w: selected route requires completed relay e2ee", relay.ErrSelectedRouteE2EERequired)
+	}
+	if err := c.routePolicy.ValidateStream(streamType); err != nil {
+		return err
+	}
+	if streamType == e2ee.TunnelStreamFileDownload && strings.TrimSpace(c.currentRelayDeviceID()) == "" {
+		return fmt.Errorf("%w: relay e2ee device is not bound", relay.ErrSelectedRouteDenied)
+	}
+	return nil
+}
+
+func errorCodeFromSelectedRouteError(err error) string {
+	return relay.SelectedRouteErrorCode(err)
 }
 
 type fileDownloadStream struct {
@@ -590,11 +644,21 @@ func (c *gatewayConn) writeEncryptedFileDownloadError(streamID uint64, code stri
 	if codec == nil {
 		return fmt.Errorf("%s: relay e2ee stream is not ready", relay.CodeE2EEHandshakeFailed)
 	}
-	frame, err := e2ee.NewFileDownloadErrorFrame(streamID, code, map[string]string{"message": message})
+	frame, err := newEncryptedTunnelErrorFrame(streamID, code, message)
 	if err != nil {
 		return err
 	}
 	return c.writeEncryptedTunnelFrame(codec, frame)
+}
+
+func newEncryptedTunnelErrorFrame(streamID uint64, code string, message string) (e2ee.TunnelFrame, error) {
+	metadata := map[string]string{"message": message}
+	switch code {
+	case relay.CodeStreamCancelled, relay.CodeStreamWindowExceeded, relay.CodeDownloadDenied, relay.CodeDownloadFailed:
+		return e2ee.NewFileDownloadErrorFrame(streamID, code, metadata)
+	default:
+		return e2ee.NewTunnelErrorFrame(streamID, code, metadata)
+	}
 }
 
 func (c *gatewayConn) nextTunnelSeq(streamID uint64) (uint64, error) {

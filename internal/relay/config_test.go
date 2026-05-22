@@ -90,6 +90,38 @@ func TestLoadConfigFromEnvReadsDefaultRouteAllowlists(t *testing.T) {
 	}
 }
 
+func TestSelectedRoutePolicyValidatesEncryptedRoutes(t *testing.T) {
+	policy := NewSelectedRoutePolicy(
+		[]RouteRule{{Method: "GET", Path: "/download"}},
+		[]RouteRule{{Method: "GET", Path: "/ws"}},
+	)
+	if err := policy.ValidateStream("file.download"); err != nil {
+		t.Fatalf("file.download selected route rejected: %v", err)
+	}
+	if err := policy.ValidateStream("mobilevc.ws"); err != nil {
+		t.Fatalf("mobilevc.ws selected route rejected: %v", err)
+	}
+	if policy.HTTPRouteAllowed("POST", "/download") {
+		t.Fatal("selected route policy accepted wrong method")
+	}
+	if err := policy.ValidateStream("shell.exec"); err == nil {
+		t.Fatal("selected route policy accepted unsupported stream type")
+	}
+}
+
+func TestSelectedRoutePolicyDeniesMissingRoutes(t *testing.T) {
+	policy := NewSelectedRoutePolicy(
+		[]RouteRule{{Method: "GET", Path: "/healthz"}},
+		[]RouteRule{{Method: "GET", Path: "/events"}},
+	)
+	if err := policy.ValidateStream("file.download"); err == nil {
+		t.Fatal("selected route policy accepted missing GET /download")
+	}
+	if err := policy.ValidateStream("mobilevc.ws"); err == nil {
+		t.Fatal("selected route policy accepted missing GET /ws")
+	}
+}
+
 func TestLoadConfigFromEnvRejectsInvalidRouteAllowlist(t *testing.T) {
 	withRelayEnv(t, map[string]string{
 		"RELAY_HTTP_ALLOWLIST": "GET:healthz",

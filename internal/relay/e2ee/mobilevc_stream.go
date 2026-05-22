@@ -178,6 +178,14 @@ func (c *MobileVCStreamCodec) DecodeTunnelFrame(frame RelayForwardFrame) (Tunnel
 	return UnmarshalTunnelFrame(raw)
 }
 
+func (c *MobileVCStreamCodec) DecodeTunnelFrameForRouting(frame RelayForwardFrame) (TunnelFrame, error) {
+	raw, err := c.DecodeStream(frame)
+	if err != nil {
+		return TunnelFrame{}, err
+	}
+	return UnmarshalTunnelFrameForRouting(raw)
+}
+
 func (c *MobileVCStreamCodec) frameContext(direction string, streamID uint64, counter uint64) FrameContext {
 	return FrameContext{
 		SessionID: c.SessionID, ClientID: c.ClientID, HandshakeID: c.HandshakeID,

@@ -62,5 +62,7 @@ func loadRelayConfig() (RelayConfig, error) {
 		PairingTTL:       pairingTTL,
 		AgentGracePeriod: grace,
 		PairingEventPath: strings.TrimSpace(os.Getenv("RELAY_PAIRING_EVENT_PATH")),
+		HTTPAllowlist:    strings.TrimSpace(os.Getenv("RELAY_HTTP_ALLOWLIST")),
+		WSAllowlist:      strings.TrimSpace(os.Getenv("RELAY_WS_ALLOWLIST")),
 	}, nil
 }

@@ -59,6 +59,8 @@ func preserveConfigEnv(t *testing.T) {
 		"RELAY_PAIRING_TTL",
 		"RELAY_AGENT_GRACE_PERIOD",
 		"RELAY_PAIRING_EVENT_PATH",
+		"RELAY_HTTP_ALLOWLIST",
+		"RELAY_WS_ALLOWLIST",
 	}
 	for _, key := range keys {
 		preserveEnv(t, key)
@@ -152,6 +154,8 @@ func TestLoadWithOverridesUsesCLIValues(t *testing.T) {
 		"RELAY_MODE":               "false",
 		"RELAY_URL":                "",
 		"RELAY_PAIRING_EVENT_PATH": "",
+		"RELAY_HTTP_ALLOWLIST":     "",
+		"RELAY_WS_ALLOWLIST":       "",
 	})
 	relayMode := true
 	cfg, err := LoadWithOverrides(Overrides{
@@ -161,6 +165,8 @@ func TestLoadWithOverridesUsesCLIValues(t *testing.T) {
 		RelayMode:           &relayMode,
 		RelayURL:            "wss://relay.example.test",
 		RelayPairingPath:    "/tmp/mobilevc-pairing.json",
+		RelayHTTPAllowlist:  "GET:/download",
+		RelayWSAllowlist:    "GET:/ws",
 	})
 	if err != nil {
 		t.Fatalf("LoadWithOverrides failed: %v", err)
@@ -172,8 +178,29 @@ func TestLoadWithOverridesUsesCLIValues(t *testing.T) {
 		cfg.HealthURL() != "http://127.0.0.1:9001/healthz" ||
 		!cfg.Relay.Enabled ||
 		cfg.Relay.URL != "wss://relay.example.test" ||
-		cfg.Relay.PairingEventPath != "/tmp/mobilevc-pairing.json" {
+		cfg.Relay.PairingEventPath != "/tmp/mobilevc-pairing.json" ||
+		cfg.Relay.HTTPAllowlist != "GET:/download" ||
+		cfg.Relay.WSAllowlist != "GET:/ws" {
 		t.Fatalf("unexpected config: %#v", cfg)
+	}
+}
+
+func TestLoadRelaySelectedRouteAllowlists(t *testing.T) {
+	withEnv(t, map[string]string{
+		"AUTH_TOKEN":               "test",
+		"RELAY_MODE":               "true",
+		"RELAY_URL":                "wss://relay.example.com",
+		"RELAY_PAIRING_EVENT_PATH": "/tmp/mobilevc-pairing.json",
+		"RELAY_HTTP_ALLOWLIST":     "GET:/download",
+		"RELAY_WS_ALLOWLIST":       "GET:/ws",
+	})
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if cfg.Relay.HTTPAllowlist != "GET:/download" || cfg.Relay.WSAllowlist != "GET:/ws" {
+		t.Fatalf("unexpected relay allowlists: %#v", cfg.Relay)
 	}
 }
 

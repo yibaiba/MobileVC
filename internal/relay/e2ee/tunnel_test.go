@@ -132,3 +132,14 @@ func TestTunnelFrameRejectsUnknownStreamType(t *testing.T) {
 		t.Fatalf("expected unknown stream type failure, got %v", err)
 	}
 }
+
+func TestUnmarshalTunnelFrameForRoutingPreservesUnknownStreamType(t *testing.T) {
+	raw := []byte(`{"type":"stream.open","version":1,"streamId":7,"streamType":"shell.exec","window":8}`)
+	frame, err := UnmarshalTunnelFrameForRouting(raw)
+	if err != nil {
+		t.Fatalf("routing unmarshal rejected unknown stream type: %v", err)
+	}
+	if frame.StreamType != "shell.exec" {
+		t.Fatalf("unexpected routing frame: %#v", frame)
+	}
+}

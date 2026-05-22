@@ -15,6 +15,8 @@ func TestParseServerFlags(t *testing.T) {
 		"--relay-mode=true",
 		"--relay-url", "wss://relay.example.test",
 		"--relay-pairing-event-path", "/tmp/pairing.json",
+		"--relay-http-allowlist", "GET:/download",
+		"--relay-ws-allowlist", "GET:/ws",
 		"--relay-pairing-ttl", "30m",
 		"--relay-agent-grace-period", "45s",
 	})
@@ -25,7 +27,9 @@ func TestParseServerFlags(t *testing.T) {
 		flags.overrides.AuthToken != "token" ||
 		flags.overrides.NetworkExposureMode != config.ExposureModeRelayOnly ||
 		flags.overrides.RelayURL != "wss://relay.example.test" ||
-		flags.overrides.RelayPairingPath != "/tmp/pairing.json" {
+		flags.overrides.RelayPairingPath != "/tmp/pairing.json" ||
+		flags.overrides.RelayHTTPAllowlist != "GET:/download" ||
+		flags.overrides.RelayWSAllowlist != "GET:/ws" {
 		t.Fatalf("unexpected overrides: %#v", flags.overrides)
 	}
 	if flags.overrides.RelayMode == nil || !*flags.overrides.RelayMode {

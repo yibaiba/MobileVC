@@ -70,7 +70,23 @@ func MarshalTunnelFrame(frame TunnelFrame) ([]byte, error) {
 	return raw, nil
 }
 
+func NewTunnelErrorFrame(streamID uint64, code string, metadata map[string]string) (TunnelFrame, error) {
+	frame := TunnelFrame{
+		Type: TunnelFrameStreamError, Version: TunnelVersion,
+		StreamID: streamID, ErrorCode: code, Metadata: sortedMetadata(metadata),
+	}
+	return frame, ValidateTunnelFrame(frame)
+}
+
 func UnmarshalTunnelFrame(raw []byte) (TunnelFrame, error) {
+	return unmarshalTunnelFrame(raw, true)
+}
+
+func UnmarshalTunnelFrameForRouting(raw []byte) (TunnelFrame, error) {
+	return unmarshalTunnelFrame(raw, false)
+}
+
+func unmarshalTunnelFrame(raw []byte, requireKnownStreamType bool) (TunnelFrame, error) {
 	var wire tunnelFrameJSON
 	if err := json.Unmarshal(raw, &wire); err != nil {
 		return TunnelFrame{}, fmt.Errorf("parse tunnel frame: %w", err)
@@ -88,20 +104,24 @@ func UnmarshalTunnelFrame(raw []byte) (TunnelFrame, error) {
 		StreamType: wire.StreamType, Seq: wire.Seq, Ack: wire.Ack, Window: wire.Window,
 		Payload: payload, ErrorCode: wire.ErrorCode, Metadata: wire.Metadata,
 	}
-	if err := ValidateTunnelFrame(frame); err != nil {
+	if err := validateTunnelFrame(frame, requireKnownStreamType); err != nil {
 		return TunnelFrame{}, err
 	}
 	return frame, nil
 }
 
 func ValidateTunnelFrame(frame TunnelFrame) error {
+	return validateTunnelFrame(frame, true)
+}
+
+func validateTunnelFrame(frame TunnelFrame, requireKnownStreamType bool) error {
 	if frame.Version != TunnelVersion {
 		return errors.New("invalid tunnel frame version")
 	}
 	switch frame.Type {
 	case TunnelFrameStreamOpen:
 		return validateTunnelFields(frame, tunnelFieldRule{
-			streamID: true, streamType: true, window: true, metadata: true,
+			streamID: true, streamType: true, knownStreamType: requireKnownStreamType, window: true, metadata: true,
 		})
 	case TunnelFrameStreamData:
 		return validateTunnelFields(frame, tunnelFieldRule{
@@ -179,14 +199,15 @@ func (s *TunnelCounterState) Observe(frame TunnelFrame) error {
 }
 
 type tunnelFieldRule struct {
-	streamID   bool
-	streamType bool
-	seq        bool
-	ack        bool
-	window     bool
-	payload    bool
-	errorCode  bool
-	metadata   bool
+	streamID        bool
+	streamType      bool
+	knownStreamType bool
+	seq             bool
+	ack             bool
+	window          bool
+	payload         bool
+	errorCode       bool
+	metadata        bool
 }
 
 func validateTunnelFields(frame TunnelFrame, rule tunnelFieldRule) error {
@@ -202,7 +223,7 @@ func validateTunnelFields(frame TunnelFrame, rule tunnelFieldRule) error {
 	if !rule.streamType && strings.TrimSpace(frame.StreamType) != "" {
 		return errors.New("tunnel frame has unexpected streamType")
 	}
-	if rule.streamType && !isTunnelStreamType(frame.StreamType) {
+	if rule.streamType && rule.knownStreamType && !isTunnelStreamType(frame.StreamType) {
 		return fmt.Errorf("unknown tunnel stream type: %s", frame.StreamType)
 	}
 	if rule.seq && frame.Seq == 0 {

@@ -450,6 +450,37 @@ func TestGatewayConnServesEncryptedFileDownloadTunnel(t *testing.T) {
 	}
 }
 
+func TestGatewayConnRejectsEncryptedFileDownloadWhenSelectedRouteDenied(t *testing.T) {
+	serverConn, clientConn := newRelayClientTestConns(t)
+	defer serverConn.Close()
+	handshake, clientEphemeral := testPairingHandshakeHandler(t)
+	root := t.TempDir()
+	policy := relay.NewSelectedRoutePolicy(
+		[]relay.RouteRule{{Method: http.MethodGet, Path: "/healthz"}},
+		[]relay.RouteRule{{Method: http.MethodGet, Path: relay.SelectedRouteWSMobileVC}},
+	)
+	gateway := newGatewayConnWithPolicy(clientConn, "rs_gateway", handshake, []string{root}, policy)
+	t.Cleanup(func() { _ = gateway.Close() })
+
+	filePath := filepath.Join(root, "relay-download.txt")
+	if err := os.WriteFile(filePath, []byte("secret-data"), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	clientCodec := activateGatewayE2EETestStream(t, serverConn, clientEphemeral)
+	gateway.SetRelayE2EEDeviceID("dev_bound")
+	openFrame, err := e2ee.NewFileDownloadOpenFrame(42, e2ee.FileDownloadMetadata{Path: filePath}, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeEncryptedTunnelFrame(t, serverConn, clientCodec, "msg_download_open", openFrame)
+	go drainGatewayRead(t, gateway)
+
+	tunnelFrame := readEncryptedTunnelFrame(t, serverConn, clientCodec)
+	if tunnelFrame.Type != e2ee.TunnelFrameStreamError || tunnelFrame.ErrorCode != relay.CodeDownloadDenied {
+		t.Fatalf("expected denied selected route stream error, got %#v", tunnelFrame)
+	}
+}
+
 func TestGatewayConnRejectsEncryptedFileDownloadBeforeDeviceBinding(t *testing.T) {
 	serverConn, clientConn := newRelayClientTestConns(t)
 	defer serverConn.Close()
@@ -499,6 +530,53 @@ func TestGatewayConnRejectsEncryptedFileDownloadBeforeDeviceBinding(t *testing.T
 	}
 	if tunnelFrame.Type != e2ee.TunnelFrameStreamError || tunnelFrame.ErrorCode != relay.CodeDownloadDenied {
 		t.Fatalf("expected download_denied stream error, got %#v", tunnelFrame)
+	}
+}
+
+func TestGatewayConnRejectsMobileVCStreamWhenSelectedRouteDenied(t *testing.T) {
+	serverConn, clientConn := newRelayClientTestConns(t)
+	defer serverConn.Close()
+	handshake, clientEphemeral := testPairingHandshakeHandler(t)
+	policy := relay.NewSelectedRoutePolicy(
+		[]relay.RouteRule{{Method: http.MethodGet, Path: relay.SelectedRouteHTTPDownload}},
+		[]relay.RouteRule{{Method: http.MethodGet, Path: "/events"}},
+	)
+	gateway := newGatewayConnWithPolicy(clientConn, "rs_gateway", handshake, nil, policy)
+	t.Cleanup(func() { _ = gateway.Close() })
+
+	clientCodec := activateGatewayE2EETestStream(t, serverConn, clientEphemeral)
+	inbound, err := clientCodec.EncodeJSON("msg_in", map[string]string{"action": "ping"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := serverConn.WriteJSON(relay.ForwardEnvelope(inbound)); err != nil {
+		t.Fatalf("write encrypted inbound: %v", err)
+	}
+	var decoded map[string]any
+	err = gateway.ReadJSON(&decoded)
+	if err == nil || !strings.Contains(err.Error(), relay.CodeProtocolError) {
+		t.Fatalf("expected mobilevc selected route protocol error, got payload=%#v err=%v", decoded, err)
+	}
+}
+
+func TestGatewayConnRejectsUnsupportedSelectedRouteStreamType(t *testing.T) {
+	serverConn, clientConn := newRelayClientTestConns(t)
+	defer serverConn.Close()
+	handshake, clientEphemeral := testPairingHandshakeHandler(t)
+	gateway := newGatewayConnWithE2EE(clientConn, "rs_gateway", handshake)
+	t.Cleanup(func() { _ = gateway.Close() })
+
+	clientCodec := activateGatewayE2EETestStream(t, serverConn, clientEphemeral)
+	openFrame := e2ee.TunnelFrame{
+		Type: e2ee.TunnelFrameStreamOpen, Version: e2ee.TunnelVersion,
+		StreamID: 44, StreamType: "shell.exec", Window: 4,
+	}
+	writeRawTunnelFrame(t, serverConn, clientCodec, "msg_unknown_open", openFrame)
+	go drainGatewayRead(t, gateway)
+
+	tunnelFrame := readEncryptedTunnelFrame(t, serverConn, clientCodec)
+	if tunnelFrame.Type != e2ee.TunnelFrameStreamError || tunnelFrame.ErrorCode != relay.CodeProtocolError {
+		t.Fatalf("expected unsupported selected route stream cancellation, got %#v", tunnelFrame)
 	}
 }
 
@@ -1116,6 +1194,67 @@ func driveGatewayE2EEHandshake(t *testing.T, serverConn *websocket.Conn, clientE
 		t.Fatal(err)
 	}
 	return keys
+}
+
+func activateGatewayE2EETestStream(t *testing.T, serverConn *websocket.Conn, clientEphemeral *e2ee.EphemeralKeyPair) *e2ee.MobileVCStreamCodec {
+	t.Helper()
+	if err := serverConn.WriteJSON(relay.ClientAttachedFrame{
+		Type: relay.TypeClientAttached, Version: relay.Version,
+		SessionID: "rs_gateway", ClientID: "rc_attached",
+	}); err != nil {
+		t.Fatalf("write attached: %v", err)
+	}
+	clientKeys := driveGatewayE2EEHandshake(t, serverConn, clientEphemeral)
+	codec, err := e2ee.NewClientMobileVCStreamCodec("rs_gateway", "rc_attached", "hs_pairing", clientKeys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return codec
+}
+
+func writeEncryptedTunnelFrame(t *testing.T, serverConn *websocket.Conn, codec *e2ee.MobileVCStreamCodec, messageID string, frame e2ee.TunnelFrame) {
+	t.Helper()
+	forward, err := codec.EncodeTunnelFrame(messageID, frame)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := serverConn.WriteJSON(relay.ForwardEnvelope(forward)); err != nil {
+		t.Fatalf("write encrypted tunnel frame: %v", err)
+	}
+}
+
+func writeRawTunnelFrame(t *testing.T, serverConn *websocket.Conn, codec *e2ee.MobileVCStreamCodec, messageID string, frame e2ee.TunnelFrame) {
+	t.Helper()
+	raw, err := json.Marshal(frame)
+	if err != nil {
+		t.Fatalf("marshal raw tunnel frame: %v", err)
+	}
+	forward, err := codec.EncodeStream(frame.StreamID, messageID, raw)
+	if err != nil {
+		t.Fatalf("encode raw tunnel frame: %v", err)
+	}
+	if err := serverConn.WriteJSON(relay.ForwardEnvelope(forward)); err != nil {
+		t.Fatalf("write raw tunnel frame: %v", err)
+	}
+}
+
+func readEncryptedTunnelFrame(t *testing.T, serverConn *websocket.Conn, codec *e2ee.MobileVCStreamCodec) e2ee.TunnelFrame {
+	t.Helper()
+	var env relay.ForwardEnvelope
+	if err := serverConn.ReadJSON(&env); err != nil {
+		t.Fatalf("read encrypted tunnel frame: %v", err)
+	}
+	tunnelFrame, err := codec.DecodeTunnelFrame(e2ee.RelayForwardFrame(env))
+	if err != nil {
+		t.Fatalf("decode encrypted tunnel frame: %v", err)
+	}
+	return tunnelFrame
+}
+
+func drainGatewayRead(t *testing.T, gateway *gatewayConn) {
+	t.Helper()
+	var payload map[string]any
+	_ = gateway.ReadJSON(&payload)
 }
 
 func newRelayClientTestConns(t *testing.T) (*websocket.Conn, *websocket.Conn) {

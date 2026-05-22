@@ -6,25 +6,28 @@
 
 ## Overview
 
-<!--
-Document your project's quality standards here.
+Backend code should be explicit, testable, and boundary-oriented. MobileVC has several stateful boundaries: local websocket actions, runner processes, file-backed persistence, relay routing, relay E2EE, and local filesystem access. Changes should preserve those ownership boundaries and fail visibly when a boundary contract is violated.
 
-Questions to answer:
-- What patterns are forbidden?
-- What linting rules do you enforce?
-- What are your testing requirements?
-- What code review standards apply?
--->
+Use normal Go tooling and keep changes focused:
 
-(To be filled by the team)
+- Run `gofmt` on edited Go files.
+- Run `go test -timeout 60s` for affected packages.
+- Prefer small functions with guard clauses over deeply nested handler logic.
+- Wrap errors with operation context and return them to the caller.
+- Keep security, relay, filesystem, and runner failures explicit; do not add silent fallback paths.
 
 ---
 
 ## Forbidden Patterns
 
-<!-- Patterns that should never be used and why -->
-
-(To be filled by the team)
+- Hardcoding secrets, API keys, auth tokens, relay secrets, APNs key material, or device credentials.
+- Logging direct auth tokens, relay pairing/reconnect secrets, private keys, traffic keys, file contents, image bytes, raw decrypted payloads, or full conversation text.
+- Faking success for command execution, runner output, relay pairing, E2EE, filesystem, or push workflows.
+- Swallowing config parse/validation errors and falling back to defaults for security-sensitive settings.
+- Mixing package ownership, such as importing gateway/session logic into the public relay server, or parsing MobileVC business actions inside `internal/relay`.
+- Reading whole large files into memory for relay/download flows when chunking/backpressure is required.
+- Trusting UI-side validation as the only authorization boundary for filesystem or relay device operations.
+- Adding compatibility shims for obsolete direct websocket/trusted-path flows unless explicitly required by the current task.
 
 ---
 
@@ -46,6 +49,8 @@ Questions to answer:
 - Relay capacity env: `RELAY_MAX_AGENT_CONNS`, `RELAY_MAX_CLIENT_CONNS`, `RELAY_MAX_CONNS_PER_IP`, `RELAY_FORWARD_QUEUE_SIZE`
 - Relay liveness env: `RELAY_PING_INTERVAL`, `RELAY_PONG_TIMEOUT`, `RELAY_AGENT_GRACE_PERIOD`
 - Trusted proxy env: `RELAY_TRUSTED_PROXY_CIDRS=<comma-separated-cidrs>`
+- Relay selected-route env: `RELAY_HTTP_ALLOWLIST=<METHOD:/path,...>`, `RELAY_WS_ALLOWLIST=<METHOD:/path,...>`
+- Local backend selected-route flags: `--relay-http-allowlist <METHOD:/path,...>`, `--relay-ws-allowlist <METHOD:/path,...>`
 - Relay E2EE env: `RELAY_REQUIRE_E2EE=true|false`, `RELAY_PLAINTEXT_TEST_MODE=true|false`
 - Relay E2EE flags: `--require-e2ee[=true|false]`, `--plaintext-test-mode[=true|false]`
 - Relay E2EE capabilities: `e2ee.CapabilitySet`, `e2ee.ProductionCapabilities()`, `e2ee.PlaintextTestCapabilities()`, `ValidateProductionCapabilities`, `ValidatePlaintextTestCapabilities`
@@ -56,6 +61,7 @@ Questions to answer:
 - Relay node identity store: `e2ee.LoadOrCreateNodeIdentityStore(path)`, `NodeIdentityStore.Current()`, `NodeIdentityStore.Rotate()`
 - Gateway relay metadata: `gateway.RelayE2EEInfo{Enabled, SessionID, ClientID, HandshakeID, DeviceID}`
 - Relay encrypted download config: `relayclient.Config.DownloadRoots []string`, `relayclient.DefaultDownloadRoot(workspaceRoot string)`
+- Relay selected-route policy: `relay.SelectedRoutePolicy`, `relay.SelectedRoutePolicyFromAllowlists(httpAllowlist, wsAllowlist)`, `relayclient.Config.SelectedRoutes`
 - Relay encrypted download helpers: `e2ee.NewFileDownloadOpenFrame`, `e2ee.NewFileDownloadDataFrame`, `e2ee.NewFileDownloadAckFrame`, `e2ee.NewFileDownloadCloseFrame`, `e2ee.NewFileDownloadCancelFrame`, `e2ee.NewFileDownloadErrorFrame`
 - Relay encrypted tunnel codec helpers: `MobileVCStreamCodec.EncodeStream`, `MobileVCStreamCodec.DecodeStream`, `MobileVCStreamCodec.EncodeTunnelFrame`, `MobileVCStreamCodec.DecodeTunnelFrame`
 - Relay local audit helper: `relay.LogAuditEvent(relay.AuditEvent{Action, Result, SessionID, ClientID, DeviceID, StreamID, Path, ErrorCode})`
@@ -80,6 +86,10 @@ Questions to answer:
 - E2EE tunnel frames use `stream.open`, `stream.data`, `stream.ack`, `stream.close`, `stream.reset`, `stream.error`, `ping`, and `pong`; each frame type must reject fields that do not belong to that type.
 - E2EE tunnel stream sequence allocation is per `streamId`, not global across the connection; stream `7` and stream `8` may both send sequence `1` without replay conflict.
 - `stream.open` must use a known `streamType` (`mobilevc.ws` or `file.download`) and a non-zero window.
+- Public relay selected-route allowlists are policy metadata only. They must not register plaintext public `/download` or `/ws` handlers on `cmd/relay`; selected routes are enforced by the local relay agent after E2EE.
+- Selected-route policy is deny-by-default and method/path specific. `file.download` maps to `GET /download`; `mobilevc.ws` maps to `GET /ws`.
+- `cmd/server` passes selected-route allowlists into `relayclient.Config.SelectedRoutes`; when unset, defaults are `GET:/healthz,GET:/version,GET:/download` for HTTP metadata/download and `GET:/ws` for MobileVC websocket semantics.
+- The local relay agent must validate selected routes before accepting encrypted MobileVC business frames or encrypted tunnel `stream.open` frames. It must not inspect decrypted business actions in `internal/relay`.
 - Encrypted relay file downloads use the E2EE tunnel `file.download` stream type, not public relay HTTP `/download`. The file path, response metadata, chunks, close, cancel, and error frames all live inside encrypted `relay.forward` payloads on a non-`MobileVCStreamID` stream.
 - File download streams use `stream.open` with metadata `path`, agent response `stream.open` with `fileName`, `contentType`, and optional `size`, `stream.data` chunks, client `stream.ack`, terminal `stream.close` / `stream.error`, and client `stream.reset` for cancel.
 - Encrypted `file.download` requires completed relay E2EE plus a bound device ID on the local gateway connection. Flutter gating is not enough; the local relay agent must reject unbound encrypted download attempts with an explicit stream error.
@@ -147,6 +157,10 @@ Questions to answer:
 - E2EE forward missing `streamId` or `handshakeId` -> `relay.error` with `protocol_error`.
 - Forward with missing or mismatched `clientId` -> `relay.error` with `protocol_error`.
 - E2EE handshake control frame with wrong role/direction/session/client ID -> `relay.error` with `protocol_error`.
+- Invalid `RELAY_HTTP_ALLOWLIST`, `RELAY_WS_ALLOWLIST`, `--relay-http-allowlist`, or `--relay-ws-allowlist` entry -> startup/config error.
+- Selected-route `file.download` denied by allowlist -> encrypted `stream.error` with `download_denied`.
+- Selected-route `mobilevc.ws` denied by allowlist -> local relay client read error with `protocol_error`.
+- Unsupported encrypted selected-route `stream.open` type -> encrypted `stream.error` with `protocol_error`.
 - Missing production relay download root -> config error `relay download root is required for e2ee mode`.
 - Invalid relay download root, missing root, non-directory root, or unreadable root -> config error / `download_denied` at request time.
 - Encrypted `file.download stream.open` with empty `metadata.path` -> `download_denied`.
@@ -242,6 +256,7 @@ Questions to answer:
 - Relay client tests must cover valid local agent pairing handshake, node signature verification, pairing proof validation, matching derived traffic keys, and mismatched proof routing failure.
 - Relay client tests must cover valid local agent reconnect handshake, unknown device, revoked device, wrong proof, bad signature, matching fresh traffic keys, and no plaintext business frame before E2EE stream activation.
 - Relay client tests must cover encrypted MobileVC `relay.forward` after local pairing handshake: client-to-agent decrypts to gateway JSON, agent-to-client `WriteJSON` emits E2EE metadata, and ciphertext does not contain plaintext business values.
+- Relay client tests must cover selected-route policy: allowed `file.download`/`mobilevc.ws`, denied method/path, denied `file.download` stream, denied MobileVC websocket stream, and unsupported selected-route stream types.
 - Relay client tests must cover encrypted `file.download`: open frame path stays encrypted, agent streams encrypted open/data/close, file contents stay encrypted in relay envelopes, gateway `ReadJSON` does not receive tunnel frames, ACK backpressure is honored, and no whole-file buffer is required.
 - Relay client tests must cover encrypted `file.download` rejection before bound device ID.
 - Relay client tests must cover download root enforcement: configured root allowed, outside root denied, symlink escape denied, missing root rejected in production E2EE config, directory target denied, and missing file denied.
@@ -356,14 +371,24 @@ device.CredentialHash = DeviceCredentialHash(plaintextCredential)
 
 ## Testing Requirements
 
-<!-- What level of testing is expected -->
+Use focused package tests for backend changes:
 
-(To be filled by the team)
+- Config changes: `go test -timeout 60s ./internal/config ./cmd/server` when flags/startup are affected.
+- Gateway/session/protocol changes: test the owning package and any cross-layer protocol package touched.
+- Relay server changes: `go test -timeout 60s ./internal/relay ./cmd/relay`.
+- Relay client/E2EE changes: `go test -timeout 60s ./internal/relayclient ./internal/relay/e2ee ./internal/gateway` when device actions or encrypted forwarding are affected.
+- Data store changes: include reload, corrupted-file, permission, and concurrency cases where relevant.
+
+Tests should assert explicit error codes/messages for boundary failures. Do not rely only on "no panic" checks for security, relay, or filesystem behavior.
 
 ---
 
 ## Code Review Checklist
 
-<!-- What reviewers should check -->
-
-(To be filled by the team)
+- Package ownership is preserved: entrypoint in `cmd/*`, transport in `gateway`/`relayclient`, public relay routing in `relay`, persistence in `data`, pure E2EE in `relay/e2ee`.
+- New protocol fields are reflected in `internal/protocol` and corresponding Flutter models when cross-end behavior changes.
+- Errors are wrapped or surfaced explicitly; no broad silent fallback was introduced.
+- Logs contain useful metadata and no secrets.
+- File permissions and authorization boundaries are explicit for persisted or downloaded data.
+- Relay/E2EE behavior follows the scenario contracts above, including capability negotiation, plaintext rejection, device binding, bounded queues, and chunked downloads.
+- Tests cover happy path and the important rejection path for every changed boundary.

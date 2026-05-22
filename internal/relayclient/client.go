@@ -31,6 +31,7 @@ type Config struct {
 	NodeIdentity       *e2ee.NodeIdentity
 	NodeIdentityStore  *e2ee.NodeIdentityStore
 	DeviceTrust        *e2ee.DeviceTrustStore
+	SelectedRoutes     relay.SelectedRoutePolicy
 }
 
 type ReconnectBackoff struct {
@@ -169,6 +170,13 @@ func validateConfig(cfg Config) error {
 
 func e2eeRequired(capabilities e2ee.CapabilitySet) bool {
 	return e2ee.ValidateProductionCapabilities(capabilities) == nil
+}
+
+func selectedRoutePolicy(cfg Config) relay.SelectedRoutePolicy {
+	if cfg.SelectedRoutes.IsZero() {
+		return relay.DefaultSelectedRoutePolicy()
+	}
+	return relay.NewSelectedRoutePolicy(cfg.SelectedRoutes.HTTPAllowedRoutes, cfg.SelectedRoutes.WSAllowedRoutes)
 }
 
 func DefaultDownloadRoot(workspaceRoot string) (string, error) {

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"mobilevc/internal/config"
@@ -16,6 +17,7 @@ import (
 	"mobilevc/internal/gateway"
 	"mobilevc/internal/logx"
 	"mobilevc/internal/push"
+	"mobilevc/internal/relay"
 	"mobilevc/internal/relay/e2ee"
 	"mobilevc/internal/relayclient"
 	"mobilevc/internal/tts"
@@ -213,17 +215,33 @@ func relayConfig(cfg config.Config, trustStore *e2ee.DeviceTrustStore, nodeIdent
 	if err != nil {
 		return relayclient.Config{}, fmt.Errorf("resolve relay download root: %w", err)
 	}
+	selectedRoutes, err := localSelectedRoutePolicy(cfg)
+	if err != nil {
+		return relayclient.Config{}, err
+	}
 	return relayclient.Config{
 		RelayURL:           cfg.Relay.URL,
 		PairingTTL:         cfg.Relay.PairingTTL,
 		AgentGracePeriod:   cfg.Relay.AgentGracePeriod,
 		PairingEventPath:   cfg.Relay.PairingEventPath,
 		DownloadRoots:      []string{downloadRoot},
+		SelectedRoutes:     selectedRoutes,
 		Capabilities:       e2ee.ProductionCapabilities(),
 		NodeFingerprintHex: fmt.Sprintf("%x", identity.Fingerprint),
 		NodeIdentityStore:  nodeIdentityStore,
 		DeviceTrust:        trustStore,
 	}, nil
+}
+
+func localSelectedRoutePolicy(cfg config.Config) (relay.SelectedRoutePolicy, error) {
+	policy, err := relay.SelectedRoutePolicyFromAllowlists(
+		strings.TrimSpace(cfg.Relay.HTTPAllowlist),
+		strings.TrimSpace(cfg.Relay.WSAllowlist),
+	)
+	if err != nil {
+		return relay.SelectedRoutePolicy{}, fmt.Errorf("load relay selected route policy: %w", err)
+	}
+	return policy, nil
 }
 
 func initTTSHandler(cfg config.Config) *tts.HTTPHandler {
