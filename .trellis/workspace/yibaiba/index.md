@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 1
-- **Last Active**: 2026-05-19
+- **Total Sessions**: 2
+- **Last Active**: 2026-05-22
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~42 | Active |
+| `journal-1.md` | ~81 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 2 | 2026-05-22 | Relay E2EE hardening and downloads | `ecfdac7`, `d574b4a`, `784e57d`, `489e4a9`, `15f4842`, `1f97d83`, `efc7047` | `main` |
 | 1 | 2026-05-19 | Relay mode public access | `182f902`, `856f07b`, `fc2f8e1` | `main` |
 <!-- @@@/auto:session-history -->
 
