@@ -3,7 +3,12 @@ package relayclient
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"mime"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -15,9 +20,12 @@ import (
 	"mobilevc/internal/relay/e2ee"
 )
 
+var errRelayTunnelFrameConsumed = fmt.Errorf("relay encrypted tunnel frame consumed")
+
 type gatewayConn struct {
 	conn          *websocket.Conn
 	sessionID     string
+	downloadRoots []string
 	clientID      string
 	mu            sync.Mutex
 	attachCh      chan struct{}
@@ -33,6 +41,9 @@ type gatewayConn struct {
 	stream        *e2ee.MobileVCStreamCodec
 	streamHS      string
 	deviceID      string
+	tunnelSend    *e2ee.TunnelCounterState
+	downloadsMu   sync.Mutex
+	downloads     map[uint64]*fileDownloadStream
 }
 
 type readResult struct {
@@ -46,11 +57,17 @@ func newGatewayConn(conn *websocket.Conn, sessionID string) *gatewayConn {
 	return newGatewayConnWithE2EE(conn, sessionID, nil)
 }
 
-func newGatewayConnWithE2EE(conn *websocket.Conn, sessionID string, e2eeHandler *agentE2EEHandshakeHandler) *gatewayConn {
+func newGatewayConnWithE2EE(conn *websocket.Conn, sessionID string, e2eeHandler *agentE2EEHandshakeHandler, downloadRoots ...[]string) *gatewayConn {
+	roots := []string(nil)
+	if len(downloadRoots) > 0 {
+		roots = downloadRoots[0]
+	}
 	gateway := &gatewayConn{
-		conn: conn, sessionID: sessionID,
+		conn: conn, sessionID: sessionID, downloadRoots: append([]string(nil), roots...),
 		attachCh: make(chan struct{}), readCh: make(chan readResult, relayReadQueueSize),
 		readDone: make(chan struct{}), closeCh: make(chan struct{}), e2ee: e2eeHandler,
+		tunnelSend: e2ee.NewTunnelCounterState(),
+		downloads:  map[uint64]*fileDownloadStream{},
 	}
 	if e2eeHandler != nil {
 		gateway.e2eeReadyCh = make(chan struct{})
@@ -69,6 +86,9 @@ func (c *gatewayConn) ReadJSON(v any) error {
 			return result.err
 		}
 		if err := c.decodeForward(result.env, v); err != nil {
+			if errors.Is(err, errRelayTunnelFrameConsumed) {
+				continue
+			}
 			return err
 		}
 		return nil
@@ -245,6 +265,9 @@ func (c *gatewayConn) decodeEncryptedForward(env relay.ForwardEnvelope, v any) e
 		return fmt.Errorf("%s: encrypted relay forward before e2ee activation", relay.CodeE2EEHandshakeFailed)
 	}
 	frame := e2ee.RelayForwardFrame(env)
+	if frame.StreamID != e2ee.MobileVCStreamID {
+		return c.handleEncryptedTunnelForward(codec, frame)
+	}
 	if err := codec.DecodeJSON(frame, v); err != nil {
 		if strings.Contains(err.Error(), "replay") {
 			return fmt.Errorf("%s: %w", relay.CodeE2EEReplayDetected, err)
@@ -252,6 +275,319 @@ func (c *gatewayConn) decodeEncryptedForward(env relay.ForwardEnvelope, v any) e
 		return fmt.Errorf("%s: %w", relay.CodeE2EEDecryptFailed, err)
 	}
 	return nil
+}
+
+func (c *gatewayConn) handleEncryptedTunnelForward(codec *e2ee.MobileVCStreamCodec, frame e2ee.RelayForwardFrame) error {
+	tunnelFrame, err := codec.DecodeTunnelFrame(frame)
+	if err != nil {
+		if strings.Contains(err.Error(), "replay") {
+			return fmt.Errorf("%s: %w", relay.CodeE2EEReplayDetected, err)
+		}
+		return fmt.Errorf("%s: %w", relay.CodeE2EEDecryptFailed, err)
+	}
+	if tunnelFrame.Type == e2ee.TunnelFrameStreamOpen && tunnelFrame.StreamType == e2ee.TunnelStreamFileDownload {
+		go c.serveEncryptedFileDownload(tunnelFrame)
+		return errRelayTunnelFrameConsumed
+	}
+	if c.routeFileDownloadControl(tunnelFrame) {
+		return errRelayTunnelFrameConsumed
+	}
+	if tunnelFrame.StreamID != 0 {
+		_ = c.writeEncryptedFileDownloadError(tunnelFrame.StreamID, relay.CodeStreamCancelled, "unsupported encrypted tunnel frame")
+		return errRelayTunnelFrameConsumed
+	}
+	return fmt.Errorf("%s: unsupported encrypted tunnel frame", relay.CodeProtocolError)
+}
+
+type fileDownloadStream struct {
+	controlCh chan e2ee.TunnelFrame
+	done      chan struct{}
+}
+
+const fileDownloadControlQueueSize = 8
+
+func (c *gatewayConn) registerFileDownload(streamID uint64) (*fileDownloadStream, bool) {
+	c.downloadsMu.Lock()
+	defer c.downloadsMu.Unlock()
+
+	if c.downloads[streamID] != nil {
+		return nil, false
+	}
+	stream := &fileDownloadStream{
+		controlCh: make(chan e2ee.TunnelFrame, fileDownloadControlQueueSize),
+		done:      make(chan struct{}),
+	}
+	c.downloads[streamID] = stream
+	return stream, true
+}
+
+func (c *gatewayConn) unregisterFileDownload(streamID uint64, stream *fileDownloadStream) {
+	c.downloadsMu.Lock()
+	defer c.downloadsMu.Unlock()
+
+	if c.downloads[streamID] == stream {
+		delete(c.downloads, streamID)
+		close(stream.done)
+	}
+}
+
+func (c *gatewayConn) routeFileDownloadControl(frame e2ee.TunnelFrame) bool {
+	switch frame.Type {
+	case e2ee.TunnelFrameStreamAck, e2ee.TunnelFrameStreamReset:
+	default:
+		return false
+	}
+	c.downloadsMu.Lock()
+	stream := c.downloads[frame.StreamID]
+	c.downloadsMu.Unlock()
+	if stream == nil {
+		return true
+	}
+	select {
+	case stream.controlCh <- frame:
+	default:
+		_ = c.writeEncryptedFileDownloadError(frame.StreamID, relay.CodeStreamWindowExceeded, "file download control queue is full")
+	}
+	return true
+}
+
+func (c *gatewayConn) serveEncryptedFileDownload(openFrame e2ee.TunnelFrame) {
+	stream, ok := c.registerFileDownload(openFrame.StreamID)
+	if !ok {
+		_ = c.writeEncryptedFileDownloadError(openFrame.StreamID, relay.CodeStreamWindowExceeded, "file download stream already exists")
+		return
+	}
+	defer c.unregisterFileDownload(openFrame.StreamID, stream)
+
+	if err := c.sendEncryptedFile(openFrame, stream); err != nil {
+		code := relay.CodeDownloadFailed
+		if strings.Contains(err.Error(), relay.CodeDownloadDenied) || strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "directory") {
+			code = relay.CodeDownloadDenied
+		}
+		_ = c.writeEncryptedFileDownloadError(openFrame.StreamID, code, err.Error())
+	}
+}
+
+func (c *gatewayConn) sendEncryptedFile(openFrame e2ee.TunnelFrame, stream *fileDownloadStream) error {
+	path, file, info, err := openDownloadTarget(openFrame.Metadata["path"], c.downloadRoots)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	codec := c.e2eeStream()
+	if codec == nil {
+		return fmt.Errorf("%s: relay e2ee stream is not ready", relay.CodeE2EEHandshakeFailed)
+	}
+	size := info.Size()
+	metadata := e2ee.FileDownloadMetadata{
+		Path: path, FileName: filepath.Base(path), ContentType: relayDownloadContentType(path), Size: &size,
+	}
+	responseOpen, err := e2ee.NewFileDownloadOpenFrame(openFrame.StreamID, metadata, openFrame.Window)
+	if err != nil {
+		return err
+	}
+	if err := c.writeEncryptedTunnelFrame(codec, responseOpen); err != nil {
+		return err
+	}
+
+	chunker, err := e2ee.NewFileDownloadChunker(file, e2ee.FileDownloadDefaultChunkSize)
+	if err != nil {
+		return err
+	}
+	window, err := e2ee.NewFileDownloadSendWindow(openFrame.Window)
+	if err != nil {
+		return err
+	}
+	for {
+		chunk, err := chunker.Next()
+		if err == io.EOF {
+			return c.writeEncryptedFileDownloadClose(codec, openFrame.StreamID)
+		}
+		if err != nil {
+			return fmt.Errorf("%s: read file chunk: %w", relay.CodeDownloadFailed, err)
+		}
+		if err := c.writeEncryptedFileDownloadChunk(codec, stream, window, openFrame.StreamID, chunk); err != nil {
+			return err
+		}
+	}
+}
+
+func openDownloadTarget(rawPath string, rawRoots []string) (string, *os.File, os.FileInfo, error) {
+	target := strings.TrimSpace(rawPath)
+	if target == "" {
+		return "", nil, nil, fmt.Errorf("%s: path is required", relay.CodeDownloadDenied)
+	}
+	roots, err := validateDownloadRoots(rawRoots)
+	if err != nil {
+		return "", nil, nil, fmt.Errorf("%s: invalid download root: %w", relay.CodeDownloadDenied, err)
+	}
+	if len(roots) == 0 {
+		return "", nil, nil, fmt.Errorf("%s: download root is not configured", relay.CodeDownloadDenied)
+	}
+	absPath, err := resolveDownloadPath(target)
+	if err != nil {
+		return "", nil, nil, fmt.Errorf("%s: invalid path: %w", relay.CodeDownloadDenied, err)
+	}
+	if !downloadPathAllowed(absPath, roots) {
+		return "", nil, nil, fmt.Errorf("%s: path is outside allowed download roots", relay.CodeDownloadDenied)
+	}
+	info, err := os.Stat(absPath)
+	if err != nil {
+		return "", nil, nil, fmt.Errorf("%s: file not found", relay.CodeDownloadDenied)
+	}
+	if info.IsDir() {
+		return "", nil, nil, fmt.Errorf("%s: path is a directory", relay.CodeDownloadDenied)
+	}
+	file, err := os.Open(absPath)
+	if err != nil {
+		return "", nil, nil, fmt.Errorf("%s: open file: %w", relay.CodeDownloadFailed, err)
+	}
+	return absPath, file, info, nil
+}
+
+func validateDownloadRoots(rawRoots []string) ([]string, error) {
+	roots := make([]string, 0, len(rawRoots))
+	seen := map[string]struct{}{}
+	for _, raw := range rawRoots {
+		root, err := resolveDownloadRoot(raw)
+		if err != nil {
+			return nil, err
+		}
+		if _, ok := seen[root]; ok {
+			continue
+		}
+		seen[root] = struct{}{}
+		roots = append(roots, root)
+	}
+	return roots, nil
+}
+
+func resolveDownloadRoot(raw string) (string, error) {
+	root, err := resolveDownloadPath(raw)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(root)
+	if err != nil {
+		return "", err
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("download root is not a directory: %s", root)
+	}
+	return root, nil
+}
+
+func resolveDownloadPath(raw string) (string, error) {
+	target := strings.TrimSpace(raw)
+	if target == "" {
+		return "", fmt.Errorf("path is required")
+	}
+	absPath, err := filepath.Abs(filepath.Clean(target))
+	if err != nil {
+		return "", err
+	}
+	evaluated, err := filepath.EvalSymlinks(absPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return absPath, nil
+		}
+		return "", err
+	}
+	return evaluated, nil
+}
+
+func downloadPathAllowed(path string, roots []string) bool {
+	for _, root := range roots {
+		if path == root {
+			return true
+		}
+		rel, err := filepath.Rel(root, path)
+		if err == nil && rel != "." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && rel != ".." {
+			return true
+		}
+	}
+	return false
+}
+
+func relayDownloadContentType(path string) string {
+	contentType := mime.TypeByExtension(filepath.Ext(path))
+	if contentType != "" {
+		return contentType
+	}
+	return "application/octet-stream"
+}
+
+func (c *gatewayConn) writeEncryptedFileDownloadChunk(codec *e2ee.MobileVCStreamCodec, stream *fileDownloadStream, window *e2ee.FileDownloadSendWindow, streamID uint64, chunk []byte) error {
+	seq, err := c.nextTunnelSeq(streamID)
+	if err != nil {
+		return err
+	}
+	frame, err := e2ee.NewFileDownloadDataFrame(streamID, seq, chunk, e2ee.FileDownloadDefaultChunkSize)
+	if err != nil {
+		return err
+	}
+	for {
+		err = window.ObserveSend(frame)
+		if err == nil {
+			break
+		}
+		if !strings.Contains(err.Error(), e2ee.FileDownloadErrorWindowExceeded) {
+			return err
+		}
+		if err := c.waitFileDownloadAck(stream, window); err != nil {
+			return err
+		}
+	}
+	return c.writeEncryptedTunnelFrame(codec, frame)
+}
+
+func (c *gatewayConn) waitFileDownloadAck(stream *fileDownloadStream, window *e2ee.FileDownloadSendWindow) error {
+	select {
+	case frame := <-stream.controlCh:
+		if frame.Type == e2ee.TunnelFrameStreamReset {
+			return fmt.Errorf("%s: file download cancelled", relay.CodeStreamCancelled)
+		}
+		return window.ObserveAck(frame)
+	case <-stream.done:
+		return fmt.Errorf("%s: file download closed", relay.CodeStreamCancelled)
+	case <-c.closeCh:
+		return c.readError()
+	}
+}
+
+func (c *gatewayConn) writeEncryptedFileDownloadClose(codec *e2ee.MobileVCStreamCodec, streamID uint64) error {
+	seq, err := c.nextTunnelSeq(streamID)
+	if err != nil {
+		return err
+	}
+	frame, err := e2ee.NewFileDownloadCloseFrame(streamID, seq)
+	if err != nil {
+		return err
+	}
+	return c.writeEncryptedTunnelFrame(codec, frame)
+}
+
+func (c *gatewayConn) writeEncryptedFileDownloadError(streamID uint64, code string, message string) error {
+	codec := c.e2eeStream()
+	if codec == nil {
+		return fmt.Errorf("%s: relay e2ee stream is not ready", relay.CodeE2EEHandshakeFailed)
+	}
+	frame, err := e2ee.NewFileDownloadErrorFrame(streamID, code, map[string]string{"message": message})
+	if err != nil {
+		return err
+	}
+	return c.writeEncryptedTunnelFrame(codec, frame)
+}
+
+func (c *gatewayConn) nextTunnelSeq(streamID uint64) (uint64, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.tunnelSend == nil {
+		c.tunnelSend = e2ee.NewTunnelCounterState()
+	}
+	return c.tunnelSend.NextSeq(streamID)
 }
 
 func (c *gatewayConn) WriteJSON(v any) error {
@@ -363,6 +699,14 @@ func (c *gatewayConn) encryptedForwardEnvelope(payload []byte) (relay.ForwardEnv
 		return relay.ForwardEnvelope{}, fmt.Errorf("%s: %w", relay.CodeE2EEDecryptFailed, err)
 	}
 	return relay.ForwardEnvelope(frame), nil
+}
+
+func (c *gatewayConn) writeEncryptedTunnelFrame(codec *e2ee.MobileVCStreamCodec, frame e2ee.TunnelFrame) error {
+	env, err := codec.EncodeTunnelFrame("msg_"+uuid.NewString(), frame)
+	if err != nil {
+		return err
+	}
+	return c.writeControl(relay.ForwardEnvelope(env))
 }
 
 func (c *gatewayConn) e2eeStream() *e2ee.MobileVCStreamCodec {

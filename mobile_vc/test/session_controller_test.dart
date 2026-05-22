@@ -12,6 +12,8 @@ import 'package:mobile_vc/core/relay_e2ee/relay_device_identity.dart';
 import 'package:mobile_vc/core/relay_e2ee/relay_e2ee_crypto.dart';
 import 'package:mobile_vc/core/relay_e2ee/relay_e2ee_handshake.dart';
 import 'package:mobile_vc/core/relay_e2ee/relay_e2ee_handshake_frames.dart';
+import 'package:mobile_vc/core/relay_e2ee/relay_file_download.dart';
+import 'package:mobile_vc/core/relay_e2ee/relay_tunnel.dart';
 import 'package:mobile_vc/core/relay_e2ee/relay_mobilevc_stream.dart';
 import 'package:mobile_vc/core/relay_e2ee/relay_security_state.dart';
 import 'package:mobile_vc/data/models/events.dart';
@@ -113,6 +115,43 @@ Future<void> _servePairingE2eeRelay(
         final relayCodec = codec;
         if (relayCodec == null) {
           throw StateError('test relay e2ee codec missing');
+        }
+        final streamId = (frame['streamId'] as num?)?.toInt() ?? 0;
+        if (streamId != relayMobileVcStreamId) {
+          final tunnelFrame = await relayCodec.decodeTunnelFrame(frame);
+          observedPlaintexts?.add(tunnelFrame.toJson());
+          if (tunnelFrame.type == tunnelFrameStreamOpen &&
+              tunnelFrame.streamType == tunnelStreamFileDownload) {
+            socket.add(jsonEncode(await relayCodec.encodeTunnelFrame(
+              messageId: 'msg_download_open',
+              frame: relayFileDownloadOpenFrame(
+                streamId: tunnelFrame.streamId,
+                metadata: const RelayFileDownloadMetadata(
+                  path: '/workspace/secret.txt',
+                  fileName: 'secret.txt',
+                  contentType: 'text/plain',
+                  size: 11,
+                ),
+                window: 4,
+              ),
+            )));
+            socket.add(jsonEncode(await relayCodec.encodeTunnelFrame(
+              messageId: 'msg_download_data',
+              frame: relayFileDownloadDataFrame(
+                streamId: tunnelFrame.streamId,
+                seq: 1,
+                chunk: utf8.encode('hello relay'),
+              ),
+            )));
+            socket.add(jsonEncode(await relayCodec.encodeTunnelFrame(
+              messageId: 'msg_download_close',
+              frame: relayFileDownloadCloseFrame(
+                streamId: tunnelFrame.streamId,
+                seq: 2,
+              ),
+            )));
+          }
+          break;
         }
         final decoded = await relayCodec.decodeJson(frame);
         observedPlaintexts?.add(Map<String, dynamic>.from(decoded));
@@ -308,6 +347,19 @@ Future<Map<String, dynamic>> _waitForRelayDeviceRegistration(
     await Future<void>.delayed(const Duration(milliseconds: 10));
   }
   throw StateError('relay device registration was not observed');
+}
+
+Future<void> _waitForObservedFrame(
+  List<Map<String, dynamic>> observed,
+  bool Function(Map<String, dynamic>) matches,
+) async {
+  for (var i = 0; i < 100; i++) {
+    if (observed.any(matches)) {
+      return;
+    }
+    await Future<void>.delayed(const Duration(milliseconds: 10));
+  }
+  throw StateError('expected relay frame was not observed');
 }
 
 ActionNeededSignal _expectSignal(
@@ -723,6 +775,76 @@ void main() {
       );
       expect(events.whereType<PongEvent>().single.sessionId, 'session-test');
       expect(events.whereType<ErrorEvent>(), isEmpty);
+    });
+
+    test('relay E2EE downloads files through encrypted tunnel', () async {
+      final nodeIdentity = await RelayE2eeHandshake.newEphemeralKeyPair();
+      final nodeFingerprint = await RelayE2eeCrypto.fingerprint(
+        nodeIdentity.publicKey,
+      );
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(server.close);
+      final observedForwards = <Map<String, dynamic>>[];
+      final observedPlaintexts = <Map<String, dynamic>>[];
+      server.transform(WebSocketTransformer()).listen((socket) {
+        _servePairingE2eeRelay(
+          socket,
+          nodeIdentity,
+          observedForwards,
+          observedPlaintexts,
+        );
+      });
+      final service = _testRelayService();
+      addTearDown(service.dispose);
+
+      await service.connectRelay(
+        relayUrl: 'ws://127.0.0.1:${server.port}',
+        sessionId: 'rs_test',
+        pairingSecret: 'pair-secret-128-bit-minimum',
+        nodeFingerprintHex: _testHex(nodeFingerprint),
+        relayCapabilities: RelayE2eeCapabilitySet.production(),
+      );
+      service.markRelayDeviceRegistered(RelayDeviceRegisterResultEvent(
+        timestamp: DateTime.now(),
+        sessionId: 'rs_test',
+        runtimeMeta: const RuntimeMeta(),
+        raw: const <String, dynamic>{'type': 'relay_device_register_result'},
+        deviceId: 'device-bound',
+      ));
+
+      final progress = <int>[];
+      final result = await service.downloadRelayFile(
+        '/workspace/secret.txt',
+        onProgress: (received, _) => progress.add(received),
+      );
+      await _waitForObservedFrame(
+        observedPlaintexts,
+        (frame) =>
+            frame['type'] == tunnelFrameStreamAck &&
+            (frame['streamId'] as num?)?.toInt() != 1,
+      );
+
+      expect(utf8.decode(result.bytes!), 'hello relay');
+      expect(result.fileName, 'secret.txt');
+      expect(progress, contains(11));
+      final downloadForwards = observedForwards
+          .where((frame) => (frame['streamId'] as num?)?.toInt() != 1)
+          .toList();
+      expect(downloadForwards, hasLength(greaterThanOrEqualTo(1)));
+      expect(
+        downloadForwards.first['payload'].toString(),
+        isNot(contains('/workspace/secret.txt')),
+      );
+      expect(
+        downloadForwards.first['payload'].toString(),
+        isNot(contains('hello relay')),
+      );
+      expect(
+        observedPlaintexts.any((frame) =>
+            frame['type'] == tunnelFrameStreamAck &&
+            (frame['streamId'] as num?)?.toInt() != 1),
+        isTrue,
+      );
     });
 
     test('relay pairing rejects E2EE node fingerprint mismatch', () async {
@@ -8969,6 +9091,10 @@ class _FakeMobileVcWsService extends MobileVcWsService {
   Uint8List relayNodeFingerprint =
       Uint8List.fromList(List<int>.filled(32, 0x11));
   String markedRelayDeviceId = '';
+  RelayFileDownloadResult relayDownloadResult = RelayFileDownloadResult(
+    bytes: Uint8List.fromList(<int>[1, 2, 3]),
+    fileName: 'download.bin',
+  );
 
   @override
   Stream<AppEvent> get events => _controller.stream;
@@ -9071,6 +9197,18 @@ class _FakeMobileVcWsService extends MobileVcWsService {
   bool send(Map<String, dynamic> payload) {
     sentPayloads.add(Map<String, dynamic>.from(payload));
     return true;
+  }
+
+  @override
+  Future<RelayFileDownloadResult> downloadRelayFile(
+    String path, {
+    void Function(int receivedBytes, int? totalBytes)? onProgress,
+    FutureOr<void> Function(Uint8List chunk)? onChunk,
+  }) async {
+    await onChunk?.call(relayDownloadResult.bytes ?? Uint8List(0));
+    onProgress?.call(
+        relayDownloadResult.bytes?.length ?? 0, relayDownloadResult.totalBytes);
+    return relayDownloadResult;
   }
 
   void emit(AppEvent event) {

@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:uuid/uuid.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
@@ -10,11 +11,15 @@ import '../../core/relay_e2ee/relay_e2ee_crypto.dart';
 import '../../core/relay_e2ee/relay_device_identity.dart';
 import '../../core/relay_e2ee/relay_e2ee_handshake.dart';
 import '../../core/relay_e2ee/relay_e2ee_handshake_frames.dart';
+import '../../core/relay_e2ee/relay_file_download.dart';
 import '../../core/relay_e2ee/relay_mobilevc_stream.dart';
 import '../../core/relay_e2ee/relay_security_state.dart';
+import '../../core/relay_e2ee/relay_tunnel.dart';
 import '../models/events.dart';
 import '../models/runtime_meta.dart';
 import 'mobilevc_mapper.dart';
+
+const _relayDownloadWindow = 4;
 
 class MobileVcWsService {
   MobileVcWsService({
@@ -132,6 +137,7 @@ class MobileVcWsService {
     _relayE2eeState = null;
     _relaySendQueue = Future<void>.value();
     _relayReceiveQueue = Future<void>.value();
+    _failRelayDownloads(StateError('Relay connection replaced'));
     _connectionEpoch++;
     await previousSubscription?.cancel();
     await previousChannel?.sink.close();
@@ -354,6 +360,7 @@ class MobileVcWsService {
     _relayE2eeState = null;
     _relaySendQueue = Future<void>.value();
     _relayReceiveQueue = Future<void>.value();
+    _failRelayDownloads(StateError('Relay connection closed'));
     _connectionEpoch++;
     await previousSubscription?.cancel();
     await previousChannel?.sink.close();
@@ -423,6 +430,9 @@ class MobileVcWsService {
   _RelayE2eeHandshakeState? _relayE2eeState;
   Future<void> _relaySendQueue = Future<void>.value();
   Future<void> _relayReceiveQueue = Future<void>.value();
+  final Map<int, _RelayFileDownloadState> _relayDownloads =
+      <int, _RelayFileDownloadState>{};
+  int _nextDownloadStreamId = 41;
 
   void markRelayDeviceRegistered(
     RelayDeviceRegisterResultEvent event,
@@ -442,6 +452,78 @@ class MobileVcWsService {
     _relayE2eeState = null;
   }
 
+  int _nextRelayDownloadStreamId() {
+    _nextDownloadStreamId += 2;
+    return _nextDownloadStreamId;
+  }
+
+  String _fallbackFileName(String path) {
+    final normalized = path.replaceAll('\\', '/').trim();
+    if (normalized.isEmpty) {
+      return 'download.bin';
+    }
+    final index = normalized.lastIndexOf('/');
+    final fileName = index == -1 ? normalized : normalized.substring(index + 1);
+    return fileName.isEmpty ? 'download.bin' : fileName;
+  }
+
+  Future<RelayFileDownloadResult> downloadRelayFile(
+    String path, {
+    void Function(int receivedBytes, int? totalBytes)? onProgress,
+    FutureOr<void> Function(Uint8List chunk)? onChunk,
+  }) async {
+    final channel = _channel;
+    final state = _relayE2eeState;
+    final codec = state?.streamCodec;
+    final target = path.trim();
+    if (channel == null || _relayContext.sessionId.isEmpty) {
+      throw StateError('Relay is not connected');
+    }
+    if (target.isEmpty) {
+      throw const FormatException('download path is required');
+    }
+    if (state?.complete != true || codec == null) {
+      throw StateError('Relay E2EE stream is not ready');
+    }
+    if (state!.boundDeviceId.trim().isEmpty) {
+      throw StateError('Relay E2EE device is not bound');
+    }
+    if (!state.capabilities.supportsFileDownload) {
+      throw StateError('Relay E2EE file download is unsupported');
+    }
+
+    final streamId = _nextRelayDownloadStreamId();
+    final pending = _RelayFileDownloadState(
+      streamId: streamId,
+      fallbackFileName: _fallbackFileName(target),
+      onProgress: onProgress,
+      onChunk: onChunk,
+    );
+    _relayDownloads[streamId] = pending;
+    try {
+      final openFrame = relayFileDownloadOpenFrame(
+        streamId: streamId,
+        metadata: RelayFileDownloadMetadata(path: target),
+        window: _relayDownloadWindow,
+      );
+      final forward = await codec.encodeTunnelFrame(
+        messageId: 'msg_${const Uuid().v4()}',
+        frame: openFrame,
+      );
+      if (_channel != channel) {
+        throw StateError('Relay connection changed during download');
+      }
+      channel.sink.add(jsonEncode(forward));
+      return await pending.result.future;
+    } catch (error) {
+      _relayDownloads.remove(streamId);
+      if (!pending.result.isCompleted) {
+        pending.result.completeError(error);
+      }
+      rethrow;
+    }
+  }
+
   RelaySession? takeRelaySession() {
     final session = _relaySession;
     _relaySession = null;
@@ -451,6 +533,7 @@ class MobileVcWsService {
   Future<Map<String, dynamic>?> _decodeRelayFrame(
     Map<String, dynamic> frame,
     void Function(String clientId, String clientReconnectSecret) setClientId,
+    WebSocketChannel channel,
   ) async {
     final type = (frame['type'] ?? '').toString();
     if (type == 'client.paired') {
@@ -477,6 +560,14 @@ class MobileVcWsService {
         throw StateError(
             'Relay E2EE frame received before encrypted stream is ready');
       }
+      if (_relayFrameStreamId(frame) != relayMobileVcStreamId) {
+        await _handleRelayTunnelFrame(
+          channel: channel,
+          frame: frame,
+          state: e2eeState!,
+        );
+        return null;
+      }
       return codec.decodeJson(frame);
     }
     if (e2eeState?.complete == true) {
@@ -491,6 +582,91 @@ class MobileVcWsService {
         base64Url.decode(base64Url.normalize(frame['payload'].toString()));
     final decoded = jsonDecode(utf8.decode(raw));
     return decoded is Map<String, dynamic> ? decoded : null;
+  }
+
+  Future<void> _handleRelayTunnelFrame({
+    required WebSocketChannel channel,
+    required Map<String, dynamic> frame,
+    required _RelayE2eeHandshakeState state,
+  }) async {
+    final tunnelFrame = await state.streamCodec!.decodeTunnelFrame(frame);
+    validateRelayFileDownloadFrame(tunnelFrame);
+    final pending = _relayDownloads[tunnelFrame.streamId];
+    if (pending == null) {
+      if (tunnelFrame.type == tunnelFrameStreamData) {
+        await _sendRelayDownloadAck(
+          channel: channel,
+          state: state,
+          streamId: tunnelFrame.streamId,
+          seq: tunnelFrame.seq,
+        );
+      }
+      return;
+    }
+    switch (tunnelFrame.type) {
+      case tunnelFrameStreamOpen:
+        pending.applyOpen(tunnelFrame);
+      case tunnelFrameStreamData:
+        await pending.addChunk(tunnelFrame.payload);
+        await _sendRelayDownloadAck(
+          channel: channel,
+          state: state,
+          streamId: tunnelFrame.streamId,
+          seq: tunnelFrame.seq,
+        );
+      case tunnelFrameStreamClose:
+        _relayDownloads.remove(tunnelFrame.streamId);
+        pending.complete();
+      case tunnelFrameStreamError:
+        _relayDownloads.remove(tunnelFrame.streamId);
+        pending.completeError(RelayPairingException(
+          tunnelFrame.errorCode,
+          relayErrorMessage(<String, dynamic>{
+            'type': 'relay.error',
+            'code': tunnelFrame.errorCode,
+            'message': tunnelFrame.metadata['message'] ?? '',
+          }),
+        ));
+      case tunnelFrameStreamReset:
+        _relayDownloads.remove(tunnelFrame.streamId);
+        pending.completeError(StateError(
+          tunnelFrame.metadata['message'] ?? 'Relay download cancelled',
+        ));
+      default:
+        throw FormatException(
+            'unexpected file download frame ${tunnelFrame.type}');
+    }
+  }
+
+  Future<void> _sendRelayDownloadAck({
+    required WebSocketChannel channel,
+    required _RelayE2eeHandshakeState state,
+    required int streamId,
+    required int seq,
+  }) async {
+    final ack = relayFileDownloadAckFrame(
+      streamId: streamId,
+      ack: seq,
+      window: _relayDownloadWindow,
+    );
+    final forward = await state.streamCodec!.encodeTunnelFrame(
+      messageId: 'msg_${const Uuid().v4()}',
+      frame: ack,
+    );
+    if (_channel == channel) {
+      channel.sink.add(jsonEncode(forward));
+    }
+  }
+
+  void _failRelayDownloads(Object error) {
+    if (_relayDownloads.isEmpty) {
+      return;
+    }
+    final downloads = List<_RelayFileDownloadState>.of(_relayDownloads.values);
+    _relayDownloads.clear();
+    for (final download in downloads) {
+      download.completeError(error);
+    }
   }
 
   Future<_RelayE2eeHandshakeState> _startRelayE2EEHandshake({
@@ -754,7 +930,7 @@ class MobileVcWsService {
       if (epoch != _connectionEpoch || _channel != channel) {
         return;
       }
-      final relayEvent = await _decodeRelayFrame(frame, setClientId);
+      final relayEvent = await _decodeRelayFrame(frame, setClientId, channel);
       if (relayEvent != null &&
           epoch == _connectionEpoch &&
           _channel == channel) {
@@ -931,6 +1107,17 @@ bool _isRelayForwardFrame(Map<String, dynamic> frame) {
   return (frame['type'] ?? '').toString() == relayForwardType;
 }
 
+int _relayFrameStreamId(Map<String, dynamic> frame) {
+  final value = frame['streamId'];
+  if (value is int) {
+    return value;
+  }
+  if (value is num) {
+    return value.toInt();
+  }
+  return int.tryParse(value?.toString() ?? '') ?? 0;
+}
+
 String _hex(Uint8List bytes) {
   final buffer = StringBuffer();
   for (final byte in bytes) {
@@ -1069,6 +1256,77 @@ class RelaySession {
   final String sessionId;
   final String clientId;
   final String clientReconnectSecret;
+}
+
+class RelayFileDownloadResult {
+  const RelayFileDownloadResult({
+    required this.fileName,
+    this.bytes,
+    this.contentType = '',
+    this.totalBytes,
+  });
+
+  final Uint8List? bytes;
+  final String fileName;
+  final String contentType;
+  final int? totalBytes;
+}
+
+class _RelayFileDownloadState {
+  _RelayFileDownloadState({
+    required this.streamId,
+    required this.fallbackFileName,
+    this.onProgress,
+    this.onChunk,
+  });
+
+  final int streamId;
+  final String fallbackFileName;
+  final void Function(int receivedBytes, int? totalBytes)? onProgress;
+  final FutureOr<void> Function(Uint8List chunk)? onChunk;
+  final Completer<RelayFileDownloadResult> result =
+      Completer<RelayFileDownloadResult>();
+  final BytesBuilder _bytes = BytesBuilder(copy: false);
+  int _receivedBytes = 0;
+  String fileName = '';
+  String contentType = '';
+  int? totalBytes;
+
+  void applyOpen(RelayTunnelFrame frame) {
+    fileName = (frame.metadata['fileName'] ?? '').trim();
+    contentType = (frame.metadata['contentType'] ?? '').trim();
+    totalBytes = int.tryParse((frame.metadata['size'] ?? '').trim());
+    onProgress?.call(_receivedBytes, totalBytes);
+  }
+
+  Future<void> addChunk(List<int> chunk) async {
+    final immutableChunk = Uint8List.fromList(chunk);
+    if (onChunk == null) {
+      _bytes.add(immutableChunk);
+    } else {
+      await onChunk!(immutableChunk);
+    }
+    _receivedBytes += immutableChunk.length;
+    onProgress?.call(_receivedBytes, totalBytes);
+  }
+
+  void complete() {
+    if (result.isCompleted) {
+      return;
+    }
+    result.complete(RelayFileDownloadResult(
+      bytes: onChunk == null ? _bytes.takeBytes() : null,
+      fileName: fileName.isNotEmpty ? fileName : fallbackFileName,
+      contentType: contentType,
+      totalBytes: totalBytes,
+    ));
+  }
+
+  void completeError(Object error) {
+    if (!result.isCompleted) {
+      result.completeError(error);
+    }
+  }
 }
 
 class _RelayContext {

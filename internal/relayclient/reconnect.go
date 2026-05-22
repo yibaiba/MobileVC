@@ -28,7 +28,7 @@ func serveWithReconnect(ctx context.Context, cfg Config, handler Handler, conn *
 			nodeIdentity,
 			cfg.DeviceTrust,
 		)
-		gatewayConn := newGatewayConnWithE2EE(conn, sessionID, e2eeHandler)
+		gatewayConn := newGatewayConnWithE2EE(conn, sessionID, e2eeHandler, cfg.DownloadRoots)
 		handler.ServeClientConn(ctx, gatewayConn)
 		if errors.Is(gatewayConn.closeReason(), errRelaySessionRotated) {
 			return errRelaySessionRotated

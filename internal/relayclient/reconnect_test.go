@@ -58,6 +58,7 @@ func TestRunRegistersNewSessionAfterRotate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	downloadRoot := t.TempDir()
 	events := make(chan PairingReadyEvent, 2)
 	handler := &rotateThenStopHandler{cancel: cancel}
 	errCh := make(chan error, 1)
@@ -67,6 +68,7 @@ func TestRunRegistersNewSessionAfterRotate(t *testing.T) {
 			PairingTTL:        time.Minute,
 			AgentGracePeriod:  time.Minute,
 			PairingEventPath:  filepath.Join(t.TempDir(), "pairing.json"),
+			DownloadRoots:     []string{downloadRoot},
 			Capabilities:      e2ee.ProductionCapabilities(),
 			NodeIdentityStore: nodeStore,
 		}, handler, func(_ string, event PairingReadyEvent) error {

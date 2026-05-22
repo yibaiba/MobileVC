@@ -55,6 +55,9 @@ Questions to answer:
 - Relay E2EE device result events: `relay_device_register_result`, `relay_device_list_result`, `relay_device_revoke_result`, `relay_device_rotate_result`
 - Relay node identity store: `e2ee.LoadOrCreateNodeIdentityStore(path)`, `NodeIdentityStore.Current()`, `NodeIdentityStore.Rotate()`
 - Gateway relay metadata: `gateway.RelayE2EEInfo{Enabled, SessionID, ClientID, HandshakeID, DeviceID}`
+- Relay encrypted download config: `relayclient.Config.DownloadRoots []string`, `relayclient.DefaultDownloadRoot(workspaceRoot string)`
+- Relay encrypted download helpers: `e2ee.NewFileDownloadOpenFrame`, `e2ee.NewFileDownloadDataFrame`, `e2ee.NewFileDownloadAckFrame`, `e2ee.NewFileDownloadCloseFrame`, `e2ee.NewFileDownloadCancelFrame`, `e2ee.NewFileDownloadErrorFrame`
+- Relay encrypted tunnel codec helpers: `MobileVCStreamCodec.EncodeStream`, `MobileVCStreamCodec.DecodeStream`, `MobileVCStreamCodec.EncodeTunnelFrame`, `MobileVCStreamCodec.DecodeTunnelFrame`
 
 #### 3. Contracts
 - Relay server forwards only `relay.forward` envelopes with base64url payloads; it must not parse MobileVC business actions.
@@ -76,6 +79,14 @@ Questions to answer:
 - E2EE tunnel frames use `stream.open`, `stream.data`, `stream.ack`, `stream.close`, `stream.reset`, `stream.error`, `ping`, and `pong`; each frame type must reject fields that do not belong to that type.
 - E2EE tunnel stream sequence allocation is per `streamId`, not global across the connection; stream `7` and stream `8` may both send sequence `1` without replay conflict.
 - `stream.open` must use a known `streamType` (`mobilevc.ws` or `file.download`) and a non-zero window.
+- Encrypted relay file downloads use the E2EE tunnel `file.download` stream type, not public relay HTTP `/download`. The file path, response metadata, chunks, close, cancel, and error frames all live inside encrypted `relay.forward` payloads on a non-`MobileVCStreamID` stream.
+- File download streams use `stream.open` with metadata `path`, agent response `stream.open` with `fileName`, `contentType`, and optional `size`, `stream.data` chunks, client `stream.ack`, terminal `stream.close` / `stream.error`, and client `stream.reset` for cancel.
+- The default encrypted file download chunk size is `256 KiB`; max supported chunk size is `512 KiB`. Backend relay downloads must read through `e2ee.FileDownloadChunker` or equivalent bounded chunks and must not read a whole file into memory.
+- Encrypted file download backpressure is window/ack based. The local relay client must keep a bounded per-stream control queue and must stop sending when in-flight chunks reach the peer window until ACKs arrive.
+- `relayclient.Config.DownloadRoots` is the local authorization boundary for encrypted relay downloads. Production E2EE relay config must include at least one valid download root.
+- Download roots and requested paths must be normalized with absolute paths plus symlink evaluation before authorization. A symlink that resolves outside every configured root is denied even if the symlink itself is inside a root.
+- `cmd/server` derives the default relay download root from `RUNTIME_WORKSPACE_ROOT`; when that is empty, it resolves the current working directory. This root is passed only to the local relay client, not to the public relay server.
+- E2EE protects relay confidentiality but does not broaden file permissions. Download authorization remains local-node policy, and relay server route allowlists must not be used to bypass local `DownloadRoots`.
 - `agent.register` sends only secret hashes; plaintext pairing secret is local-only and written through `RELAY_PAIRING_EVENT_PATH`.
 - `client.pair` is the only place a client sends the one-time pairing secret.
 - Direct backend `AUTH_TOKEN` must not appear in relay control frames, relay envelopes, relay QR URIs, relay logs, or relay event files.
@@ -133,6 +144,18 @@ Questions to answer:
 - E2EE forward missing `streamId` or `handshakeId` -> `relay.error` with `protocol_error`.
 - Forward with missing or mismatched `clientId` -> `relay.error` with `protocol_error`.
 - E2EE handshake control frame with wrong role/direction/session/client ID -> `relay.error` with `protocol_error`.
+- Missing production relay download root -> config error `relay download root is required for e2ee mode`.
+- Invalid relay download root, missing root, non-directory root, or unreadable root -> config error / `download_denied` at request time.
+- Encrypted `file.download stream.open` with empty `metadata.path` -> `download_denied`.
+- Encrypted `file.download` path outside configured roots -> `stream.error` with `download_denied`.
+- Encrypted `file.download` path whose symlink target escapes configured roots -> `stream.error` with `download_denied`.
+- Encrypted `file.download` path that is missing or is a directory -> `stream.error` with `download_denied`.
+- Encrypted `file.download` read/open failure after authorization -> `stream.error` with `download_failed`.
+- Encrypted `file.download` duplicate stream ID -> `stream.error` with `stream_window_exceeded`.
+- Encrypted `file.download` ACK/reset control queue full -> `stream.error` with `stream_window_exceeded`.
+- Encrypted `file.download` peer cancel/reset -> local stream stops and reports `stream_cancelled`.
+- Encrypted tunnel frame with unsupported non-zero stream type -> encrypted `stream.error`; zero-stream unsupported tunnel frame -> protocol error.
+- Encrypted tunnel frame with duplicate per-stream counter -> `e2ee_replay_detected`.
 - Local agent E2EE pairing proof with mismatched `sessionId`, `clientId`, or `handshakeId` -> `agent.e2ee_result` with `ok=false`, `errorCode=e2ee_handshake_failed`, then local read error.
 - Local agent E2EE reconnect without a device trust store -> `e2ee_handshake_failed`.
 - Local agent E2EE reconnect for unknown device, wrong device proof, bad device signature, or device public-key mismatch -> `agent.e2ee_result` with `ok=false`, `errorCode=device_unknown`.
@@ -172,6 +195,9 @@ Questions to answer:
 - Good: `relay_device_revoke` revokes a different bound device, clears its active state, closes any tracked active connection for that device, then emits a refreshed list.
 - Good: `relay_device_rotate` writes the rotate result to the current phone, rotates the local node fingerprint, clears all trusted devices, closes active relay E2EE connections through `RotateRelaySession()`, and the relay client registers a new `agent.register` session with a new pairing event.
 - Good: MobileVC stream codec counter/replay state is connection-local and protected against concurrent read/write access.
+- Good: encrypted `file.download` uses a non-1 stream ID, per-stream counters, bounded chunks, ACK backpressure, and encrypted metadata; relay-visible payloads never contain file paths or file contents.
+- Good: local relay download authorization resolves both configured roots and requested paths through absolute paths plus symlink evaluation before opening the file.
+- Good: `cmd/server` passes one explicit default download root to `relayclient.Config.DownloadRoots` in relay mode.
 - Good: local test relay agent declares `PlaintextTestCapabilities()` and production relay agent declares `ProductionCapabilities()`; never infer mode from missing fields.
 - Good: `mobilevc://relay/v1` includes `nodeFingerprint=<64 lowercase hex chars>` plus capability hints, but never includes node private keys, device private keys, or traffic keys.
 - Good: relay-only backend logs `health=http://127.0.0.1:<port>/healthz` and `ws=ws://127.0.0.1:<port>/ws?token=<redacted>`; it must not concatenate `localhost` with a full host:port listen address.
@@ -184,6 +210,9 @@ Questions to answer:
 - Bad: returning `agent.e2ee_result ok=true` for a proof whose `clientId` differs from the pending hello's `clientId`.
 - Bad: showing "E2EE verified" after handshake-only traffic keys exist while `relay.forward` still carries plaintext MobileVC payloads.
 - Bad: falling back to plaintext decode after an E2EE decrypt failure, or allowing plaintext `relay.forward` after the E2EE stream has been activated.
+- Bad: using public relay `/download` or selected-route plaintext HTTP for relay file contents after E2EE is available.
+- Bad: reading the full target file into memory before sending encrypted download chunks.
+- Bad: authorizing downloads by string prefix without resolving symlinks.
 - Bad: accepting a duplicate `agent.register` for an existing `sessionId` after disconnect; that bypasses reconnect-secret semantics.
 - Bad: implementing global rotate as only `ClearTrustedDevicesForNodeRotation`; real rotate must also replace node identity and close/rekey active relay sessions.
 - Bad: treating global rotate as an ordinary connection close; that makes the relay client attempt `agent.reconnect` on the old session instead of publishing a fresh pairing link.
@@ -205,6 +234,9 @@ Questions to answer:
 - Relay client tests must cover valid local agent pairing handshake, node signature verification, pairing proof validation, matching derived traffic keys, and mismatched proof routing failure.
 - Relay client tests must cover valid local agent reconnect handshake, unknown device, revoked device, wrong proof, bad signature, matching fresh traffic keys, and no plaintext business frame before E2EE stream activation.
 - Relay client tests must cover encrypted MobileVC `relay.forward` after local pairing handshake: client-to-agent decrypts to gateway JSON, agent-to-client `WriteJSON` emits E2EE metadata, and ciphertext does not contain plaintext business values.
+- Relay client tests must cover encrypted `file.download`: open frame path stays encrypted, agent streams encrypted open/data/close, file contents stay encrypted in relay envelopes, gateway `ReadJSON` does not receive tunnel frames, ACK backpressure is honored, and no whole-file buffer is required.
+- Relay client tests must cover download root enforcement: configured root allowed, outside root denied, symlink escape denied, missing root rejected in production E2EE config, directory target denied, and missing file denied.
+- E2EE codec tests must cover per-stream send counters and replay maps, including MobileVC stream and file download stream both starting at counter `0` without cross-stream replay.
 - Gateway relay device tests must cover list/revoke/rotate requiring bound relay E2EE, list result metadata/current flags, same-device revoke rejection, store update after revoke, global rotate replacing node identity, clearing devices, writing a rotate result, and active relay-session rotation/closure.
 - Relay client tests must cover global rotate causing a fresh `agent.register` session and new pairing event instead of old-session `agent.reconnect`.
 - Relay client tests must cover `relay.ping` response for the current/no session and rejection of wrong-session pings.
@@ -223,6 +255,21 @@ Correct:
 
 ```go
 _ = relayclient.EmitPairingFile(pairingEventPath, event)
+```
+
+Wrong:
+
+```go
+data, _ := os.ReadFile(path)
+_ = writeRelayHTTPDownload(data)
+```
+
+Correct:
+
+```go
+chunker, _ := e2ee.NewFileDownloadChunker(file, e2ee.FileDownloadDefaultChunkSize)
+frame, _ := e2ee.NewFileDownloadDataFrame(streamID, seq, chunk, e2ee.FileDownloadDefaultChunkSize)
+_ = gateway.writeEncryptedTunnelFrame(codec, frame)
 ```
 
 ### Scenario: Relay E2EE Device Trust Store

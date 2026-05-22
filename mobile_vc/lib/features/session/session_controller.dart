@@ -2494,6 +2494,18 @@ class SessionController extends ChangeNotifier {
     notifyListeners();
   }
 
+  Future<RelayFileDownloadResult> downloadRelayFile(
+    String path, {
+    void Function(int receivedBytes, int? totalBytes)? onProgress,
+    FutureOr<void> Function(Uint8List chunk)? onChunk,
+  }) {
+    return _service.downloadRelayFile(
+      path,
+      onProgress: onProgress,
+      onChunk: onChunk,
+    );
+  }
+
   void requestRelayDeviceList() {
     if (!canManageRelayDevices) {
       _relayDeviceStatus =

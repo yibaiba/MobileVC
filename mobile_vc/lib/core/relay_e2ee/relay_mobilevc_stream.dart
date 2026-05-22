@@ -70,9 +70,9 @@ class RelayMobileVcStreamCodec {
   final Uint8List receiveKey;
   final String sendDirection;
   final String receiveDirection;
-  var _sendCounter = 0;
-  final Set<int> _seenCounters = <int>{};
-  final Set<int> _pendingCounters = <int>{};
+  final Map<int, int> _sendCounters = <int, int>{};
+  final Map<int, Set<int>> _seenCountersByStream = <int, Set<int>>{};
+  final Map<int, Set<int>> _pendingCountersByStream = <int, Set<int>>{};
 
   Future<Map<String, dynamic>> encodeJson({
     required String messageId,
@@ -87,16 +87,20 @@ class RelayMobileVcStreamCodec {
   Future<Map<String, dynamic>> encode({
     required String messageId,
     required Uint8List plaintext,
+    int streamId = relayMobileVcStreamId,
   }) async {
     if (messageId.trim().isEmpty) {
       throw ArgumentError('message id is required');
     }
-    final counter = _sendCounter;
-    _sendCounter++;
+    if (streamId == 0) {
+      throw ArgumentError('stream id is required');
+    }
+    final counter = _sendCounters[streamId] ?? 0;
+    _sendCounters[streamId] = counter + 1;
     final sealed = await RelayE2eeCrypto.encrypt(
       key: sendKey,
       plaintext: plaintext,
-      context: _frameContext(sendDirection, counter),
+      context: _frameContext(sendDirection, streamId, counter),
     );
     return <String, dynamic>{
       'type': relayForwardType,
@@ -109,7 +113,7 @@ class RelayMobileVcStreamCodec {
       'encryption': relayE2eeSuite,
       'payloadEncoding': relayForwardPayloadBase64Url,
       'payload': base64Url.encode(sealed).replaceAll('=', ''),
-      'streamId': relayMobileVcStreamId,
+      'streamId': streamId,
       'counter': counter,
       'handshakeId': handshakeId,
     };
@@ -127,11 +131,24 @@ class RelayMobileVcStreamCodec {
 
   Future<Uint8List> decode(Map<String, dynamic> frame) async {
     _validateFrame(frame);
+    if (_intField(frame, 'streamId') != relayMobileVcStreamId) {
+      throw const FormatException('invalid MobileVC E2EE relay frame');
+    }
+    return decodeStream(frame);
+  }
+
+  Future<Uint8List> decodeStream(Map<String, dynamic> frame) async {
+    _validateFrame(frame);
+    final streamId = _intField(frame, 'streamId');
     final counter = _intField(frame, 'counter');
-    if (_seenCounters.contains(counter) || _pendingCounters.contains(counter)) {
+    final seenCounters =
+        _seenCountersByStream.putIfAbsent(streamId, () => <int>{});
+    final pendingCounters =
+        _pendingCountersByStream.putIfAbsent(streamId, () => <int>{});
+    if (seenCounters.contains(counter) || pendingCounters.contains(counter)) {
       throw StateError('e2ee replay detected');
     }
-    _pendingCounters.add(counter);
+    pendingCounters.add(counter);
     final sealed = Uint8List.fromList(
       base64Url.decode(base64Url.normalize(frame['payload'].toString())),
     );
@@ -139,22 +156,47 @@ class RelayMobileVcStreamCodec {
       final plaintext = await RelayE2eeCrypto.decrypt(
         key: receiveKey,
         sealed: sealed,
-        context: _frameContext(receiveDirection, counter),
+        context: _frameContext(receiveDirection, streamId, counter),
       );
-      _seenCounters.add(counter);
+      seenCounters.add(counter);
       return plaintext;
     } finally {
-      _pendingCounters.remove(counter);
+      pendingCounters.remove(counter);
     }
   }
 
-  RelayE2eeFrameContext _frameContext(String direction, int counter) {
+  Future<Map<String, dynamic>> encodeTunnelFrame({
+    required String messageId,
+    required RelayTunnelFrame frame,
+  }) {
+    final raw = Uint8List.fromList(utf8.encode(jsonEncode(frame.toJson())));
+    return encode(
+      messageId: messageId,
+      plaintext: raw,
+      streamId: frame.streamId,
+    );
+  }
+
+  Future<RelayTunnelFrame> decodeTunnelFrame(Map<String, dynamic> frame) async {
+    final raw = await decodeStream(frame);
+    final decoded = jsonDecode(utf8.decode(raw));
+    if (decoded is! Map<String, dynamic>) {
+      throw const FormatException('Relay tunnel payload is not a JSON object');
+    }
+    return RelayTunnelFrame.fromJson(decoded);
+  }
+
+  RelayE2eeFrameContext _frameContext(
+    String direction,
+    int streamId,
+    int counter,
+  ) {
     return RelayE2eeFrameContext(
       sessionId: sessionId,
       clientId: clientId,
       handshakeId: handshakeId,
       direction: direction,
-      streamId: relayMobileVcStreamId,
+      streamId: streamId,
       counter: counter,
     );
   }
@@ -169,7 +211,7 @@ class RelayMobileVcStreamCodec {
         frame['encryption'] == relayE2eeSuite &&
         frame['payloadEncoding'] == relayForwardPayloadBase64Url &&
         frame['handshakeId'] == handshakeId &&
-        _intField(frame, 'streamId') == relayMobileVcStreamId &&
+        _intField(frame, 'streamId') != 0 &&
         frame['messageId'].toString().trim().isNotEmpty &&
         frame['payload'].toString().trim().isNotEmpty;
     if (!valid) {

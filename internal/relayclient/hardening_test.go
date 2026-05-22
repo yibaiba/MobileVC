@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -344,6 +346,177 @@ func TestGatewayConnWaitsForE2EEBeforeWritingProductionForward(t *testing.T) {
 	}
 	if plaintext["event"] != "ready" {
 		t.Fatalf("unexpected decrypted outbound: %#v", plaintext)
+	}
+}
+
+func TestGatewayConnServesEncryptedFileDownloadTunnel(t *testing.T) {
+	serverConn, clientConn := newRelayClientTestConns(t)
+	defer serverConn.Close()
+	handshake, clientEphemeral := testPairingHandshakeHandler(t)
+	root := t.TempDir()
+	gateway := newGatewayConnWithE2EE(clientConn, "rs_gateway", handshake, []string{root})
+	t.Cleanup(func() { _ = gateway.Close() })
+
+	filePath := filepath.Join(root, "relay-download.txt")
+	content := strings.Repeat("secret-data-", 32)
+	if err := os.WriteFile(filePath, []byte(content), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	if err := serverConn.WriteJSON(relay.ClientAttachedFrame{
+		Type: relay.TypeClientAttached, Version: relay.Version,
+		SessionID: "rs_gateway", ClientID: "rc_attached",
+	}); err != nil {
+		t.Fatalf("write attached: %v", err)
+	}
+	clientKeys := driveGatewayE2EEHandshake(t, serverConn, clientEphemeral)
+	clientCodec, err := e2ee.NewClientMobileVCStreamCodec("rs_gateway", "rc_attached", "hs_pairing", clientKeys)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	openFrame, err := e2ee.NewFileDownloadOpenFrame(42, e2ee.FileDownloadMetadata{Path: filePath}, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	openForward, err := clientCodec.EncodeTunnelFrame("msg_download_open", openFrame)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(openForward.Payload, filePath) {
+		t.Fatal("encrypted download open leaked path in relay payload")
+	}
+	if err := serverConn.WriteJSON(relay.ForwardEnvelope(openForward)); err != nil {
+		t.Fatalf("write encrypted open: %v", err)
+	}
+	readErr := make(chan error, 1)
+	go func() {
+		var payload map[string]any
+		readErr <- gateway.ReadJSON(&payload)
+	}()
+
+	downloaded := make([]byte, 0, len(content))
+	sawOpen := false
+	for {
+		var env relay.ForwardEnvelope
+		if err := serverConn.ReadJSON(&env); err != nil {
+			t.Fatalf("read encrypted download frame: %v", err)
+		}
+		if env.StreamID != 42 || env.Encryption != relay.EncryptionE2EEV1 {
+			t.Fatalf("unexpected encrypted download envelope: %#v", env)
+		}
+		if strings.Contains(env.Payload, content) || strings.Contains(env.Payload, filePath) {
+			t.Fatal("encrypted download payload leaked plaintext")
+		}
+		tunnelFrame, err := clientCodec.DecodeTunnelFrame(e2ee.RelayForwardFrame(env))
+		if err != nil {
+			t.Fatalf("decode encrypted tunnel frame: %v", err)
+		}
+		switch tunnelFrame.Type {
+		case e2ee.TunnelFrameStreamOpen:
+			sawOpen = true
+			if tunnelFrame.Metadata["fileName"] != "relay-download.txt" {
+				t.Fatalf("unexpected open metadata: %#v", tunnelFrame.Metadata)
+			}
+		case e2ee.TunnelFrameStreamData:
+			downloaded = append(downloaded, tunnelFrame.Payload...)
+			ack, err := e2ee.NewFileDownloadAckFrame(42, tunnelFrame.Seq, 4)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ackForward, err := clientCodec.EncodeTunnelFrame("msg_download_ack", ack)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := serverConn.WriteJSON(relay.ForwardEnvelope(ackForward)); err != nil {
+				t.Fatalf("write download ack: %v", err)
+			}
+		case e2ee.TunnelFrameStreamClose:
+			if !sawOpen {
+				t.Fatal("download closed before open response")
+			}
+			if string(downloaded) != content {
+				t.Fatalf("downloaded content mismatch: %q", string(downloaded))
+			}
+			select {
+			case err := <-readErr:
+				t.Fatalf("download tunnel leaked into gateway ReadJSON: %v", err)
+			case <-time.After(20 * time.Millisecond):
+			}
+			return
+		default:
+			t.Fatalf("unexpected tunnel frame: %#v", tunnelFrame)
+		}
+	}
+}
+
+func TestOpenDownloadTargetEnforcesConfiguredRoots(t *testing.T) {
+	root := t.TempDir()
+	allowed := filepath.Join(root, "allowed.txt")
+	if err := os.WriteFile(allowed, []byte("ok"), 0o600); err != nil {
+		t.Fatalf("write allowed fixture: %v", err)
+	}
+	outsideDir := t.TempDir()
+	outside := filepath.Join(outsideDir, "outside.txt")
+	if err := os.WriteFile(outside, []byte("no"), 0o600); err != nil {
+		t.Fatalf("write outside fixture: %v", err)
+	}
+
+	path, file, _, err := openDownloadTarget(allowed, []string{root})
+	if err != nil {
+		t.Fatalf("open allowed target: %v", err)
+	}
+	_ = file.Close()
+	resolvedAllowed, err := filepath.EvalSymlinks(allowed)
+	if err != nil {
+		t.Fatalf("resolve allowed path: %v", err)
+	}
+	if path != resolvedAllowed {
+		t.Fatalf("path: got %q want %q", path, allowed)
+	}
+
+	if _, _, _, err := openDownloadTarget(outside, []string{root}); err == nil || !strings.Contains(err.Error(), relay.CodeDownloadDenied) {
+		t.Fatalf("expected outside root denial, got %v", err)
+	}
+}
+
+func TestOpenDownloadTargetRejectsSymlinkOutsideRoot(t *testing.T) {
+	root := t.TempDir()
+	outsideDir := t.TempDir()
+	outside := filepath.Join(outsideDir, "outside.txt")
+	if err := os.WriteFile(outside, []byte("no"), 0o600); err != nil {
+		t.Fatalf("write outside fixture: %v", err)
+	}
+	link := filepath.Join(root, "link.txt")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+
+	if _, _, _, err := openDownloadTarget(link, []string{root}); err == nil || !strings.Contains(err.Error(), relay.CodeDownloadDenied) {
+		t.Fatalf("expected symlink escape denial, got %v", err)
+	}
+}
+
+func TestValidateConfigRequiresDownloadRootInProductionE2EE(t *testing.T) {
+	cfg := Config{
+		RelayURL:           "wss://relay.example.test",
+		PairingTTL:         time.Minute,
+		AgentGracePeriod:   time.Minute,
+		PairingEventPath:   filepath.Join(t.TempDir(), "pairing.json"),
+		Capabilities:       e2ee.ProductionCapabilities(),
+		NodeFingerprintHex: strings.Repeat("a", 64),
+	}
+	nodeIdentity, err := e2ee.GenerateNodeIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.NodeIdentity = nodeIdentity
+	if err := validateConfig(cfg); err == nil || !strings.Contains(err.Error(), "download root") {
+		t.Fatalf("expected missing download root error, got %v", err)
+	}
+
+	cfg.DownloadRoots = []string{t.TempDir()}
+	if err := validateConfig(cfg); err != nil {
+		t.Fatalf("valid download root rejected: %v", err)
 	}
 }
 

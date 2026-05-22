@@ -209,11 +209,16 @@ func relayConfig(cfg config.Config, trustStore *e2ee.DeviceTrustStore, nodeIdent
 	if err != nil {
 		return relayclient.Config{}, err
 	}
+	downloadRoot, err := relayclient.DefaultDownloadRoot(cfg.Runtime.WorkspaceRoot)
+	if err != nil {
+		return relayclient.Config{}, fmt.Errorf("resolve relay download root: %w", err)
+	}
 	return relayclient.Config{
 		RelayURL:           cfg.Relay.URL,
 		PairingTTL:         cfg.Relay.PairingTTL,
 		AgentGracePeriod:   cfg.Relay.AgentGracePeriod,
 		PairingEventPath:   cfg.Relay.PairingEventPath,
+		DownloadRoots:      []string{downloadRoot},
 		Capabilities:       e2ee.ProductionCapabilities(),
 		NodeFingerprintHex: fmt.Sprintf("%x", identity.Fingerprint),
 		NodeIdentityStore:  nodeIdentityStore,

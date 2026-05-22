@@ -87,6 +87,8 @@ final wsUrl = config.wsUrlFor();
 - `AppConfig.fromLaunchUri(String raw, {AppConfig fallback}) -> AppConfig?`
 - `validateRelayUrl(String raw) -> void`
 - `MobileVcWsService.connectRelay({required relayUrl, required sessionId, required pairingSecret})`
+- `MobileVcWsService.downloadRelayFile(String path, {onProgress, onChunk})`
+- `SessionController.downloadRelayFile(String path, {onProgress, onChunk})`
 - Relay E2EE connect metadata: `nodeFingerprintHex`, `relayCapabilities`
 - Relay QR: `mobilevc://relay/v1?relay=<url>&session=<id>&secret=<secret>&exp=<unix-seconds>`
 
@@ -106,24 +108,41 @@ final wsUrl = config.wsUrlFor();
 - Flutter relay send and receive paths must serialize async E2EE stream operations per connection. AES-GCM counters and replay state are part of the codec state; do not create a fresh codec per frame, and do not run inbound decrypts concurrently when MobileVC event ordering matters.
 - After E2EE completion, Flutter must reject plaintext `relay.forward` frames explicitly and must not retry/decode them as plaintext. Decrypt failure and replay detection must surface as E2EE errors and disconnect the relay channel instead of silently falling back.
 - Relay mode must not send direct backend `AUTH_TOKEN` in relay envelopes or control frames.
-- HTTP `/download` is disabled in relay mode and must show `Relay 模式暂不支持下载`.
+- Direct/LAN mode downloads continue to use `AppConfig.downloadUri(...)` and HTTP `/download`.
+- Relay mode must never fall back to direct HTTP `/download`. Production relay file downloads require completed E2EE, backend-confirmed device binding, and `supportsFileDownloadStream=true`.
+- Relay mode downloads use `MobileVcWsService.downloadRelayFile`, sending an encrypted tunnel `file.download stream.open` on a non-`relayMobileVcStreamId` stream. The requested path, response metadata, file chunks, ACKs, close, reset, and errors are encrypted tunnel payloads.
+- Relay file download UI must stream chunks to disk through `onChunk` when saving files, then send ACK only after the chunk callback completes. It must not require buffering the whole file in memory for normal save-to-disk UX.
+- If `onChunk` is omitted, `RelayFileDownloadResult.bytes` may contain the complete bytes for tests/small utility callers. UI save paths should prefer `onChunk` streaming.
+- Pending relay downloads must fail explicitly if the relay connection is replaced or closed.
+- Relay download errors must use actionable copy from `relayErrorMessage` for `download_denied`, `download_failed`, `stream_cancelled`, and `stream_window_exceeded`.
 
 #### 4. Validation & Error Matrix
 - `http://` or `https://` relay URL -> `FormatException`.
 - Public-host `ws://` relay URL -> `FormatException`.
 - Missing relay URL/session/secret before connect -> `FormatException`.
 - `relay.error` during pairing -> connection failure and channel close.
+- Relay download before connection -> `StateError('Relay is not connected')`.
+- Relay download with empty path -> `FormatException('download path is required')`.
+- Relay download before completed E2EE stream -> `StateError('Relay E2EE stream is not ready')`.
+- Relay download before backend-confirmed device binding -> `StateError('Relay E2EE device is not bound')`.
+- Relay download when capability lacks `supportsFileDownloadStream` -> `StateError('Relay E2EE file download is unsupported')`.
+- Relay download receives plaintext `relay.forward` after E2EE -> connection failure; do not decode or retry as plaintext.
+- Relay download tunnel `stream.error` -> complete the pending download with mapped actionable error copy.
+- Relay connection replacement/close while downloads are pending -> complete each pending download with explicit error.
 
 #### 5. Good/Base/Bad Cases
 - Good: scan relay QR, connect through `/relay/client`, clear one-time fields after successful pairing, persist only URL.
+- Good: relay save-to-disk path opens the destination first, writes encrypted chunks through `onChunk`, flushes each chunk before ACK, and reports progress from encrypted stream metadata.
 - Base: direct LAN config remains default and continues using `AppConfig.wsUrlFor()`.
-- Bad: storing the pairing secret in `SharedPreferences`, or falling back to direct `/download` in relay mode.
+- Bad: storing the pairing secret in `SharedPreferences`, falling back to direct `/download` in relay mode, or showing the old "Relay mode does not support download" copy after E2EE file download is negotiated.
 
 #### 6. Tests Required
 - Relay URI parsing preserves direct host/port/token and fills in-memory relay fields.
 - `toJson()` omits relay session and pairing secret fields.
 - Relay URL validation rejects `http(s)://` and public `ws://`.
 - Controller relay connect validates URL and clears one-time fields after success.
+- Service tests assert relay E2EE file downloads send encrypted non-1 stream frames, do not leak the path or file contents in relay payloads, process encrypted open/data/close, send ACKs, and surface progress.
+- UI/controller tests for relay download must cover streaming `onChunk` save behavior, unsupported capability/device-not-bound errors, and connection-close failure.
 
 #### 7. Wrong vs Correct
 
@@ -177,6 +196,8 @@ await prefs.setString('mobilevc.app_config', jsonEncode(config.toJson()));
 - `AppConfig.relayNodeFingerprintHex` is non-secret pairing metadata and may be persisted; pairing secrets and pairing expiry remain non-persistent.
 - `RelayTunnelFrame.validate()` must enforce both required fields and unexpected-field rejection per frame type; `ping` and `pong` carry no stream metadata.
 - `RelayTunnelCounterState.nextSeq(streamId)` must allocate sequence numbers per stream ID, not globally across the relay tunnel.
+- `RelayMobileVcStreamCodec` must allocate encrypted `relay.forward` counters per `streamId`. MobileVC stream `1` and file download stream IDs can both start at counter `0`; replay detection is also per stream.
+- `RelayMobileVcStreamCodec.decode(...)` is for MobileVC stream `1`; tunnel frames must use `decodeTunnelFrame(...)`.
 - Fingerprint mismatch, revoked device, decrypt failure, unsupported version, missing capability, or missing plaintext rejection must produce neutral or blocking copy, not security-positive copy.
 - Relay error codes for E2EE, device, stream, and download failures must map to actionable Chinese copy through `relayErrorMessage`; do not show raw server messages such as `e2ee required` to users.
 - Full fingerprint and short fingerprint are derived from the node public key; UI must not invent or truncate fingerprint values outside this evaluator.
@@ -255,6 +276,7 @@ await prefs.setString('mobilevc.app_config', jsonEncode(config.toJson()));
 - Config/import tests assert relay capability hints persist as non-secret config while pairing secret and expiry do not.
 - Service tests assert production E2EE relay pairing waits for `agent.e2ee_result ok`, verifies node fingerprint, and rejects fingerprint mismatch.
 - Service tests assert production E2EE relay `send()` emits encrypted `relay.forward` without plaintext leakage, and inbound encrypted `relay.forward` decrypts into the expected `AppEvent`.
+- Service tests assert production E2EE relay file download uses encrypted tunnel frames, requires bound device and file-download capability, sends ACK after chunk handling, and never exposes path/content in relay-visible payloads.
 - Service tests assert production E2EE persisted reconnect performs device rekey, rejects `device_revoked` / `device_unknown`, does not leak the raw device credential in control frames, and fails immediately if a `relay.forward` arrives before E2EE completion.
 - Controller tests assert `relay_device_register_result` enables management and triggers a device-list refresh, while handshake-only state does not.
 - Controller tests assert list/revoke actions require relay E2EE device binding and same-device revoke is blocked before send.

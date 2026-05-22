@@ -1108,19 +1108,29 @@ class _SessionHomePageState extends State<SessionHomePage> {
 
   Future<void> _downloadFile(String path) async {
     final messenger = ScaffoldMessenger.of(context);
-    if (controller.config.isRelayMode) {
-      messenger
-        ..hideCurrentSnackBar()
-        ..showSnackBar(const SnackBar(content: Text('Relay 模式暂不支持下载')));
-      return;
-    }
     final scaffoldContext = context;
     final fileName = _fileNameOf(path);
     messenger
       ..hideCurrentSnackBar()
-      ..showSnackBar(SnackBar(content: Text('开始下载：$path')));
+      ..showSnackBar(SnackBar(
+        content: Text(controller.config.isRelayMode
+            ? '开始 Relay 加密下载：$path'
+            : '开始下载：$path'),
+      ));
 
     try {
+      if (controller.config.isRelayMode) {
+        final savedFile = await _downloadRelayFileToDisk(
+          path: path,
+          fileName: fileName,
+          messenger: messenger,
+        );
+        if (!scaffoldContext.mounted || savedFile == null) {
+          return;
+        }
+        _showSavedSnackBar(savedFile);
+        return;
+      }
       final bytes = await _fetchFileBytes(path);
       final selectedPath = await _pickSavePath(fileName, bytes);
       if (!scaffoldContext.mounted) {
@@ -1146,6 +1156,71 @@ class _SessionHomePageState extends State<SessionHomePage> {
         ..hideCurrentSnackBar()
         ..showSnackBar(SnackBar(content: Text('下载失败：$error')));
     }
+  }
+
+  Future<File?> _downloadRelayFileToDisk({
+    required String path,
+    required String fileName,
+    required ScaffoldMessengerState messenger,
+  }) async {
+    final selectedPath = await _pickRelaySavePath(fileName);
+    if (selectedPath == null || selectedPath.trim().isEmpty) {
+      messenger
+        ..hideCurrentSnackBar()
+        ..showSnackBar(const SnackBar(content: Text('已取消保存')));
+      return null;
+    }
+    final targetFile = File(selectedPath);
+    final parent = targetFile.parent;
+    if (!await parent.exists()) {
+      await parent.create(recursive: true);
+    }
+    final sink = targetFile.openWrite();
+    try {
+      await controller.downloadRelayFile(
+        path,
+        onChunk: (chunk) async {
+          sink.add(chunk);
+          await sink.flush();
+        },
+        onProgress: (received, total) {
+          if (!mounted || total == null || total <= 0) {
+            return;
+          }
+          messenger
+            ..hideCurrentSnackBar()
+            ..showSnackBar(SnackBar(
+              content: Text(
+                  'Relay 加密下载中：${_formatBytes(received)} / ${_formatBytes(total)}'),
+            ));
+        },
+      );
+      await sink.close();
+      return targetFile;
+    } catch (error) {
+      try {
+        await sink.close();
+      } catch (closeError) {
+        Error.throwWithStackTrace(closeError, StackTrace.current);
+      }
+      Error.throwWithStackTrace(error, StackTrace.current);
+    }
+  }
+
+  Future<String?> _pickRelaySavePath(String fileName) async {
+    if (_shouldUseSystemSaveDialog) {
+      return FilePicker.platform.saveFile(
+        dialogTitle: '保存文件',
+        fileName: fileName,
+      );
+    }
+
+    final directory = await getApplicationDocumentsDirectory();
+    final downloadsDir = Directory('${directory.path}/downloads');
+    if (!await downloadsDir.exists()) {
+      await downloadsDir.create(recursive: true);
+    }
+    return '${downloadsDir.path}/$fileName';
   }
 
   Future<Uint8List> _fetchFileBytes(String path) async {
@@ -1245,6 +1320,16 @@ class _SessionHomePageState extends State<SessionHomePage> {
     final index = normalized.lastIndexOf('/');
     final fileName = index == -1 ? normalized : normalized.substring(index + 1);
     return fileName.isEmpty ? 'download.bin' : fileName;
+  }
+
+  String _formatBytes(int bytes) {
+    if (bytes >= 1024 * 1024) {
+      return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+    }
+    if (bytes >= 1024) {
+      return '${(bytes / 1024).toStringAsFixed(1)} KB';
+    }
+    return '$bytes B';
   }
 
   Future<void> _openStatusDetails(BuildContext context) async {

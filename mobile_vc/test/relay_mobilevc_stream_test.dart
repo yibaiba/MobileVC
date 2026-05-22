@@ -3,6 +3,7 @@ import 'dart:typed_data';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:mobile_vc/core/relay_e2ee/relay_e2ee_crypto.dart';
 import 'package:mobile_vc/core/relay_e2ee/relay_e2ee_handshake.dart';
+import 'package:mobile_vc/core/relay_e2ee/relay_file_download.dart';
 import 'package:mobile_vc/core/relay_e2ee/relay_mobilevc_stream.dart';
 
 void main() {
@@ -72,6 +73,34 @@ void main() {
     ]) {
       expect(frame, contains(key));
     }
+  });
+
+  test('tunnel frame streams use independent counters', () async {
+    final (client, agent) = _codecs();
+    final open = relayFileDownloadOpenFrame(
+      streamId: 43,
+      metadata: const RelayFileDownloadMetadata(path: '/workspace/a.txt'),
+      window: 4,
+    );
+    final first = await client.encodeTunnelFrame(
+      messageId: 'msg_download_1',
+      frame: open,
+    );
+    final second = await client.encodeJson(
+      messageId: 'msg_mobilevc_1',
+      payload: <String, dynamic>{'type': 'ping'},
+    );
+
+    expect(first['streamId'], 43);
+    expect(first['counter'], 0);
+    expect(second['streamId'], relayMobileVcStreamId);
+    expect(second['counter'], 0);
+    expect(first['payload'].toString(), isNot(contains('/workspace/a.txt')));
+
+    final decoded = await agent.decodeTunnelFrame(first);
+    expect(decoded.streamId, 43);
+    expect(decoded.metadata['path'], '/workspace/a.txt');
+    expect((await agent.decodeJson(second))['type'], 'ping');
   });
 }
 

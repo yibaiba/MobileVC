@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -24,6 +25,7 @@ type Config struct {
 	AgentGracePeriod   time.Duration
 	PairingEventPath   string
 	ReconnectBackoff   ReconnectBackoff
+	DownloadRoots      []string
 	Capabilities       e2ee.CapabilitySet
 	NodeFingerprintHex string
 	NodeIdentity       *e2ee.NodeIdentity
@@ -142,6 +144,15 @@ func validateConfig(cfg Config) error {
 	if strings.TrimSpace(cfg.PairingEventPath) == "" {
 		return fmt.Errorf("relay pairing event path is required")
 	}
+	if e2eeRequired(relayClientCapabilities(cfg)) {
+		roots, err := validateDownloadRoots(cfg.DownloadRoots)
+		if err != nil {
+			return fmt.Errorf("validate relay download roots: %w", err)
+		}
+		if len(roots) == 0 {
+			return fmt.Errorf("relay download root is required for e2ee mode")
+		}
+	}
 	if currentNodeFingerprintHex(cfg) == "" {
 		return fmt.Errorf("relay node fingerprint is required")
 	}
@@ -154,6 +165,26 @@ func validateConfig(cfg Config) error {
 		}
 	}
 	return nil
+}
+
+func e2eeRequired(capabilities e2ee.CapabilitySet) bool {
+	return e2ee.ValidateProductionCapabilities(capabilities) == nil
+}
+
+func DefaultDownloadRoot(workspaceRoot string) (string, error) {
+	root := strings.TrimSpace(workspaceRoot)
+	if root == "" {
+		root = "."
+	}
+	absRoot, err := filepath.Abs(filepath.Clean(root))
+	if err != nil {
+		return "", err
+	}
+	evaluated, err := filepath.EvalSymlinks(absRoot)
+	if err != nil {
+		return "", err
+	}
+	return evaluated, nil
 }
 
 func currentNodeIdentity(cfg Config) (*e2ee.NodeIdentity, error) {
