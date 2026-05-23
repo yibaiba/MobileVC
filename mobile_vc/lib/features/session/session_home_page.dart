@@ -385,6 +385,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
                       ? controller.config.host
                       : hostController.text.trim()),
             );
+            final relayModeSelected = pendingConfig.isRelayMode;
 
             void applyScannedConfig(AppConfig scanned) {
               pendingConfig = scanned;
@@ -410,19 +411,44 @@ class _SessionHomePageState extends State<SessionHomePage> {
             }
 
             AppConfig? parseConnectionLink(String raw) {
-              return AppConfig.fromLaunchUri(
-                raw,
-                fallback: pendingConfig.copyWith(
-                  host: hostController.text.trim(),
-                  port: portController.text.trim(),
-                  token: tokenController.text.trim(),
-                  cwd: cwdController.text.trim(),
-                  engine: selectedEngine,
-                  permissionMode: permissionController.text.trim(),
-                  fastMode: controller.fastMode,
-                  adbIceServersJson: encodedIceConfig(),
-                ),
-              );
+              try {
+                return AppConfig.fromLaunchUri(
+                  raw,
+                  fallback: pendingConfig.copyWith(
+                    host: hostController.text.trim(),
+                    port: portController.text.trim(),
+                    token: tokenController.text.trim(),
+                    cwd: cwdController.text.trim(),
+                    engine: selectedEngine,
+                    permissionMode: permissionController.text.trim(),
+                    fastMode: controller.fastMode,
+                    adbIceServersJson: encodedIceConfig(),
+                  ),
+                );
+              } on FormatException catch (error) {
+                final message = error.message.toString().trim();
+                scanHint = message.isEmpty ? '链接格式错误' : '导入失败：$message';
+                return null;
+              }
+            }
+
+            Future<bool> handleRelayImport(
+              AppConfig scanned,
+              String raw,
+            ) async {
+              if (!scanned.isRelayMode) {
+                return false;
+              }
+              final imported = await controller.importConnectionLink(raw);
+              if (!context.mounted) {
+                return imported;
+              }
+              pendingConfig = controller.config;
+              applyScannedConfig(pendingConfig);
+              scanHint = imported
+                  ? '已导入 Relay 配对，点击连接完成配对'
+                  : controller.connectionMessage;
+              return true;
             }
 
             Future<void> handleScan() async {
@@ -437,36 +463,60 @@ class _SessionHomePageState extends State<SessionHomePage> {
               final scanned = parseConnectionLink(scannedRaw);
               if (scanned == null) {
                 setSheetState(() {
-                  scanHint = '扫码内容无法识别，请确认二维码来自 MobileVC 启动器。';
+                  if (scanHint.trim().isEmpty) {
+                    scanHint = '扫码内容无法识别，请确认二维码来自 MobileVC 启动器。';
+                  }
                 });
+                showImportSnackBar(scanHint);
+                return;
+              }
+              final handledRelay = await handleRelayImport(scanned, scannedRaw);
+              if (!context.mounted) {
                 return;
               }
               setSheetState(() {
                 linkController.text = scannedRaw.trim();
-                applyScannedConfig(scanned);
+                if (!handledRelay) {
+                  applyScannedConfig(scanned);
+                }
               });
               showImportSnackBar(scanHint);
             }
 
-            void handlePasteLink() {
+            Future<void> handlePasteLink() async {
               final scanned = parseConnectionLink(linkController.text);
-              setSheetState(() {
-                if (scanned == null) {
-                  scanHint = '链接无法识别，请粘贴 mobilevc://relay/v1 或启动器二维码内容。';
-                  showImportSnackBar(scanHint);
-                  return;
-                }
-                applyScannedConfig(scanned);
+              if (scanned == null) {
+                setSheetState(() {
+                  if (scanHint.trim().isEmpty) {
+                    scanHint = '链接无法识别，请粘贴 mobilevc://relay/v1 或启动器二维码内容。';
+                  }
+                });
                 showImportSnackBar(scanHint);
+                return;
+              }
+              final handledRelay =
+                  await handleRelayImport(scanned, linkController.text);
+              if (!context.mounted) {
+                return;
+              }
+              setSheetState(() {
+                if (!handledRelay) {
+                  applyScannedConfig(scanned);
+                }
               });
+              showImportSnackBar(scanHint);
             }
 
             Future<void> persistConfig({bool connect = false}) async {
               final hostText = hostController.text.trim();
               final nextConfig = pendingConfig.copyWith(
-                host: hostText,
-                port: _portForHostInput(hostText, portController.text),
-                token: tokenController.text.trim(),
+                host: relayModeSelected ? pendingConfig.host : hostText,
+                port: relayModeSelected
+                    ? pendingConfig.port
+                    : _portForHostInput(hostText, portController.text),
+                token: relayModeSelected
+                    ? pendingConfig.token
+                    : tokenController.text.trim(),
                 cwd: cwdController.text.trim(),
                 engine: selectedEngine,
                 permissionMode: permissionController.text.trim(),

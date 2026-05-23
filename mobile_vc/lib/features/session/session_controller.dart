@@ -1289,6 +1289,67 @@ class SessionController extends ChangeNotifier {
     notifyListeners();
   }
 
+  Future<bool> importConnectionLink(String raw) async {
+    final AppConfig? imported;
+    try {
+      imported = AppConfig.fromLaunchUri(raw, fallback: _config);
+    } catch (error) {
+      _connectionMessage = _connectionImportErrorMessage(error);
+      _pushSystem('error', _connectionMessage);
+      _syncDerivedState();
+      notifyListeners();
+      return false;
+    }
+    if (imported == null) {
+      _pushSystem('error', '链接无法识别，请使用 MobileVC 连接链接或 Relay 配对二维码');
+      notifyListeners();
+      return false;
+    }
+    if (imported.isRelayMode) {
+      await _prepareForImportedRelayLink();
+    }
+    await saveConfig(imported);
+    _connectionMessage =
+        imported.isRelayMode ? '已导入 Relay 配对，点击连接完成配对' : '已导入连接配置';
+    if (imported.isRelayMode) {
+      _connectionStage = SessionConnectionStage.disconnected;
+      _latestError = null;
+    }
+    _pushSystem(
+      'session',
+      imported.isRelayMode
+          ? '已导入 Relay 配对，点击连接完成配对'
+          : '已导入连接配置：${imported.displayEndpoint}',
+    );
+    notifyListeners();
+    return true;
+  }
+
+  String _connectionImportErrorMessage(Object error) {
+    if (error is FormatException) {
+      final message = error.message.toString().trim();
+      return message.isEmpty ? '导入失败：链接格式错误' : '导入失败：$message';
+    }
+    return '导入失败：$error';
+  }
+
+  Future<void> _prepareForImportedRelayLink() async {
+    _cancelReconnectTimer();
+    _autoReconnectEnabled = false;
+    _reconnectAttempt = 0;
+    unawaited(_saveConnectionIntent(false));
+    if (_connected || _connecting || _service.isConnected) {
+      await _service.disconnect();
+    }
+    _connected = false;
+    _connecting = false;
+    _connectionStage = SessionConnectionStage.disconnected;
+    _latestError = null;
+    _relayDevices.clear();
+    _relayDeviceStatus = '';
+    _relayDeviceListLoading = false;
+  }
+
   Future<void> switchWorkingDirectory(String path,
       {bool refreshList = true}) async {
     final normalized = path.trim();

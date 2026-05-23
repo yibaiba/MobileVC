@@ -1304,6 +1304,57 @@ void main() {
       expect(controller.config.relayClientReconnectSecret, 'reconnect_secret');
     });
 
+    test('imported relay pairing link disconnects active stale relay session',
+        () async {
+      SharedPreferences.setMockInitialValues({});
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.saveConfig(const AppConfig(
+        connectionMode: 'relay',
+        relayUrl: 'wss://relay.example.test',
+        relaySessionId: 'rs_old',
+        relayClientId: 'rc_old',
+        relayClientReconnectSecret: 'old_reconnect_secret',
+      ));
+      await controller.connect();
+      expect(controller.connected, isTrue);
+
+      final imported = await controller.importConnectionLink(
+        'mobilevc://relay/v1?relay=wss%3A%2F%2Frelay.example.test'
+        '&session=rs_new&secret=new_pair_secret&exp=1760000000'
+        '&nodeFingerprint=1111111111111111111111111111111111111111111111111111111111111111'
+        '&relayProtocolVersion=1&e2eeProtocolVersion=1'
+        '&cryptoSuite=p256-ecdsa%2Bp256-ecdh%2Bhkdf-sha256%2Baes-256-gcm'
+        '&tunnelProtocolVersion=1&supportsMultiplexStreams=true'
+        '&supportsFileDownloadStream=true&supportsDeviceManagement=true'
+        '&requiresE2EE=true&plaintextTestMode=false',
+      );
+
+      expect(imported, isTrue);
+      expect(service.disconnectCalls, 1);
+      expect(controller.connected, isFalse);
+      expect(controller.connecting, isFalse);
+      expect(controller.autoReconnectEnabled, isFalse);
+      expect(controller.connectionStage, SessionConnectionStage.disconnected);
+      expect(controller.connectionMessage, '已导入 Relay 配对，点击连接完成配对');
+      expect(controller.config.relaySessionId, 'rs_new');
+      expect(controller.config.relayPairingSecret, 'new_pair_secret');
+      expect(controller.config.relayClientId, isEmpty);
+      expect(controller.config.relayClientReconnectSecret, isEmpty);
+
+      final prefs = await SharedPreferences.getInstance();
+      expect(prefs.getBool('mobilevc.connection_intent'), isFalse);
+      final persisted = jsonDecode(prefs.getString('mobilevc.app_config')!)
+          as Map<String, dynamic>;
+      expect(persisted['relaySessionId'], 'rs_new');
+      expect(persisted.containsKey('relayPairingSecret'), isFalse);
+      expect(persisted.containsKey('relayClientId'), isFalse);
+      expect(persisted.containsKey('relayClientReconnectSecret'), isFalse);
+    });
+
     test('relay device register result enables management list refresh',
         () async {
       SharedPreferences.setMockInitialValues({});
