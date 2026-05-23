@@ -32,6 +32,7 @@ Future<void> _servePairingE2eeRelay(
   RelayE2eeEphemeralKeyPair nodeIdentity,
   List<Map<String, dynamic>>? observedForwards,
   List<Map<String, dynamic>>? observedPlaintexts, {
+  List<Map<String, dynamic>>? observedControls,
   bool keepDownloadOpen = false,
   String downloadErrorCode = '',
 }) async {
@@ -41,6 +42,7 @@ Future<void> _servePairingE2eeRelay(
   RelayE2eeEphemeralKeyPair? nodeEphemeralKey;
   await for (final raw in socket) {
     final frame = jsonDecode(raw as String) as Map<String, dynamic>;
+    observedControls?.add(Map<String, dynamic>.from(frame));
     switch ((frame['type'] ?? '').toString()) {
       case 'client.pair':
         socket.add(jsonEncode(const <String, dynamic>{
@@ -208,6 +210,14 @@ Future<void> _serveReconnectE2eeRelay({
     final frame = jsonDecode(raw as String) as Map<String, dynamic>;
     observedControls?.add(Map<String, dynamic>.from(frame));
     switch ((frame['type'] ?? '').toString()) {
+      case 'client.pair':
+        socket.add(jsonEncode(const <String, dynamic>{
+          'type': 'client.paired',
+          'version': 1,
+          'sessionId': 'rs_test',
+          'clientId': 'rc_test',
+          'clientReconnectSecret': 'reconnect_secret',
+        }));
       case 'client.reconnect':
         socket.add(jsonEncode(const <String, dynamic>{
           'type': 'client.paired',
@@ -609,6 +619,73 @@ void main() {
       expect(
           events.whereType<PongEvent>().single.sessionId, 'session-reconnect');
       expect(events.whereType<ErrorEvent>(), isEmpty);
+    });
+
+    test('new pairing link forces E2EE pairing and device registration',
+        () async {
+      final nodeIdentity = await RelayE2eeHandshake.newEphemeralKeyPair();
+      final nodeFingerprint = await RelayE2eeCrypto.fingerprint(
+        nodeIdentity.publicKey,
+      );
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(server.close);
+      final observedPairingPlaintexts = <Map<String, dynamic>>[];
+      server.transform(WebSocketTransformer()).listen((socket) {
+        _servePairingE2eeRelay(
+          socket,
+          nodeIdentity,
+          null,
+          observedPairingPlaintexts,
+        );
+      });
+      final service = _testRelayService();
+      addTearDown(service.dispose);
+
+      await service.connectRelay(
+        relayUrl: 'ws://127.0.0.1:${server.port}',
+        sessionId: 'rs_test',
+        pairingSecret: 'pair-secret-128-bit-minimum',
+        nodeFingerprintHex: _testHex(nodeFingerprint),
+        relayCapabilities: RelayE2eeCapabilitySet.production(),
+      );
+      await _waitForRelayDeviceRegistration(observedPairingPlaintexts);
+      await service.disconnect();
+
+      final nextServer = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(nextServer.close);
+      final observedControls = <Map<String, dynamic>>[];
+      final observedPlaintexts = <Map<String, dynamic>>[];
+      nextServer.transform(WebSocketTransformer()).listen((socket) {
+        _servePairingE2eeRelay(
+          socket,
+          nodeIdentity,
+          null,
+          observedPlaintexts,
+          observedControls: observedControls,
+        );
+      });
+
+      await service.connectRelay(
+        relayUrl: 'ws://127.0.0.1:${nextServer.port}',
+        sessionId: 'rs_test',
+        pairingSecret: 'new-pair-secret-after-backend-restart',
+        nodeFingerprintHex: _testHex(nodeFingerprint),
+        relayCapabilities: RelayE2eeCapabilitySet.production(),
+      );
+
+      expect(service.hasRelayE2eeHandshake, isTrue);
+      expect(
+        observedControls
+            .where((frame) => frame['type'] == relayFrameClientE2eeHello)
+            .single['kind'],
+        relayE2eeHandshakeKindPairing,
+      );
+      await _waitForRelayDeviceRegistration(observedPlaintexts);
+      expect(
+        observedPlaintexts
+            .where((event) => event['action'] == 'relay_device_register'),
+        hasLength(1),
+      );
     });
 
     test('production E2EE relay reconnect surfaces device rejection', () async {
@@ -1086,6 +1163,40 @@ void main() {
       expect(service.disconnectCalls, 1);
     });
 
+    test('external relay deep link imports relay config instead of host',
+        () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      final imported = await controller.importConnectionLink(
+        'mobilevc://relay/v1?relay=wss%3A%2F%2Frelay.example.test'
+        '&session=rs_import&secret=pair_secret&exp=1760000000'
+        '&nodeFingerprint=1111111111111111111111111111111111111111111111111111111111111111'
+        '&relayProtocolVersion=1&e2eeProtocolVersion=1'
+        '&cryptoSuite=p256-ecdsa%2Bp256-ecdh%2Bhkdf-sha256%2Baes-256-gcm'
+        '&tunnelProtocolVersion=1&supportsMultiplexStreams=true'
+        '&supportsFileDownloadStream=true&supportsDeviceManagement=true'
+        '&requiresE2EE=true&plaintextTestMode=false',
+      );
+
+      expect(imported, isTrue);
+      expect(controller.config.isRelayMode, isTrue);
+      expect(controller.config.host, 'localhost');
+      expect(controller.config.relayUrl, 'wss://relay.example.test');
+      expect(controller.config.relaySessionId, 'rs_import');
+      expect(controller.config.relayPairingSecret, 'pair_secret');
+      expect(controller.config.relayCapabilities, isNotNull);
+
+      final prefs = await SharedPreferences.getInstance();
+      final persisted = jsonDecode(prefs.getString('mobilevc.app_config')!)
+          as Map<String, dynamic>;
+      expect(persisted['connectionMode'], 'relay');
+      expect(persisted['relayUrl'], 'wss://relay.example.test');
+      expect(persisted.containsKey('relayPairingSecret'), isFalse);
+    });
+
     test('relay connect validates url and persists reconnect fields', () async {
       SharedPreferences.setMockInitialValues({
         'mobilevc.app_config': jsonEncode(const AppConfig(
@@ -1152,6 +1263,45 @@ void main() {
         'reconnect_secret',
       );
       expect(controller.connected, isTrue);
+    });
+
+    test('imported relay pairing link overrides stale reconnect credentials',
+        () async {
+      SharedPreferences.setMockInitialValues({
+        'mobilevc.app_config': jsonEncode(const AppConfig(
+          connectionMode: 'relay',
+          relayUrl: 'wss://relay.example.test',
+          relaySessionId: 'rs_old',
+          relayClientId: 'rc_old',
+          relayClientReconnectSecret: 'old_reconnect_secret',
+        ).toJson()),
+      });
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      final imported = await controller.importConnectionLink(
+        'mobilevc://relay/v1?relay=wss%3A%2F%2Frelay.example.test'
+        '&session=rs_new&secret=new_pair_secret&exp=1760000000'
+        '&nodeFingerprint=1111111111111111111111111111111111111111111111111111111111111111'
+        '&relayProtocolVersion=1&e2eeProtocolVersion=1'
+        '&cryptoSuite=p256-ecdsa%2Bp256-ecdh%2Bhkdf-sha256%2Baes-256-gcm'
+        '&tunnelProtocolVersion=1&supportsMultiplexStreams=true'
+        '&supportsFileDownloadStream=true&supportsDeviceManagement=true'
+        '&requiresE2EE=true&plaintextTestMode=false',
+      );
+      expect(imported, isTrue);
+
+      await controller.connect();
+
+      final call = service.connectedRelays.single;
+      expect(call.sessionId, 'rs_new');
+      expect(call.pairingSecret, 'new_pair_secret');
+      expect(call.clientId, isEmpty);
+      expect(call.clientReconnectSecret, isEmpty);
+      expect(controller.config.relayClientId, 'rc_test');
+      expect(controller.config.relayClientReconnectSecret, 'reconnect_secret');
     });
 
     test('relay device register result enables management list refresh',
@@ -2303,6 +2453,114 @@ void main() {
       expect(service.sentPayloads[0]['model'], 'gpt-5.5');
       expect(service.sentPayloads[0]['reasoningEffort'], 'high');
       expect(service.sentPayloads[0].containsKey('command'), isFalse);
+    });
+
+    test('命令栏模型摘要使用保存的配置，不被旧 runtime meta 覆盖', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.saveConfig(
+        const AppConfig(
+          engine: 'codex',
+          codexModel: 'gpt-5.5',
+          codexReasoningEffort: 'high',
+        ),
+      );
+      await controller.connect();
+      service.emit(
+        SessionStateEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-1',
+          runtimeMeta: const RuntimeMeta(
+            command: 'codex -m gpt-5-codex',
+            engine: 'codex',
+            model: 'gpt-5-codex',
+            reasoningEffort: 'medium',
+          ),
+          raw: const {'type': 'session_state'},
+          state: 'IDLE',
+          message: 'old codex session',
+        ),
+      );
+      await _flushEvents();
+
+      expect(controller.configuredAiEngine, 'codex');
+      expect(controller.configuredAiModel, 'gpt-5.5');
+      expect(controller.configuredAiReasoningEffort, 'high');
+      expect(controller.commandBarModelSummary, 'gpt-5.5 · HIGH');
+    });
+
+    test('配置为 Codex 时模型更新不被旧 Claude runtime meta 分流', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.saveConfig(
+        const AppConfig(
+          engine: 'codex',
+          codexModel: 'gpt-5-codex',
+          codexReasoningEffort: 'medium',
+        ),
+      );
+      await controller.connect();
+      service.emit(
+        AgentStateEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-1',
+          runtimeMeta: const RuntimeMeta(
+            command: 'claude',
+            engine: 'claude',
+            claudeLifecycle: 'waiting_input',
+          ),
+          raw: const {'type': 'agent_state'},
+          state: 'WAIT_INPUT',
+          message: '等待输入',
+          awaitInput: true,
+          command: 'claude',
+        ),
+      );
+      await _flushEvents();
+
+      await controller.updateAiModelSelection(
+        model: 'gpt-5.5',
+        reasoningEffort: 'high',
+      );
+
+      expect(controller.config.claudeModel, isEmpty);
+      expect(controller.config.codexModel, 'gpt-5.5');
+      expect(controller.config.codexReasoningEffort, 'high');
+      expect(controller.commandBarModelSummary, 'gpt-5.5 · HIGH');
+    });
+
+    test('显式 engine 保存 Codex 模型会切换配置引擎并保留 Claude 模型', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.saveConfig(
+        const AppConfig(
+          engine: 'claude',
+          claudeModel: 'sonnet',
+          codexReasoningEffort: 'medium',
+        ),
+      );
+      await controller.connect();
+
+      await controller.updateAiModelSelection(
+        model: 'gpt-5.5',
+        reasoningEffort: 'high',
+        engine: 'codex',
+      );
+
+      expect(controller.config.engine, 'codex');
+      expect(controller.config.claudeModel, 'sonnet');
+      expect(controller.config.codexModel, 'gpt-5.5');
+      expect(controller.config.codexReasoningEffort, 'high');
+      expect(controller.commandBarModelSummary, 'gpt-5.5 · HIGH');
     });
 
     test('Codex 启动时不会把残留的 Claude 模型配置发给后端', () async {
@@ -4973,6 +5231,52 @@ void main() {
       ]);
       expect(controller.timeline.last.kind, 'error');
       expect(controller.timeline.last.body, contains('删除会话失败'));
+    });
+
+    test(
+        'deleteSession pending does not relabel runtime errors as delete failure',
+        () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      service.emit(
+        SessionListResultEvent(
+          timestamp: _timestamp,
+          sessionId: '',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_list_result'},
+          items: const [
+            SessionSummary(id: 'session-a', title: 'Session A'),
+            SessionSummary(id: 'session-b', title: 'Session B'),
+          ],
+        ),
+      );
+      await _flushEvents();
+
+      controller.deleteSession('session-a');
+      await _flushEvents();
+
+      service.emit(
+        ErrorEvent(
+          timestamp: _timestamp.add(const Duration(seconds: 1)),
+          sessionId: 'session-b',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'error'},
+          message:
+              'start codex app-server: exec: "codex": executable file not found in \$PATH',
+          code: '',
+        ),
+      );
+      await _flushEvents();
+
+      expect(controller.sessions.map((item) => item.id).toList(), [
+        'session-b',
+      ]);
+      expect(controller.timeline.last.kind, 'error');
+      expect(controller.timeline.last.body, contains('start codex app-server'));
+      expect(controller.timeline.last.body, isNot(contains('删除会话失败')));
     });
 
     test('历史 terminal entry 优先用 text，并可恢复成 markdown', () async {
@@ -8755,6 +9059,75 @@ void main() {
         sessionId: 'session-1',
         runtimeMeta:
             const RuntimeMeta(command: 'claude', executionId: 'exec-new'),
+        raw: const {'type': 'ai_status'},
+        visible: false,
+        phase: 'settled',
+      ));
+      await _flushEvents();
+      await Future<void>.delayed(const Duration(milliseconds: 650));
+
+      expect(controller.aiStatusIndicatorVisible, isFalse);
+    });
+
+    test('codex 第二轮无 markdown 日志时 settled 会结束提交保护', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionCreatedEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-1',
+        runtimeMeta: const RuntimeMeta(),
+        raw: const {'type': 'session_created'},
+        summary: const SessionSummary(id: 'session-1', title: 'Test'),
+      ));
+      service.emit(AgentStateEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-1',
+        runtimeMeta: const RuntimeMeta(
+          command: 'codex',
+          engine: 'codex',
+          executionId: 'exec-old',
+          claudeLifecycle: 'waiting_input',
+        ),
+        raw: const {'type': 'agent_state'},
+        state: 'WAIT_INPUT',
+        message: '等待输入',
+        awaitInput: true,
+        command: 'codex',
+      ));
+      await _flushEvents();
+
+      controller.sendInputText('继续第二轮');
+      await _flushEvents();
+
+      expect(controller.aiStatusIndicatorVisible, isTrue);
+
+      service.emit(AIStatusEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 100)),
+        sessionId: 'session-1',
+        runtimeMeta: const RuntimeMeta(
+          command: 'codex',
+          engine: 'codex',
+          executionId: 'exec-new',
+          claudeLifecycle: 'active',
+        ),
+        raw: const {'type': 'ai_status'},
+        visible: true,
+        label: '思考中',
+        phase: 'thinking',
+      ));
+      service.emit(AIStatusEvent(
+        timestamp: _timestamp.add(const Duration(seconds: 1)),
+        sessionId: 'session-1',
+        runtimeMeta: const RuntimeMeta(
+          command: 'codex',
+          engine: 'codex',
+          executionId: 'exec-new',
+          claudeLifecycle: 'settled',
+        ),
         raw: const {'type': 'ai_status'},
         visible: false,
         phase: 'settled',

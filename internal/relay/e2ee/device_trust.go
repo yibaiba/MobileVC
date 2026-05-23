@@ -136,8 +136,8 @@ func (s *DeviceTrustStore) RegisterDevice(reg DeviceRegistration) (TrustedDevice
 	if err != nil {
 		return TrustedDevice{}, err
 	}
-	if _, exists := s.file.Devices[normalized.ID]; exists {
-		return TrustedDevice{}, errors.New("device_already_bound")
+	if existing, exists := s.file.Devices[normalized.ID]; exists {
+		return s.rebindDeviceLocked(existing, normalized, now)
 	}
 	device := trustedDeviceFile{
 		ID: normalized.ID, DisplayName: normalized.DisplayName,
@@ -152,6 +152,28 @@ func (s *DeviceTrustStore) RegisterDevice(reg DeviceRegistration) (TrustedDevice
 		return TrustedDevice{}, err
 	}
 	return device.toTrusted()
+}
+
+func (s *DeviceTrustStore) rebindDeviceLocked(existing trustedDeviceFile, reg DeviceRegistration, now time.Time) (TrustedDevice, error) {
+	if strings.TrimSpace(existing.RevokedAt) != "" {
+		return TrustedDevice{}, errors.New("device_already_bound")
+	}
+	if !DeviceCredentialMatches(existing.CredentialHash, reg.DeviceCredential) {
+		return TrustedDevice{}, errors.New("device_already_bound")
+	}
+	if encoded := base64.RawStdEncoding.EncodeToString(reg.PublicKey); encoded != existing.PublicKeyBase64 {
+		return TrustedDevice{}, errors.New("device_already_bound")
+	}
+	if strings.TrimSpace(reg.DisplayName) != "" {
+		existing.DisplayName = reg.DisplayName
+	}
+	existing.LastSeenAt = now.Format(time.RFC3339Nano)
+	existing.ActiveSessionID = ""
+	s.file.Devices[existing.ID] = existing
+	if err := s.save(); err != nil {
+		return TrustedDevice{}, err
+	}
+	return existing.toTrusted()
 }
 
 func (s *DeviceTrustStore) ListDevices() ([]TrustedDevice, error) {

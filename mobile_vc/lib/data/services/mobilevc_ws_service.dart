@@ -265,13 +265,14 @@ class MobileVcWsService {
                 e2eeState == null) {
               unawaited(() async {
                 try {
+                  final handshakeKind = await _relayE2EEHandshakeKind(
+                    relayPairingSecret: relayPairingSecret,
+                  );
                   e2eeState = await _startRelayE2EEHandshake(
                     channel: channel,
                     sessionId: relaySessionId,
                     clientId: clientId,
-                    kind: relayPairingSecret.trim().isEmpty
-                        ? relayE2eeHandshakeKindReconnect
-                        : relayE2eeHandshakeKindPairing,
+                    kind: handshakeKind,
                     pairingSecret: relayPairingSecret,
                     expectedNodeFingerprintHex: relayNodeFingerprintHex,
                     capabilities: relayCapabilities!,
@@ -794,6 +795,15 @@ class MobileVcWsService {
     return state;
   }
 
+  Future<String> _relayE2EEHandshakeKind({
+    required String relayPairingSecret,
+  }) async {
+    if (relayPairingSecret.trim().isNotEmpty) {
+      return relayE2eeHandshakeKindPairing;
+    }
+    return relayE2eeHandshakeKindReconnect;
+  }
+
   bool _handleRelayE2EEFrame({
     required WebSocketChannel channel,
     required Map<String, dynamic> frame,
@@ -981,6 +991,14 @@ class MobileVcWsService {
     required String relayClientId,
     required String relayClientReconnectSecret,
   }) {
+    if (relayPairingSecret.trim().isNotEmpty) {
+      return <String, dynamic>{
+        'type': 'client.pair',
+        'version': 1,
+        'sessionId': relaySessionId,
+        'pairingSecret': relayPairingSecret,
+      };
+    }
     if (relayClientId.trim().isNotEmpty &&
         relayClientReconnectSecret.trim().isNotEmpty) {
       return <String, dynamic>{
@@ -1320,7 +1338,11 @@ class _RelayE2eeHandshakeState {
         handshakeId: handshakeId,
         keys: keys,
       ),
-      boundDeviceId: boundDeviceId,
+      boundDeviceId: boundDeviceId.trim().isNotEmpty
+          ? boundDeviceId
+          : kind == relayE2eeHandshakeKindReconnect
+              ? deviceIdentity?.fullFingerprintHex ?? ''
+              : '',
       complete: true,
     );
   }

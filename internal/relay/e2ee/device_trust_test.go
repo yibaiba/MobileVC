@@ -80,6 +80,51 @@ func TestDeviceTrustStoreVerifiesCredentialAndRejectsRevokedDevice(t *testing.T)
 	}
 }
 
+func TestDeviceTrustStoreRegisterDeviceIsIdempotentForSameDeviceCredential(t *testing.T) {
+	store := testDeviceTrustStore(t)
+	publicKey := testDeviceIdentityPublicKey(t)
+	first, err := store.RegisterDevice(DeviceRegistration{
+		ID: "dev_1", DisplayName: "Pixel", PublicKey: publicKey,
+		DeviceCredential: "credential-one", Now: time.Date(2026, 5, 21, 10, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	second, err := store.RegisterDevice(DeviceRegistration{
+		ID: "dev_1", DisplayName: "Pixel renamed", PublicKey: publicKey,
+		DeviceCredential: "credential-one", Now: time.Date(2026, 5, 21, 10, 2, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.ID != first.ID || second.CreatedAt != first.CreatedAt {
+		t.Fatalf("idempotent registration changed identity: first=%#v second=%#v", first, second)
+	}
+	if second.DisplayName != "Pixel renamed" || !second.LastSeenAt.After(first.LastSeenAt) {
+		t.Fatalf("idempotent registration did not refresh metadata: first=%#v second=%#v", first, second)
+	}
+}
+
+func TestDeviceTrustStoreRegisterDeviceRejectsDuplicateWithDifferentCredential(t *testing.T) {
+	store := testDeviceTrustStore(t)
+	publicKey := testDeviceIdentityPublicKey(t)
+	if _, err := store.RegisterDevice(DeviceRegistration{
+		ID: "dev_1", DisplayName: "Pixel", PublicKey: publicKey,
+		DeviceCredential: "credential-one", Now: time.Date(2026, 5, 21, 10, 0, 0, 0, time.UTC),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := store.RegisterDevice(DeviceRegistration{
+		ID: "dev_1", DisplayName: "Pixel", PublicKey: publicKey,
+		DeviceCredential: "credential-two", Now: time.Date(2026, 5, 21, 10, 2, 0, 0, time.UTC),
+	})
+	if err == nil || !strings.Contains(err.Error(), "device_already_bound") {
+		t.Fatalf("expected duplicate device rejection, got %v", err)
+	}
+}
+
 func TestDeviceTrustStoreVerifiesReconnectDeviceProof(t *testing.T) {
 	store := testDeviceTrustStore(t)
 	deviceIdentity := testNodeIdentity(t)
