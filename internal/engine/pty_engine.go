@@ -75,6 +75,9 @@ type PtyRunner struct {
 	// stallWatchdogCancel 用于在 runner 关闭时停止后台巡检 goroutine。
 	lastEngineOutputAt  time.Time
 	stallWatchdogCancel context.CancelFunc
+	// stallWatchdogPaused=true 时 runStallWatchdog 跳过沉默检查，
+	// 用于 Claude/Codex 回合结束等待用户输入的窗口期。
+	stallWatchdogPaused bool
 	// toolUsePending is set true when Claude issues a tool_use (e.g. Bash)
 	// and reset false when the next assistant message with no tool_use arrives.
 	// During the pending window the stall watchdog uses an extended abort threshold
@@ -414,6 +417,11 @@ func (r *PtyRunner) Run(ctx context.Context, req ExecRequest, sink EventSink) er
 
 	sendEvent(sink, protocol.NewSessionStateEvent(req.SessionID, "active", "command started"))
 
+	executionID := strings.TrimSpace(req.RuntimeMeta.ExecutionID)
+	if executionID != "" {
+		sendEvent(sink, protocol.NewExecutionLogEvent(req.SessionID, executionID, req.Command, "", "started", nil))
+	}
+
 	var readWG sync.WaitGroup
 	readWG.Add(1)
 	go func() {
@@ -434,19 +442,32 @@ func (r *PtyRunner) Run(ctx context.Context, req ExecRequest, sink EventSink) er
 
 	if waitErr != nil {
 		if r.shouldSuppressExitError() {
+			if executionID != "" {
+				exitCode := 0
+				sendEvent(sink, protocol.NewExecutionLogEvent(req.SessionID, executionID, "", "", "finished", &exitCode))
+			}
 			sendEvent(sink, protocol.NewSessionStateEvent(req.SessionID, "closed", "command finished"))
 			return nil
 		}
 		message := waitErr.Error()
+		exitCode := -1
 		var exitErr *exec.ExitError
 		if errors.As(waitErr, &exitErr) {
-			message = fmt.Sprintf("command exited with code %d", exitErr.ExitCode())
+			exitCode = exitErr.ExitCode()
+			message = fmt.Sprintf("command exited with code %d", exitCode)
+		}
+		if executionID != "" {
+			sendEvent(sink, protocol.NewExecutionLogEvent(req.SessionID, executionID, "", "", "finished", &exitCode))
 		}
 		sendEvent(sink, protocol.NewErrorEvent(req.SessionID, message, ""))
 		sendEvent(sink, protocol.NewSessionStateEvent(req.SessionID, "closed", "command finished with error"))
 		return waitErr
 	}
 
+	if executionID != "" {
+		exitCode := 0
+		sendEvent(sink, protocol.NewExecutionLogEvent(req.SessionID, executionID, "", "", "finished", &exitCode))
+	}
 	sendEvent(sink, protocol.NewSessionStateEvent(req.SessionID, "closed", "command finished"))
 	return nil
 }
@@ -458,6 +479,10 @@ func (r *PtyRunner) Write(ctx context.Context, data []byte) error {
 
 	for {
 		r.mu.Lock()
+		if r.stallWatchdogPaused {
+			r.stallWatchdogPaused = false
+			r.lastEngineOutputAt = time.Now()
+		}
 		lazyStart := r.lazyStart
 		interactive := r.interactive
 		awaitingReadyPrompt := r.awaitingReadyPrompt
@@ -849,6 +874,7 @@ func (r *PtyRunner) markInteractiveReady() {
 	defer r.mu.Unlock()
 	r.awaitingReadyPrompt = false
 	r.interactive = true
+	r.stallWatchdogPaused = true
 }
 
 func (r *PtyRunner) SetPermissionMode(mode string) {
@@ -935,10 +961,14 @@ func (r *PtyRunner) runStallWatchdog(ctx context.Context, sessionID string, sink
 		lastAt := r.lastEngineOutputAt
 		closed := r.closed
 		toolRunning := r.toolUsePending
+		paused := r.stallWatchdogPaused
 		r.mu.Unlock()
 
 		if closed {
 			return
+		}
+		if paused {
+			continue
 		}
 		if lastAt.IsZero() {
 			continue
@@ -985,6 +1015,7 @@ func (r *PtyRunner) clearGeneration(generation uint64) {
 	}
 	cancel := r.stallWatchdogCancel
 	r.stallWatchdogCancel = nil
+	r.stallWatchdogPaused = false
 	r.runCtx = nil
 	r.writer = nil
 	r.closer = nil

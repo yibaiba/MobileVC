@@ -922,11 +922,11 @@ class SessionController extends ChangeNotifier {
     if (sessionState == 'THINKING' || sessionState == 'RUNNING_TOOL') {
       return true;
     }
-    if (_hasRunningTerminalExecution) {
-      return true;
-    }
     if (sessionState != 'RUNNING') {
       return false;
+    }
+    if (_hasRunningTerminalExecution) {
+      return true;
     }
     final runningKey = _runtimeExecutionKey(
       _sessionState?.runtimeMeta ??
@@ -4286,6 +4286,7 @@ class SessionController extends ChangeNotifier {
             state.runtimeMeta,
             finishedAt: state.timestamp,
           );
+          _endUserSubmissionProtection();
         }
         if (_isIdleLikeState(state.state) && !_shouldPreserveBlockingPrompt()) {
           _pendingInteraction = null;
@@ -4485,6 +4486,9 @@ class SessionController extends ChangeNotifier {
         }
         _pendingInteraction = null;
         _pendingPrompt = prompt;
+        if (prompt.isReady) {
+          _agentState = null;
+        }
         _endUserSubmissionProtection();
         _syncRuntimePermissionMode();
         _pushDebug('收到 prompt_request', _debugReviewStateSummary());
@@ -4977,7 +4981,8 @@ class SessionController extends ChangeNotifier {
         normalized == 'IDLE' ||
         normalized == 'DONE' ||
         normalized == 'COMPLETED' ||
-        normalized == 'DISCONNECTED';
+        normalized == 'DISCONNECTED' ||
+        normalized == 'CLOSED';
   }
 
   void _checkAndClearExecutionState(String agentState) {
@@ -7973,7 +7978,7 @@ class SessionController extends ChangeNotifier {
     if (original.isEmpty) {
       return chunk;
     }
-    return '$original$chunk';
+    return '$original\n$chunk';
   }
 
   bool _shouldCaptureTerminalLog(

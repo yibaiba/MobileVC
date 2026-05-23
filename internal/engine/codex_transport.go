@@ -922,6 +922,7 @@ func (s *codexAppSession) emitReadyPromptAfterReply() {
 			return
 		}
 		s.mu.Unlock()
+		s.runner.markInteractiveReady()
 		emitCodexReadyPrompt(sessionID, sink, meta)
 	}()
 }
