@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import '../relay_e2ee/relay_e2ee_capability.dart';
 
 enum ConnectionMode { direct, relay }
@@ -18,6 +20,36 @@ class RelayPairing {
   final int expiresAt;
   final String nodeFingerprintHex;
   final RelayE2eeCapabilitySet? capabilities;
+}
+
+String relayPairingUriFromEventJson(Map<String, Object?> json) {
+  final relayUrl = (json['relayUrl'] ?? '').toString().trim();
+  final sessionId = (json['sessionId'] ?? '').toString().trim();
+  final secret = (json['pairingSecret'] ?? '').toString().trim();
+  final expiresAt = (json['expiresAt'] as num?)?.toInt() ?? 0;
+  final nodeFingerprintHex =
+      (json['nodeFingerprintHex'] ?? '').toString().trim().toLowerCase();
+  final capabilities = _relayCapabilitiesFromEvent(json['capabilities']);
+  if (relayUrl.isEmpty ||
+      sessionId.isEmpty ||
+      secret.isEmpty ||
+      !_isFingerprintHex(nodeFingerprintHex)) {
+    throw const FormatException('relay pairing event is missing fields');
+  }
+  final query = <String, String>{
+    'relay': relayUrl,
+    'session': sessionId,
+    'secret': secret,
+    'exp': expiresAt.toString(),
+    'nodeFingerprint': nodeFingerprintHex,
+    ..._relayCapabilityQuery(capabilities),
+  };
+  return Uri(
+    scheme: 'mobilevc',
+    host: 'relay',
+    path: '/v1',
+    queryParameters: query,
+  ).toString();
 }
 
 String normalizeConnectionMode(Object? value) {
@@ -44,7 +76,8 @@ void validateRelayUrl(String raw) {
 }
 
 RelayPairing? parseRelayPairingUri(String raw) {
-  final uri = Uri.tryParse(raw.trim());
+  final normalized = _normalizeRelayPairingInput(raw);
+  final uri = Uri.tryParse(normalized);
   if (uri == null || uri.scheme != 'mobilevc') {
     return null;
   }
@@ -57,14 +90,22 @@ RelayPairing? parseRelayPairingUri(String raw) {
   final expiresAt = int.tryParse(uri.queryParameters['exp'] ?? '');
   final nodeFingerprintHex =
       (uri.queryParameters['nodeFingerprint'] ?? '').trim().toLowerCase();
-  final capabilities = _parseRelayCapabilities(uri);
-  if (relayUrl.isEmpty || sessionId.isEmpty || secret.isEmpty) {
-    throw const FormatException('relay pairing uri is missing fields');
+  final missingFields = <String>[
+    if (relayUrl.isEmpty) 'relay',
+    if (sessionId.isEmpty) 'session',
+    if (secret.isEmpty) 'secret',
+  ];
+  if (missingFields.isNotEmpty) {
+    throw FormatException(
+      'relay pairing uri is missing fields: ${missingFields.join(', ')}',
+    );
   }
+  _validatePairingSecret(secret);
   if (!_isFingerprintHex(nodeFingerprintHex)) {
     throw const FormatException(
         'relay pairing uri is missing node fingerprint');
   }
+  final capabilities = _parseRelayCapabilities(uri);
   validateRelayUrl(relayUrl);
   return RelayPairing(
     relayUrl: relayUrl,
@@ -74,6 +115,27 @@ RelayPairing? parseRelayPairingUri(String raw) {
     nodeFingerprintHex: nodeFingerprintHex,
     capabilities: capabilities,
   );
+}
+
+String _normalizeRelayPairingInput(String raw) {
+  final trimmed = raw.trim();
+  if (!trimmed.startsWith('{')) {
+    return trimmed;
+  }
+  final decoded = jsonDecode(trimmed);
+  if (decoded is! Map) {
+    throw const FormatException('relay pairing json must be an object');
+  }
+  return relayPairingUriFromEventJson(Map<String, Object?>.from(decoded));
+}
+
+void _validatePairingSecret(String secret) {
+  final normalized = secret.trim().toLowerCase();
+  if (normalized == '<redacted>' || normalized == 'redacted') {
+    throw const FormatException(
+      'relay pairing uri secret is redacted; scan the QR code or paste the full link',
+    );
+  }
 }
 
 bool _isFingerprintHex(String value) {
@@ -117,6 +179,29 @@ RelayE2eeCapabilitySet? _parseRelayCapabilities(Uri uri) {
     'requiresE2EE': _requiredBool(uri, 'requiresE2EE'),
     'plaintextTestMode': _requiredBool(uri, 'plaintextTestMode'),
   });
+}
+
+RelayE2eeCapabilitySet _relayCapabilitiesFromEvent(Object? raw) {
+  if (raw is! Map) {
+    throw const FormatException('relay pairing event is missing capabilities');
+  }
+  return RelayE2eeCapabilitySet.fromJson(Map<String, Object?>.from(raw));
+}
+
+Map<String, String> _relayCapabilityQuery(RelayE2eeCapabilitySet capabilities) {
+  return <String, String>{
+    'relayProtocolVersion': capabilities.relayProtocolVersion.toString(),
+    'e2eeProtocolVersion': capabilities.e2eeProtocolVersion.toString(),
+    'cryptoSuite': capabilities.cryptoSuite,
+    'tunnelProtocolVersion': capabilities.tunnelProtocolVersion.toString(),
+    'supportsMultiplexStreams':
+        capabilities.supportsMultiplexStreams.toString(),
+    'supportsFileDownloadStream': capabilities.supportsFileDownload.toString(),
+    'supportsDeviceManagement':
+        capabilities.supportsDeviceManagement.toString(),
+    'requiresE2EE': capabilities.requiresE2EE.toString(),
+    'plaintextTestMode': capabilities.plaintextTestMode.toString(),
+  };
 }
 
 const _relayCapabilityQueryKeys = <String>{

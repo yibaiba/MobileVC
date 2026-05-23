@@ -295,6 +295,70 @@ void main() {
         throwsFormatException,
       );
     });
+
+    test('relay pairing uri reports specific missing fields', () {
+      expect(
+        () => parseRelayPairingUri('mobilevc://relay/v1'),
+        throwsA(
+          isA<FormatException>().having(
+            (error) => error.message,
+            'message',
+            contains('relay, session, secret'),
+          ),
+        ),
+      );
+    });
+
+    test('relay pairing event json imports as relay config', () {
+      final config = AppConfig.fromLaunchUri(
+        '''
+{
+  "type": "mobilevc.relay.pairing_ready",
+  "relayUrl": "wss://relay.example.test",
+  "sessionId": "rs_json",
+  "pairingSecret": "pair_secret",
+  "expiresAt": 1760000000,
+  "nodeFingerprintHex": "$testNodeFingerprint",
+  "capabilities": {
+    "relayProtocolVersion": 1,
+    "e2eeProtocolVersion": 1,
+    "cryptoSuite": "p256-ecdsa+p256-ecdh+hkdf-sha256+aes-256-gcm",
+    "tunnelProtocolVersion": 1,
+    "supportsMultiplexStreams": true,
+    "supportsFileDownloadStream": true,
+    "supportsDeviceManagement": true,
+    "requiresE2EE": true,
+    "plaintextTestMode": false
+  }
+}
+''',
+      );
+
+      expect(config, isNotNull);
+      expect(config!.isRelayMode, isTrue);
+      expect(config.relayUrl, 'wss://relay.example.test');
+      expect(config.relaySessionId, 'rs_json');
+      expect(config.relayPairingSecret, 'pair_secret');
+      expect(config.relayNodeFingerprintHex, testNodeFingerprint);
+      config.relayCapabilities!.validateProduction();
+    });
+
+    test('relay pairing uri rejects redacted secret', () {
+      expect(
+        () => parseRelayPairingUri(
+          'mobilevc://relay/v1?relay=wss%3A%2F%2Frelay.example.test'
+          '&session=rs_test&secret=%3Credacted%3E'
+          '&nodeFingerprint=$testNodeFingerprint',
+        ),
+        throwsA(
+          isA<FormatException>().having(
+            (error) => error.message,
+            'message',
+            contains('secret is redacted'),
+          ),
+        ),
+      );
+    });
   });
 
   group('AppConfig adb ice', () {
