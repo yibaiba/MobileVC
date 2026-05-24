@@ -84,6 +84,7 @@ The root directory now keeps only entry-point docs and release notes. Topic docs
 - Project index: [docs/project-index.md](docs/project-index.md)
 - Architecture blueprint: [docs/architecture/blueprint.md](docs/architecture/blueprint.md)
 - Current logic notes: [docs/architecture/current-logic.md](docs/architecture/current-logic.md)
+- Relay deployment guide: [docs/guides/relay-deployment.md](docs/guides/relay-deployment.md)
 - Push setup checklist: [docs/guides/push-integration-checklist.md](docs/guides/push-integration-checklist.md)
 - Web embed path: [docs/guides/web-embed-path.md](docs/guides/web-embed-path.md)
 - Flutter Web blank screen: [docs/troubleshooting/flutter-web-blank-screen.md](docs/troubleshooting/flutter-web-blank-screen.md)

@@ -11,6 +11,7 @@ Documentation is grouped by purpose. The repository root keeps only the main ent
 
 ## Guides
 
+- [Relay Deployment](guides/relay-deployment.md): public relay deployment, Docker Compose, Caddy, and local node startup.
 - [Push Integration Checklist](guides/push-integration-checklist.md): iOS APNs push integration checklist.
 - [Push Setup](guides/push-setup.md): APNs, Firebase, Xcode, and backend environment setup.
 - [Web Embed Path](guides/web-embed-path.md): correct flow for syncing Flutter Web output into Go embed assets.
