@@ -1238,6 +1238,127 @@ void main() {
       expect(persisted['relayClientReconnectSecret'], 'reconnect_secret');
     });
 
+
+
+    test('unacknowledged relay send reconnects and resends queued action',
+        () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(
+        service: service,
+        outboundAckRetryDelay: const Duration(milliseconds: 40),
+        outboundAckStaleTimeout: const Duration(milliseconds: 20),
+      );
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.saveConfig(const AppConfig(
+        connectionMode: 'relay',
+        relayUrl: 'wss://relay.example.test',
+        relaySessionId: 'rs_test',
+        relayClientId: 'rc_test',
+        relayClientReconnectSecret: 'reconnect_secret',
+      ));
+      await controller.connect();
+      service.emit(
+        SessionCreatedEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-1',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_created'},
+          summary: const SessionSummary(id: 'session-1', title: 'Relay'),
+        ),
+      );
+      await _flushEvents();
+      service.sentPayloads.clear();
+
+      controller.sendInputText('半开连接消息');
+      await _flushEvents();
+
+      final initialTurn = service.sentPayloads.singleWhere(
+        (payload) => payload['action'] == 'ai_turn',
+      );
+      final clientActionId = initialTurn['clientActionId'];
+      expect(clientActionId, isA<String>());
+      expect(controller.timeline.where((item) => item.body == '半开连接消息'),
+          hasLength(1));
+
+      await Future<void>.delayed(const Duration(milliseconds: 120));
+      await _flushEvents();
+
+      expect(service.disconnectCalls, greaterThanOrEqualTo(1));
+      expect(service.connectCalls, greaterThanOrEqualTo(2));
+      final resentTurns = service.sentPayloads
+          .where((payload) =>
+              payload['action'] == 'ai_turn' &&
+              payload['clientActionId'] == clientActionId)
+          .toList();
+      expect(resentTurns.length, greaterThanOrEqualTo(2));
+      expect(controller.timeline.where((item) => item.body == '半开连接消息'),
+          hasLength(1));
+    });
+
+    test('unacknowledged relay send reconnects despite server deltas',
+        () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(
+        service: service,
+        outboundAckRetryDelay: const Duration(milliseconds: 40),
+        outboundAckStaleTimeout: const Duration(milliseconds: 20),
+      );
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.saveConfig(const AppConfig(
+        connectionMode: 'relay',
+        relayUrl: 'wss://relay.example.test',
+        relaySessionId: 'rs_test',
+        relayClientId: 'rc_test',
+        relayClientReconnectSecret: 'reconnect_secret',
+      ));
+      await controller.connect();
+      service.emit(
+        SessionCreatedEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-1',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_created'},
+          summary: const SessionSummary(id: 'session-1', title: 'Relay'),
+        ),
+      );
+      await _flushEvents();
+      service.sentPayloads.clear();
+
+      controller.sendInputText('有心跳但无确认');
+      await _flushEvents();
+
+      final initialTurn = service.sentPayloads.singleWhere(
+        (payload) => payload['action'] == 'ai_turn',
+      );
+      final clientActionId = initialTurn['clientActionId'];
+      service.emit(SessionStateEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 30)),
+        sessionId: 'session-1',
+        runtimeMeta: const RuntimeMeta(),
+        raw: const {'type': 'session_state'},
+        state: 'idle',
+        message: 'heartbeat',
+      ));
+      await _flushEvents();
+
+      await Future<void>.delayed(const Duration(milliseconds: 120));
+      await _flushEvents();
+
+      expect(service.disconnectCalls, greaterThanOrEqualTo(1));
+      expect(service.connectCalls, greaterThanOrEqualTo(2));
+      final resentTurns = service.sentPayloads
+          .where((payload) =>
+              payload['action'] == 'ai_turn' &&
+              payload['clientActionId'] == clientActionId)
+          .toList();
+      expect(resentTurns.length, greaterThanOrEqualTo(2));
+      expect(controller.timeline.where((item) => item.body == '有心跳但无确认'),
+          hasLength(1));
+    });
     test('relay reconnect uses persisted client credentials', () async {
       SharedPreferences.setMockInitialValues({
         'mobilevc.app_config': jsonEncode(const AppConfig(

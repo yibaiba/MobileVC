@@ -6,25 +6,28 @@
 
 ## Overview
 
-<!--
-Document your project's quality standards here.
+Frontend code should keep Flutter UI, app state, transport, and protocol parsing separate. MobileVC is an operational mobile/web UI for a local backend, so correctness, explicit connection state, and actionable error copy matter more than decorative UI changes.
 
-Questions to answer:
-- What patterns are forbidden?
-- What linting rules do you enforce?
-- What are your testing requirements?
-- What code review standards apply?
--->
+Use the existing Dart/Flutter toolchain:
 
-(To be filled by the team)
+- Follow `mobile_vc/analysis_options.yaml`, which includes `package:flutter_lints/flutter.yaml`.
+- Run `flutter analyze` for edited Flutter code when feasible.
+- Run focused `flutter test` files for changed models, services, controllers, and widgets.
+- Keep user-facing copy consistent with existing Chinese UI text.
+- Treat relay/E2EE security state as a verified protocol result, not as a visual styling choice.
 
 ---
 
 ## Forbidden Patterns
 
-<!-- Patterns that should never be used and why -->
-
-(To be filled by the team)
+- Parsing backend event maps directly in widgets instead of adding typed models and `MobileVcMapper` support.
+- Hand-building backend or websocket URLs outside `AppConfig` URL helpers.
+- Persisting relay pairing secrets, reconnect secrets, device credentials, private keys, traffic keys, or raw ciphertext/plaintext payloads in `SharedPreferences`.
+- Showing "secure", "verified", shield styling, or similar trust hints unless `RelaySecurityState.canShowVerified` is true.
+- Falling back from relay mode to direct HTTP download or direct websocket when relay E2EE fails.
+- Creating a new relay E2EE stream codec per frame, which resets counters and replay protection.
+- Adding React-style hook dependencies or `use*` APIs to a Flutter app that currently uses `ChangeNotifier`, services, and `StatefulWidget`.
+- Hiding connection, decrypt, fingerprint, or device errors behind generic reconnect loops without surfacing actionable copy.
 
 ---
 
@@ -98,6 +101,7 @@ final wsUrl = config.wsUrlFor();
 - Relay scan selects `ConnectionMode.relay` without overwriting direct `host`, `port`, or `token`.
 - Persist only `connectionMode` and `relayUrl`; never persist `relaySessionId`, `relayPairingSecret`, or `relayPairingExpiresAt`.
 - Relay connect must wait for `client.paired`; pairing `relay.error` is a connection failure, not a successful connection.
+- User-visible relay actions with `clientActionId` are not delivered until the backend sends `client_action_ack`. Ordinary server events such as heartbeat/session delta must not clear or mask the pending action; if an action remains unacknowledged past the ack timeout, Flutter must reconnect and resend it with the same `clientActionId`.
 - Production E2EE relay pairing must not consider `client.paired` alone as connected. When the pairing link capabilities require E2EE and plaintext test-mode is off, Flutter must complete `client.e2ee_hello` -> `agent.e2ee_hello` -> `client.e2ee_proof` -> `agent.e2ee_result ok` before `connectRelay` returns.
 - Production E2EE relay reconnect must perform a reconnect E2EE handshake before any `relay.forward` business payload is sent. The control handshake includes device ID, device identity public key, transcript-bound `deviceProof`, and `deviceSignature`; it must never include the raw device credential.
 - Plaintext relay test-mode must remain explicit. If capability hints are absent or `plaintextTestMode=true`, Flutter must not send E2EE handshake frames because older/local test relay agents may not have the local E2EE handler wired.
@@ -313,14 +317,24 @@ final verified = state.canShowVerified;
 
 ## Testing Requirements
 
-<!-- What level of testing is expected -->
+Use focused Flutter tests:
 
-(To be filled by the team)
+- Config/URL changes: test `AppConfig`, endpoint parsing, relay URI parsing, secure transport, and persistence serialization.
+- Protocol model changes: test `fromJson`/`toJson`, invalid input, unknown event preservation, and mapper routing.
+- Service changes: test websocket send/receive behavior, relay pairing/reconnect, E2EE encrypt/decrypt, pending download completion, and close/error handling.
+- Controller changes: test `SessionController` state transitions, emitted actions, notifications, permission/review/plan gates, and relay device management gates.
+- Widget changes: add widget tests using stable `ValueKey`s where interaction behavior can regress.
+
+For relay/E2EE, tests must include both the successful path and explicit rejection paths such as fingerprint mismatch, plaintext after E2EE, unsupported capabilities, revoked/unknown device, and download denied/cancelled.
 
 ---
 
 ## Code Review Checklist
 
-<!-- What reviewers should check -->
-
-(To be filled by the team)
+- UI code stays in feature/widgets layers; transport stays in `MobileVcWsService`; pure config/E2EE logic stays in `core`.
+- New backend event types are represented by Dart models and wired through `MobileVcMapper`.
+- `SessionController` remains the app-state coordinator; widgets do not own long-lived connection state.
+- Persisted config excludes one-time relay secrets and device credentials.
+- Relay mode uses encrypted service paths for business messages and downloads when E2EE is required.
+- Security UI is derived from `RelaySecurityStateEvaluator` and cannot show verified for test-mode, missing capability, unbound device, or plaintext paths.
+- Analyze/tests were run for the affected Flutter files, or the reason they were not run is documented.

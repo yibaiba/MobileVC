@@ -137,6 +137,7 @@ class _PendingOutboundAction {
     required this.label,
     required this.createdAt,
     required this.clientActionId,
+    this.lastSentAt,
     this.displayed = false,
     this.sendAttempts = 0,
   });
@@ -146,11 +147,13 @@ class _PendingOutboundAction {
   final String label;
   final DateTime createdAt;
   final String clientActionId;
+  final DateTime? lastSentAt;
   final bool displayed;
   final int sendAttempts;
 
   _PendingOutboundAction copyWith({
     Map<String, dynamic>? payload,
+    DateTime? lastSentAt,
     bool? displayed,
     int? sendAttempts,
   }) =>
@@ -160,6 +163,7 @@ class _PendingOutboundAction {
         label: label,
         createdAt: createdAt,
         clientActionId: clientActionId,
+        lastSentAt: lastSentAt ?? this.lastSentAt,
         displayed: displayed ?? this.displayed,
         sendAttempts: sendAttempts ?? this.sendAttempts,
       );
@@ -187,8 +191,15 @@ bool shouldPreserveAdbFailureStatus(String status) {
 }
 
 class SessionController extends ChangeNotifier {
-  SessionController({MobileVcWsService? service})
-      : _service = service ?? MobileVcWsService();
+  SessionController({
+    MobileVcWsService? service,
+    @visibleForTesting
+    Duration outboundAckRetryDelay = const Duration(seconds: 6),
+    @visibleForTesting
+    Duration outboundAckStaleTimeout = const Duration(seconds: 12),
+  })  : _service = service ?? MobileVcWsService(),
+        _outboundAckRetryDelay = outboundAckRetryDelay,
+        _outboundAckStaleTimeout = outboundAckStaleTimeout;
 
   static const _prefsKey = 'mobilevc.app_config';
   static const _connectionIntentPrefsKey = 'mobilevc.connection_intent';
@@ -196,9 +207,10 @@ class SessionController extends ChangeNotifier {
   static const Duration _connectionHealthInterval = Duration(seconds: 10);
   static const Duration _connectionSilenceTimeout = Duration(seconds: 45);
   static const Duration _observedSessionSyncInterval = Duration(seconds: 3);
-  static const Duration _outboundAckRetryDelay = Duration(seconds: 6);
   final MobileVcWsService _service;
   final AdbWebRtcService _adbWebRtc = AdbWebRtcService();
+  final Duration _outboundAckRetryDelay;
+  final Duration _outboundAckStaleTimeout;
 
   StreamSubscription<AppEvent>? _subscription;
   AppConfig _config = const AppConfig();
@@ -1423,7 +1435,11 @@ class SessionController extends ChangeNotifier {
     final sent = _service.send(outboundPayload);
     if (sent) {
       _pendingOutboundActions.add(
-        pendingAction.copyWith(displayed: true, sendAttempts: 1),
+        pendingAction.copyWith(
+          displayed: true,
+          lastSentAt: DateTime.now(),
+          sendAttempts: 1,
+        ),
       );
       _appendLocalUserTimeline(userText, clientActionId);
       _schedulePendingOutboundRetry();
@@ -1601,6 +1617,7 @@ class SessionController extends ChangeNotifier {
       _pendingOutboundActions.add(
         action.copyWith(
           displayed: true,
+          lastSentAt: DateTime.now(),
           sendAttempts: action.sendAttempts + 1,
         ),
       );
@@ -1644,7 +1661,30 @@ class SessionController extends ChangeNotifier {
       _schedulePendingOutboundRetry();
       return;
     }
+    if (_hasStaleUnacknowledgedOutboundAction()) {
+      unawaited(_service.disconnect());
+      _handleUnexpectedSocketDisconnect('消息投递确认超时，正在重连并补发...');
+      _schedulePendingOutboundRetry();
+      return;
+    }
     _flushPendingOutboundActions();
+  }
+
+  bool _hasStaleUnacknowledgedOutboundAction() {
+    final now = DateTime.now();
+    for (final action in _pendingOutboundActions) {
+      if (action.sendAttempts <= 0) {
+        continue;
+      }
+      if (now.difference(action.createdAt) < _outboundAckStaleTimeout) {
+        continue;
+      }
+      final sentAt = action.lastSentAt ?? action.createdAt;
+      if (now.difference(sentAt) >= _outboundAckStaleTimeout) {
+        return true;
+      }
+    }
+    return false;
   }
 
   Map<String, dynamic> _aiTurnPayload({
