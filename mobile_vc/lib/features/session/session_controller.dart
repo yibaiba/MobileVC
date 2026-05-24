@@ -113,24 +113,6 @@ class _DeferredFirstInput {
   final String text;
 }
 
-class ChatImageAttachment {
-  const ChatImageAttachment({
-    required this.name,
-    required this.mimeType,
-    required this.bytes,
-  });
-
-  final String name;
-  final String mimeType;
-  final Uint8List bytes;
-
-  Map<String, dynamic> toJson() => {
-        'name': name,
-        'mimeType': mimeType,
-        'data': base64Encode(bytes),
-      };
-}
-
 class _PendingOutboundAction {
   const _PendingOutboundAction({
     required this.payload,
@@ -288,6 +270,7 @@ class SessionController extends ChangeNotifier {
   // 收到带有新 executionKey 的 AgentStateEvent（或 IDLE/WAIT_INPUT）时解锁。
   bool _isSubmitting = false;
   String _isSubmittingBaselineKey = '';
+  bool _pendingAiLaunchAwaitingInput = false;
   // 用于把 _activityVisible=false 平滑延迟，避免瞬时跳变造成视觉闪烁。
   Timer? _activityHideDebounce;
   AgentStateEvent? _agentState;
@@ -765,8 +748,8 @@ class SessionController extends ChangeNotifier {
   int get pendingDiffCount => _pendingDiffs.length;
   int get pendingReviewGroupCount =>
       _reviewGroups.where((group) => group.pendingCount > 0).length;
-  List<HistoryContext> get diffItems => List.unmodifiable(_recentDiffs);
-  List<HistoryContext> get pendingDiffs => List.unmodifiable(_pendingDiffs);
+  List<HistoryContext> get diffItems => _recentDiffsView;
+  List<HistoryContext> get pendingDiffs => UnmodifiableListView(_pendingDiffs);
   String get activeReviewDiffId => _activeReviewDiffId;
   HistoryContext? get currentDiffContext => _resolvedCurrentDiff();
   HistoryContext? get currentReviewDiff => _currentReviewDiff();
@@ -1013,6 +996,9 @@ class SessionController extends ChangeNotifier {
     if (_isStopping) {
       return false;
     }
+    if (awaitInput || _isClaudePendingReadyForInput) {
+      return false;
+    }
     if (_hasRunningTerminalExecution) {
       return true;
     }
@@ -1076,7 +1062,11 @@ class SessionController extends ChangeNotifier {
     if (_isStopping) {
       return '正在停止';
     }
-    if (_isClaudePendingReadyForInput) {
+    final agentState = (_agentState?.state ?? '').trim().toUpperCase();
+    if (_isClaudePendingReadyForInput ||
+        _pendingAiLaunchAwaitingInput ||
+        agentState == 'WAIT_INPUT' ||
+        awaitInput) {
       return '待输入';
     }
     final stepSummary = _currentStepSummary.trim();
@@ -1097,7 +1087,7 @@ class SessionController extends ChangeNotifier {
     if (_isStopping) {
       return '等待后端确认停止...';
     }
-    if (_isClaudePendingReadyForInput) {
+    if (_isClaudePendingReadyForInput || _pendingAiLaunchAwaitingInput) {
       return 'Claude 已启动，请继续输入';
     }
     final stepSummary = _currentStepSummary.trim();
@@ -1579,11 +1569,15 @@ class SessionController extends ChangeNotifier {
     if (status.phase.trim().toLowerCase() != 'settled') {
       return false;
     }
-    final replyKey = _lastAssistantReplyExecutionKey;
-    if (replyKey.isEmpty) {
+    if (status.runtimeMeta.claudeLifecycle.trim().toLowerCase() ==
+        'waiting_input') {
       return false;
     }
+    final replyKey = _lastAssistantReplyExecutionKey;
     final statusKey = _runtimeExecutionKey(status.runtimeMeta);
+    if (replyKey.isEmpty) {
+      return statusKey.isNotEmpty && statusKey != _isSubmittingBaselineKey;
+    }
     return statusKey.isEmpty || statusKey == replyKey;
   }
 
@@ -1622,6 +1616,27 @@ class SessionController extends ChangeNotifier {
     // 立即点亮状态球——这是用户最直观的反馈。流式 LogEvent 在后端会被忙碌态保护，
     // 不会再发 visible:false；本端不依赖 backend 即可拿到第一帧亮起。
     _setAiStatusVisible(true, label: '思考中');
+    _syncDerivedState();
+  }
+
+  void _markLocalSubmissionRunning({String command = ''}) {
+    final meta = (_agentState?.runtimeMeta ??
+            _sessionState?.runtimeMeta ??
+            const RuntimeMeta())
+        .merge(RuntimeMeta(command: command));
+    _pendingPrompt = null;
+    _pendingInteraction = null;
+    _clearPlanInteractionState();
+    _agentState = AgentStateEvent(
+      timestamp: DateTime.now(),
+      sessionId: _selectedSessionId,
+      runtimeMeta: meta,
+      raw: const {'type': 'agent_state', 'source': 'local_submission'},
+      state: 'THINKING',
+      message: '思考中',
+      command: command.isNotEmpty ? command : meta.command,
+    );
+    _sessionRuntimeAlive = true;
     _syncDerivedState();
   }
 
@@ -1934,10 +1949,11 @@ class SessionController extends ChangeNotifier {
       }
       _sendCachedPushTokenIfPossible();
       _restorePendingNotificationSessionIfNeeded();
-      _flushPendingOutboundActions();
     } catch (error) {
       _connected = false;
-      if (silently && _autoReconnectEnabled) {
+      final relayAgentReconnecting =
+          error is RelayPairingException && error.code == 'agent_disconnected';
+      if ((silently || relayAgentReconnecting) && _autoReconnectEnabled) {
         if (_appInForeground &&
             _reconnectAttempt >= _maxForegroundReconnectAttempts) {
           _autoReconnectEnabled = false;
@@ -1961,6 +1977,7 @@ class SessionController extends ChangeNotifier {
       _connecting = false;
       if (_connected) {
         _restorePendingNotificationSessionIfNeeded();
+        _flushPendingOutboundActions();
       }
       if (shouldRetrySilently) {
         _scheduleReconnect();
@@ -1983,15 +2000,26 @@ class SessionController extends ChangeNotifier {
       throw const FormatException('Relay 配对信息不完整，请重新扫码');
     }
     validateRelayUrl(relayUrl);
-    await _service.connectRelay(
-      relayUrl: relayUrl,
-      sessionId: sessionId,
-      pairingSecret: pairingSecret,
-      clientId: clientId,
-      clientReconnectSecret: clientReconnectSecret,
-      nodeFingerprintHex: _config.relayNodeFingerprintHex,
-      relayCapabilities: _config.relayCapabilities,
-    );
+    try {
+      await _service.connectRelay(
+        relayUrl: relayUrl,
+        sessionId: sessionId,
+        pairingSecret: pairingSecret,
+        clientId: clientId,
+        clientReconnectSecret: clientReconnectSecret,
+        nodeFingerprintHex: _config.relayNodeFingerprintHex,
+        relayCapabilities: _config.relayCapabilities,
+      );
+    } catch (error) {
+      if (_shouldClearRelayPairingAfterFailure(error, pairingSecret)) {
+        await _clearRelayPairingAfterFailure();
+        throw RelayPairingException(
+          'relay_pairing_consumed',
+          'Relay 配对未完成：当前配对链接已一次性使用，请导入新的中继链接后重试。原始错误：$error',
+        );
+      }
+      rethrow;
+    }
     final relaySession = _service.takeRelaySession();
     _config = _config.copyWith(
       relaySessionId: relaySession?.sessionId ?? sessionId,
@@ -2002,6 +2030,32 @@ class SessionController extends ChangeNotifier {
           relaySession?.clientReconnectSecret ?? clientReconnectSecret,
     );
     unawaited(_persistCurrentConfig());
+  }
+
+  bool _shouldClearRelayPairingAfterFailure(
+    Object error,
+    String pairingSecret,
+  ) {
+    if (pairingSecret.trim().isEmpty) {
+      return false;
+    }
+    if (error is RelayPairingException) {
+      return error.code != 'agent_disconnected';
+    }
+    if (error is TimeoutException) {
+      final message = (error.message ?? '').trim();
+      return message.contains('E2EE') || message.contains('配对');
+    }
+    final message = error.toString();
+    return message.contains('Relay E2EE') || message.contains('E2EE 握手');
+  }
+
+  Future<void> _clearRelayPairingAfterFailure() async {
+    _config = _config.copyWith(
+      relayPairingSecret: '',
+      relayPairingExpiresAt: 0,
+    );
+    await _persistCurrentConfig();
   }
 
   Future<void> disconnect() async {
@@ -2097,6 +2151,7 @@ class SessionController extends ChangeNotifier {
     _activityHideDebounce = null;
     _isSubmitting = false;
     _isSubmittingBaselineKey = '';
+    _pendingAiLaunchAwaitingInput = false;
     _aiStatusHideDebounce?.cancel();
     _aiStatusHideDebounce = null;
     _aiStatusIndicatorVisible = false;
@@ -2461,6 +2516,7 @@ class SessionController extends ChangeNotifier {
     _activityHideDebounce = null;
     _isSubmitting = false;
     _isSubmittingBaselineKey = '';
+    _pendingAiLaunchAwaitingInput = false;
     _aiStatusHideDebounce?.cancel();
     _aiStatusHideDebounce = null;
     _aiStatusIndicatorVisible = false;
@@ -2497,6 +2553,7 @@ class SessionController extends ChangeNotifier {
     _activityHideDebounce = null;
     _isSubmitting = false;
     _isSubmittingBaselineKey = '';
+    _pendingAiLaunchAwaitingInput = false;
     _aiStatusHideDebounce?.cancel();
     _aiStatusHideDebounce = null;
     _aiStatusIndicatorVisible = false;
@@ -3418,6 +3475,11 @@ class SessionController extends ChangeNotifier {
     if (!launchSent) {
       return;
     }
+    if (value.isEmpty && imageAttachments.isEmpty) {
+      _pendingAiLaunchAwaitingInput = true;
+      _syncDerivedState();
+      notifyListeners();
+    }
   }
 
   void _submitClaudeContinuation(
@@ -3450,6 +3512,7 @@ class SessionController extends ChangeNotifier {
     if (!sent) {
       return;
     }
+    _markLocalSubmissionRunning(command: continuationEngine);
   }
 
   void continueWithCurrentFile([String text = '基于当前文件继续处理']) {
@@ -3822,6 +3885,11 @@ class SessionController extends ChangeNotifier {
       'targetPath': interaction.targetPath,
       'targetText': currentMeta.targetText,
     });
+    _pendingInteraction = null;
+    _pendingPrompt = null;
+    _clearPlanInteractionState();
+    _runtimePhase = null;
+    _syncDerivedState();
     notifyListeners();
   }
 
@@ -3955,6 +4023,7 @@ class SessionController extends ChangeNotifier {
     List<ChatImageAttachment> imageAttachments = const [],
   }) {
     _beginUserSubmission();
+    _markLocalSubmissionRunning();
     final payload = <String, dynamic>{
       'action': 'input',
       'data': '$value\n',
@@ -4526,6 +4595,12 @@ class SessionController extends ChangeNotifier {
             _continueSameSessionEnabled = false;
             _continuedSameSessionId = '';
           }
+        } else if (_isDefinitiveAgentState(
+          '',
+          state.state.trim().toUpperCase(),
+        )) {
+          _sessionRuntimeAlive = true;
+          _pendingAiLaunchAwaitingInput = false;
         }
         _maybeAutoSyncAiModel(state.runtimeMeta);
         _syncRuntimePermissionMode();
@@ -4585,6 +4660,7 @@ class SessionController extends ChangeNotifier {
         if (!_eventTargetsCurrentSession(agent.sessionId)) {
           break;
         }
+        _pendingAiLaunchAwaitingInput = false;
         _agentState = agent;
         final agentStateName = agent.state.trim().toUpperCase();
         // Only lift to true; never force to false — delta/history events
@@ -4679,6 +4755,7 @@ class SessionController extends ChangeNotifier {
       case ErrorEvent error:
         _fileListLoading = false;
         _fileReading = false;
+        final mutationFailureHandled = _handleMutationFailure(error);
         if (error.code.startsWith('device_') ||
             error.code.startsWith('e2ee_')) {
           _relayDeviceListLoading = false;
@@ -4689,11 +4766,15 @@ class SessionController extends ChangeNotifier {
         final errorMessage = error.message.trim();
         if (error.code == 'ws_closed' ||
             error.code == 'ws_stream_error' ||
-            error.code == 'ws_send_error') {
+            error.code == 'ws_send_error' ||
+            error.code == 'agent_disconnected') {
           _handleUnexpectedSocketDisconnect(errorMessage);
           break;
         }
         if (_shouldSuppressIntentionalHandoffNoise(errorMessage)) {
+          break;
+        }
+        if (mutationFailureHandled && error.code == 'session_delete_failed') {
           break;
         }
         if (errorMessage.contains('ADB') ||
@@ -4729,7 +4810,6 @@ class SessionController extends ChangeNotifier {
             context: _latestError,
           ),
         );
-        _handleMutationFailure(error);
         break;
       case RelayDeviceListResultEvent result:
         _relayDeviceListLoading = false;
@@ -4756,6 +4836,7 @@ class SessionController extends ChangeNotifier {
         await _handleRelayDeviceRotateResult(result);
         break;
       case PromptRequestEvent prompt:
+        _pendingAiLaunchAwaitingInput = false;
         if (prompt.isReview && _reviewShouldAutoAccept(prompt.runtimeMeta)) {
           if (_pendingInteraction?.isReview == true) {
             _pendingInteraction = null;
@@ -4784,6 +4865,7 @@ class SessionController extends ChangeNotifier {
         notifyListeners();
         break;
       case InteractionRequestEvent interaction:
+        _pendingAiLaunchAwaitingInput = false;
         if (interaction.isReview &&
             _reviewShouldAutoAccept(interaction.runtimeMeta)) {
           if (_pendingInteraction?.isReview == true) {
@@ -5236,10 +5318,12 @@ class SessionController extends ChangeNotifier {
     return changed;
   }
 
-  void _handleMutationFailure(ErrorEvent error) {
+  bool _handleMutationFailure(ErrorEvent error) {
     final message = error.message;
+    var handled = false;
     if (error.code == 'session_delete_failed' &&
         _pendingDeletedSessions.isNotEmpty) {
+      handled = true;
       final restored = _pendingDeletedSessions.values.toList();
       _pendingDeletedSessions.clear();
       for (final summary in restored.reversed) {
@@ -5253,9 +5337,11 @@ class SessionController extends ChangeNotifier {
       }
     }
     if (_autoSessionCreating) {
+      handled = true;
       _clearDeferredFirstInput();
     }
     if (_pendingSessionContextTarget != null) {
+      handled = true;
       _pendingSessionContextTarget = null;
       _pendingToggleSkillNames.clear();
       _pendingToggleMemoryIds.clear();
@@ -5264,17 +5350,20 @@ class SessionController extends ChangeNotifier {
       }
     }
     if (_isSavingSkill) {
+      handled = true;
       _isSavingSkill = false;
       if (message.trim().isNotEmpty) {
         _skillSyncStatus = '保存 skill 失败：$message';
       }
     }
     if (_isSavingMemory) {
+      handled = true;
       _isSavingMemory = false;
       if (message.trim().isNotEmpty) {
         _memorySyncStatus = '保存 memory 失败：$message';
       }
     }
+    return handled;
   }
 
   bool _isIdleLikeState(String state) {
@@ -7329,9 +7418,10 @@ class SessionController extends ChangeNotifier {
     if (currentInteraction?.isPermission == true ||
         currentPrompt?.isPermission == true) {
       if (!incoming.isPermission) {
-        // AI 结束（end_turn）发送的 ready prompt 应替换陈旧权限提示，
-        // 避免_clearPermissionBlockingState 未生效时用户看到已批准的授权卡片。
-        if (incoming.isReady) {
+        // Ready prompt can replace a permission prompt because it is backend
+        // acknowledgement that the prompt is stale. Keep interaction requests
+        // until a permission decision/auto-apply event explicitly clears them.
+        if (incoming.isReady && currentInteraction?.isPermission != true) {
           return false;
         }
         return true;
@@ -7411,7 +7501,8 @@ class SessionController extends ChangeNotifier {
     final hasBlockingPrompt = awaitInput ||
         hasPendingPermission ||
         shouldShowReviewChoices ||
-        hasPendingPlanQuestions;
+        hasPendingPlanQuestions ||
+        _pendingAiLaunchAwaitingInput;
     final hasRealRunningSignal = _executionActive ||
         _sessionRuntimeAlive ||
         agentState == 'THINKING' ||
@@ -7434,6 +7525,7 @@ class SessionController extends ChangeNotifier {
     final hideImmediately = hasPendingPermission ||
         hasBlockingPrompt ||
         _isClaudePendingReadyForInput ||
+        _pendingAiLaunchAwaitingInput ||
         !_connected;
     if (active) {
       // 一旦本轮重新激活，立即取消任何延迟消隐计时器，保证状态球瞬间点亮。
@@ -7909,7 +8001,7 @@ class SessionController extends ChangeNotifier {
     if (!_connected) {
       return _connecting ? '连接中' : '未连接';
     }
-    if (_isClaudePendingReadyForInput) {
+    if (_isClaudePendingReadyForInput || _pendingAiLaunchAwaitingInput) {
       return '待输入';
     }
     final state = _agentState?.state ?? '';
@@ -8309,6 +8401,7 @@ class SessionController extends ChangeNotifier {
       return;
     }
     unawaited(saveConfig(_config.copyWith(
+      engine: engine,
       claudeModel: engine == 'claude' ? normalizedModel : _config.claudeModel,
       codexModel: engine == 'codex' ? normalizedModel : _config.codexModel,
       codexReasoningEffort:

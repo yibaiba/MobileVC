@@ -1,3 +1,6 @@
+import 'dart:convert';
+import 'dart:typed_data';
+
 import 'runtime_meta.dart';
 
 DateTime? _parseDate(String? value) {
@@ -530,6 +533,24 @@ class PermissionRule {
       'matchCount': matchCount,
     };
   }
+}
+
+class ChatImageAttachment {
+  const ChatImageAttachment({
+    required this.name,
+    required this.mimeType,
+    required this.bytes,
+  });
+
+  final String name;
+  final String mimeType;
+  final Uint8List bytes;
+
+  Map<String, dynamic> toJson() => {
+        'name': name,
+        'mimeType': mimeType,
+        'data': base64Encode(bytes),
+      };
 }
 
 class SkillDefinition {

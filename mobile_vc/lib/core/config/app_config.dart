@@ -288,7 +288,13 @@ class AppConfig {
           (json['relayClientReconnectSecret'] ?? '').toString(),
       relayNodeFingerprintHex:
           (json['relayNodeFingerprintHex'] ?? '').toString(),
-      relayCapabilities: _relayCapabilitiesFromJson(json['relayCapabilities']),
+      relayCapabilities: _relayCapabilitiesFromJson(
+        json['relayCapabilities'],
+        hasRelayNodeFingerprint: (json['relayNodeFingerprintHex'] ?? '')
+            .toString()
+            .trim()
+            .isNotEmpty,
+      ),
     );
   }
 
@@ -313,14 +319,28 @@ class AppConfig {
     }
     final relayPairing = parseRelayPairingUri(trimmed);
     if (relayPairing != null) {
+      final sameRelaySession = fallback.isRelayMode &&
+          fallback.relayUrl.trim() == relayPairing.relayUrl.trim() &&
+          fallback.relaySessionId.trim() == relayPairing.sessionId.trim();
+      final hasReconnectCredentials =
+          fallback.relayClientId.trim().isNotEmpty &&
+              fallback.relayClientReconnectSecret.trim().isNotEmpty;
       return fallback.copyWith(
         connectionMode: ConnectionMode.relay.name,
         relayUrl: relayPairing.relayUrl,
         relaySessionId: relayPairing.sessionId,
-        relayPairingSecret: relayPairing.pairingSecret,
-        relayPairingExpiresAt: relayPairing.expiresAt,
-        relayClientId: '',
-        relayClientReconnectSecret: '',
+        relayPairingSecret: sameRelaySession && hasReconnectCredentials
+            ? ''
+            : relayPairing.pairingSecret,
+        relayPairingExpiresAt: sameRelaySession && hasReconnectCredentials
+            ? 0
+            : relayPairing.expiresAt,
+        relayClientId: sameRelaySession && hasReconnectCredentials
+            ? fallback.relayClientId
+            : '',
+        relayClientReconnectSecret: sameRelaySession && hasReconnectCredentials
+            ? fallback.relayClientReconnectSecret
+            : '',
         relayNodeFingerprintHex: relayPairing.nodeFingerprintHex,
         relayCapabilities: relayPairing.capabilities,
       );
@@ -365,16 +385,25 @@ class AppConfig {
       AdbIceConfig(host: host, rawJson: adbIceServersJson);
 }
 
-RelayE2eeCapabilitySet? _relayCapabilitiesFromJson(Object? value) {
+RelayE2eeCapabilitySet? _relayCapabilitiesFromJson(
+  Object? value, {
+  required bool hasRelayNodeFingerprint,
+}) {
   if (value == null) {
-    return null;
+    return hasRelayNodeFingerprint ? RelayE2eeCapabilitySet.production() : null;
   }
   if (value is! Map) {
-    throw const FormatException('invalid relay capabilities');
+    return hasRelayNodeFingerprint ? RelayE2eeCapabilitySet.production() : null;
   }
-  return RelayE2eeCapabilitySet.fromJson(
-    Map<String, Object?>.from(value),
-  );
+  try {
+    return RelayE2eeCapabilitySet.fromJson(
+      Map<String, Object?>.from(value),
+    );
+  } on FormatException {
+    return hasRelayNodeFingerprint ? RelayE2eeCapabilitySet.production() : null;
+  } on ArgumentError {
+    return hasRelayNodeFingerprint ? RelayE2eeCapabilitySet.production() : null;
+  }
 }
 
 String _launchUriPort(Uri uri, String fallbackPort) {

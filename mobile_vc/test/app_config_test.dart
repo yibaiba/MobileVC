@@ -215,6 +215,51 @@ void main() {
       expect(restored.relayNodeFingerprintHex, testNodeFingerprint);
     });
 
+    test('invalid persisted relay capabilities keep reconnect credentials', () {
+      final config = AppConfig.fromJson(const {
+        'connectionMode': 'relay',
+        'relayUrl': 'wss://relay.example.test',
+        'relaySessionId': 'rs_test',
+        'relayClientId': 'rc_test',
+        'relayClientReconnectSecret': 'reconnect_secret',
+        'relayNodeFingerprintHex': testNodeFingerprint,
+        'relayCapabilities': {
+          'relayProtocolVersion': 0,
+        },
+      });
+
+      expect(config.isRelayMode, isTrue);
+      expect(config.relayUrl, 'wss://relay.example.test');
+      expect(config.relaySessionId, 'rs_test');
+      expect(config.relayClientId, 'rc_test');
+      expect(config.relayClientReconnectSecret, 'reconnect_secret');
+      expect(config.relayNodeFingerprintHex, testNodeFingerprint);
+      config.relayCapabilities!.validateProduction();
+    });
+
+    test('same relay pairing import preserves existing reconnect credentials',
+        () {
+      final config = AppConfig.fromLaunchUri(
+        'mobilevc://relay/v1?relay=wss%3A%2F%2Frelay.example.test'
+        '&session=rs_test&secret=stale_pair_secret&exp=1760000000'
+        '&nodeFingerprint=$testNodeFingerprint',
+        fallback: const AppConfig(
+          connectionMode: 'relay',
+          relayUrl: 'wss://relay.example.test',
+          relaySessionId: 'rs_test',
+          relayClientId: 'rc_existing',
+          relayClientReconnectSecret: 'reconnect_existing',
+          relayNodeFingerprintHex: testNodeFingerprint,
+        ),
+      );
+
+      expect(config, isNotNull);
+      expect(config!.relayPairingSecret, isEmpty);
+      expect(config.relayPairingExpiresAt, 0);
+      expect(config.relayClientId, 'rc_existing');
+      expect(config.relayClientReconnectSecret, 'reconnect_existing');
+    });
+
     test('relay url validation rejects public ws and http schemes', () {
       expect(
         () => AppConfig.fromLaunchUri(

@@ -488,6 +488,17 @@ void main() {
       );
     });
 
+    test('relay agent disconnected message is reconnectable', () {
+      final message = relayErrorMessage(const <String, dynamic>{
+        'type': 'relay.error',
+        'code': 'agent_disconnected',
+        'message': 'agent disconnected',
+      });
+
+      expect(message, contains('正在重连'));
+      expect(message, isNot(contains('重新配对')));
+    });
+
     test('relay auth error is pending for reconnect attempts', () {
       expect(
         isRelayAuthError(
@@ -1118,7 +1129,10 @@ void main() {
         ).toJson()),
       });
       final service = _FakeMobileVcWsService();
-      final controller = SessionController(service: service);
+      final controller = SessionController(
+        service: service,
+        outboundAckStaleTimeout: const Duration(milliseconds: 40),
+      );
       await controller.initialize();
       addTearDown(controller.disposeController);
       await _flushEvents();
@@ -1238,7 +1252,150 @@ void main() {
       expect(persisted['relayClientReconnectSecret'], 'reconnect_secret');
     });
 
+    test('relay pairing failure clears one-time secret and asks reimport',
+        () async {
+      final service = _FakeMobileVcWsService()
+        ..connectRelayError = const RelayPairingException(
+          'e2ee_handshake_failed',
+          'Relay E2EE 握手失败',
+        );
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
 
+      await controller.saveConfig(const AppConfig(
+        connectionMode: 'relay',
+        relayUrl: 'wss://relay.example.test',
+        relaySessionId: 'rs_test',
+        relayPairingSecret: 'pair_secret',
+        relayPairingExpiresAt: 1760000000,
+      ));
+
+      await controller.connect();
+
+      expect(controller.connected, isFalse);
+      expect(controller.connectionStage, SessionConnectionStage.failed);
+      expect(controller.connectionMessage, contains('请导入新的中继链接'));
+      expect(controller.config.relayPairingSecret, isEmpty);
+      expect(controller.config.relayPairingExpiresAt, 0);
+
+      final prefs = await SharedPreferences.getInstance();
+      final persisted = jsonDecode(prefs.getString('mobilevc.app_config')!)
+          as Map<String, dynamic>;
+      expect(persisted.containsKey('relayPairingSecret'), isFalse);
+      expect(persisted.containsKey('relayPairingExpiresAt'), isFalse);
+    });
+
+    test('relay agent reconnecting does not clear one-time pairing secret',
+        () async {
+      final service = _FakeMobileVcWsService()
+        ..connectRelayError = const RelayPairingException(
+          'agent_disconnected',
+          '本机 Relay 正在重连，请稍后自动恢复',
+        );
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.saveConfig(const AppConfig(
+        connectionMode: 'relay',
+        relayUrl: 'wss://relay.example.test',
+        relaySessionId: 'rs_test',
+        relayPairingSecret: 'pair_secret',
+        relayPairingExpiresAt: 1760000000,
+      ));
+
+      await controller.connect();
+
+      expect(controller.connected, isFalse);
+      expect(controller.connectionStage, SessionConnectionStage.reconnecting);
+      expect(controller.config.relayPairingSecret, 'pair_secret');
+      expect(controller.config.relayPairingExpiresAt, 1760000000);
+    });
+
+    test('relay agent disconnect auto reconnects and resends unacked action',
+        () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.saveConfig(const AppConfig(
+        connectionMode: 'relay',
+        relayUrl: 'wss://relay.example.test',
+        relaySessionId: 'rs_test',
+        relayClientId: 'rc_test',
+        relayClientReconnectSecret: 'reconnect_secret',
+      ));
+      await controller.connect();
+      service.emit(
+        SessionCreatedEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-1',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_created'},
+          summary: const SessionSummary(id: 'session-1', title: 'Relay'),
+        ),
+      );
+      await _flushEvents();
+      service.sentPayloads.clear();
+
+      controller.sendInputText('自动恢复消息');
+      await _flushEvents();
+
+      final initialTurn = service.sentPayloads.singleWhere(
+        (payload) => payload['action'] == 'ai_turn',
+      );
+      final clientActionId = initialTurn['clientActionId'];
+      expect(clientActionId, isA<String>());
+      expect(controller.timeline.where((item) => item.body == '自动恢复消息'),
+          hasLength(1));
+
+      service.emit(
+        ErrorEvent(
+          timestamp: _timestamp.add(const Duration(seconds: 1)),
+          sessionId: 'session-1',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'error'},
+          code: 'agent_disconnected',
+          message: '本机 Relay 正在重连，请稍后自动恢复',
+        ),
+      );
+      await _flushEvents();
+      await _flushEvents();
+
+      expect(service.connectCalls, 2);
+      expect(controller.connected, isTrue);
+      final resentTurns = service.sentPayloads
+          .where((payload) =>
+              payload['action'] == 'ai_turn' &&
+              payload['clientActionId'] == clientActionId)
+          .toList();
+      expect(resentTurns, hasLength(2));
+      expect(controller.timeline.where((item) => item.body == '自动恢复消息'),
+          hasLength(1));
+
+      service.emit(ClientActionAckEvent(
+        timestamp: _timestamp.add(const Duration(seconds: 2)),
+        sessionId: 'session-1',
+        runtimeMeta: const RuntimeMeta(),
+        raw: const {'type': 'client_action_ack'},
+        action: 'ai_turn',
+        clientActionId: clientActionId as String,
+        status: 'accepted',
+      ));
+      await _flushEvents();
+      service.sentPayloads.clear();
+      controller.resumeConnectionIfNeeded();
+      await _flushEvents();
+
+      expect(
+        service.sentPayloads.where((payload) =>
+            payload['action'] == 'ai_turn' &&
+            payload['clientActionId'] == clientActionId),
+        isEmpty,
+      );
+    });
 
     test('unacknowledged relay send reconnects and resends queued action',
         () async {
@@ -1359,6 +1516,7 @@ void main() {
       expect(controller.timeline.where((item) => item.body == '有心跳但无确认'),
           hasLength(1));
     });
+
     test('relay reconnect uses persisted client credentials', () async {
       SharedPreferences.setMockInitialValues({
         'mobilevc.app_config': jsonEncode(const AppConfig(
@@ -1423,6 +1581,47 @@ void main() {
       expect(call.clientReconnectSecret, isEmpty);
       expect(controller.config.relayClientId, 'rc_test');
       expect(controller.config.relayClientReconnectSecret, 'reconnect_secret');
+    });
+
+    test('reimporting same relay link keeps existing reconnect credentials',
+        () async {
+      SharedPreferences.setMockInitialValues({
+        'mobilevc.app_config': jsonEncode(const AppConfig(
+          connectionMode: 'relay',
+          relayUrl: 'wss://relay.example.test',
+          relaySessionId: 'rs_test',
+          relayClientId: 'rc_existing',
+          relayClientReconnectSecret: 'reconnect_existing',
+        ).toJson()),
+      });
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      final imported = await controller.importConnectionLink(
+        'mobilevc://relay/v1?relay=wss%3A%2F%2Frelay.example.test'
+        '&session=rs_test&secret=stale_pair_secret&exp=1760000000'
+        '&nodeFingerprint=1111111111111111111111111111111111111111111111111111111111111111'
+        '&relayProtocolVersion=1&e2eeProtocolVersion=1'
+        '&cryptoSuite=p256-ecdsa%2Bp256-ecdh%2Bhkdf-sha256%2Baes-256-gcm'
+        '&tunnelProtocolVersion=1&supportsMultiplexStreams=true'
+        '&supportsFileDownloadStream=true&supportsDeviceManagement=true'
+        '&requiresE2EE=true&plaintextTestMode=false',
+      );
+
+      expect(imported, isTrue);
+      expect(controller.config.relayPairingSecret, isEmpty);
+      expect(controller.config.relayClientId, 'rc_existing');
+      expect(
+          controller.config.relayClientReconnectSecret, 'reconnect_existing');
+
+      await controller.connect();
+
+      final call = service.connectedRelays.single;
+      expect(call.pairingSecret, isEmpty);
+      expect(call.clientId, 'rc_existing');
+      expect(call.clientReconnectSecret, 'reconnect_existing');
     });
 
     test('imported relay pairing link disconnects active stale relay session',
@@ -2372,7 +2571,6 @@ void main() {
         'ai_turn',
       ]);
       expect(service.sentPayloads[3]['engine'], 'claude');
-      expect(service.sentPayloads[3]['model'], 'sonnet');
       expect(service.sentPayloads[3]['data'], '请帮我总结当前问题\n');
       expect(controller.selectedSessionId, 'session-new');
     });
@@ -3108,7 +3306,7 @@ void main() {
       expect(controller.commandBarModelSummary, 'GPT-5.4 · XHIGH');
     });
 
-    test('sendInputText 在 Claude 模式下继续普通文本时走 input 而不是新的 exec', () async {
+    test('sendInputText 在 Claude 模式下继续普通文本时走 ai_turn', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);
       await controller.initialize();
@@ -3536,7 +3734,7 @@ void main() {
       await _flushEvents();
 
       expect(controller.awaitInput, isTrue);
-      expect(controller.isSessionBusy, isTrue);
+      expect(controller.isSessionBusy, isFalse);
       expect(controller.activityVisible, isFalse);
       expect(controller.activityBannerAnimated, isFalse);
       expect(controller.activityBannerShowsElapsed, isFalse);
@@ -4366,7 +4564,7 @@ void main() {
       expect(controller.currentMeta.cwd, '/workspace/history');
     });
 
-    test('加载可恢复历史会话后，普通输入会直接走 Claude continuation', () async {
+    test('加载可恢复历史会话后，普通输入会走 ai_turn continuation', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);
       await controller.initialize();
@@ -4392,7 +4590,7 @@ void main() {
       controller.sendInputText('hello');
 
       expect(service.sentPayloads, hasLength(1));
-      expect(service.sentPayloads.single['action'], 'input');
+      expect(service.sentPayloads.single['action'], 'ai_turn');
       expect(service.sentPayloads.single['data'], 'hello\n');
     });
 
@@ -4553,7 +4751,7 @@ void main() {
       expect(controller.agentState?.state, 'THINKING');
     });
 
-    test('新建会话会清空旧 continuation 状态，首条 codex 输入重新走 exec', () async {
+    test('新建会话会清空旧 continuation 状态，首条 codex 输入重新走 ai_turn', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);
       await controller.initialize();
@@ -4653,11 +4851,8 @@ void main() {
       controller.sendInputText('codex');
 
       expect(service.sentPayloads, hasLength(1));
-      expect(service.sentPayloads.single['action'], 'exec');
-      expect(
-        (service.sentPayloads.single['cmd'] ?? '').toString(),
-        startsWith('codex'),
-      );
+      expect(service.sentPayloads.single['action'], 'ai_turn');
+      expect(service.sentPayloads.single['engine'], 'codex');
     });
   });
 
@@ -6404,7 +6599,7 @@ void main() {
       expect(controller.runtimeProcesses, isEmpty);
       expect(controller.activeRuntimeProcessPid, 0);
       expect(controller.activeRuntimeProcessLog, isNull);
-      expect(controller.runtimeProcessListLoading, isTrue);
+      expect(controller.runtimeProcessListLoading, isFalse);
       expect(controller.runtimeProcessLogLoading, isFalse);
     });
 
@@ -6784,7 +6979,7 @@ void main() {
       expect(controller.memoryItems.single.id, 'mem-author');
     });
 
-    test('saveGeneratedSkill 在 Claude 会话中走 input continuation', () async {
+    test('saveGeneratedSkill 在 Claude 会话中走 ai_turn continuation', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);
       await controller.initialize();
@@ -6818,8 +7013,8 @@ void main() {
       controller.saveGeneratedSkill(request: '生成一个总结 diff 的 skill');
 
       expect(service.sentPayloads, hasLength(1));
-      expect(service.sentPayloads[0]['action'], 'input');
-      expect(service.sentPayloads[0]['command'], 'claude');
+      expect(service.sentPayloads[0]['action'], 'ai_turn');
+      expect(service.sentPayloads[0]['engine'], 'claude');
       expect(service.sentPayloads[0]['targetType'], 'skill');
       expect(service.sentPayloads[0]['resultView'], 'skill-catalog');
       expect(
@@ -6828,7 +7023,7 @@ void main() {
           isTrue);
     });
 
-    test('saveGeneratedSkill 首次发起时仍走 Claude exec 编排链', () async {
+    test('saveGeneratedSkill 首次发起时走单条 ai_turn 编排', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);
       await controller.initialize();
@@ -6844,28 +7039,27 @@ void main() {
 
       controller.saveGeneratedSkill(request: '生成一个总结 diff 的 skill');
 
-      expect(service.sentPayloads, hasLength(2));
-      expect(service.sentPayloads[0]['action'], 'exec');
-      expect(service.sentPayloads[0]['mode'], 'pty');
+      expect(service.sentPayloads, hasLength(1));
+      expect(service.sentPayloads[0]['action'], 'ai_turn');
+      expect(service.sentPayloads[0]['engine'], 'claude');
       expect(service.sentPayloads[0]['targetType'], 'skill');
       expect(service.sentPayloads[0]['resultView'], 'skill-catalog');
-      expect(service.sentPayloads[1]['action'], 'input');
       expect(
-          (service.sentPayloads[1]['data'] as String)
+          (service.sentPayloads[0]['data'] as String)
               .contains('"mobilevcCatalogAuthoring":true'),
           isTrue);
       expect(
-          (service.sentPayloads[1]['data'] as String)
+          (service.sentPayloads[0]['data'] as String)
               .contains('"kind":"skill"'),
           isTrue);
       expect(
-        (service.sentPayloads[1]['data'] as String)
+        (service.sentPayloads[0]['data'] as String)
             .contains('生成一个总结 diff 的 skill'),
         isTrue,
       );
     });
 
-    test('reviseMemoryWithClaude 在 Claude 会话中走 input continuation', () async {
+    test('reviseMemoryWithClaude 在 Claude 会话中走 ai_turn continuation', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);
       await controller.initialize();
@@ -6902,8 +7096,8 @@ void main() {
       );
 
       expect(service.sentPayloads, hasLength(1));
-      expect(service.sentPayloads[0]['action'], 'input');
-      expect(service.sentPayloads[0]['command'], 'claude');
+      expect(service.sentPayloads[0]['action'], 'ai_turn');
+      expect(service.sentPayloads[0]['engine'], 'claude');
       expect(service.sentPayloads[0]['targetType'], 'memory');
       expect(service.sentPayloads[0]['resultView'], 'memory-catalog');
       expect(
@@ -6912,7 +7106,7 @@ void main() {
           isTrue);
     });
 
-    test('reviseMemoryWithClaude 首次发起时仍走 Claude exec 编排链', () async {
+    test('reviseMemoryWithClaude 首次发起时走单条 ai_turn 编排', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);
       await controller.initialize();
@@ -6931,21 +7125,21 @@ void main() {
         '改成强调 iOS 风格 UI 偏好',
       );
 
-      expect(service.sentPayloads, hasLength(2));
-      expect(service.sentPayloads[0]['action'], 'exec');
+      expect(service.sentPayloads, hasLength(1));
+      expect(service.sentPayloads[0]['action'], 'ai_turn');
+      expect(service.sentPayloads[0]['engine'], 'claude');
       expect(service.sentPayloads[0]['targetType'], 'memory');
       expect(service.sentPayloads[0]['resultView'], 'memory-catalog');
-      expect(service.sentPayloads[1]['action'], 'input');
       expect(
-          (service.sentPayloads[1]['data'] as String)
+          (service.sentPayloads[0]['data'] as String)
               .contains('"mobilevcCatalogAuthoring":true'),
           isTrue);
       expect(
-          (service.sentPayloads[1]['data'] as String)
+          (service.sentPayloads[0]['data'] as String)
               .contains('"kind":"memory"'),
           isTrue);
       expect(
-        (service.sentPayloads[1]['data'] as String)
+        (service.sentPayloads[0]['data'] as String)
             .contains('改成强调 iOS 风格 UI 偏好'),
         isTrue,
       );
@@ -7335,7 +7529,7 @@ void main() {
       controller.sendInputText('继续处理');
 
       expect(service.sentPayloads, hasLength(1));
-      expect(service.sentPayloads[0]['action'], 'input');
+      expect(service.sentPayloads[0]['action'], 'ai_turn');
       expect(service.sentPayloads[0]['data'], '继续处理\n');
       expect(service.sentPayloads[0]['permissionMode'], 'default');
     });
@@ -10012,6 +10206,7 @@ class _FakeMobileVcWsService extends MobileVcWsService {
   bool relayE2eeDeviceBinding = false;
   Uint8List relayNodeFingerprint =
       Uint8List.fromList(List<int>.filled(32, 0x11));
+  Object? connectRelayError;
   String markedRelayDeviceId = '';
   RelayFileDownloadResult relayDownloadResult = RelayFileDownloadResult(
     bytes: Uint8List.fromList(<int>[1, 2, 3]),
@@ -10083,6 +10278,10 @@ class _FakeMobileVcWsService extends MobileVcWsService {
     RelayE2eeCapabilitySet? relayCapabilities,
   }) async {
     connectCalls++;
+    final error = connectRelayError;
+    if (error != null) {
+      throw error;
+    }
     _relaySession = RelaySession(
       sessionId: sessionId,
       clientId: clientId.trim().isNotEmpty ? clientId : 'rc_test',

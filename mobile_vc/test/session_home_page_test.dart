@@ -82,10 +82,9 @@ void main() {
   });
 
   testWidgets('Claude 模型面板点击卡片立即显示选中态，应用前不保存', (tester) async {
+    await _useTallSurface(tester);
     final service = _FakeMobileVcWsService();
     final controller = SessionController(service: service);
-    await controller.initialize();
-    addTearDown(controller.disposeController);
 
     await controller.saveConfig(
       const AppConfig(
@@ -101,44 +100,118 @@ void main() {
         home: SessionHomePage(controller: controller),
       ),
     );
-    await tester.pumpAndSettle();
+    await _pumpFrames(tester);
 
     await tester.tap(find.text('模型 · Sonnet'));
-    await tester.pump();
+    await _pumpFrames(tester);
 
-    service.emit(
-      RuntimeInfoResultEvent(
-        timestamp: _timestamp,
-        sessionId: 'session-1',
-        runtimeMeta: const RuntimeMeta(),
-        raw: const {'type': 'runtime_info_result'},
-        query: 'claude_models',
-        title: 'Claude 模型目录',
-        message: 'ok',
-        items: const [
-          RuntimeInfoItem(label: 'sonnet', value: 'Sonnet', status: 'default'),
-          RuntimeInfoItem(
-              label: 'Opus Plan', value: 'Opus Plan', status: 'ready'),
-        ],
+    expect(controller.configuredAiModel, 'sonnet');
+    expect(find.byIcon(Icons.check_circle_rounded), findsOneWidget);
+    expect(find.text('Sonnet 4.5'), findsAtLeastNWidgets(1));
+
+    await tester.tap(find.text('Sonnet 4.5').first);
+    await _pumpFrames(tester);
+
+    expect(controller.configuredAiModel, 'sonnet');
+    expect(find.byIcon(Icons.check_circle_rounded), findsOneWidget);
+    expect(find.text('应用 CLAUDE-SONNET-4-5'), findsOneWidget);
+
+    await tester.tap(find.text('应用 CLAUDE-SONNET-4-5'));
+    await _pumpFrames(tester);
+
+    expect(controller.configuredAiModel, 'claude-sonnet-4-5');
+
+    await controller.disposeController();
+  });
+
+  testWidgets('Codex 模型面板正确高亮 Default 并保存显式模型', (tester) async {
+    await _useTallSurface(tester);
+    final service = _FakeMobileVcWsService();
+    final controller = _ModelCatalogSessionController(service: service);
+
+    await controller.saveConfig(
+      const AppConfig(
+        cwd: '/workspace',
+        engine: 'codex',
+        permissionMode: 'default',
+        codexReasoningEffort: 'medium',
       ),
     );
-    await tester.pumpAndSettle();
 
-    expect(controller.configuredAiModel, 'sonnet');
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SessionHomePage(controller: controller),
+      ),
+    );
+    await _pumpFrames(tester);
+
+    await tester.tap(find.text('模型 · Default · MEDIUM'));
+    await _pumpFrames(tester);
+
+    expect(controller.catalogRequestCount, 1);
     expect(find.byIcon(Icons.check_circle_rounded), findsOneWidget);
-    expect(find.text('Opus Plan'), findsAtLeastNWidgets(1));
+    expect(find.text('Default'), findsAtLeastNWidgets(1));
 
-    await tester.tap(find.text('Opus Plan').first);
-    await tester.pumpAndSettle();
+    await tester.tap(find.text('gpt-5.5').first);
+    await _pumpFrames(tester);
 
-    expect(controller.configuredAiModel, 'sonnet');
-    expect(find.byIcon(Icons.check_circle_rounded), findsOneWidget);
-    expect(find.text('应用 OPUS PLAN'), findsOneWidget);
+    expect(controller.configuredAiModel, isEmpty);
+    expect(find.text('应用 gpt-5.5 · MEDIUM'), findsOneWidget);
 
-    await tester.tap(find.text('应用 OPUS PLAN'));
-    await tester.pumpAndSettle();
+    await tester.tap(find.text('应用 gpt-5.5 · MEDIUM'));
+    await _pumpFrames(tester);
 
-    expect(controller.configuredAiModel, 'opusplan');
+    expect(controller.configuredAiEngine, 'codex');
+    expect(controller.configuredAiModel, 'gpt-5.5');
+    expect(controller.configuredAiReasoningEffort, 'medium');
+    expect(controller.commandBarModelSummary, 'gpt-5.5 · MEDIUM');
+    expect(controller.catalogRequestCount, 1);
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump();
+    await controller.disposeController();
+  });
+
+  testWidgets('Relay 连接中禁用重复点击并显示进度', (tester) async {
+    await _useTallSurface(tester);
+    final service = _BlockingRelayWsService();
+    final controller = SessionController(service: service);
+    await controller.saveConfig(const AppConfig(
+      connectionMode: 'relay',
+      relayUrl: 'wss://relay.example.test',
+      relaySessionId: 'rs_test',
+      relayPairingSecret: 'pair_secret',
+      relayPairingExpiresAt: 1760000000,
+    ));
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SessionHomePage(controller: controller),
+      ),
+    );
+    await _pumpFrames(tester);
+
+    await tester.tap(find.byIcon(Icons.settings_outlined));
+    await _pumpFrames(tester);
+    await tester.tap(find.text('连接'));
+    await tester.pump();
+    await tester.tap(find.text('连接中'));
+    await tester.pump();
+
+    expect(find.text('连接中'), findsOneWidget);
+    expect(find.textContaining('一次性使用'), findsOneWidget);
+    expect(service.connectRelayCalls, 1);
+
+    service.fail(const RelayPairingException(
+      'e2ee_handshake_failed',
+      'Relay E2EE 握手失败',
+    ));
+    await _pumpFrames(tester);
+
+    expect(find.text('连接'), findsOneWidget);
+    expect(find.textContaining('当前配对链接已一次性使用'), findsAtLeastNWidgets(1));
+
+    await controller.disposeController();
   });
 }
 
@@ -147,6 +220,21 @@ final _timestamp = DateTime(2026, 1, 1);
 Future<void> _flushEvents() async {
   await Future<void>.delayed(const Duration(milliseconds: 1));
   await Future<void>.delayed(const Duration(milliseconds: 1));
+}
+
+Future<void> _useTallSurface(WidgetTester tester) async {
+  await tester.binding.setSurfaceSize(const Size(900, 1100));
+  addTearDown(() => tester.binding.setSurfaceSize(null));
+}
+
+Future<void> _pumpFrames(
+  WidgetTester tester, [
+  int count = 4,
+  Duration step = const Duration(milliseconds: 120),
+]) async {
+  for (var i = 0; i < count; i++) {
+    await tester.pump(step);
+  }
 }
 
 class _FakeMobileVcWsService extends MobileVcWsService {
@@ -159,7 +247,9 @@ class _FakeMobileVcWsService extends MobileVcWsService {
   Stream<AppEvent> get events => _controller.stream;
 
   @override
-  Future<void> connect(String url) async {}
+  Future<void> connect(String url) async {
+    connectedUrls.add(url);
+  }
 
   @override
   Future<void> connectRelay({
@@ -176,14 +266,77 @@ class _FakeMobileVcWsService extends MobileVcWsService {
   Future<void> disconnect() async {}
 
   @override
-  bool send(Map<String, dynamic> payload) => true;
+  bool send(Map<String, dynamic> payload) {
+    sentPayloads.add(Map<String, dynamic>.from(payload));
+    return true;
+  }
 
   void emit(AppEvent event) {
     _controller.add(event);
   }
 
+  final List<String> connectedUrls = [];
+  final List<Map<String, dynamic>> sentPayloads = [];
+
   @override
   Future<void> dispose() async {
     await _controller.close();
+  }
+}
+
+class _BlockingRelayWsService extends _FakeMobileVcWsService {
+  final Completer<void> _connectCompleter = Completer<void>();
+  int connectRelayCalls = 0;
+
+  @override
+  Future<void> connectRelay({
+    required String relayUrl,
+    required String sessionId,
+    String pairingSecret = '',
+    String clientId = '',
+    String clientReconnectSecret = '',
+    String nodeFingerprintHex = '',
+    RelayE2eeCapabilitySet? relayCapabilities,
+  }) async {
+    connectRelayCalls++;
+    return _connectCompleter.future;
+  }
+
+  void fail(Object error) {
+    if (!_connectCompleter.isCompleted) {
+      _connectCompleter.completeError(error);
+    }
+  }
+}
+
+class _ModelCatalogSessionController extends SessionController {
+  _ModelCatalogSessionController({required super.service});
+
+  int catalogRequestCount = 0;
+
+  @override
+  List<CodexModelCatalogEntry> get codexModelCatalog => const [
+        CodexModelCatalogEntry(
+          model: 'gpt-5.5',
+          displayName: 'gpt-5.5',
+          description: 'GPT-5.5',
+          defaultReasoningEffort: 'high',
+          supportedReasoningEfforts: ['medium', 'high'],
+          reasoningEffortOptions: [
+            CodexReasoningEffortOption(reasoningEffort: 'medium'),
+            CodexReasoningEffortOption(reasoningEffort: 'high'),
+          ],
+        ),
+      ];
+
+  @override
+  bool get codexModelCatalogLoading => false;
+
+  @override
+  String get codexModelCatalogMessage => '';
+
+  @override
+  void requestCodexModelCatalog({bool force = false}) {
+    catalogRequestCount++;
   }
 }

@@ -1,5 +1,8 @@
+import 'dart:typed_data';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:mobile_vc/data/models/session_models.dart';
 import 'package:mobile_vc/features/chat/command_input_bar.dart';
 
 void main() {
@@ -9,7 +12,7 @@ void main() {
       await tester.pumpWidget(
         _buildTestApp(
           shouldShowPermissionChoices: true,
-          onSubmit: (value) => submitted = value,
+          onSubmit: (value, _) => submitted = value,
         ),
       );
 
@@ -46,7 +49,7 @@ void main() {
       String? submitted;
       await tester.pumpWidget(
         _buildTestApp(
-          onSubmit: (value) => submitted = value,
+          onSubmit: (value, _) => submitted = value,
         ),
       );
 
@@ -86,7 +89,7 @@ void main() {
           showClaudeMode: true,
           currentEngine: 'claude',
           canStop: true,
-          onSubmit: (_) => submitted = true,
+          onSubmit: (text, images) => submitted = true,
           onStop: () => stopped = true,
         ),
       );
@@ -153,6 +156,75 @@ void main() {
       expect(stopped, isTrue);
     });
 
+    testWidgets('选择图片后先显示预览，发送时连同用户文本一起提交', (tester) async {
+      String? submittedText;
+      List<ChatImageAttachment> submittedImages = const [];
+      var pickCount = 0;
+      await tester.pumpWidget(
+        _buildTestApp(
+          onAttachImage: () async {
+            pickCount++;
+            return ChatImageAttachment(
+              name: 'screen.png',
+              mimeType: 'image/png',
+              bytes: _transparentPngBytes,
+            );
+          },
+          onSubmit: (value, images) {
+            submittedText = value;
+            submittedImages = images;
+          },
+        ),
+      );
+
+      await tester.tap(find.byTooltip('添加图片'));
+      await tester.pump();
+
+      expect(pickCount, 1);
+      expect(find.byKey(const ValueKey('imageAttachmentPreview:screen.png')),
+          findsOneWidget);
+      expect(submittedText, isNull);
+
+      await tester.enterText(find.byType(TextField), '这张图哪里有问题？');
+      await tester.tap(find.byType(FilledButton));
+      await tester.pump();
+
+      expect(submittedText, '这张图哪里有问题？');
+      expect(submittedImages, hasLength(1));
+      expect(submittedImages.single.name, 'screen.png');
+      expect(find.byKey(const ValueKey('imageAttachmentPreview:screen.png')),
+          findsNothing);
+    });
+
+    testWidgets('图片预览可以在发送前移除', (tester) async {
+      List<ChatImageAttachment>? submittedImages;
+      await tester.pumpWidget(
+        _buildTestApp(
+          onAttachImage: () async => ChatImageAttachment(
+            name: 'screen.png',
+            mimeType: 'image/png',
+            bytes: _transparentPngBytes,
+          ),
+          onSubmit: (_, images) => submittedImages = images,
+        ),
+      );
+
+      await tester.tap(find.byTooltip('添加图片'));
+      await tester.pump();
+      expect(find.byKey(const ValueKey('imageAttachmentPreview:screen.png')),
+          findsOneWidget);
+
+      await tester.tap(find.byTooltip('移除图片'));
+      await tester.pump();
+      expect(find.byKey(const ValueKey('imageAttachmentPreview:screen.png')),
+          findsNothing);
+
+      await tester.enterText(find.byType(TextField), '只发送文字');
+      await tester.tap(find.byType(FilledButton));
+      await tester.pump();
+      expect(submittedImages, isEmpty);
+    });
+
     testWidgets('loading 期间显示会话切换中 hint 并禁用输入', (tester) async {
       await tester.pumpWidget(
         _buildTestApp(
@@ -178,8 +250,9 @@ Widget _buildTestApp({
   bool showClaudeMode = true,
   String currentEngine = 'claude',
   bool isSessionLoading = false,
-  ValueChanged<String>? onSubmit,
-  VoidCallback? onAttachImage,
+  void Function(String text, List<ChatImageAttachment> imageAttachments)?
+      onSubmit,
+  Future<ChatImageAttachment?> Function()? onAttachImage,
   VoidCallback? onStop,
 }) {
   return MaterialApp(
@@ -193,8 +266,8 @@ Widget _buildTestApp({
         permissionMode: 'default',
         shouldShowPermissionChoices: shouldShowPermissionChoices,
         shouldShowReviewChoices: shouldShowReviewChoices,
-        onSubmit: onSubmit ?? (_) {},
-        onAttachImage: onAttachImage ?? () {},
+        onSubmit: onSubmit ?? (text, images) {},
+        onAttachImage: onAttachImage ?? () async => null,
         onStop: onStop ?? () {},
         onOpenSessions: () {},
         onOpenRuntimeInfo: () {},
@@ -214,3 +287,73 @@ Widget _buildTestApp({
     ),
   );
 }
+
+final _transparentPngBytes = Uint8List.fromList([
+  0x89,
+  0x50,
+  0x4e,
+  0x47,
+  0x0d,
+  0x0a,
+  0x1a,
+  0x0a,
+  0x00,
+  0x00,
+  0x00,
+  0x0d,
+  0x49,
+  0x48,
+  0x44,
+  0x52,
+  0x00,
+  0x00,
+  0x00,
+  0x01,
+  0x00,
+  0x00,
+  0x00,
+  0x01,
+  0x08,
+  0x06,
+  0x00,
+  0x00,
+  0x00,
+  0x1f,
+  0x15,
+  0xc4,
+  0x89,
+  0x00,
+  0x00,
+  0x00,
+  0x0a,
+  0x49,
+  0x44,
+  0x41,
+  0x54,
+  0x78,
+  0x9c,
+  0x63,
+  0x00,
+  0x01,
+  0x00,
+  0x00,
+  0x05,
+  0x00,
+  0x01,
+  0x0d,
+  0x0a,
+  0x2d,
+  0xb4,
+  0x00,
+  0x00,
+  0x00,
+  0x00,
+  0x49,
+  0x45,
+  0x4e,
+  0x44,
+  0xae,
+  0x42,
+  0x60,
+  0x82,
+]);

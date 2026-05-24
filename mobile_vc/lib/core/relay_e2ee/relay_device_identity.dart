@@ -77,6 +77,11 @@ class RelayDeviceIdentityStore {
     return identity;
   }
 
+  Future<bool> hasStored() async {
+    final stored = await _secureStore.read(_privateKeyName);
+    return stored != null && stored.trim().isNotEmpty;
+  }
+
   Future<void> reset() => _secureStore.delete(_privateKeyName);
 
   Future<Uint8List> signTranscript({
@@ -258,6 +263,11 @@ class RelayDeviceCredentialStore {
     final credential = RelayDeviceCredential(_newCredential());
     await _secureStore.write(_credentialName, credential.value);
     return credential;
+  }
+
+  Future<bool> hasStored() async {
+    final stored = await _secureStore.read(_credentialName);
+    return stored != null && stored.trim().isNotEmpty;
   }
 
   Future<void> reset() => _secureStore.delete(_credentialName);

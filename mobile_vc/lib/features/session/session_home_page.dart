@@ -9,6 +9,7 @@ import 'package:share_plus/share_plus.dart';
 import '../../core/config/app_config.dart';
 import '../../core/config/app_connection_endpoint.dart';
 import '../../core/config/app_connection_environment.dart';
+import '../../core/config/relay_config.dart';
 import '../../core/relay_e2ee/relay_security_state.dart';
 import '../../data/services/mobilevc_ws_service.dart';
 import '../../data/models/events.dart';
@@ -230,8 +231,8 @@ class _SessionHomePageState extends State<SessionHomePage> {
         shouldShowPermissionChoices: controller.shouldShowPermissionChoices,
         shouldShowReviewChoices: controller.shouldShowReviewChoices,
         shouldShowPlanChoices: controller.shouldShowPlanChoices,
-        onSubmit: controller.sendInputText,
-        onAttachImage: () => _sendImageAttachment(context),
+        onSubmit: controller.sendInputTextWithImages,
+        onAttachImage: () => _pickImageAttachment(context),
         onStop: controller.stopCurrentRun,
         onOpenSessions: () => _openSessions(context),
         onOpenRuntimeInfo: () => _openRuntimeInfo(context),
@@ -258,7 +259,8 @@ class _SessionHomePageState extends State<SessionHomePage> {
     _scaffoldKey.currentState?.openDrawer();
   }
 
-  Future<void> _sendImageAttachment(BuildContext context) async {
+  Future<ChatImageAttachment?> _pickImageAttachment(
+      BuildContext context) async {
     final messenger = ScaffoldMessenger.of(context);
     try {
       final result = await FilePicker.platform.pickFiles(
@@ -268,7 +270,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
         withData: true,
       );
       if (!context.mounted || result == null || result.files.isEmpty) {
-        return;
+        return null;
       }
       final file = result.files.single;
       final bytes = file.bytes ?? await _readPickedFileBytes(file);
@@ -276,38 +278,34 @@ class _SessionHomePageState extends State<SessionHomePage> {
         messenger
           ..hideCurrentSnackBar()
           ..showSnackBar(const SnackBar(content: Text('无法读取图片内容')));
-        return;
+        return null;
       }
       if (bytes.length > _maxImageAttachmentBytes) {
         messenger
           ..hideCurrentSnackBar()
           ..showSnackBar(const SnackBar(content: Text('图片不能超过 4 MiB')));
-        return;
+        return null;
       }
       final mimeType = _imageMimeType(file.name);
       if (mimeType.isEmpty) {
         messenger
           ..hideCurrentSnackBar()
           ..showSnackBar(const SnackBar(content: Text('仅支持 JPG、PNG、WebP、GIF')));
-        return;
+        return null;
       }
-      controller.sendInputTextWithImages(
-        '请查看这张图片。',
-        [
-          ChatImageAttachment(
-            name: file.name,
-            mimeType: mimeType,
-            bytes: bytes,
-          ),
-        ],
+      return ChatImageAttachment(
+        name: file.name,
+        mimeType: mimeType,
+        bytes: bytes,
       );
     } catch (error) {
       if (!context.mounted) {
-        return;
+        return null;
       }
       messenger
         ..hideCurrentSnackBar()
-        ..showSnackBar(SnackBar(content: Text('发送图片失败：$error')));
+        ..showSnackBar(SnackBar(content: Text('选择图片失败：$error')));
+      return null;
     }
   }
 
@@ -363,6 +361,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
         ? 'claude'
         : controller.config.engine.trim();
     var pendingConfig = controller.config;
+    var connectingFromSheet = false;
 
     await showModalBottomSheet<void>(
       context: context,
@@ -386,6 +385,11 @@ class _SessionHomePageState extends State<SessionHomePage> {
                       : hostController.text.trim()),
             );
             final relayModeSelected = pendingConfig.isRelayMode;
+            final connectionBusy = connectingFromSheet || controller.connecting;
+            final canConnectRelay = !relayModeSelected ||
+                pendingConfig.relayPairingSecret.trim().isNotEmpty ||
+                (pendingConfig.relayClientId.trim().isNotEmpty &&
+                    pendingConfig.relayClientReconnectSecret.trim().isNotEmpty);
 
             void applyScannedConfig(AppConfig scanned) {
               pendingConfig = scanned;
@@ -452,6 +456,9 @@ class _SessionHomePageState extends State<SessionHomePage> {
             }
 
             Future<void> handleScan() async {
+              if (connectionBusy) {
+                return;
+              }
               final scannedRaw = await showModalBottomSheet<String>(
                 context: context,
                 isScrollControlled: true,
@@ -484,6 +491,9 @@ class _SessionHomePageState extends State<SessionHomePage> {
             }
 
             Future<void> handlePasteLink() async {
+              if (connectionBusy) {
+                return;
+              }
               final scanned = parseConnectionLink(linkController.text);
               if (scanned == null) {
                 setSheetState(() {
@@ -507,7 +517,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
               showImportSnackBar(scanHint);
             }
 
-            Future<void> persistConfig({bool connect = false}) async {
+            Future<bool> persistConfig({bool connect = false}) async {
               final hostText = hostController.text.trim();
               final nextConfig = pendingConfig.copyWith(
                 host: relayModeSelected ? pendingConfig.host : hostText,
@@ -527,12 +537,15 @@ class _SessionHomePageState extends State<SessionHomePage> {
               if (connect) {
                 await controller.connect();
                 if (!controller.connected) {
-                  return;
+                  pendingConfig = controller.config;
+                  scanHint = controller.connectionMessage;
+                  return false;
                 }
               }
               if (context.mounted) {
                 Navigator.pop(context);
               }
+              return true;
             }
 
             return Padding(
@@ -546,14 +559,14 @@ class _SessionHomePageState extends State<SessionHomePage> {
                     Text('连接配置', style: Theme.of(context).textTheme.titleLarge),
                     const SizedBox(height: 6),
                     Text(
-                      '支持扫描 MobileVC 后端二维码自动回填，也保留手动输入方式。',
+                      '支持扫描局域网二维码或 Relay 配对二维码，也保留手动输入方式。',
                       style: Theme.of(context).textTheme.bodySmall,
                     ),
                     const SizedBox(height: 12),
                     SizedBox(
                       width: double.infinity,
                       child: OutlinedButton.icon(
-                        onPressed: handleScan,
+                        onPressed: connectionBusy ? null : handleScan,
                         icon: const Icon(Icons.qr_code_scanner),
                         label: const Text('扫码连接'),
                       ),
@@ -564,6 +577,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
                         Expanded(
                           child: TextField(
                             controller: linkController,
+                            enabled: !connectionBusy,
                             decoration: const InputDecoration(
                               labelText: '连接链接',
                               hintText: 'mobilevc://relay/v1?...',
@@ -572,7 +586,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
                         ),
                         const SizedBox(width: 10),
                         FilledButton.tonal(
-                          onPressed: handlePasteLink,
+                          onPressed: connectionBusy ? null : handlePasteLink,
                           child: const Text('导入'),
                         ),
                       ],
@@ -585,25 +599,89 @@ class _SessionHomePageState extends State<SessionHomePage> {
                       ),
                     ],
                     const SizedBox(height: 12),
-                    TextField(
-                      controller: hostController,
-                      decoration: const InputDecoration(
-                        labelText: 'Host / URL',
-                        hintText: 'https://host',
+                    if (relayModeSelected) ...[
+                      _RelayPairingSummary(config: pendingConfig),
+                    ] else ...[
+                      TextField(
+                        controller: hostController,
+                        enabled: !connectionBusy,
+                        decoration: const InputDecoration(
+                          labelText: 'Host / URL',
+                          hintText: 'https://host',
+                        ),
+                        onChanged: (_) => setSheetState(() {}),
                       ),
-                      onChanged: (_) => setSheetState(() {}),
+                      const SizedBox(height: 10),
+                      TextField(
+                          controller: portController,
+                          enabled: !connectionBusy,
+                          decoration: const InputDecoration(labelText: 'Port')),
+                      const SizedBox(height: 10),
+                      TextField(
+                          controller: tokenController,
+                          enabled: !connectionBusy,
+                          decoration:
+                              const InputDecoration(labelText: 'Token')),
+                    ],
+                    const SizedBox(height: 10),
+                    SegmentedButton<ConnectionMode>(
+                      segments: const [
+                        ButtonSegment(
+                          value: ConnectionMode.direct,
+                          icon: Icon(Icons.lan_outlined),
+                          label: Text('直连'),
+                        ),
+                        ButtonSegment(
+                          value: ConnectionMode.relay,
+                          icon: Icon(Icons.hub_outlined),
+                          label: Text('中继'),
+                        ),
+                      ],
+                      selected: {
+                        relayModeSelected
+                            ? ConnectionMode.relay
+                            : ConnectionMode.direct,
+                      },
+                      onSelectionChanged: connectionBusy
+                          ? null
+                          : (selection) {
+                              final mode = selection.first;
+                              setSheetState(() {
+                                if (mode == ConnectionMode.direct) {
+                                  pendingConfig = pendingConfig.copyWith(
+                                    connectionMode: ConnectionMode.direct.name,
+                                  );
+                                  scanHint = '已切换为局域网直连模式';
+                                  return;
+                                }
+                                if (pendingConfig.relayUrl.trim().isEmpty ||
+                                    pendingConfig.relaySessionId
+                                        .trim()
+                                        .isEmpty) {
+                                  scanHint = '请先导入 Relay 配对链接';
+                                  return;
+                                }
+                                pendingConfig = pendingConfig.copyWith(
+                                  connectionMode: ConnectionMode.relay.name,
+                                );
+                                scanHint = '已切换为 Relay 中继模式';
+                              });
+                            },
                     ),
-                    const SizedBox(height: 10),
-                    TextField(
-                        controller: portController,
-                        decoration: const InputDecoration(labelText: 'Port')),
-                    const SizedBox(height: 10),
-                    TextField(
-                        controller: tokenController,
-                        decoration: const InputDecoration(labelText: 'Token')),
+                    if (relayModeSelected &&
+                        pendingConfig.relayNodeFingerprintHex
+                            .trim()
+                            .isNotEmpty) ...[
+                      const SizedBox(height: 8),
+                      Text(
+                        '节点指纹：${_shortFingerprint(pendingConfig.relayNodeFingerprintHex)}',
+                        style: Theme.of(context).textTheme.bodySmall,
+                      ),
+                    ],
                     const SizedBox(height: 10),
                     TextField(
                         controller: cwdController,
+                        enabled: !connectionBusy,
                         decoration: const InputDecoration(labelText: 'CWD')),
                     const SizedBox(height: 10),
                     DropdownButtonFormField<String>(
@@ -623,18 +701,21 @@ class _SessionHomePageState extends State<SessionHomePage> {
                           child: Text('Gemini'),
                         ),
                       ],
-                      onChanged: (value) {
-                        if (value == null) {
-                          return;
-                        }
-                        setSheetState(() {
-                          selectedEngine = value;
-                        });
-                      },
+                      onChanged: connectionBusy
+                          ? null
+                          : (value) {
+                              if (value == null) {
+                                return;
+                              }
+                              setSheetState(() {
+                                selectedEngine = value;
+                              });
+                            },
                     ),
                     const SizedBox(height: 10),
                     TextField(
                         controller: permissionController,
+                        enabled: !connectionBusy,
                         decoration: const InputDecoration(
                             labelText: 'Permission Mode')),
                     const SizedBox(height: 10),
@@ -644,11 +725,13 @@ class _SessionHomePageState extends State<SessionHomePage> {
                         labelText: 'ADB TURN Host Override',
                         hintText: '留空则跟 Host 一致',
                       ),
+                      enabled: !relayModeSelected && !connectionBusy,
                       onChanged: (_) => setSheetState(() {}),
                     ),
                     const SizedBox(height: 10),
                     TextField(
                       controller: iceUsernameController,
+                      enabled: !connectionBusy,
                       decoration: const InputDecoration(
                         labelText: 'ADB TURN Username',
                         hintText: 'mobilevc',
@@ -657,6 +740,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
                     const SizedBox(height: 10),
                     TextField(
                       controller: iceCredentialController,
+                      enabled: !connectionBusy,
                       decoration: const InputDecoration(
                         labelText: 'ADB TURN Credential',
                         hintText: 'credential',
@@ -690,25 +774,71 @@ class _SessionHomePageState extends State<SessionHomePage> {
                       children: [
                         Expanded(
                           child: FilledButton.tonal(
-                            onPressed: () => persistConfig(),
+                            onPressed:
+                                connectionBusy ? null : () => persistConfig(),
                             child: const Text('保存'),
                           ),
                         ),
                         const SizedBox(width: 10),
                         Expanded(
                           child: FilledButton(
-                            onPressed: () async {
-                              await persistConfig(connect: true);
-                              if (!context.mounted || controller.connected) {
-                                return;
-                              }
-                              ScaffoldMessenger.of(context).showSnackBar(
-                                SnackBar(
-                                    content:
-                                        Text(controller.connectionMessage)),
-                              );
-                            },
-                            child: const Text('连接'),
+                            onPressed: connectionBusy || !canConnectRelay
+                                ? null
+                                : () async {
+                                    setSheetState(() {
+                                      connectingFromSheet = true;
+                                      scanHint = relayModeSelected
+                                          ? '正在连接 Relay：配对链接会一次性使用，请等待结果。'
+                                          : '正在连接...';
+                                    });
+                                    var connected = false;
+                                    try {
+                                      connected =
+                                          await persistConfig(connect: true);
+                                    } catch (error) {
+                                      if (!context.mounted) {
+                                        return;
+                                      }
+                                      setSheetState(() {
+                                        connectingFromSheet = false;
+                                        pendingConfig = controller.config;
+                                        scanHint = '连接配置失败：$error';
+                                      });
+                                    }
+                                    if (!context.mounted ||
+                                        connected ||
+                                        controller.connected) {
+                                      return;
+                                    }
+                                    setSheetState(() {
+                                      connectingFromSheet = false;
+                                      pendingConfig = controller.config;
+                                      scanHint = controller.connectionMessage;
+                                    });
+                                    ScaffoldMessenger.of(context).showSnackBar(
+                                      SnackBar(
+                                        content:
+                                            Text(controller.connectionMessage),
+                                      ),
+                                    );
+                                  },
+                            child: connectionBusy
+                                ? const Row(
+                                    mainAxisAlignment: MainAxisAlignment.center,
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      SizedBox(
+                                        width: 16,
+                                        height: 16,
+                                        child: CircularProgressIndicator(
+                                          strokeWidth: 2,
+                                        ),
+                                      ),
+                                      SizedBox(width: 8),
+                                      Text('连接中'),
+                                    ],
+                                  )
+                                : const Text('连接'),
                           ),
                         ),
                       ],
@@ -718,12 +848,14 @@ class _SessionHomePageState extends State<SessionHomePage> {
                       SizedBox(
                         width: double.infinity,
                         child: OutlinedButton(
-                          onPressed: () async {
-                            await controller.disconnect();
-                            if (context.mounted) {
-                              Navigator.pop(context);
-                            }
-                          },
+                          onPressed: connectionBusy
+                              ? null
+                              : () async {
+                                  await controller.disconnect();
+                                  if (context.mounted) {
+                                    Navigator.pop(context);
+                                  }
+                                },
                           child: const Text('断开连接'),
                         ),
                       ),
@@ -732,7 +864,9 @@ class _SessionHomePageState extends State<SessionHomePage> {
                       SizedBox(
                         width: double.infinity,
                         child: OutlinedButton.icon(
-                          onPressed: () => _openRelaySecurity(context),
+                          onPressed: connectionBusy
+                              ? null
+                              : () => _openRelaySecurity(context),
                           icon: const Icon(Icons.verified_user_outlined),
                           label: const Text('Relay 安全设备'),
                         ),
@@ -1122,7 +1256,10 @@ class _SessionHomePageState extends State<SessionHomePage> {
   }
 
   Future<void> _openModelSwitcher(BuildContext context) async {
-    final engine = controller.currentAiEngine;
+    final engine = controller.configuredAiEngine;
+    if (engine == 'codex') {
+      controller.requestCodexModelCatalog(force: true);
+    }
 
     // 先打开模态框，显示加载状态
     await showModalBottomSheet<void>(
@@ -1132,11 +1269,6 @@ class _SessionHomePageState extends State<SessionHomePage> {
       showDragHandle: true,
       backgroundColor: Colors.transparent,
       builder: (context) {
-        // 在打开时请求模型目录（移除 isEmpty 检查，总是请求）
-        if (engine == 'codex') {
-          controller.requestCodexModelCatalog(force: true);
-        }
-
         return _ModelSwitcherSheet(
           controller: controller,
           engine: engine,
@@ -1902,8 +2034,12 @@ class _ModelSwitcherSheetState extends State<_ModelSwitcherSheet> {
                                                           selectedModel,
                                                           option.value,
                                                         )
-                                                      : selectedModel ==
-                                                          option.value,
+                                                      : option.value ==
+                                                              selectedModel ||
+                                                          (option.value ==
+                                                                  'default' &&
+                                                              selectedModel
+                                                                  .isEmpty),
                                                   onTap: () {
                                                     setState(() {
                                                       selectedModel =
@@ -1949,6 +2085,7 @@ class _ModelSwitcherSheetState extends State<_ModelSwitcherSheet> {
                                     await controller.updateAiModelSelection(
                                       model: selectedModel,
                                       reasoningEffort: selectedEffort,
+                                      engine: engine,
                                     );
                                     if (context.mounted) {
                                       Navigator.of(context).pop();
@@ -1969,6 +2106,7 @@ class _ModelSwitcherSheetState extends State<_ModelSwitcherSheet> {
                                         await controller.updateAiModelSelection(
                                           model: selectedModel,
                                           reasoningEffort: selectedEffort,
+                                          engine: engine,
                                         );
                                         if (context.mounted) {
                                           Navigator.of(context).pop();
@@ -2258,6 +2396,99 @@ class _SessionObservationBanner extends StatelessWidget {
               child: const Text('继续同会话'),
             ),
           ],
+        ],
+      ),
+    );
+  }
+}
+
+class _RelayPairingSummary extends StatelessWidget {
+  const _RelayPairingSummary({required this.config});
+
+  final AppConfig config;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final sessionId = config.relaySessionId.trim();
+    final relayUrl = config.relayUrl.trim();
+    final expiresAt = config.relayPairingExpiresAt;
+    return Material(
+      color: scheme.surfaceContainerHighest.withValues(alpha: 0.42),
+      borderRadius: BorderRadius.circular(16),
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(Icons.hub_outlined, color: scheme.primary),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    'Relay 中继已导入',
+                    style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                          fontWeight: FontWeight.w800,
+                        ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 10),
+            _RelaySummaryLine(label: 'Relay', value: relayUrl),
+            if (sessionId.isNotEmpty)
+              _RelaySummaryLine(label: 'Session', value: sessionId),
+            if (expiresAt > 0)
+              _RelaySummaryLine(
+                label: '有效期',
+                value: _formatRelayPairingExpiry(expiresAt),
+              ),
+            _RelaySummaryLine(
+              label: 'E2EE',
+              value: config.relayCapabilities?.requiresE2EE == true
+                  ? '需要端到端加密'
+                  : '未声明',
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _RelaySummaryLine extends StatelessWidget {
+  const _RelaySummaryLine({required this.label, required this.value});
+
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Padding(
+      padding: const EdgeInsets.only(top: 4),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 64,
+            child: Text(
+              label,
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: scheme.onSurfaceVariant,
+                  ),
+            ),
+          ),
+          Expanded(
+            child: Text(
+              value,
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                fontFeatures: const [FontFeature.tabularFigures()],
+                height: 1.35,
+              ),
+            ),
+          ),
         ],
       ),
     );
@@ -2635,6 +2866,14 @@ String _shortFingerprint(String value) {
       ? normalized
       : '${normalized.substring(0, 8)} ${normalized.substring(8, 16)}';
   return 'fp $prefix';
+}
+
+String _formatRelayPairingExpiry(int unixSeconds) {
+  final value = DateTime.fromMillisecondsSinceEpoch(
+    unixSeconds * 1000,
+    isUtc: true,
+  ).toLocal();
+  return _formatRelayDeviceTime(value);
 }
 
 String _formatRelayDeviceTime(DateTime? value) {

@@ -1485,6 +1485,7 @@ bool isRelayAuthError(Map<String, dynamic> frame, bool authPending) =>
 String relayErrorMessage(Map<String, dynamic> frame) =>
     switch ((frame['code'] ?? '').toString()) {
       'payload_too_large' => 'Relay 数据包过大：当前消息超过中继限制，请关闭 ADB 截屏流或减少单次同步内容后重试',
+      'agent_disconnected' => '本机 Relay 正在重连，请稍后自动恢复',
       'e2ee_required' => 'Relay 已禁用明文连接：请更新手机端和本机服务，重新配对并启用 E2EE',
       'e2ee_unsupported_version' => 'Relay E2EE 版本不兼容：请更新手机端和本机服务后重新连接',
       'e2ee_fingerprint_mismatch' => 'Relay 节点指纹不一致：请停止连接并重新确认配对链接',
