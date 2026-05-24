@@ -44,6 +44,8 @@ node_modules/
 .vscode/
 *.swp
 *.swo
+.fvm/
+.fvmrc
 
 # 系统文件
 .DS_Store
