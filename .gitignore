@@ -1,5 +1,11 @@
 # 编译产物
 /server
+/mobilevc-server
+/mobilevc-relay
+/relay
+/*.apk
+/*.aab
+/*.ipa
 packages/
 cmd/server/web/*
 !cmd/server/web/.gitkeep
