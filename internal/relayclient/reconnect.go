@@ -56,6 +56,9 @@ func reconnectWithinGrace(ctx context.Context, cfg Config, sessionID string, rec
 				return conn, nil
 			}
 			_ = conn.Close()
+			if errors.Is(err, errAgentReconnectRejected) {
+				return nil, err
+			}
 		}
 		if err := sleepBackoff(ctx, backoff.Initial); err != nil {
 			return nil, err

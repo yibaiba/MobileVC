@@ -1,6 +1,9 @@
 package relay
 
-import "testing"
+import (
+	"path/filepath"
+	"testing"
+)
 
 func TestLoadConfigFromEnvRejectsInvalidDuration(t *testing.T) {
 	withRelayEnv(t, map[string]string{
@@ -43,6 +46,35 @@ func TestLoadConfigFromEnvReadsPayloadByteLimit(t *testing.T) {
 	}
 	if cfg.MaxPayloadBytes != 12*1024 {
 		t.Fatalf("payload bytes: got %d", cfg.MaxPayloadBytes)
+	}
+}
+
+func TestLoadConfigFromEnvUsesDefaultStatePath(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	withRelayEnv(t, map[string]string{})
+
+	cfg, err := LoadConfigFromEnv()
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	want := filepath.Join(home, ".mobilevc", "relay", "public_relay_state.json")
+	if cfg.StatePath != want {
+		t.Fatalf("state path: got %q want %q", cfg.StatePath, want)
+	}
+}
+
+func TestLoadConfigReadsStatePathOverride(t *testing.T) {
+	withRelayEnv(t, map[string]string{
+		"RELAY_STATE_PATH": "/tmp/mobilevc-relay-state.json",
+	})
+
+	cfg, err := LoadConfig(Overrides{StatePath: "/tmp/override-relay-state.json"})
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.StatePath != "/tmp/override-relay-state.json" {
+		t.Fatalf("state path override not applied: %#v", cfg)
 	}
 }
 
@@ -198,6 +230,7 @@ func withRelayEnv(t *testing.T, values map[string]string) {
 		"RELAY_MAX_PAYLOAD_BYTES",
 		"RELAY_HTTP_ALLOWLIST",
 		"RELAY_WS_ALLOWLIST",
+		"RELAY_STATE_PATH",
 		"RELAY_REQUIRE_E2EE",
 		"RELAY_PLAINTEXT_TEST_MODE",
 	}

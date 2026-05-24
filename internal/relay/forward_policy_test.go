@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"encoding/json"
 	"errors"
 	"testing"
 )
@@ -32,6 +33,24 @@ func TestForwardSecurityPolicyAcceptsE2EEForwardMetadata(t *testing.T) {
 
 	if err := policy.Validate(env); err != nil {
 		t.Fatalf("validate e2ee forward: %v", err)
+	}
+}
+
+func TestE2EEForwardJSONIncludesZeroCounter(t *testing.T) {
+	env := forwardPolicyEnvelope(EncryptionE2EEV1)
+	env.StreamID = 1
+	env.Counter = 0
+	env.HandshakeID = "hs_123"
+	raw, err := json.Marshal(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := decoded["counter"]; !ok {
+		t.Fatalf("missing zero counter field in %s", raw)
 	}
 }
 

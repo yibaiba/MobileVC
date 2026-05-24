@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -56,13 +57,29 @@ func loadRelayConfig() (RelayConfig, error) {
 	if err != nil {
 		return RelayConfig{}, err
 	}
+	sessionStatePath, err := relayAgentSessionStatePath()
+	if err != nil {
+		return RelayConfig{}, err
+	}
 	return RelayConfig{
 		Enabled:          getEnvBool("RELAY_MODE", false),
 		URL:              strings.TrimSpace(os.Getenv("RELAY_URL")),
 		PairingTTL:       pairingTTL,
 		AgentGracePeriod: grace,
 		PairingEventPath: strings.TrimSpace(os.Getenv("RELAY_PAIRING_EVENT_PATH")),
+		SessionStatePath: sessionStatePath,
 		HTTPAllowlist:    strings.TrimSpace(os.Getenv("RELAY_HTTP_ALLOWLIST")),
 		WSAllowlist:      strings.TrimSpace(os.Getenv("RELAY_WS_ALLOWLIST")),
 	}, nil
+}
+
+func relayAgentSessionStatePath() (string, error) {
+	if value := strings.TrimSpace(os.Getenv("RELAY_AGENT_SESSION_STATE_PATH")); value != "" {
+		return value, nil
+	}
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(homeDir, ".mobilevc", "relay", "agent_session.json"), nil
 }

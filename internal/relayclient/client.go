@@ -24,6 +24,7 @@ type Config struct {
 	PairingTTL         time.Duration
 	AgentGracePeriod   time.Duration
 	PairingEventPath   string
+	SessionStatePath   string
 	ReconnectBackoff   ReconnectBackoff
 	DownloadRoots      []string
 	Capabilities       e2ee.CapabilitySet
@@ -53,7 +54,10 @@ type LocalPairingEmitter func(string, PairingReadyEvent) error
 
 const relayControlTimeout = 10 * time.Second
 
-var errRelaySessionRotated = errors.New("relay session rotated")
+var (
+	errRelaySessionRotated    = errors.New("relay session rotated")
+	errAgentReconnectRejected = errors.New("relay agent reconnect rejected")
+)
 
 type agentRegisterRequest struct {
 	SessionID       string
@@ -86,6 +90,30 @@ func Run(ctx context.Context, cfg Config, handler Handler, emit LocalPairingEmit
 }
 
 func runRegisteredSession(ctx context.Context, cfg Config, handler Handler, emit LocalPairingEmitter) error {
+	store := newAgentSessionStore(cfg.SessionStatePath)
+	saved, err := store.load()
+	if err != nil {
+		return err
+	}
+	if saved.valid() {
+		err := runSavedSession(ctx, cfg, handler, saved)
+		if errors.Is(err, errRelaySessionRotated) {
+			if deleteErr := store.delete(); deleteErr != nil {
+				return deleteErr
+			}
+			return err
+		}
+		if errors.Is(err, errAgentReconnectRejected) {
+			if deleteErr := store.delete(); deleteErr != nil {
+				return deleteErr
+			}
+			logx.Warn("relay", "saved relay session was rejected; registering new relay session")
+		} else if err == nil || ctx.Err() != nil {
+			return err
+		} else {
+			logx.Warn("relay", "saved relay session reconnect failed; registering new relay session: %v", err)
+		}
+	}
 	pairingSecret, err := relay.NewSecret()
 	if err != nil {
 		return err
@@ -112,6 +140,13 @@ func runRegisteredSession(ctx context.Context, cfg Config, handler Handler, emit
 		_ = conn.Close()
 		return fmt.Errorf("relay node fingerprint is required")
 	}
+	if err := store.save(agentSessionState{
+		SessionID:       sessionID,
+		ReconnectSecret: reconnectSecret,
+	}); err != nil {
+		_ = conn.Close()
+		return err
+	}
 	if err := emit(cfg.PairingEventPath, PairingReadyEvent{
 		Type:               "mobilevc.relay.pairing_ready",
 		RelayURL:           cfg.RelayURL,
@@ -122,10 +157,31 @@ func runRegisteredSession(ctx context.Context, cfg Config, handler Handler, emit
 		NodeFingerprintHex: nodeFingerprintHex,
 	}); err != nil {
 		_ = conn.Close()
+		_ = store.delete()
 		return err
 	}
 	defer removePairingEventFile(cfg.PairingEventPath)
-	return serveWithReconnect(ctx, cfg, handler, conn, sessionID, pairingSecret, reconnectSecret)
+	err = serveWithReconnect(ctx, cfg, handler, conn, sessionID, pairingSecret, reconnectSecret)
+	if errors.Is(err, errRelaySessionRotated) {
+		if deleteErr := store.delete(); deleteErr != nil {
+			return deleteErr
+		}
+	}
+	return err
+}
+
+func runSavedSession(ctx context.Context, cfg Config, handler Handler, saved agentSessionState) error {
+	conn, err := reconnectWithinGrace(
+		ctx,
+		cfg,
+		saved.SessionID,
+		saved.ReconnectSecret,
+		time.Now().Add(cfg.AgentGracePeriod),
+	)
+	if err != nil {
+		return err
+	}
+	return serveWithReconnect(ctx, cfg, handler, conn, saved.SessionID, "", saved.ReconnectSecret)
 }
 
 func relayClientCapabilities(cfg Config) e2ee.CapabilitySet {
@@ -304,7 +360,7 @@ func reconnectAgent(conn *websocket.Conn, req agentReconnectRequest) error {
 		return fmt.Errorf("read relay agent reconnect response: %w", err)
 	}
 	if registered.Type != relay.TypeAgentRegistered || registered.SessionID != req.SessionID {
-		return fmt.Errorf("relay agent reconnect rejected")
+		return errAgentReconnectRejected
 	}
 	return nil
 }
@@ -334,11 +390,8 @@ func EmitPairingFile(path string, event PairingReadyEvent) error {
 	if err != nil {
 		return fmt.Errorf("marshal pairing event: %w", err)
 	}
-	if err := os.WriteFile(path, append(raw, '\n'), 0o600); err != nil {
+	if err := writeFileAtomic(path, append(raw, '\n'), 0o600); err != nil {
 		return fmt.Errorf("write pairing event file: %w", err)
-	}
-	if err := os.Chmod(path, 0o600); err != nil {
-		return fmt.Errorf("secure pairing event file: %w", err)
 	}
 	return nil
 }

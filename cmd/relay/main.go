@@ -55,6 +55,7 @@ func parseRelayFlags(args []string) (relay.Overrides, bool, error) {
 	var pairingTTL, gracePeriod, handshakeTimeout, registerTimeout, pingInterval, pongTimeout string
 	fs.StringVar(&overrides.Addr, "addr", "", "listen address, e.g. :9000")
 	fs.StringVar(&overrides.PublicURL, "public-url", "", "public relay ws:// or wss:// URL")
+	fs.StringVar(&overrides.StatePath, "state-path", "", "owner-only relay state JSON path for device reconnect across relay restarts")
 	fs.StringVar(&pairingTTL, "pairing-ttl", "", "pairing TTL, e.g. 5m")
 	fs.StringVar(&gracePeriod, "agent-grace-period", "", "agent reconnect grace period, e.g. 60s")
 	fs.StringVar(&handshakeTimeout, "pairing-handshake-timeout", "", "client pairing handshake timeout, e.g. 10s")

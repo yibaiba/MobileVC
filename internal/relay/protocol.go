@@ -130,7 +130,7 @@ type ForwardEnvelope struct {
 	PayloadEncoding string `json:"payloadEncoding"`
 	Payload         string `json:"payload"`
 	StreamID        uint64 `json:"streamId,omitempty"`
-	Counter         uint64 `json:"counter,omitempty"`
+	Counter         uint64 `json:"counter"`
 	HandshakeID     string `json:"handshakeId,omitempty"`
 }
 
@@ -171,7 +171,7 @@ func defaultErrorMessage(code string) string {
 	case CodeQueueFull:
 		return "queue full"
 	case CodeAgentDisconnected:
-		return "agent disconnected"
+		return "agent reconnecting"
 	case CodeControllerDisconnect:
 		return "controller disconnected"
 	case CodeE2EERequired:

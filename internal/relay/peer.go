@@ -89,11 +89,13 @@ func (p *peerConn) StartWriter(interval time.Duration) {
 				return
 			}
 			if err := p.WriteJSON(msg); err != nil {
+				_ = p.Close()
 				return
 			}
 		case <-ticker.C:
 			deadline := time.Now().Add(peerWriteTimeout)
 			if err := p.WriteControl(websocket.PingMessage, nil, deadline); err != nil {
+				_ = p.Close()
 				return
 			}
 		}

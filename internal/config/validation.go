@@ -18,6 +18,9 @@ func (c Config) validateRelay() error {
 	if strings.TrimSpace(c.Relay.PairingEventPath) == "" {
 		return fmt.Errorf("RELAY_PAIRING_EVENT_PATH is required when RELAY_MODE is true")
 	}
+	if strings.TrimSpace(c.Relay.SessionStatePath) == "" {
+		return fmt.Errorf("RELAY_AGENT_SESSION_STATE_PATH is required when RELAY_MODE is true")
+	}
 	if c.Relay.PairingTTL <= 0 || c.Relay.AgentGracePeriod <= 0 {
 		return fmt.Errorf("relay durations must be positive")
 	}

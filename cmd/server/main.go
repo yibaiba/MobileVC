@@ -224,6 +224,7 @@ func relayConfig(cfg config.Config, trustStore *e2ee.DeviceTrustStore, nodeIdent
 		PairingTTL:         cfg.Relay.PairingTTL,
 		AgentGracePeriod:   cfg.Relay.AgentGracePeriod,
 		PairingEventPath:   cfg.Relay.PairingEventPath,
+		SessionStatePath:   cfg.Relay.SessionStatePath,
 		DownloadRoots:      []string{downloadRoot},
 		SelectedRoutes:     selectedRoutes,
 		Capabilities:       e2ee.ProductionCapabilities(),

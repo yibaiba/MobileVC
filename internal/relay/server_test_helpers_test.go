@@ -78,6 +78,9 @@ func applyTestOverrides(cfg *Config, overrides Config) {
 	if overrides.TrustedProxyCIDRs != "" {
 		cfg.TrustedProxyCIDRs = overrides.TrustedProxyCIDRs
 	}
+	if overrides.StatePath != "" {
+		cfg.StatePath = overrides.StatePath
+	}
 	if overrides.RequireE2EE {
 		cfg.RequireE2EE = true
 		cfg.PlaintextTestMode = false

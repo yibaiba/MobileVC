@@ -51,6 +51,9 @@ func (s *Server) dispatchPostAuthFrame(peer *peerConn, sessionID string, directi
 		}
 		return s.forwardEnvelope(peer, sessionID, direction, env)
 	}
+	if frame.Type == TypeRelayPong {
+		return nil
+	}
 	if isE2EEHandshakeFrameType(frame.Type) {
 		return s.forwardE2EEHandshakeFrame(peer, sessionID, direction, frame.Type, raw)
 	}
@@ -79,7 +82,7 @@ func (s *Server) forwardE2EEHandshakeFrame(peer *peerConn, sessionID string, dir
 	}
 	target := s.targetConn(sessionID, direction)
 	if target == nil {
-		writeError(peer, CodeTargetUnavailable)
+		writeError(peer, s.targetUnavailableCode(sessionID, direction))
 		return errors.New("target unavailable")
 	}
 	if err := target.Enqueue(frame); err != nil {
@@ -157,10 +160,17 @@ func (s *Server) forwardEnvelope(peer *peerConn, sessionID string, direction str
 	var err error
 	env, err = s.normalizeForward(peer, sessionID, direction, env)
 	if err != nil {
+		logForwardReject(peer, sessionID, direction, env, "normalize", err)
 		writeError(peer, CodeProtocolError)
 		return err
 	}
-	if err := s.validateForward(peer, sessionID, direction, env); err != nil {
+	if err := validateForwardMetadata(env, sessionID, direction); err != nil {
+		logForwardReject(peer, sessionID, direction, env, "metadata", err)
+		writeError(peer, CodeProtocolError)
+		return err
+	}
+	if err := s.forwardSecurityPolicy().Validate(env); err != nil {
+		logForwardReject(peer, sessionID, direction, env, "security", err)
 		writeError(peer, forwardValidationErrorCode(err))
 		return err
 	}
@@ -176,14 +186,39 @@ func (s *Server) forwardEnvelope(peer *peerConn, sessionID string, direction str
 	}
 	target := s.targetConn(sessionID, direction)
 	if target == nil {
-		writeError(peer, CodeTargetUnavailable)
-		return errors.New("target unavailable")
+		writeError(peer, s.targetUnavailableCode(sessionID, direction))
+		return nil
+	}
+	if !s.forwardClientIDMatches(peer, sessionID, env.ClientID) {
+		logForwardReject(peer, sessionID, direction, env, "client_id", errors.New("invalid forward client id"))
+		writeError(peer, CodeProtocolError)
+		return errors.New("invalid forward client id")
 	}
 	if err := target.Enqueue(env); err != nil {
 		writeError(peer, CodeQueueFull)
-		return err
+		return nil
 	}
 	return nil
+}
+
+func logForwardReject(peer *peerConn, sessionID string, direction string, env ForwardEnvelope, stage string, err error) {
+	logx.Warn(
+		"relay",
+		"reject relay forward: role=%s remote=%s sessionID=%s direction=%s envSessionID=%s clientID=%s envDirection=%s encryption=%s streamID=%d handshakeIDSet=%t counter=%d stage=%s err=%v",
+		peer.role,
+		peer.remote,
+		sessionID,
+		direction,
+		env.SessionID,
+		env.ClientID,
+		env.Direction,
+		env.Encryption,
+		env.StreamID,
+		strings.TrimSpace(env.HandshakeID) != "",
+		env.Counter,
+		stage,
+		err,
+	)
 }
 
 func (s *Server) normalizeForward(peer *peerConn, sessionID string, direction string, env ForwardEnvelope) (ForwardEnvelope, error) {
@@ -206,19 +241,6 @@ func (s *Server) activeClientID(peer *peerConn, sessionID string) (string, error
 		return "", errors.New("missing active relay client")
 	}
 	return state.clientID, nil
-}
-
-func (s *Server) validateForward(peer *peerConn, sessionID string, direction string, env ForwardEnvelope) error {
-	if err := validateForwardMetadata(env, sessionID, direction); err != nil {
-		return err
-	}
-	if err := s.forwardSecurityPolicy().Validate(env); err != nil {
-		return err
-	}
-	if !s.forwardClientIDMatches(peer, sessionID, env.ClientID) {
-		return errors.New("invalid forward client id")
-	}
-	return nil
 }
 
 func (s *Server) forwardSecurityPolicy() ForwardSecurityPolicy {
@@ -306,6 +328,20 @@ func (s *Server) targetConn(sessionID string, direction string) *peerConn {
 	return state.client
 }
 
+func (s *Server) targetUnavailableCode(sessionID string, direction string) string {
+	if direction == DirectionClientToAgent && s.agentTemporarilyDisconnected(sessionID) {
+		return CodeAgentDisconnected
+	}
+	return CodeTargetUnavailable
+}
+
+func (s *Server) agentTemporarilyDisconnected(sessionID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state := s.sessions[sessionID]
+	return state.agentDisconnectedWithinGrace(s.cfg.AgentGracePeriod)
+}
+
 func (s *Server) markAgentDisconnected(sessionID string, peer *peerConn) {
 	s.mu.Lock()
 	state := s.sessions[sessionID]
@@ -316,6 +352,7 @@ func (s *Server) markAgentDisconnected(sessionID string, peer *peerConn) {
 	state.agent = nil
 	state.agentDisconnectedAt = time.Now()
 	disconnectedAt := state.agentDisconnectedAt
+	_ = s.saveStateLocked()
 	s.mu.Unlock()
 	go s.expireDisconnectedAgent(sessionID, disconnectedAt)
 }
@@ -336,6 +373,7 @@ func (s *Server) removeExpiredDisconnectedAgent(sessionID string, disconnectedAt
 		return nil
 	}
 	delete(s.sessions, sessionID)
+	_ = s.saveStateLocked()
 	return state.client
 }
 
@@ -347,13 +385,17 @@ func (s *Server) markClientDisconnected(sessionID string, peer *peerConn) {
 		return
 	}
 	state.client = nil
+	state.clientID = ""
+	_ = s.saveStateLocked()
 }
 
 func writeError(peer *peerConn, code string) {
+	logx.Warn("relay", "sending relay error: role=%s remote=%s code=%s", peer.role, peer.remote, code)
 	_ = peer.WriteJSON(NewErrorFrame(code))
 }
 
 func writeErrorFrame(peer *peerConn, frame ErrorFrame) {
+	logx.Warn("relay", "sending relay error: role=%s remote=%s code=%s", peer.role, peer.remote, frame.Code)
 	_ = peer.WriteJSON(frame)
 }
 

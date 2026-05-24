@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -30,6 +31,7 @@ const (
 	defaultWSAllowedRoutes         = "GET:/ws"
 	defaultRequireE2EE             = true
 	defaultPlaintextTestMode       = false
+	defaultStateFileName           = "public_relay_state.json"
 )
 
 type RouteRule struct {
@@ -40,6 +42,7 @@ type RouteRule struct {
 type Config struct {
 	Addr                    string
 	PublicURL               string
+	StatePath               string
 	PairingTTL              time.Duration
 	AgentGracePeriod        time.Duration
 	PairingHandshakeTimeout time.Duration
@@ -64,6 +67,7 @@ type Config struct {
 type Overrides struct {
 	Addr                    string
 	PublicURL               string
+	StatePath               string
 	PairingTTL              time.Duration
 	AgentGracePeriod        time.Duration
 	PairingHandshakeTimeout time.Duration
@@ -109,6 +113,9 @@ func applyOverrides(cfg *Config, overrides Overrides) error {
 	}
 	if strings.TrimSpace(overrides.PublicURL) != "" {
 		cfg.PublicURL = strings.TrimSpace(overrides.PublicURL)
+	}
+	if strings.TrimSpace(overrides.StatePath) != "" {
+		cfg.StatePath = strings.TrimSpace(overrides.StatePath)
 	}
 	applyDurationOverrides(cfg, overrides)
 	applyIntegerOverrides(cfg, overrides)
@@ -199,9 +206,14 @@ func loadConfigFromEnv() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	statePath, err := relayStatePath()
+	if err != nil {
+		return Config{}, err
+	}
 	cfg := Config{
 		Addr:              getEnv("RELAY_ADDR", defaultAddr),
 		PublicURL:         getEnv("RELAY_PUBLIC_URL", defaultPublicURL),
+		StatePath:         statePath,
 		PairingTTL:        pairingTTL,
 		AgentGracePeriod:  grace,
 		TrustedProxyCIDRs: strings.TrimSpace(os.Getenv("RELAY_TRUSTED_PROXY_CIDRS")),
@@ -224,6 +236,17 @@ func loadConfigFromEnv() (Config, error) {
 	}
 	applyLimitConfig(&cfg, limits)
 	return cfg, nil
+}
+
+func relayStatePath() (string, error) {
+	if value := strings.TrimSpace(os.Getenv("RELAY_STATE_PATH")); value != "" {
+		return value, nil
+	}
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve relay state path: %w", err)
+	}
+	return filepath.Join(homeDir, ".mobilevc", "relay", defaultStateFileName), nil
 }
 
 type limitConfig struct {

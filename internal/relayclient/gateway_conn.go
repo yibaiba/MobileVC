@@ -132,7 +132,7 @@ func (c *gatewayConn) dispatchRawFrame(raw map[string]any) (*relay.ForwardEnvelo
 			return nil, err
 		}
 		if frame.SessionID == c.sessionID {
-			c.setClientID(frame.ClientID)
+			c.activateAttachedClient(frame.ClientID)
 		}
 		return nil, nil
 	case relay.TypeRelayPing:
@@ -147,6 +147,15 @@ func (c *gatewayConn) dispatchRawFrame(raw map[string]any) (*relay.ForwardEnvelo
 			return nil, err
 		}
 		return nil, nil
+	case relay.TypeRelayError:
+		var frame relay.ErrorFrame
+		if err := decodeRawFrame(raw, &frame); err != nil {
+			return nil, err
+		}
+		if isRelayDeliveryError(frame.Code) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("%s: %s", frame.Code, frame.Message)
 	case relay.TypeClientE2EEHello:
 		return nil, c.handleClientE2EEHello(raw)
 	case relay.TypeClientE2EEProof:
@@ -159,6 +168,15 @@ func (c *gatewayConn) dispatchRawFrame(raw map[string]any) (*relay.ForwardEnvelo
 		return nil, err
 	}
 	return &env, nil
+}
+
+func isRelayDeliveryError(code string) bool {
+	switch strings.TrimSpace(code) {
+	case relay.CodeTargetUnavailable, relay.CodeQueueFull:
+		return true
+	default:
+		return false
+	}
 }
 
 func decodeRawFrame(raw map[string]any, out any) error {
@@ -691,6 +709,38 @@ func (c *gatewayConn) setClientID(clientID string) {
 	}
 }
 
+func (c *gatewayConn) activateAttachedClient(clientID string) {
+	c.mu.Lock()
+	nextClientID := strings.TrimSpace(clientID)
+	c.clientID = nextClientID
+	if nextClientID != "" {
+		c.attachOnce.Do(func() { close(c.attachCh) })
+	}
+	resetE2EE := c.e2ee != nil && (c.stream != nil || c.streamHS != "" || c.deviceID != "")
+	if resetE2EE {
+		c.stream = nil
+		c.streamHS = ""
+		c.deviceID = ""
+		c.tunnelSend = e2ee.NewTunnelCounterState()
+		c.e2eeReadyCh = make(chan struct{})
+		c.e2eeReadyOnce = sync.Once{}
+	}
+	c.mu.Unlock()
+
+	if resetE2EE {
+		c.cancelFileDownloads()
+	}
+}
+
+func (c *gatewayConn) cancelFileDownloads() {
+	c.downloadsMu.Lock()
+	defer c.downloadsMu.Unlock()
+	for streamID, stream := range c.downloads {
+		delete(c.downloads, streamID)
+		close(stream.done)
+	}
+}
+
 func (c *gatewayConn) waitAttached() error {
 	select {
 	case <-c.attachCh:
@@ -735,10 +785,10 @@ func (c *gatewayConn) setCloseReason(err error) {
 }
 
 func (c *gatewayConn) writeForward(payload []byte) error {
-	env, err := c.forwardEnvelope(payload)
-	if err != nil {
-		return err
+	if c.requiresE2EE() {
+		return c.writeEncryptedForward(payload)
 	}
+	env := c.plaintextForwardEnvelope(payload)
 	return c.writeControl(env)
 }
 
@@ -748,13 +798,7 @@ func (c *gatewayConn) writeControl(frame any) error {
 	return c.conn.WriteJSON(frame)
 }
 
-func (c *gatewayConn) forwardEnvelope(payload []byte) (relay.ForwardEnvelope, error) {
-	if c.requiresE2EE() {
-		if err := c.waitE2EEReady(); err != nil {
-			return relay.ForwardEnvelope{}, err
-		}
-		return c.encryptedForwardEnvelope(payload)
-	}
+func (c *gatewayConn) plaintextForwardEnvelope(payload []byte) relay.ForwardEnvelope {
 	clientID := c.currentClientID()
 	return relay.ForwardEnvelope{
 		Type:            relay.TypeRelayForward,
@@ -767,19 +811,56 @@ func (c *gatewayConn) forwardEnvelope(payload []byte) (relay.ForwardEnvelope, er
 		Encryption:      relay.EncryptionNone,
 		PayloadEncoding: relay.PayloadBase64URL,
 		Payload:         base64.RawURLEncoding.EncodeToString(payload),
-	}, nil
+	}
 }
 
-func (c *gatewayConn) encryptedForwardEnvelope(payload []byte) (relay.ForwardEnvelope, error) {
-	codec := c.e2eeStream()
-	if codec == nil {
-		return relay.ForwardEnvelope{}, fmt.Errorf("%s: relay e2ee stream is not ready", relay.CodeE2EEHandshakeFailed)
+func (c *gatewayConn) writeEncryptedForward(payload []byte) error {
+	for {
+		readyCh, err := c.currentE2EEReadyCh()
+		if err != nil {
+			return err
+		}
+		if readyCh != nil {
+			if err := c.waitE2EEReady(readyCh); err != nil {
+				return err
+			}
+		}
+		wrote, err := c.tryWriteEncryptedForward(payload, readyCh)
+		if err != nil {
+			return err
+		}
+		if wrote {
+			return nil
+		}
 	}
-	frame, err := codec.Encode("msg_"+uuid.NewString(), payload)
+}
+
+func (c *gatewayConn) currentE2EEReadyCh() (chan struct{}, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.stream != nil {
+		return nil, nil
+	}
+	if c.e2eeReadyCh == nil {
+		return nil, fmt.Errorf("%s: relay e2ee stream is not ready", relay.CodeE2EEHandshakeFailed)
+	}
+	return c.e2eeReadyCh, nil
+}
+
+func (c *gatewayConn) tryWriteEncryptedForward(payload []byte, readyCh chan struct{}) (bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if readyCh != nil && c.e2eeReadyCh != readyCh {
+		return false, nil
+	}
+	if c.stream == nil {
+		return false, nil
+	}
+	frame, err := c.stream.Encode("msg_"+uuid.NewString(), payload)
 	if err != nil {
-		return relay.ForwardEnvelope{}, fmt.Errorf("%s: %w", relay.CodeE2EEDecryptFailed, err)
+		return false, fmt.Errorf("%s: %w", relay.CodeE2EEDecryptFailed, err)
 	}
-	return relay.ForwardEnvelope(frame), nil
+	return true, c.conn.WriteJSON(relay.ForwardEnvelope(frame))
 }
 
 func (c *gatewayConn) writeEncryptedTunnelFrame(codec *e2ee.MobileVCStreamCodec, frame e2ee.TunnelFrame) error {
@@ -802,12 +883,9 @@ func (c *gatewayConn) requiresE2EE() bool {
 	return c.e2ee != nil
 }
 
-func (c *gatewayConn) waitE2EEReady() error {
-	if c.e2eeReadyCh == nil {
-		return nil
-	}
+func (c *gatewayConn) waitE2EEReady(readyCh chan struct{}) error {
 	select {
-	case <-c.e2eeReadyCh:
+	case <-readyCh:
 		return nil
 	case <-c.readDone:
 		return c.readError()

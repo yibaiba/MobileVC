@@ -47,6 +47,15 @@ func (s *Server) RevokeDevice(sessionID string, clientID string) bool {
 		state.client = nil
 		state.clientID = ""
 	}
+	if err := s.saveStateLocked(); err != nil {
+		if connected {
+			state.client = client
+			state.clientID = device.ClientID
+		}
+		device.Revoked = false
+		s.mu.Unlock()
+		return false
+	}
 	s.mu.Unlock()
 	if connected && client != nil {
 		_ = client.Close()
@@ -68,6 +77,10 @@ func (s *Server) RotateSessionCredentials(sessionID string) bool {
 	state.devices = map[string]*deviceState{}
 	state.pairingHash = ""
 	state.pairingConsumed = true
+	if err := s.saveStateLocked(); err != nil {
+		s.mu.Unlock()
+		return false
+	}
 	s.mu.Unlock()
 	if client != nil {
 		_ = client.Close()

@@ -55,6 +55,65 @@ func TestRelayClientReconnectUpdatesDeviceLastSeen(t *testing.T) {
 	}
 }
 
+func TestRelayStatePersistsClientReconnectAcrossRelayRestart(t *testing.T) {
+	statePath := t.TempDir() + "/relay-state.json"
+	sessionID := "rs_persisted_device"
+	secret := "pair-secret-128-bit-minimum"
+	agentReconnectSecret := "reconnect-secret-128-bit-minimum"
+
+	firstRelay, firstServer := newInspectableRelayServer(t, Config{StatePath: statePath})
+	agent := dialRelay(t, firstServer.URL, "/relay/agent")
+	registerAgent(t, agent, sessionID, secret, agentReconnectSecret, time.Now().Add(time.Minute))
+	client := dialRelay(t, firstServer.URL, "/relay/client")
+	clientID, clientReconnectSecret := pairClientWithReconnectSecret(t, client, sessionID, secret)
+	readAttached(t, agent, clientID)
+	_ = client.Close()
+	_ = agent.Close()
+	waitForRelaySessionDisconnected(t, firstRelay, sessionID)
+	firstServer.Close()
+	if got := onlyDevice(t, firstRelay.Devices(sessionID)); got.ClientID != clientID {
+		t.Fatalf("unexpected first relay device: %#v", got)
+	}
+
+	secondRelay, secondServer := newInspectableRelayServer(t, Config{StatePath: statePath})
+	reconnectedAgent := dialRelay(t, secondServer.URL, "/relay/agent")
+	reconnectAgent(t, reconnectedAgent, sessionID, agentReconnectSecret)
+
+	reconnectedClient := dialRelay(t, secondServer.URL, "/relay/client")
+	reconnectClient(t, reconnectedClient, sessionID, clientID, clientReconnectSecret)
+	readAttached(t, reconnectedAgent, clientID)
+	_ = reconnectedClient.Close()
+	_ = reconnectedAgent.Close()
+	waitForRelaySessionDisconnected(t, secondRelay, sessionID)
+	secondServer.Close()
+}
+
+func TestRelayStatePersistsUnusedPairingAcrossRelayRestart(t *testing.T) {
+	statePath := t.TempDir() + "/relay-state.json"
+	sessionID := "rs_persisted_pairing"
+	secret := "pair-secret-128-bit-minimum"
+	agentReconnectSecret := "reconnect-secret-128-bit-minimum"
+
+	firstRelay, firstServer := newInspectableRelayServer(t, Config{StatePath: statePath})
+	agent := dialRelay(t, firstServer.URL, "/relay/agent")
+	registerAgent(t, agent, sessionID, secret, agentReconnectSecret, time.Now().Add(time.Minute))
+	_ = agent.Close()
+	waitForRelaySessionDisconnected(t, firstRelay, sessionID)
+	firstServer.Close()
+
+	secondRelay, secondServer := newInspectableRelayServer(t, Config{StatePath: statePath})
+	reconnectedAgent := dialRelay(t, secondServer.URL, "/relay/agent")
+	reconnectAgent(t, reconnectedAgent, sessionID, agentReconnectSecret)
+
+	client := dialRelay(t, secondServer.URL, "/relay/client")
+	clientID := pairClient(t, client, sessionID, secret)
+	readAttached(t, reconnectedAgent, clientID)
+	_ = client.Close()
+	_ = reconnectedAgent.Close()
+	waitForRelaySessionDisconnected(t, secondRelay, sessionID)
+	secondServer.Close()
+}
+
 func TestRelayRevokedDeviceCannotReconnect(t *testing.T) {
 	relayServer, server := newInspectableRelayServer(t, Config{})
 	defer server.Close()
@@ -149,6 +208,28 @@ func reconnectClient(t *testing.T, conn interface {
 	}
 }
 
+func reconnectAgent(t *testing.T, conn interface {
+	WriteJSON(any) error
+	ReadJSON(any) error
+}, sessionID string, secret string) {
+	t.Helper()
+	if err := conn.WriteJSON(AgentReconnectFrame{
+		Type:                 TypeAgentReconnect,
+		Version:              Version,
+		SessionID:            sessionID,
+		AgentReconnectSecret: secret,
+	}); err != nil {
+		t.Fatalf("write agent reconnect: %v", err)
+	}
+	var registered AgentRegisteredFrame
+	if err := conn.ReadJSON(&registered); err != nil {
+		t.Fatalf("read agent reconnect response: %v", err)
+	}
+	if registered.Type != TypeAgentRegistered || registered.SessionID != sessionID {
+		t.Fatalf("unexpected agent reconnect response: %#v", registered)
+	}
+}
+
 func writeReconnectClient(t *testing.T, conn interface{ WriteJSON(any) error }, sessionID string, clientID string, secret string) {
 	t.Helper()
 	if err := conn.WriteJSON(ClientReconnectFrame{
@@ -184,4 +265,20 @@ func onlyDevice(t *testing.T, devices []DeviceInfo) DeviceInfo {
 		t.Fatalf("device count: got %d want 1", len(devices))
 	}
 	return devices[0]
+}
+
+func waitForRelaySessionDisconnected(t *testing.T, server *Server, sessionID string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		server.mu.Lock()
+		state := server.sessions[sessionID]
+		disconnected := state == nil || (state.agent == nil && state.client == nil)
+		server.mu.Unlock()
+		if disconnected {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("relay session %s did not disconnect before timeout", sessionID)
 }

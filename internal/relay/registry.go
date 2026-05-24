@@ -27,6 +27,11 @@ func (s *Server) registerAgent(peer *peerConn, raw []byte) (string, error) {
 		return "", errors.New("session capacity reached")
 	}
 	s.sessions[state.id] = state
+	if err := s.saveStateLocked(); err != nil {
+		delete(s.sessions, state.id)
+		s.mu.Unlock()
+		return "", err
+	}
 	s.mu.Unlock()
 	return state.id, writeRegistered(peer, state.id)
 }
@@ -101,6 +106,12 @@ func (s *Server) reconnectAgent(peer *peerConn, raw []byte) (string, error) {
 	state.agent = peer
 	state.agentDisconnectedAt = time.Time{}
 	sessionID := state.id
+	if err := s.saveStateLocked(); err != nil {
+		state.agent = nil
+		state.agentDisconnectedAt = disconnectedAt
+		s.mu.Unlock()
+		return "", err
+	}
 	s.mu.Unlock()
 	if err := writeRegistered(peer, sessionID); err != nil {
 		s.rollbackAgentReconnect(sessionID, peer, disconnectedAt)
@@ -117,10 +128,11 @@ func (s *Server) reconnectAgent(peer *peerConn, raw []byte) (string, error) {
 }
 
 func (s *Server) canReconnectAgent(state *sessionState, secret string) bool {
-	if state == nil || state.agent != nil || state.agentDisconnectedAt.IsZero() {
+	if state == nil || state.agent != nil {
 		return false
 	}
-	if time.Since(state.agentDisconnectedAt) > s.cfg.AgentGracePeriod {
+	if !state.agentDisconnectedAt.IsZero() &&
+		time.Since(state.agentDisconnectedAt) > s.cfg.AgentGracePeriod {
 		delete(s.sessions, state.id)
 		return false
 	}
@@ -154,6 +166,16 @@ func (s *Server) pairClient(peer *peerConn, raw []byte, remote string) (string, 
 	state.pairingHash = ""
 	state.pairingConsumed = true
 	s.rememberDeviceLocked(state, clientID, frame.DeviceName, state.clientReconnectHash)
+	if err := s.saveStateLocked(); err != nil {
+		state.client = nil
+		state.clientID = ""
+		state.clientReconnectHash = ""
+		state.pairingHash = pairingHash
+		state.pairingConsumed = false
+		delete(state.devices, clientID)
+		s.mu.Unlock()
+		return "", "", err
+	}
 	s.mu.Unlock()
 	if err := writePaired(peer, sessionID, clientID, clientReconnectSecret); err != nil {
 		s.rollbackPairing(sessionID, peer, pairingHash)
@@ -179,12 +201,19 @@ func (s *Server) reconnectClient(peer *peerConn, raw []byte) (string, string, er
 		return "", "", err
 	}
 	previousClient := state.client
+	previousClientID := state.clientID
 	state.client = peer
 	state.clientID = device.ClientID
 	device.LastSeenAt = time.Now().UTC()
 	sessionID := state.id
 	clientID := device.ClientID
 	agent := state.agent
+	if err := s.saveStateLocked(); err != nil {
+		state.client = previousClient
+		state.clientID = previousClientID
+		s.mu.Unlock()
+		return "", "", err
+	}
 	s.mu.Unlock()
 	if previousClient != nil && previousClient != peer {
 		_ = previousClient.Close()
@@ -216,7 +245,13 @@ func (s *Server) canReconnectClient(state *sessionState, clientID string, secret
 }
 
 func (s *Server) reconnectableDevice(state *sessionState, clientID string, secret string) (*deviceState, error) {
-	if state == nil || state.agent == nil {
+	if state == nil {
+		return nil, newCodeError(CodeDeviceUnknown, "client reconnect rejected")
+	}
+	if state.agent == nil {
+		if state.agentDisconnectedWithinGrace(s.cfg.AgentGracePeriod) {
+			return nil, newCodeError(CodeAgentDisconnected, "agent is reconnecting")
+		}
 		return nil, newCodeError(CodeDeviceUnknown, "client reconnect rejected")
 	}
 	normalizedID := strings.TrimSpace(clientID)
@@ -255,6 +290,7 @@ func (s *Server) rollbackPairing(sessionID string, peer *peerConn, pairingHash s
 	state.clientReconnectHash = ""
 	state.pairingHash = pairingHash
 	state.pairingConsumed = false
+	_ = s.saveStateLocked()
 }
 
 func (s *Server) rollbackClientReconnect(sessionID string, peer *peerConn) {
@@ -265,6 +301,8 @@ func (s *Server) rollbackClientReconnect(sessionID string, peer *peerConn) {
 		return
 	}
 	state.client = nil
+	state.clientID = ""
+	_ = s.saveStateLocked()
 }
 
 func (s *Server) rollbackAgentReconnect(sessionID string, peer *peerConn, disconnectedAt time.Time) {
@@ -276,6 +314,7 @@ func (s *Server) rollbackAgentReconnect(sessionID string, peer *peerConn, discon
 	}
 	state.agent = nil
 	state.agentDisconnectedAt = disconnectedAt
+	_ = s.saveStateLocked()
 }
 
 func writeRegistered(peer *peerConn, sessionID string) error {
@@ -298,4 +337,8 @@ func notifyClientAttached(peer *peerConn, sessionID string, clientID string) err
 	return peer.Enqueue(ClientAttachedFrame{
 		Type: TypeClientAttached, Version: Version, SessionID: sessionID, ClientID: clientID,
 	})
+}
+
+func (s *Server) saveStateLocked() error {
+	return s.stateStore.save(s.sessions)
 }

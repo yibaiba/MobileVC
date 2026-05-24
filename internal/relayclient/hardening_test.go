@@ -111,6 +111,46 @@ func TestGatewayConnRespondsToRelayPing(t *testing.T) {
 	}
 }
 
+func TestGatewayConnRejectsRelayErrorAsControlFrame(t *testing.T) {
+	serverConn, clientConn := newRelayClientTestConns(t)
+	defer serverConn.Close()
+	gateway := newGatewayConn(clientConn, "rs_gateway")
+	t.Cleanup(func() { _ = gateway.Close() })
+
+	if err := serverConn.WriteJSON(relay.NewErrorFrame(relay.CodeE2EERequired)); err != nil {
+		t.Fatalf("write relay error: %v", err)
+	}
+	var payload map[string]any
+	err := gateway.ReadJSON(&payload)
+	if err == nil || !strings.Contains(err.Error(), relay.CodeE2EERequired) {
+		t.Fatalf("expected relay control error, got %v", err)
+	}
+}
+
+func TestGatewayConnIgnoresRelayDeliveryErrors(t *testing.T) {
+	serverConn, clientConn := newRelayClientTestConns(t)
+	defer serverConn.Close()
+	gateway := newGatewayConn(clientConn, "rs_gateway")
+	t.Cleanup(func() { _ = gateway.Close() })
+
+	go func() {
+		_ = serverConn.WriteJSON(relay.NewErrorFrame(relay.CodeTargetUnavailable))
+		_ = serverConn.WriteJSON(relay.ClientAttachedFrame{
+			Type: relay.TypeClientAttached, Version: relay.Version,
+			SessionID: "rs_gateway", ClientID: "rc_attached",
+		})
+		_ = serverConn.WriteJSON(testRelayForward("rc_attached"))
+	}()
+
+	var payload map[string]any
+	if err := gateway.ReadJSON(&payload); err != nil {
+		t.Fatalf("delivery error should not close gateway read loop: %v", err)
+	}
+	if payload["action"] != "ping" {
+		t.Fatalf("unexpected payload after delivery error: %#v", payload)
+	}
+}
+
 func TestGatewayConnRejectsWrongSessionRelayPing(t *testing.T) {
 	serverConn, clientConn := newRelayClientTestConns(t)
 	defer serverConn.Close()
@@ -346,6 +386,87 @@ func TestGatewayConnWaitsForE2EEBeforeWritingProductionForward(t *testing.T) {
 	}
 	if plaintext["event"] != "ready" {
 		t.Fatalf("unexpected decrypted outbound: %#v", plaintext)
+	}
+}
+
+func TestGatewayConnResetsE2EEWhenClientReattaches(t *testing.T) {
+	serverConn, clientConn := newRelayClientTestConns(t)
+	defer serverConn.Close()
+	handshake, clientEphemeral := testPairingHandshakeHandler(t)
+	gateway := newGatewayConnWithE2EE(clientConn, "rs_gateway", handshake)
+	t.Cleanup(func() { _ = gateway.Close() })
+
+	if err := serverConn.WriteJSON(relay.ClientAttachedFrame{
+		Type: relay.TypeClientAttached, Version: relay.Version,
+		SessionID: "rs_gateway", ClientID: "rc_attached",
+	}); err != nil {
+		t.Fatalf("write attached: %v", err)
+	}
+	clientKeys := driveGatewayE2EEHandshake(t, serverConn, clientEphemeral)
+	firstCodec, err := e2ee.NewClientMobileVCStreamCodec("rs_gateway", "rc_attached", "hs_pairing", clientKeys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.WriteJSON(map[string]string{"event": "first"}); err != nil {
+		t.Fatalf("write first encrypted event: %v", err)
+	}
+	var first relay.ForwardEnvelope
+	if err := serverConn.ReadJSON(&first); err != nil {
+		t.Fatalf("read first encrypted event: %v", err)
+	}
+	var firstPlain map[string]any
+	if err := firstCodec.DecodeJSON(e2ee.RelayForwardFrame(first), &firstPlain); err != nil {
+		t.Fatalf("decrypt first event: %v", err)
+	}
+
+	if err := serverConn.WriteJSON(relay.ClientAttachedFrame{
+		Type: relay.TypeClientAttached, Version: relay.Version,
+		SessionID: "rs_gateway", ClientID: "rc_attached",
+	}); err != nil {
+		t.Fatalf("write reattached: %v", err)
+	}
+	if err := serverConn.WriteJSON(relay.ControlFrame{Type: relay.TypeRelayPing, Version: relay.Version}); err != nil {
+		t.Fatalf("write relay ping after reattach: %v", err)
+	}
+	var pong relay.ControlFrame
+	if err := serverConn.ReadJSON(&pong); err != nil {
+		t.Fatalf("read relay pong after reattach: %v", err)
+	}
+	writeDone := make(chan error, 1)
+	go func() {
+		writeDone <- gateway.WriteJSON(map[string]string{"event": "after-reattach"})
+	}()
+	select {
+	case err := <-writeDone:
+		t.Fatalf("write completed before rekey: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	nextEphemeral, err := e2ee.NewEphemeralKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	nextKeys := driveGatewayE2EEHandshakeWithIDs(t, serverConn, nextEphemeral, "rc_attached", "hs_rekey")
+	secondCodec, err := e2ee.NewClientMobileVCStreamCodec("rs_gateway", "rc_attached", "hs_rekey", nextKeys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := <-writeDone; err != nil {
+		t.Fatalf("write after rekey: %v", err)
+	}
+	var second relay.ForwardEnvelope
+	if err := serverConn.ReadJSON(&second); err != nil {
+		t.Fatalf("read second encrypted event: %v", err)
+	}
+	if second.HandshakeID != "hs_rekey" {
+		t.Fatalf("expected rekey handshake id, got %#v", second)
+	}
+	var secondPlain map[string]any
+	if err := secondCodec.DecodeJSON(e2ee.RelayForwardFrame(second), &secondPlain); err != nil {
+		t.Fatalf("decrypt second event: %v", err)
+	}
+	if secondPlain["event"] != "after-reattach" {
+		t.Fatalf("unexpected second plaintext: %#v", secondPlain)
 	}
 }
 
@@ -1138,10 +1259,21 @@ func driveReconnectHello(t *testing.T, serverConn *websocket.Conn, clientEphemer
 
 func driveGatewayE2EEHandshake(t *testing.T, serverConn *websocket.Conn, clientEphemeral *e2ee.EphemeralKeyPair) *e2ee.TrafficKeys {
 	t.Helper()
+	return driveGatewayE2EEHandshakeWithIDs(t, serverConn, clientEphemeral, "rc_attached", "hs_pairing")
+}
+
+func driveGatewayE2EEHandshakeWithIDs(
+	t *testing.T,
+	serverConn *websocket.Conn,
+	clientEphemeral *e2ee.EphemeralKeyPair,
+	clientID string,
+	handshakeID string,
+) *e2ee.TrafficKeys {
+	t.Helper()
 	capabilities := e2ee.ProductionCapabilities()
 	clientHello := relay.E2EEClientHelloFrame{
 		Type: relay.TypeClientE2EEHello, Version: relay.Version,
-		SessionID: "rs_gateway", ClientID: "rc_attached", HandshakeID: "hs_pairing",
+		SessionID: "rs_gateway", ClientID: clientID, HandshakeID: handshakeID,
 		Kind: e2ee.HandshakeKindPairing, Capabilities: &capabilities,
 		ClientEphemeralPublicKey: e2ee.EncodeFrameBytes(clientEphemeral.PublicKey),
 	}
@@ -1159,8 +1291,8 @@ func driveGatewayE2EEHandshake(t *testing.T, serverConn *websocket.Conn, clientE
 	input := capabilities.ApplyToHandshake(e2ee.HandshakeInput{
 		Kind:                     e2ee.HandshakeKindPairing,
 		SessionID:                "rs_gateway",
-		ClientID:                 "rc_attached",
-		HandshakeID:              "hs_pairing",
+		ClientID:                 clientID,
+		HandshakeID:              handshakeID,
 		ClientEphemeralPublicKey: clientEphemeral.PublicKey,
 		NodeEphemeralPublicKey:   agentMaterial.NodeEphemeralPublicKey,
 		NodeIdentityPublicKey:    agentMaterial.NodeIdentityPublicKey,
@@ -1171,7 +1303,7 @@ func driveGatewayE2EEHandshake(t *testing.T, serverConn *websocket.Conn, clientE
 	}
 	proof := relay.E2EEClientProofFrame{
 		Type: relay.TypeClientE2EEProof, Version: relay.Version,
-		SessionID: "rs_gateway", ClientID: "rc_attached", HandshakeID: "hs_pairing",
+		SessionID: "rs_gateway", ClientID: clientID, HandshakeID: handshakeID,
 		Kind:         e2ee.HandshakeKindPairing,
 		PairingProof: e2ee.EncodeFrameBytes(e2ee.PairingProof("pair-secret-128-bit-minimum", transcript)),
 	}

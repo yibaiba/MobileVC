@@ -108,6 +108,8 @@ Use normal Go tooling and keep changes focused:
 - Relay writes must be serialized per websocket connection; authentication responses, `relay.error`, ping frames, and queued forwards share the same write lock.
 - Relay must not write authentication or pairing responses while holding the global relay session mutex. Mutate shared session state under the mutex, release it, then write to the websocket with a write deadline.
 - Forwarding must use a bounded per-peer queue. Queue exhaustion is explicit `relay.error` with `queue_full`, never a blocking goroutine leak.
+- Agent-to-client delivery errors are not agent protocol failures. If the paired client is absent or its queue is full, public relay returns `target_unavailable` or `queue_full` to the agent and keeps the agent session alive. The local relay client must treat those delivery codes as non-fatal control frames so a phone disconnect does not force the local agent websocket to reconnect.
+- Public relay peer writer failures must close the underlying websocket so the matching read loop can mark agent/client state disconnected and persist the registry transition. A writer goroutine must not exit while leaving a stale non-nil peer in the session registry.
 - Relay must enforce global role caps and per-IP caps before websocket upgrade.
 - `X-Forwarded-For` and `X-Real-IP` are honored only when the socket peer IP is inside `RELAY_TRUSTED_PROXY_CIDRS`; otherwise the socket IP is the capacity key.
 - Agent reconnect uses `agent.reconnect` plus `agentReconnectSecret` only during the grace window. New `agent.register` must not replace an existing session ID.
@@ -189,6 +191,9 @@ Use normal Go tooling and keep changes focused:
 - Local relay client receives `relay.ping` for a different non-empty session ID -> explicit local read error; do not send `relay.pong`.
 - Post-auth raw websocket frames must be size-bounded while reading, before JSON decode. Frames above the post-auth raw frame limit -> `relay.error` with `frame_too_large`; decoded relay payloads above `MaxPayloadBytes` still -> `payload_too_large`.
 - First agent-to-client forward with an empty `clientId` after successful client pairing -> relay fills the current active `clientId`; wrong non-empty `clientId` still -> `protocol_error`.
+- Agent-to-client forward when the paired client is disconnected -> `relay.error` with `target_unavailable` to the agent; agent connection stays registered and later client reconnect receives `client.attached`.
+- Forward target queue full -> `relay.error` with `queue_full` to the sender; sender connection stays open.
+- Local relay client receives `target_unavailable` or `queue_full` from public relay -> consume the control frame and keep the local gateway read loop open.
 - Missing `client.attached` before the relay websocket closes -> local relay client write returns the underlying read/close error.
 - E2EE handshake control frame delivered to the local relay client before the handshake state machine is wired -> explicit relay client read error mentioning E2EE handshake.
 - Encrypted `relay.forward` before local E2EE stream activation -> `e2ee_handshake_failed`.
@@ -223,6 +228,7 @@ Use normal Go tooling and keep changes focused:
 - Good: relay-only backend logs `health=http://127.0.0.1:<port>/healthz` and `ws=ws://127.0.0.1:<port>/ws?token=<redacted>`; it must not concatenate `localhost` with a full host:port listen address.
 - Good: local test relay uses explicit `--require-e2ee=false --plaintext-test-mode=true` and UI/logs label it as test-only.
 - Good: relay behind a trusted reverse proxy enforces caps by forwarded client IP, while direct internet clients cannot spoof forwarded headers.
+- Good: phone client disconnects, agent-to-client events receive `target_unavailable`, the local relay agent remains connected, and the same client can reconnect without a new agent session.
 - Base: direct `/ws?token=...` path still performs token and origin checks.
 - Bad: printing `mobilevc.relay.pairing_ready` JSON to stdout/stderr because server logs then retain the one-time secret.
 - Bad: accepting `encryption=none` on a long-lived public relay session because E2EE handshake code is not fully integrated yet.
@@ -238,6 +244,7 @@ Use normal Go tooling and keep changes focused:
 - Bad: accepting a duplicate `agent.register` for an existing `sessionId` after disconnect; that bypasses reconnect-secret semantics.
 - Bad: implementing global rotate as only `ClearTrustedDevicesForNodeRotation`; real rotate must also replace node identity and close/rekey active relay sessions.
 - Bad: treating global rotate as an ordinary connection close; that makes the relay client attempt `agent.reconnect` on the old session instead of publishing a fresh pairing link.
+- Bad: treating `target_unavailable` or `queue_full` as a fatal local relay agent error and reconnecting the agent websocket during ordinary phone disconnects.
 
 #### 6. Tests Required
 - Relay pairing, one-time secret consumption, URL validation, oversized payload, and opaque unknown business payload forwarding.
@@ -251,7 +258,9 @@ Use normal Go tooling and keep changes focused:
 - Relay plaintext rejection, plaintext test-mode allowance, E2EE metadata validation, unsupported encryption rejection, config env parsing, and CLI flag parsing.
 - Relay per-IP caps, trusted forwarded IP positive/negative cases, ping writer shutdown, mismatched `clientId`, duplicate session register rejection, and reconnect within grace.
 - Relay agent-disconnect grace expiry must remove orphan sessions and close paired clients.
+- Relay tests must cover agent-to-client delivery failure while the client is disconnected: relay returns `target_unavailable`, keeps the agent connected, sends `client.attached` after client reconnect, and forwards later agent events.
 - Relay client tests must cover consuming `client.attached` before `relay.forward`, writing with the attached `clientId`, and timing out register/reconnect response reads.
+- Relay client tests must cover ignoring `target_unavailable` and `queue_full` as non-fatal delivery errors while still failing explicit protocol/security errors such as `e2ee_required`.
 - Relay client tests must cover that E2EE handshake control frames are not passed into gateway payload decoding when no handshake handler exists.
 - Relay client tests must cover valid local agent pairing handshake, node signature verification, pairing proof validation, matching derived traffic keys, and mismatched proof routing failure.
 - Relay client tests must cover valid local agent reconnect handshake, unknown device, revoked device, wrong proof, bad signature, matching fresh traffic keys, and no plaintext business frame before E2EE stream activation.
