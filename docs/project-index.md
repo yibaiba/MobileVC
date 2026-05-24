@@ -22,6 +22,7 @@ Scope: current repository state. If this document conflicts with code, treat cod
 - On connect/reconnect/foreground recovery, Flutter requests `task_snapshot_get` and `session_delta_get` for the selected session.
 - The Go server handles `task_snapshot_get` and heartbeat snapshots, then handles `session_delta_get` for incremental projection/history/terminal output updates. `session_resume` remains the full-sync fallback when delta cursors/counts no longer match.
 - Server WebSocket writes now use a write deadline to avoid long-lived stuck writes on broken mobile/network connections.
+- Flutter derives `ws/http` versus `wss/https` from `AppConfig` URL helpers; Flutter Web pages loaded over HTTPS initiate `wss://` before the browser constructs the socket.
 
 ### Launcher, QR, and Workspace CWD
 
@@ -94,4 +95,4 @@ Scope: current repository state. If this document conflicts with code, treat cod
 
 - Runtime continuity is now based on direct backend snapshot/projection sync, not log replay caching. Only blocking prompt/interaction events remain in the short pending buffer.
 - Some historical docs are version-specific release notes and may intentionally describe older npm versions.
-- Several large generated/build artifacts are present; avoid treating `cmd/server/web/main.dart.js` as source.
+- Flutter Web generated artifacts under `cmd/server/web/` are local build output and ignored by Git; rebuild them before `go build` when the Flutter app changes.
