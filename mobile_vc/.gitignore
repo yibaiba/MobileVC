@@ -32,6 +32,14 @@ migrate_working_dir/
 .pub-cache/
 .pub/
 /build/
+/android/build/
+/android/app/build/
+/ios/build/
+/macos/build/
+/coverage/
+*.xcarchive
+*.dSYM
+*.ipa
 
 # Symbolication related
 app.*.symbols

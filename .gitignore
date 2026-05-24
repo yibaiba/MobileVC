@@ -6,9 +6,32 @@
 /*.apk
 /*.aab
 /*.ipa
+/*.tgz
+/*.tar
+/*.tar.gz
+/*.zip
+/*.dmg
+/*.pkg
+/*.msi
+/*.deb
+/*.rpm
+/dist/
+/release/
+/out/
+/coverage/
+.nyc_output/
 packages/
+cmd/server/server
+cmd/server/mobilevc-server
+cmd/relay/relay
+cmd/relay/mobilevc-relay
 cmd/server/web/*
 !cmd/server/web/.gitkeep
+
+# 本地环境/部署密钥
+.env
+.env.*
+!.env.example
 
 # 依赖
 node_modules/
