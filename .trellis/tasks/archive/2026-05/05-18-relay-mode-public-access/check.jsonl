@@ -1,4 +1,0 @@
-{"file": ".trellis/spec/backend/index.md", "reason": "Backend relay/gateway/session quality checks"}
-{"file": ".trellis/spec/frontend/index.md", "reason": "Flutter relay connection quality checks"}
-{"file": ".trellis/tasks/05-18-relay-mode-public-access/research/relay-mode-notes.md", "reason": "Relay security acceptance criteria"}
-{"file": ".trellis/tasks/05-18-relay-mode-public-access/info.md", "reason": "Relay mode technical design acceptance checks"}

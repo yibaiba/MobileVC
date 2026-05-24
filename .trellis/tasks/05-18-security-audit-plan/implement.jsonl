@@ -1,5 +1,0 @@
-{"file": ".trellis/spec/backend/index.md", "reason": "Backend audit touches server routes, WebSocket handling, command execution, data access, logging, and error handling."}
-{"file": ".trellis/spec/frontend/index.md", "reason": "Frontend audit touches Flutter connection config, local storage, push token handling, and platform-specific client behavior."}
-{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "Security boundaries cross backend, Flutter clients, WebSocket protocol, local filesystem, and release packaging."}
-{"file": ".trellis/tasks/05-18-security-audit-plan/research/local-security-surface.md", "reason": "Initial repo-local security surface map and audit command list."}
-{"file": ".trellis/tasks/05-18-security-audit-plan/research/security-audit-report.md", "reason": "Security audit findings, evidence, and recommended fix ordering."}

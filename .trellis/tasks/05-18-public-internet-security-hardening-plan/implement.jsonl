@@ -1,5 +1,0 @@
-{"type":"spec","path":".trellis/spec/backend/index.md","note":"Backend config, WebSocket, filesystem, logging, and command-execution hardening."}
-{"type":"spec","path":".trellis/spec/frontend/index.md","note":"Flutter sensitive logging and public-mode UX impact."}
-{"type":"spec","path":".trellis/spec/guides/cross-layer-thinking-guide.md","note":"Public hardening spans backend, launcher, Flutter, and deployment behavior."}
-{"type":"research","path":".trellis/tasks/05-18-public-internet-security-hardening-plan/research/owasp-public-exposure-notes.md","note":"OWASP WebSocket/logging guidance for public exposure."}
-{"type":"research","path":".trellis/tasks/05-18-security-audit-plan/research/security-audit-report.md","note":"Existing MobileVC security audit findings and evidence."}
