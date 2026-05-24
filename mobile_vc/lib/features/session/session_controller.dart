@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
@@ -199,7 +200,31 @@ class SessionController extends ChangeNotifier {
     Duration outboundAckStaleTimeout = const Duration(seconds: 12),
   })  : _service = service ?? MobileVcWsService(),
         _outboundAckRetryDelay = outboundAckRetryDelay,
-        _outboundAckStaleTimeout = outboundAckStaleTimeout;
+        _outboundAckStaleTimeout = outboundAckStaleTimeout {
+    _terminalExecutionsView = UnmodifiableListView(_terminalExecutions);
+    _runtimeProcessesView = UnmodifiableListView(_runtimeProcesses);
+    _codexModelCatalogView = UnmodifiableListView(_codexModelCatalog);
+    _claudeModelCatalogView = UnmodifiableListView(_claudeModelCatalog);
+    _currentDirectoryItemsView = UnmodifiableListView(_currentDirectoryItems);
+    _recentDiffsView = UnmodifiableListView(_recentDiffs);
+    _sessionsView = UnmodifiableListView(_sessions);
+    _relayDevicesView = UnmodifiableListView(_relayDevices);
+    _skillsView = UnmodifiableListView(_skills);
+    _memoryItemsView = UnmodifiableListView(_memoryItems);
+    _sessionPermissionRulesView = UnmodifiableListView(_sessionPermissionRules);
+    _persistentPermissionRulesView =
+        UnmodifiableListView(_persistentPermissionRules);
+    _debugLogsView = UnmodifiableListView(_debugLogs);
+    _pendingToggleSkillNamesView =
+        UnmodifiableSetView(_pendingToggleSkillNames);
+    _pendingToggleMemoryIdsView = UnmodifiableSetView(_pendingToggleMemoryIds);
+    _adbDevicesView = UnmodifiableListView(_adbDevices);
+    _adbAvailableAvdsView = UnmodifiableListView(_adbAvailableAvds);
+    _pendingPlanQuestionsView = UnmodifiableListView(_pendingPlanQuestions);
+    _pendingPlanAnswersView = UnmodifiableMapView(_pendingPlanAnswers);
+    _timelineView = UnmodifiableListView(_timeline);
+    _reviewGroupsView = UnmodifiableListView(_reviewGroups);
+  }
 
   static const _prefsKey = 'mobilevc.app_config';
   static const _connectionIntentPrefsKey = 'mobilevc.connection_intent';
@@ -207,6 +232,8 @@ class SessionController extends ChangeNotifier {
   static const Duration _connectionHealthInterval = Duration(seconds: 10);
   static const Duration _connectionSilenceTimeout = Duration(seconds: 45);
   static const Duration _observedSessionSyncInterval = Duration(seconds: 3);
+  static const Duration _sessionDeltaRequestCoalesceWindow =
+      Duration(seconds: 2);
   final MobileVcWsService _service;
   final AdbWebRtcService _adbWebRtc = AdbWebRtcService();
   final Duration _outboundAckRetryDelay;
@@ -231,6 +258,8 @@ class SessionController extends ChangeNotifier {
   final Map<String, int> _sessionEventCursors = <String, int>{};
   final Map<String, SessionDeltaKnown> _sessionDeltaKnown =
       <String, SessionDeltaKnown>{};
+  final Map<String, DateTime> _sessionDeltaLastRequestedAt =
+      <String, DateTime>{};
   bool _fileListLoading = false;
   bool _fileReading = false;
   bool _relayDeviceListLoading = false;
@@ -242,7 +271,10 @@ class SessionController extends ChangeNotifier {
   String _continuedSameSessionId = '';
   bool _isStopping = false;
   Timer? _sessionLoadingTimeout;
+  Timer? _postHistoryBootstrapTimer;
   static const Duration _sessionLoadingTimeoutDuration = Duration(seconds: 15);
+  static const Duration _postHistoryBootstrapDelay =
+      Duration(milliseconds: 450);
   String _connectionMessage = '未连接';
   String _relayDeviceStatus = '';
   String _selectedSessionId = '';
@@ -302,6 +334,27 @@ class SessionController extends ChangeNotifier {
   final List<ReviewGroup> _reviewGroups = [];
   final List<TerminalExecution> _terminalExecutions = [];
   final List<RuntimeProcessItem> _runtimeProcesses = [];
+  late final List<TerminalExecution> _terminalExecutionsView;
+  late final List<RuntimeProcessItem> _runtimeProcessesView;
+  late final List<CodexModelCatalogEntry> _codexModelCatalogView;
+  late final List<ClaudeModelCatalogEntry> _claudeModelCatalogView;
+  late final List<FSItem> _currentDirectoryItemsView;
+  late final List<HistoryContext> _recentDiffsView;
+  late final List<SessionSummary> _sessionsView;
+  late final List<RelayTrustedDevice> _relayDevicesView;
+  late final List<SkillDefinition> _skillsView;
+  late final List<MemoryItem> _memoryItemsView;
+  late final List<PermissionRule> _sessionPermissionRulesView;
+  late final List<PermissionRule> _persistentPermissionRulesView;
+  late final List<String> _debugLogsView;
+  late final Set<String> _pendingToggleSkillNamesView;
+  late final Set<String> _pendingToggleMemoryIdsView;
+  late final List<AdbDevice> _adbDevicesView;
+  late final List<String> _adbAvailableAvdsView;
+  late final List<PlanQuestion> _pendingPlanQuestionsView;
+  late final Map<String, String> _pendingPlanAnswersView;
+  late final List<TimelineItem> _timelineView;
+  late final List<ReviewGroup> _reviewGroupsView;
   String _activeReviewGroupId = '';
   String _activeReviewDiffId = '';
   int _activeRuntimeProcessPid = 0;
@@ -431,13 +484,11 @@ class SessionController extends ChangeNotifier {
   String get effectiveCwd => currentDirectoryPath;
   String get terminalStdout => _terminalStdout;
   String get terminalStderr => _terminalStderr;
-  List<TerminalExecution> get terminalExecutions =>
-      List.unmodifiable(_terminalExecutions);
+  List<TerminalExecution> get terminalExecutions => _terminalExecutionsView;
   String get activeTerminalExecutionId => _activeTerminalExecutionId;
   TerminalExecution? get activeTerminalExecution =>
       _resolvedActiveTerminalExecution();
-  List<RuntimeProcessItem> get runtimeProcesses =>
-      List.unmodifiable(_runtimeProcesses);
+  List<RuntimeProcessItem> get runtimeProcesses => _runtimeProcessesView;
   int get activeRuntimeProcessPid => _activeRuntimeProcessPid;
   RuntimeProcessItem? get activeRuntimeProcess =>
       _resolvedActiveRuntimeProcess();
@@ -474,13 +525,12 @@ class SessionController extends ChangeNotifier {
   AgentStateEvent? get agentState => _agentState;
   SessionStateEvent? get sessionState => _sessionState;
   RuntimeInfoResultEvent? get runtimeInfo => _runtimeInfo;
-  List<CodexModelCatalogEntry> get codexModelCatalog =>
-      List.unmodifiable(_codexModelCatalog);
+  List<CodexModelCatalogEntry> get codexModelCatalog => _codexModelCatalogView;
   bool get codexModelCatalogLoading => _codexModelCatalogLoading;
   String get codexModelCatalogMessage => _codexModelCatalogMessage;
   bool get codexModelCatalogUnavailable => _codexModelCatalogUnavailable;
   List<ClaudeModelCatalogEntry> get claudeModelCatalog =>
-      List.unmodifiable(_claudeModelCatalog);
+      _claudeModelCatalogView;
   bool get claudeModelCatalogLoading => _claudeModelCatalogLoading;
   String get claudeModelCatalogMessage => _claudeModelCatalogMessage;
   bool get claudeModelCatalogUnavailable => _claudeModelCatalogUnavailable;
@@ -507,11 +557,10 @@ class SessionController extends ChangeNotifier {
   HistoryContext? get currentStep => _currentStep;
   HistoryContext? get latestError => _latestError;
   FileReadResult? get openedFile => _openedFile;
-  List<FSItem> get currentDirectoryItems =>
-      List.unmodifiable(_currentDirectoryItems);
-  List<HistoryContext> get recentDiffs => List.unmodifiable(_recentDiffs);
-  List<SessionSummary> get sessions => List.unmodifiable(_sessions);
-  List<RelayTrustedDevice> get relayDevices => List.unmodifiable(_relayDevices);
+  List<FSItem> get currentDirectoryItems => _currentDirectoryItemsView;
+  List<HistoryContext> get recentDiffs => _recentDiffsView;
+  List<SessionSummary> get sessions => _sessionsView;
+  List<RelayTrustedDevice> get relayDevices => _relayDevicesView;
   bool get relayDeviceListLoading => _relayDeviceListLoading;
   String get relayDeviceStatus => _relayDeviceStatus;
   bool get canManageRelayDevices =>
@@ -526,13 +575,13 @@ class SessionController extends ChangeNotifier {
     );
   }
 
-  List<SkillDefinition> get skills => List.unmodifiable(_skills);
-  List<MemoryItem> get memoryItems => List.unmodifiable(_memoryItems);
+  List<SkillDefinition> get skills => _skillsView;
+  List<MemoryItem> get memoryItems => _memoryItemsView;
   List<PermissionRule> get sessionPermissionRules =>
-      List.unmodifiable(_sessionPermissionRules);
+      _sessionPermissionRulesView;
   List<PermissionRule> get persistentPermissionRules =>
-      List.unmodifiable(_persistentPermissionRules);
-  List<String> get debugLogs => List.unmodifiable(_debugLogs);
+      _persistentPermissionRulesView;
+  List<String> get debugLogs => _debugLogsView;
   bool get sessionPermissionRulesEnabled => _sessionPermissionRulesEnabled;
   bool get persistentPermissionRulesEnabled =>
       _persistentPermissionRulesEnabled;
@@ -541,10 +590,8 @@ class SessionController extends ChangeNotifier {
   CatalogMetadata get memoryCatalogMeta => _memoryCatalogMeta;
   String get skillSyncStatus => _skillSyncStatus;
   String get memorySyncStatus => _memorySyncStatus;
-  Set<String> get pendingToggleSkillNames =>
-      Set.unmodifiable(_pendingToggleSkillNames);
-  Set<String> get pendingToggleMemoryIds =>
-      Set.unmodifiable(_pendingToggleMemoryIds);
+  Set<String> get pendingToggleSkillNames => _pendingToggleSkillNamesView;
+  Set<String> get pendingToggleMemoryIds => _pendingToggleMemoryIdsView;
   bool get isSavingSkill => _isSavingSkill;
   bool get isSavingMemory => _isSavingMemory;
   int get permissionRuleCount =>
@@ -568,8 +615,8 @@ class SessionController extends ChangeNotifier {
     return '$total 条 · $scopeText';
   }
 
-  List<AdbDevice> get adbDevices => List.unmodifiable(_adbDevices);
-  List<String> get adbAvailableAvds => List.unmodifiable(_adbAvailableAvds);
+  List<AdbDevice> get adbDevices => _adbDevicesView;
+  List<String> get adbAvailableAvds => _adbAvailableAvdsView;
   Uint8List? get adbFrameBytes => _adbFrameBytes;
   String get adbSelectedSerial => _adbSelectedSerial;
   String get adbPreferredAvd => _adbPreferredAvd;
@@ -637,10 +684,8 @@ class SessionController extends ChangeNotifier {
     return _pendingPlanQuestions[_pendingPlanQuestionIndex];
   }
 
-  List<PlanQuestion> get pendingPlanQuestionList =>
-      List.unmodifiable(_pendingPlanQuestions);
-  Map<String, String> get pendingPlanAnswers =>
-      Map.unmodifiable(_pendingPlanAnswers);
+  List<PlanQuestion> get pendingPlanQuestionList => _pendingPlanQuestionsView;
+  Map<String, String> get pendingPlanAnswers => _pendingPlanAnswersView;
   int get pendingPlanQuestionIndex => _pendingPlanQuestionIndex;
   bool get isPlanSubmissionReady =>
       hasPendingPlanQuestions &&
@@ -695,8 +740,8 @@ class SessionController extends ChangeNotifier {
       _selectedSessionId.trim().isNotEmpty &&
       _continuedSameSessionId == _selectedSessionId.trim();
 
-  List<TimelineItem> get timeline => List.unmodifiable(_timeline);
-  List<ReviewGroup> get reviewGroups => List.unmodifiable(_reviewGroups);
+  List<TimelineItem> get timeline => _timelineView;
+  List<ReviewGroup> get reviewGroups => _reviewGroupsView;
   ReviewGroup? get activeReviewGroup => _resolvedActiveReviewGroup();
   String get activeReviewGroupId => _activeReviewGroupId;
   bool get awaitInput {
@@ -842,15 +887,6 @@ class SessionController extends ChangeNotifier {
     _syncActiveReviewSelection();
     _syncDerivedState();
     notifyListeners();
-    _sessionLoadingTimeout = Timer(_sessionLoadingTimeoutDuration, () {
-      if (!_isLoadingSession) return;
-      _isLoadingSession = false;
-      _pendingSessionTargetId = '';
-      _agentPhaseLabel = '加载超时';
-      _pushSystem('error', '会话加载超时，请检查网络后重试');
-      _syncDerivedState();
-      notifyListeners();
-    });
   }
 
   void setActiveReviewDiff(String diffId) {
@@ -1274,6 +1310,7 @@ class SessionController extends ChangeNotifier {
     _connectionHealthTimer?.cancel();
     _pendingOutboundRetryTimer?.cancel();
     _sessionLoadingTimeout?.cancel();
+    _postHistoryBootstrapTimer?.cancel();
     _aiStatusHideDebounce?.cancel();
     _activityHideDebounce?.cancel();
     await _subscription?.cancel();
@@ -1978,6 +2015,8 @@ class SessionController extends ChangeNotifier {
     _connectionHealthTimer = null;
     _sessionLoadingTimeout?.cancel();
     _sessionLoadingTimeout = null;
+    _postHistoryBootstrapTimer?.cancel();
+    _postHistoryBootstrapTimer = null;
     await _adbWebRtc.stop();
     await _service.disconnect();
     _connected = false;
@@ -2116,9 +2155,12 @@ class SessionController extends ChangeNotifier {
 
   void resumeConnectionIfNeeded() {
     if (_connected && !_connecting) {
+      if (_isLoadingSession && _pendingSessionTargetId.trim().isNotEmpty) {
+        return;
+      }
       requestTaskSnapshot();
       _requestSessionResume(reason: 'foreground');
-      _requestSessionDelta(reason: 'foreground');
+      _requestSessionDelta(reason: 'foreground', force: true);
       _flushPendingOutboundActions();
       _syncObservedSessionPolling();
       return;
@@ -2129,6 +2171,12 @@ class SessionController extends ChangeNotifier {
   void _requestSessionResume({String reason = ''}) {
     final sessionId = _selectedSessionId.trim();
     if (!_connected || _connecting || sessionId.isEmpty) {
+      return;
+    }
+    final pendingTargetId = _pendingSessionTargetId.trim();
+    if (_isLoadingSession &&
+        pendingTargetId.isNotEmpty &&
+        pendingTargetId != sessionId) {
       return;
     }
     final lastSeenCursor = _sessionEventCursors[sessionId] ?? 0;
@@ -2147,11 +2195,25 @@ class SessionController extends ChangeNotifier {
     notifyListeners();
   }
 
-  void _requestSessionDelta({String reason = ''}) {
+  void _requestSessionDelta({String reason = '', bool force = false}) {
     final sessionId = _selectedSessionId.trim();
     if (!_connected || _connecting || sessionId.isEmpty) {
       return;
     }
+    final pendingTargetId = _pendingSessionTargetId.trim();
+    if (_isLoadingSession &&
+        pendingTargetId.isNotEmpty &&
+        pendingTargetId != sessionId) {
+      return;
+    }
+    final now = DateTime.now();
+    final lastRequestedAt = _sessionDeltaLastRequestedAt[sessionId];
+    if (!force &&
+        lastRequestedAt != null &&
+        now.difference(lastRequestedAt) < _sessionDeltaRequestCoalesceWindow) {
+      return;
+    }
+    _sessionDeltaLastRequestedAt[sessionId] = now;
     _service.send({
       'action': 'session_delta_get',
       'sessionId': sessionId,
@@ -2324,6 +2386,18 @@ class SessionController extends ChangeNotifier {
     if (targetId.isEmpty) {
       return;
     }
+    final selectedId = _selectedSessionId.trim();
+    final pendingTargetId = _pendingSessionTargetId.trim();
+    if (_isLoadingSession && pendingTargetId == targetId) {
+      return;
+    }
+    if (!_isLoadingSession && selectedId == targetId) {
+      return;
+    }
+    _postHistoryBootstrapTimer?.cancel();
+    _postHistoryBootstrapTimer = null;
+    _stopObservedSessionSync();
+    _sessionDeltaLastRequestedAt.clear();
     _connectionStage =
         _connected ? SessionConnectionStage.catchingUp : _connectionStage;
     _beginSessionLoading(targetId: targetId);
@@ -2353,6 +2427,19 @@ class SessionController extends ChangeNotifier {
 
   void _beginSessionLoading({String targetId = ''}) {
     _sessionLoadingTimeout?.cancel();
+    _postHistoryBootstrapTimer?.cancel();
+    _postHistoryBootstrapTimer = null;
+    _sessionLoadingTimeout = Timer(_sessionLoadingTimeoutDuration, () {
+      if (!_isLoadingSession) {
+        return;
+      }
+      _isLoadingSession = false;
+      _pendingSessionTargetId = '';
+      _agentPhaseLabel = '加载超时';
+      _pushSystem('error', '会话加载超时，请检查网络后重试');
+      _syncDerivedState();
+      notifyListeners();
+    });
     _isLoadingSession = true;
     _pendingSessionTargetId = targetId.trim();
     _pendingPrompt = null;
@@ -2488,6 +2575,26 @@ class SessionController extends ChangeNotifier {
     }
     _isLoadingSession = false;
     _pendingSessionTargetId = '';
+  }
+
+  void _schedulePostHistoryBootstrap({
+    required String sessionId,
+  }) {
+    _postHistoryBootstrapTimer?.cancel();
+    final normalizedSessionId = sessionId.trim();
+    _postHistoryBootstrapTimer = Timer(_postHistoryBootstrapDelay, () {
+      _postHistoryBootstrapTimer = null;
+      if (!_connected ||
+          _connecting ||
+          normalizedSessionId.isEmpty ||
+          _selectedSessionId.trim() != normalizedSessionId ||
+          _isLoadingSession) {
+        return;
+      }
+      requestRuntimeProcessList();
+      requestPermissionRuleList();
+      requestTaskSnapshot();
+    });
   }
 
   void updatePermissionMode(String permissionMode) {
@@ -4309,8 +4416,6 @@ class SessionController extends ChangeNotifier {
         );
         _syncActiveTerminalExecution();
         _resetRuntimeProcessState();
-        requestRuntimeProcessList();
-        requestPermissionRuleList();
         if (history.currentDiff != null) {
           final current = _normalizeHistoryDiff(history.currentDiff!);
           _mergeRecentDiff(current);
@@ -4368,13 +4473,21 @@ class SessionController extends ChangeNotifier {
             resolvedHistorySummary.id) {
           _pendingNotificationSessionTargetId = '';
         }
-        final restoredCwd = history.resumeRuntimeMeta.cwd.trim();
-        final targetCwd = restoredCwd.isNotEmpty ? restoredCwd : _config.cwd;
-        await switchWorkingDirectory(targetCwd);
-        _requestSessionDelta(reason: 'history_loaded');
         if (!_timeline.any(_hasVisibleTimelineContent)) {
           _pushSystem('session', '会话已就绪，可以继续输入');
         }
+        _syncDerivedState();
+        notifyListeners();
+        needsDerivedSync = false;
+        final restoredCwd = history.resumeRuntimeMeta.cwd.trim();
+        final targetCwd = restoredCwd.isNotEmpty ? restoredCwd : _config.cwd;
+        unawaited(_refreshContextAfterHistoryLoaded(
+          sessionId: resolvedHistorySummary.id,
+          cwd: targetCwd,
+        ));
+        _schedulePostHistoryBootstrap(
+          sessionId: resolvedHistorySummary.id,
+        );
         break;
       case SessionDeltaEvent delta:
         _handleSessionDelta(delta);
@@ -5452,6 +5565,19 @@ class SessionController extends ChangeNotifier {
     }
     _syncDerivedState();
     notifyListeners();
+  }
+
+  Future<void> _refreshContextAfterHistoryLoaded({
+    required String sessionId,
+    required String cwd,
+  }) async {
+    if (_selectedSessionId.trim() != sessionId.trim()) {
+      return;
+    }
+    await switchWorkingDirectory(cwd);
+    if (_selectedSessionId.trim() == sessionId.trim()) {
+      _requestSessionDelta(reason: 'history_loaded', force: true);
+    }
   }
 
   void _restoreTimelineFromHistory(

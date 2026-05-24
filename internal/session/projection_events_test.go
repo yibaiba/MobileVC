@@ -344,6 +344,102 @@ func TestSessionDeltaEventFromRecord_KnownExceedsLatestResetsToZero(t *testing.T
 	}
 }
 
+func TestSessionDeltaEventFromRecord_RespectsKnownTerminalExecutionCount(t *testing.T) {
+	record := data.SessionRecord{
+		Summary: data.SessionSummary{ID: "s1"},
+		Projection: data.ProjectionSnapshot{
+			TerminalExecutions: []data.TerminalExecution{
+				{ExecutionID: "exec-1", Command: "first"},
+				{ExecutionID: "exec-2", Command: "second"},
+			},
+			Runtime: data.SessionRuntime{Command: "claude"},
+		},
+	}
+	known := protocol.SessionDeltaKnown{TerminalExecutionCount: 1}
+	got := SessionDeltaEventFromRecord(record, known, DeltaCursorSnapshot{}, false)
+	if got.Latest.TerminalExecutionCount != 2 {
+		t.Fatalf("latest terminal execution count: %d", got.Latest.TerminalExecutionCount)
+	}
+	if len(got.TerminalExecutions) != 1 || got.TerminalExecutions[0].ExecutionID != "exec-2" {
+		t.Fatalf("expected only new terminal execution, got %+v", got.TerminalExecutions)
+	}
+}
+
+func TestSessionDeltaEventFromRecord_IncludesUpdatedExecutionForAppendedLog(t *testing.T) {
+	record := data.SessionRecord{
+		Summary: data.SessionSummary{ID: "s1"},
+		Projection: data.ProjectionSnapshot{
+			LogEntries: []data.SnapshotLogEntry{
+				{Kind: "terminal", Message: "started", ExecutionID: "exec-1", Phase: "started"},
+				{Kind: "terminal", Message: "done", ExecutionID: "exec-1", Phase: "finished"},
+			},
+			TerminalExecutions: []data.TerminalExecution{
+				{ExecutionID: "exec-1", Command: "go test", FinishedAt: "2026-01-01T00:00:00Z"},
+			},
+			Runtime: data.SessionRuntime{Command: "claude"},
+		},
+	}
+	known := protocol.SessionDeltaKnown{
+		LogEntryCount:          1,
+		TerminalExecutionCount: 1,
+	}
+	got := SessionDeltaEventFromRecord(record, known, DeltaCursorSnapshot{}, false)
+	if len(got.AppendLogEntries) != 1 || got.AppendLogEntries[0].Phase != "finished" {
+		t.Fatalf("expected appended finished log, got %+v", got.AppendLogEntries)
+	}
+	if len(got.TerminalExecutions) != 1 || got.TerminalExecutions[0].FinishedAt == "" {
+		t.Fatalf("expected updated terminal execution, got %+v", got.TerminalExecutions)
+	}
+}
+
+func TestSessionDeltaEventFromRecord_IncludesRunningExecutionsWhenTerminalOutputChanges(t *testing.T) {
+	record := data.SessionRecord{
+		Summary: data.SessionSummary{ID: "s1"},
+		Projection: data.ProjectionSnapshot{
+			RawTerminalByStream: map[string]string{"stdout": "new output"},
+			TerminalExecutions: []data.TerminalExecution{
+				{ExecutionID: "exec-1", Command: "first"},
+				{ExecutionID: "exec-2", Command: "second"},
+			},
+			Runtime: data.SessionRuntime{Command: "claude"},
+		},
+	}
+	known := protocol.SessionDeltaKnown{
+		TerminalExecutionCount: 2,
+		TerminalStdoutLength:   3,
+	}
+	got := SessionDeltaEventFromRecord(record, known, DeltaCursorSnapshot{}, false)
+	if got.RequiresFullSync {
+		t.Fatalf("expected incremental terminal output delta, got full sync")
+	}
+	if len(got.TerminalExecutions) != 2 {
+		t.Fatalf("expected running executions to be refreshed, got %+v", got.TerminalExecutions)
+	}
+	if got.TerminalExecutions[0].ExecutionID != "exec-1" || got.TerminalExecutions[1].ExecutionID != "exec-2" {
+		t.Fatalf("unexpected execution order: %+v", got.TerminalExecutions)
+	}
+}
+
+func TestSessionDeltaEventFromRecord_KnownTerminalExecutionExceedsLatestRequiresFullSync(t *testing.T) {
+	record := data.SessionRecord{
+		Summary: data.SessionSummary{ID: "s1"},
+		Projection: data.ProjectionSnapshot{
+			TerminalExecutions: []data.TerminalExecution{
+				{ExecutionID: "exec-1", Command: "first"},
+			},
+			Runtime: data.SessionRuntime{Command: "claude"},
+		},
+	}
+	known := protocol.SessionDeltaKnown{TerminalExecutionCount: 100}
+	got := SessionDeltaEventFromRecord(record, known, DeltaCursorSnapshot{}, false)
+	if !got.RequiresFullSync {
+		t.Fatalf("expected full sync when known terminal execution count is invalid")
+	}
+	if len(got.TerminalExecutions) != 1 {
+		t.Fatalf("expected reset to deliver all executions, got %+v", got.TerminalExecutions)
+	}
+}
+
 func TestRestoredAgentStateEventFromRecord_Idle_NoResume(t *testing.T) {
 	record := data.SessionRecord{
 		Summary: data.SessionSummary{ID: "s1"},

@@ -9694,6 +9694,248 @@ void main() {
           isTrue);
     });
 
+    test('loadSession 匹配 history 后先显示 timeline 再异步刷新目录和 delta', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.sentPayloads.clear();
+      final notifications = <String>[];
+      controller.addListener(() {
+        if (controller.selectedSessionId == 'session-target' &&
+            controller.timeline.any(
+              (item) => item.body.contains('先显示的历史回复'),
+            )) {
+          notifications.add(
+            service.sentPayloads
+                .map((payload) => payload['action'].toString())
+                .join(','),
+          );
+        }
+      });
+
+      controller.loadSession('session-target');
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-target',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-target', title: '历史会话'),
+        logEntries: const [
+          HistoryLogEntry(
+            kind: 'markdown',
+            message: '先显示的历史回复',
+            timestamp: '2026-01-01T00:00:00Z',
+          ),
+        ],
+        resumeRuntimeMeta: const RuntimeMeta(
+          command: 'claude',
+          cwd: '/tmp/mobilevc-history-cwd',
+        ),
+      ));
+      await _flushEvents();
+
+      expect(notifications, isNotEmpty);
+      expect(notifications.first, isNot(contains('session_delta_get')));
+      expect(notifications.first, isNot(contains('session_list')));
+      expect(
+        service.sentPayloads.any(
+          (payload) => payload['action'] == 'session_delta_get',
+        ),
+        isTrue,
+      );
+      expect(
+        service.sentPayloads.any((payload) => payload['action'] == 'fs_list'),
+        isTrue,
+      );
+    });
+
+    test('公开列表 getter 返回稳定不可变视图，避免 build 时复制长 timeline', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      final firstTimeline = controller.timeline;
+      final secondTimeline = controller.timeline;
+      final firstSessions = controller.sessions;
+      final secondSessions = controller.sessions;
+
+      expect(identical(firstTimeline, secondTimeline), isTrue);
+      expect(identical(firstSessions, secondSessions), isTrue);
+      expect(() => firstTimeline.add(_timelineItem('blocked')),
+          throwsUnsupportedError);
+      expect(() => firstSessions.clear(), throwsUnsupportedError);
+    });
+
+    test('loadSession 期间前台恢复不会向旧会话发送 resume/delta', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-old',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-old', title: '旧会话'),
+        runtimeAlive: true,
+      ));
+      await _flushEvents();
+      expect(controller.selectedSessionId, 'session-old');
+
+      service.sentPayloads.clear();
+      controller.loadSession('session-new');
+      controller.resumeConnectionIfNeeded();
+      await _flushEvents();
+
+      final sessionActions = service.sentPayloads
+          .where((payload) =>
+              payload['action'] == 'session_load' ||
+              payload['action'] == 'session_resume' ||
+              payload['action'] == 'session_delta_get')
+          .toList();
+      expect(sessionActions, hasLength(1));
+      expect(sessionActions.single['action'], 'session_load');
+      expect(sessionActions.single['sessionId'], 'session-new');
+    });
+
+    test('重复 loadSession 同一目标不会重复发送 session_load', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.sentPayloads.clear();
+
+      controller.loadSession('session-target');
+      controller.loadSession('session-target');
+      await _flushEvents();
+
+      final loads = service.sentPayloads
+          .where((payload) => payload['action'] == 'session_load')
+          .toList();
+      expect(loads, hasLength(1));
+      expect(loads.single['sessionId'], 'session-target');
+    });
+
+    test('loadSession history 后延后发送非关键 bootstrap 请求', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.sentPayloads.clear();
+
+      controller.loadSession('session-target');
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-target',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-target', title: '历史会话'),
+        logEntries: [
+          HistoryLogEntry(
+            kind: 'markdown',
+            message: '首屏历史',
+            timestamp: _timestamp.toIso8601String(),
+          ),
+        ],
+        resumeRuntimeMeta: const RuntimeMeta(cwd: '/workspace'),
+      ));
+      await _flushEvents();
+
+      expect(controller.timeline.any((item) => item.body.contains('首屏历史')),
+          isTrue);
+      expect(
+        service.sentPayloads.any((payload) =>
+            payload['action'] == 'runtime_process_list' ||
+            payload['action'] == 'permission_rule_list' ||
+            payload['action'] == 'task_snapshot_get'),
+        isFalse,
+      );
+      expect(
+        service.sentPayloads.any((payload) => payload['action'] == 'fs_list'),
+        isTrue,
+        reason: 'cwd/fs_list is critical session context and should not wait '
+            'for the delayed bootstrap timer',
+      );
+      expect(
+        service.sentPayloads
+            .any((payload) => payload['action'] == 'session_list'),
+        isTrue,
+        reason: 'switchWorkingDirectory should refresh the session list for '
+            'the restored cwd immediately',
+      );
+
+      await Future<void>.delayed(const Duration(milliseconds: 520));
+      await _flushEvents();
+
+      expect(
+        service.sentPayloads.any((payload) =>
+            payload['action'] == 'runtime_process_list' ||
+            payload['action'] == 'permission_rule_list' ||
+            payload['action'] == 'task_snapshot_get' ||
+            payload['action'] == 'fs_list'),
+        isTrue,
+      );
+    });
+
+    test('history_loaded delta 不会被同会话 delta coalesce 吞掉', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-target',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-target', title: '历史会话'),
+        resumeRuntimeMeta: const RuntimeMeta(cwd: '/workspace'),
+      ));
+      await _flushEvents();
+
+      service.sentPayloads.clear();
+      controller.resumeConnectionIfNeeded();
+      await _flushEvents();
+      expect(
+        service.sentPayloads.any((payload) =>
+            payload['action'] == 'session_delta_get' &&
+            payload['reason'] == 'foreground'),
+        isTrue,
+      );
+
+      service.sentPayloads.clear();
+      controller.loadSession('session-target');
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp.add(const Duration(seconds: 1)),
+        sessionId: 'session-target',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-target', title: '新历史'),
+        resumeRuntimeMeta: const RuntimeMeta(cwd: '/workspace'),
+      ));
+      await _flushEvents();
+
+      expect(
+        service.sentPayloads.any((payload) =>
+            payload['action'] == 'session_delta_get' &&
+            payload['reason'] == 'history_loaded'),
+        isTrue,
+        reason: 'history_loaded is the first post-history sync and must bypass '
+            'the short duplicate-request coalesce window',
+      );
+    });
+
     test('loadSession 期间不属于目标的 stale history 仍会被丢弃', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);
@@ -9722,6 +9964,13 @@ void main() {
 }
 
 final _timestamp = DateTime(2026, 1, 1);
+
+TimelineItem _timelineItem(String body) => TimelineItem(
+      id: 'timeline-$body',
+      kind: 'markdown',
+      timestamp: _timestamp,
+      body: body,
+    );
 
 FileDiffEvent _reviewDiffEvent({
   required String contextId,

@@ -31,6 +31,102 @@ import (
 )
 
 const wsDebugPreviewLimit = 240
+const sessionListCacheTTL = 1500 * time.Millisecond
+
+type sessionLoadTraceStage struct {
+	name     string
+	duration time.Duration
+}
+
+type sessionLoadTrace struct {
+	connectionID       string
+	initialSessionID   string
+	requestedSessionID string
+	remoteAddr         string
+	reason             string
+	startedAt          time.Time
+	lastStepAt         time.Time
+	stages             []sessionLoadTraceStage
+}
+
+type projectionTraceMetrics struct {
+	logEntries         int
+	diffs              int
+	terminalExecutions int
+	stdoutBytes        int
+	stderrBytes        int
+}
+
+type sessionListCacheEntry struct {
+	cwd       string
+	createdAt time.Time
+	items     []data.SessionSummary
+}
+
+func newSessionLoadTrace(connectionID, selectedSessionID, requestedSessionID, remoteAddr, reason string) *sessionLoadTrace {
+	now := time.Now()
+	return &sessionLoadTrace{
+		connectionID:       strings.TrimSpace(connectionID),
+		initialSessionID:   strings.TrimSpace(selectedSessionID),
+		requestedSessionID: strings.TrimSpace(requestedSessionID),
+		remoteAddr:         strings.TrimSpace(remoteAddr),
+		reason:             strings.TrimSpace(reason),
+		startedAt:          now,
+		lastStepAt:         now,
+	}
+}
+
+func (t *sessionLoadTrace) Step(name string) {
+	if t == nil {
+		return
+	}
+	now := time.Now()
+	t.stages = append(t.stages, sessionLoadTraceStage{
+		name:     strings.TrimSpace(name),
+		duration: now.Sub(t.lastStepAt),
+	})
+	t.lastStepAt = now
+}
+
+func (t *sessionLoadTrace) Finish(finalSessionID string, activeRuntimeLoad bool, metrics projectionTraceMetrics) {
+	if t == nil {
+		return
+	}
+	total := time.Since(t.startedAt)
+	stageDurations := make([]string, 0, len(t.stages))
+	for _, stage := range t.stages {
+		stageDurations = append(stageDurations, fmt.Sprintf("%s=%s", stage.name, stage.duration.Round(time.Millisecond)))
+	}
+	logx.Info(
+		"ws",
+		"session_load timings: connectionID=%s initialSessionID=%s requestedSessionID=%s finalSessionID=%s remoteAddr=%s reason=%q activeRuntimeLoad=%v total=%s stages=%s logEntries=%d diffs=%d terminalExecutions=%d stdoutBytes=%d stderrBytes=%d",
+		t.connectionID,
+		t.initialSessionID,
+		t.requestedSessionID,
+		strings.TrimSpace(finalSessionID),
+		t.remoteAddr,
+		t.reason,
+		activeRuntimeLoad,
+		total.Round(time.Millisecond),
+		strings.Join(stageDurations, ","),
+		metrics.logEntries,
+		metrics.diffs,
+		metrics.terminalExecutions,
+		metrics.stdoutBytes,
+		metrics.stderrBytes,
+	)
+}
+
+func projectionMetrics(projection data.ProjectionSnapshot) projectionTraceMetrics {
+	projection = session.NormalizeProjectionSnapshot(projection)
+	return projectionTraceMetrics{
+		logEntries:         len(projection.LogEntries),
+		diffs:              len(projection.Diffs),
+		terminalExecutions: len(projection.TerminalExecutions),
+		stdoutBytes:        len(projection.RawTerminalByStream["stdout"]),
+		stderrBytes:        len(projection.RawTerminalByStream["stderr"]),
+	}
+}
 
 type secretLogPattern struct {
 	re          *regexp.Regexp
@@ -281,6 +377,10 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 	sessionProjectionContext := func() (context.Context, context.CancelFunc) {
 		return context.WithTimeout(context.Background(), 2*time.Second)
 	}
+	sessionListCache := sessionListCacheEntry{}
+	invalidateSessionListCache := func() {
+		sessionListCache = sessionListCacheEntry{}
+	}
 
 	finalizeProjectionSnapshotForService := func(sessionID string, service *session.Service, loaded data.ProjectionSnapshot) data.ProjectionSnapshot {
 		projection := data.ProjectionSnapshot{
@@ -363,11 +463,33 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 		return snapshot.Running && strings.TrimSpace(snapshot.ActiveSession) == trimmedSessionID
 	}
 
+	loadStoredSessionRecordForRequest := func(requestedSessionID string) (data.SessionRecord, error) {
+		if h.SessionStore == nil {
+			return data.SessionRecord{}, fmt.Errorf("session store unavailable")
+		}
+		targetSessionID := strings.TrimSpace(requestedSessionID)
+		if targetSessionID == "" {
+			return data.SessionRecord{}, fmt.Errorf("session ID is required")
+		}
+		return h.SessionStore.GetSession(ctx, targetSessionID)
+	}
+
 	loadSessionRecordForRequest := func(requestedSessionID string) (data.SessionRecord, error) {
 		if activeRuntimeRecord(requestedSessionID) {
-			return h.SessionStore.GetSession(ctx, strings.TrimSpace(requestedSessionID))
+			return loadStoredSessionRecordForRequest(requestedSessionID)
 		}
 		return loadSessionRecord(ctx, h.SessionStore, requestedSessionID)
+	}
+
+	loadSessionDeltaRecord := func(requestedSessionID string) (data.SessionRecord, error) {
+		targetSessionID := strings.TrimSpace(requestedSessionID)
+		if targetSessionID == "" {
+			return data.SessionRecord{}, fmt.Errorf("session ID is required")
+		}
+		if codexsync.IsMirrorSessionID(targetSessionID) || claudesync.IsMirrorSessionID(targetSessionID) {
+			return loadSessionRecord(ctx, h.SessionStore, targetSessionID)
+		}
+		return loadStoredSessionRecordForRequest(targetSessionID)
 	}
 
 	persistProjectionFor := func(sessionID string, snapshot data.ProjectionSnapshot) {
@@ -383,6 +505,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			logx.Error("ws", "save session projection failed: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, sessionID, remoteAddr, err)
 			return
 		}
+		invalidateSessionListCache()
 		// Sync new user/assistant entries to Claude CLI JSONL.
 		syncSessionEntriesToClaudeJSONL(h.SessionStore, sessionID, snapshot)
 	}
@@ -599,6 +722,15 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			return nil
 		}
 		sessionListFilterCWD = normalizeSessionCWD(filterCWD)
+		now := time.Now()
+		if sessionListCache.cwd == sessionListFilterCWD &&
+			!sessionListCache.createdAt.IsZero() &&
+			now.Sub(sessionListCache.createdAt) <= sessionListCacheTTL {
+			cached := cloneSessionSummaries(sessionListCache.items)
+			logx.Info("ws", "session list cache hit: connectionID=%s sessionID=%s remoteAddr=%s cwd=%q items=%d", connectionID, selectedSessionID, remoteAddr, sessionListFilterCWD, len(cached))
+			emit(protocol.NewSessionListResultEvent(selectedSessionID, toProtocolSummaries(cached)))
+			return cached
+		}
 		items, err := h.SessionStore.ListSessions(ctx)
 		if err != nil {
 			logx.Error("ws", "list sessions failed: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
@@ -609,6 +741,11 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 		if mergeErr != nil {
 			logx.Warn("ws", "merge session summaries failed: connectionID=%s sessionID=%s remoteAddr=%s cwd=%q err=%v", connectionID, selectedSessionID, remoteAddr, sessionListFilterCWD, mergeErr)
 			merged = filterStoreSessionsByCWD(items, sessionListFilterCWD)
+		}
+		sessionListCache = sessionListCacheEntry{
+			cwd:       sessionListFilterCWD,
+			createdAt: now,
+			items:     cloneSessionSummaries(merged),
 		}
 		emit(protocol.NewSessionListResultEvent(selectedSessionID, toProtocolSummaries(merged)))
 		return merged
@@ -867,6 +1004,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
 				continue
 			}
+			invalidateSessionListCache()
 			if cwd := normalizeSessionCWD(req.CWD); cwd != "" {
 				record, err := h.SessionStore.GetSession(ctx, created.ID)
 				if err == nil {
@@ -874,6 +1012,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 					record.Projection.Runtime.Source = "mobilevc"
 					record.Summary.Runtime = record.Projection.Runtime
 					if _, err := h.SessionStore.UpsertSession(ctx, record); err == nil {
+						invalidateSessionListCache()
 						created = record.Summary
 					}
 				}
@@ -932,21 +1071,29 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				emit(protocol.NewErrorEvent(selectedSessionID, "session store unavailable", ""))
 				continue
 			}
+			trace := newSessionLoadTrace(connectionID, selectedSessionID, req.SessionID, remoteAddr, req.Reason)
 			activeRuntimeLoad := activeRuntimeRecord(req.SessionID)
+			trace.Step("active_runtime_check")
 			record, err := loadSessionRecordForRequest(req.SessionID)
+			trace.Step("load_record")
 			if err != nil {
 				logx.Warn("ws", "load session failed: connectionID=%s sessionID=%s requestedSessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, req.SessionID, remoteAddr, err)
+				trace.Finish("", activeRuntimeLoad, projectionTraceMetrics{})
 				emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
 				continue
 			}
 			// Merge any new events from Claude CLI JSONL (if this session was continued in CLI).
 			// Switch runtime first so merge sees the correct ActiveSession.
 			switchRuntimeSession(record.Summary.ID)
+			trace.Step("switch_runtime")
 			if !activeRuntimeLoad {
 				record = mergeClaudeJSONLToRecord(ctx, h.SessionStore, record, runtimeSvc)
+				invalidateSessionListCache()
 			}
+			trace.Step("merge_claude_jsonl")
 			augmentedProjection := session.NormalizeProjectionSnapshot(record.Projection)
 			runtimeProjection := buildProjectionSnapshotForService(record.Summary.ID, runtimeSvc)
+			trace.Step("build_projection")
 			if codexsync.IsMirrorSessionID(record.Summary.ID) {
 				record.Projection = mergeProjectionWithOptionalRuntime(augmentedProjection, runtimeProjection, runtimeSvc, record.Summary.ID)
 			} else {
@@ -957,7 +1104,9 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			}
 			record.Summary.Runtime = record.Projection.Runtime
 			loadRuntimeAlive := sessionRecordRuntimeAlive(record, runtimeSvc)
+			trace.Step("merge_projection")
 			emit(session.SessionHistoryEventFromRecord(record, loadRuntimeAlive))
+			trace.Step("emit_history")
 			emitReviewStateFromProjection(emit, selectedSessionID, record.Projection)
 			if restored := restoredAgentStateEventFromRecord(record, loadRuntimeAlive); restored != nil {
 				emit(*restored)
@@ -965,7 +1114,10 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 					emit(status)
 				}
 			}
+			trace.Step("emit_review_state")
 			emit(protocol.NewSessionStateEvent(selectedSessionID, string(session.StateActive), "history loaded"))
+			trace.Step("emit_session_state")
+			trace.Finish(record.Summary.ID, activeRuntimeLoad, projectionMetrics(record.Projection))
 		case "register_push_token":
 			var req protocol.RegisterPushTokenRequestEvent
 			if err := json.Unmarshal(payloadBytes, &req); err != nil {
@@ -996,28 +1148,59 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			if targetSessionID == "" {
 				targetSessionID = strings.TrimSpace(selectedSessionID)
 			}
-			record, err := loadSessionRecordForRequest(targetSessionID)
+			if targetSessionID == "" {
+				emit(protocol.NewErrorEvent(selectedSessionID, "session ID is required", ""))
+				continue
+			}
+			if targetSessionID != strings.TrimSpace(selectedSessionID) {
+				logx.Info("ws", "session delta requires full sync because target is not selected: connectionID=%s sessionID=%s requestedSessionID=%s remoteAddr=%s reason=%q", connectionID, selectedSessionID, targetSessionID, remoteAddr, req.Reason)
+				emit(protocol.NewSessionDeltaEvent(
+					targetSessionID,
+					protocol.SessionSummary{ID: targetSessionID},
+					req.Known,
+					protocol.SessionDeltaKnown{},
+					nil,
+					nil,
+					nil,
+					nil,
+					nil,
+					nil,
+					nil,
+					nil,
+					nil,
+					protocol.SessionContext{},
+					protocol.CatalogMetadata{},
+					protocol.CatalogMetadata{},
+					false,
+					false,
+					protocol.RuntimeMeta{},
+					true,
+				))
+				continue
+			}
+			record, err := loadSessionDeltaRecord(targetSessionID)
 			if err != nil {
 				emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
 				continue
 			}
-			switchRuntimeSession(record.Summary.ID)
-			sessionRuntime := h.runtimeSessions.Ensure(record.Summary.ID)
+			sessionRuntime, sessionRuntimeSvc := runtimeForSession(record.Summary.ID)
 			freshProjection := session.NormalizeProjectionSnapshot(record.Projection)
-			runtimeProjection := buildProjectionSnapshotForService(record.Summary.ID, runtimeSvc)
+			runtimeProjection := finalizeProjectionSnapshotForService(record.Summary.ID, sessionRuntimeSvc, freshProjection)
 			if codexsync.IsMirrorSessionID(record.Summary.ID) {
-				record.Projection = mergeProjectionWithOptionalRuntime(freshProjection, runtimeProjection, runtimeSvc, record.Summary.ID)
+				record.Projection = mergeProjectionWithOptionalRuntime(freshProjection, runtimeProjection, sessionRuntimeSvc, record.Summary.ID)
 			} else {
 				record.Projection = runtimeProjection
 			}
 			record.Summary.Runtime = record.Projection.Runtime
-			runtimeAlive := sessionRecordRuntimeAlive(record, runtimeSvc)
-			logx.Info("ws", "session delta response: sessionID=%s runtimeAlive=%v canResume=%v", record.Summary.ID, runtimeAlive, sessionRuntime != nil && runtimeAlive)
-			emit(session.SessionDeltaEventFromRecord(record, req.Known, deltaCursorSnapshot(sessionRuntime), runtimeAlive))
+			runtimeAlive := sessionRecordRuntimeAlive(record, sessionRuntimeSvc)
+			deltaEvent := session.SessionDeltaEventFromRecord(record, req.Known, deltaCursorSnapshot(sessionRuntime), runtimeAlive)
+			metrics := projectionMetrics(record.Projection)
+			logx.Info("ws", "session delta response: connectionID=%s sessionID=%s remoteAddr=%s reason=%q runtimeAlive=%v canResume=%v requiresFullSync=%v logEntries=%d diffs=%d stdoutBytes=%d stderrBytes=%d", connectionID, record.Summary.ID, remoteAddr, req.Reason, runtimeAlive, sessionRuntime != nil && runtimeAlive, deltaEvent.RequiresFullSync, metrics.logEntries, metrics.diffs, metrics.stdoutBytes, metrics.stderrBytes)
+			emit(deltaEvent)
 			emitReviewStateFromProjection(emit, selectedSessionID, record.Projection)
-			if snapshot := runtimeSvc.BuildTaskSnapshotEvent(record.Summary.ID, taskCursorSnapshot(sessionRuntime), "delta", true); snapshot != nil {
+			if snapshot := sessionRuntimeSvc.BuildTaskSnapshotEvent(record.Summary.ID, taskCursorSnapshot(sessionRuntime), "delta", true); snapshot != nil {
 				emit(*snapshot)
-				if status, ok := session.AIStatusEventForBackendEvent(record.Summary.ID, runtimeSvc, record.Projection, *snapshot); ok {
+				if status, ok := session.AIStatusEventForBackendEvent(record.Summary.ID, sessionRuntimeSvc, record.Projection, *snapshot); ok {
 					emit(status)
 				}
 			}
@@ -1171,6 +1354,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				emit(protocol.NewErrorEventWithCode(selectedSessionID, err.Error(), "", "session_delete_failed"))
 				continue
 			}
+			invalidateSessionListCache()
 			deletingCurrent := req.SessionID == selectedSessionID
 			items := emitSessionList(sessionListFilterCWD)
 			if !deletingCurrent {
@@ -1336,6 +1520,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
 				continue
 			}
+			invalidateSessionListCache()
 			emit(protocol.NewSessionContextResultEvent(selectedSessionID, toProtocolSessionContext(record.Projection.SessionContext)))
 		case "skill_catalog_get":
 			emitSkillCatalogResult(emit, h.SessionStore, ctx, selectedSessionID)
@@ -2598,6 +2783,15 @@ func toProtocolSummaries(items []data.SessionSummary) []protocol.SessionSummary 
 		result = append(result, toProtocolSummary(item))
 	}
 	return result
+}
+
+func cloneSessionSummaries(items []data.SessionSummary) []data.SessionSummary {
+	if items == nil {
+		return nil
+	}
+	cloned := make([]data.SessionSummary, len(items))
+	copy(cloned, items)
+	return cloned
 }
 
 func toProtocolCatalogMetadata(meta data.CatalogMetadata) protocol.CatalogMetadata {
@@ -4041,10 +4235,13 @@ func loadSessionRecord(ctx context.Context, sessionStore data.Store, sessionID s
 			if existingErr == nil && len(existing.Projection.LogEntries) > len(record.Projection.LogEntries) {
 				record.Projection.LogEntries = existing.Projection.LogEntries
 			}
-			if _, upsertErr := sessionStore.UpsertSession(ctx, record); upsertErr != nil {
+			summary, upsertErr := sessionStore.UpsertSession(ctx, record)
+			if upsertErr != nil {
 				logx.Warn("ws", "upsert claude mirror session failed: sessionID=%s err=%v", sessionID, upsertErr)
+				return sessionStore.GetSession(ctx, sessionID)
 			}
-			return sessionStore.GetSession(ctx, sessionID)
+			record.Summary = summary
+			return record, nil
 		}
 		if existingErr == nil && existing.Summary.ID != "" {
 			logx.Warn("ws", "claude sync failed but using cached record: sessionID=%s nativeErr=%v", sessionID, nativeErr)
@@ -4066,10 +4263,13 @@ func loadSessionRecord(ctx context.Context, sessionStore data.Store, sessionID s
 		if existingErr == nil {
 			record = mergeCodexMirrorRecord(record, existing)
 		}
-		if _, upsertErr := sessionStore.UpsertSession(ctx, record); upsertErr != nil {
+		summary, upsertErr := sessionStore.UpsertSession(ctx, record)
+		if upsertErr != nil {
 			logx.Warn("ws", "upsert codex mirror session failed: sessionID=%s err=%v", sessionID, upsertErr)
+			return sessionStore.GetSession(ctx, sessionID)
 		}
-		return sessionStore.GetSession(ctx, sessionID)
+		record.Summary = summary
+		return record, nil
 	}
 	if existingErr == nil && existing.Summary.ID != "" {
 		logx.Warn("ws", "codex sync failed but using cached record: sessionID=%s nativeErr=%v", sessionID, nativeErr)

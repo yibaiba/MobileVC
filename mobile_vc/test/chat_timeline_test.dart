@@ -175,4 +175,71 @@ void main() {
 
     expect(find.text('执行中'), findsNothing);
   });
+
+  testWidgets('review summary 仍插入到匹配 diff 后且不复制完整列表', (tester) async {
+    final diff = HistoryContext(
+      id: 'diff-1',
+      type: 'diff',
+      title: 'README.md',
+      path: '/workspace/README.md',
+      diff: '@@ -1 +1 @@',
+      pendingReview: true,
+    );
+    final items = [
+      TimelineItem(
+        id: 'msg-1',
+        kind: 'markdown',
+        timestamp: DateTime(2026, 1, 1),
+        body: '开始',
+      ),
+      TimelineItem(
+        id: 'diff-1',
+        kind: 'file_diff',
+        timestamp: DateTime(2026, 1, 1, 0, 0, 1),
+        title: 'README.md',
+        body: '/workspace/README.md',
+        context: diff,
+      ),
+    ];
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: ChatTimeline(
+            items: items,
+            activeReviewDiff: diff,
+            pendingDiffCount: 1,
+            shouldShowReviewChoices: true,
+          ),
+        ),
+      ),
+    );
+
+    expect(find.text('README.md'), findsOneWidget);
+    expect(find.text('/workspace/README.md'), findsOneWidget);
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: ChatTimeline(
+            items: items,
+            activeReviewDiff: diff,
+            pendingDiffCount: 1,
+            shouldShowReviewChoices: true,
+            pendingPrompt: PromptRequestEvent(
+              timestamp: DateTime(2026, 1, 1, 0, 0, 2),
+              sessionId: 'session-1',
+              runtimeMeta: const RuntimeMeta(command: 'claude'),
+              raw: const {'type': 'prompt_request'},
+              message: '请输入确认',
+            ),
+          ),
+        ),
+      ),
+    );
+
+    expect(find.text('README.md'), findsOneWidget);
+    expect(find.text('请输入确认'), findsNothing,
+        reason: 'review choices mode hides generic prompt card');
+  });
 }

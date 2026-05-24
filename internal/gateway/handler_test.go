@@ -247,6 +247,112 @@ type localTestServer struct {
 	listener net.Listener
 }
 
+type countingStore struct {
+	inner      data.Store
+	mu         sync.Mutex
+	getCalls   int
+	listCalls  int
+	upsertErr  error
+	upsertSeen []string
+}
+
+func (s *countingStore) CreateSession(ctx context.Context, title string) (data.SessionSummary, error) {
+	return s.inner.CreateSession(ctx, title)
+}
+
+func (s *countingStore) UpsertSession(ctx context.Context, record data.SessionRecord) (data.SessionSummary, error) {
+	s.mu.Lock()
+	s.upsertSeen = append(s.upsertSeen, record.Summary.ID)
+	err := s.upsertErr
+	s.mu.Unlock()
+	if err != nil {
+		return data.SessionSummary{}, err
+	}
+	return s.inner.UpsertSession(ctx, record)
+}
+
+func (s *countingStore) SaveProjection(ctx context.Context, sessionID string, projection data.ProjectionSnapshot) (data.SessionSummary, error) {
+	return s.inner.SaveProjection(ctx, sessionID, projection)
+}
+
+func (s *countingStore) GetSession(ctx context.Context, sessionID string) (data.SessionRecord, error) {
+	s.mu.Lock()
+	s.getCalls++
+	s.mu.Unlock()
+	return s.inner.GetSession(ctx, sessionID)
+}
+
+func (s *countingStore) ListSessions(ctx context.Context) ([]data.SessionSummary, error) {
+	s.mu.Lock()
+	s.listCalls++
+	s.mu.Unlock()
+	return s.inner.ListSessions(ctx)
+}
+
+func (s *countingStore) DeleteSession(ctx context.Context, sessionID string) error {
+	return s.inner.DeleteSession(ctx, sessionID)
+}
+
+func (s *countingStore) SavePushToken(ctx context.Context, sessionID, token, platform string) error {
+	return s.inner.SavePushToken(ctx, sessionID, token, platform)
+}
+
+func (s *countingStore) GetPushToken(ctx context.Context, sessionID string) (string, string, error) {
+	return s.inner.GetPushToken(ctx, sessionID)
+}
+
+func (s *countingStore) ListSkillCatalog(ctx context.Context) ([]data.SkillDefinition, error) {
+	return s.inner.ListSkillCatalog(ctx)
+}
+
+func (s *countingStore) SaveSkillCatalog(ctx context.Context, items []data.SkillDefinition) error {
+	return s.inner.SaveSkillCatalog(ctx, items)
+}
+
+func (s *countingStore) GetSkillCatalogSnapshot(ctx context.Context) (data.SkillCatalogSnapshot, error) {
+	return s.inner.GetSkillCatalogSnapshot(ctx)
+}
+
+func (s *countingStore) SaveSkillCatalogSnapshot(ctx context.Context, snapshot data.SkillCatalogSnapshot) error {
+	return s.inner.SaveSkillCatalogSnapshot(ctx, snapshot)
+}
+
+func (s *countingStore) ListMemoryCatalog(ctx context.Context) ([]data.MemoryItem, error) {
+	return s.inner.ListMemoryCatalog(ctx)
+}
+
+func (s *countingStore) SaveMemoryCatalog(ctx context.Context, items []data.MemoryItem) error {
+	return s.inner.SaveMemoryCatalog(ctx, items)
+}
+
+func (s *countingStore) GetMemoryCatalogSnapshot(ctx context.Context) (data.MemoryCatalogSnapshot, error) {
+	return s.inner.GetMemoryCatalogSnapshot(ctx)
+}
+
+func (s *countingStore) SaveMemoryCatalogSnapshot(ctx context.Context, snapshot data.MemoryCatalogSnapshot) error {
+	return s.inner.SaveMemoryCatalogSnapshot(ctx, snapshot)
+}
+
+func (s *countingStore) GetPermissionRuleSnapshot(ctx context.Context) (data.PermissionRuleSnapshot, error) {
+	return s.inner.GetPermissionRuleSnapshot(ctx)
+}
+
+func (s *countingStore) SavePermissionRuleSnapshot(ctx context.Context, snapshot data.PermissionRuleSnapshot) error {
+	return s.inner.SavePermissionRuleSnapshot(ctx, snapshot)
+}
+
+func (s *countingStore) getCallCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.getCalls
+}
+
+func (s *countingStore) listCallCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.listCalls
+}
+
 func (s *localTestServer) Close() {
 	if s == nil {
 		return
@@ -5336,6 +5442,95 @@ func TestHandlerInitialSessionListDoesNotMergeNativeCodexSessions(t *testing.T) 
 	}
 }
 
+func TestHandlerSessionListUsesShortTTLCache(t *testing.T) {
+	h := newTestHandler()
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	counting := &countingStore{inner: tempStore}
+	h.SessionStore = counting
+
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+	_ = readUntilType(t, conn, protocol.EventTypeSessionListResult)
+
+	if err := conn.WriteJSON(protocol.SessionListRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_list"},
+		CWD:         "",
+	}); err != nil {
+		t.Fatalf("write first session_list request: %v", err)
+	}
+	_ = readUntilType(t, conn, protocol.EventTypeSessionListResult)
+	afterFirst := counting.listCallCount()
+
+	if err := conn.WriteJSON(protocol.SessionListRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_list"},
+		CWD:         "",
+	}); err != nil {
+		t.Fatalf("write second session_list request: %v", err)
+	}
+	_ = readUntilType(t, conn, protocol.EventTypeSessionListResult)
+	if afterSecond := counting.listCallCount(); afterSecond != afterFirst {
+		t.Fatalf("expected cached session_list to avoid store rescan, calls before=%d after=%d", afterFirst, afterSecond)
+	}
+}
+
+func TestHandlerSessionCreateInvalidatesSessionListCache(t *testing.T) {
+	h := newTestHandler()
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	counting := &countingStore{inner: tempStore}
+	h.SessionStore = counting
+
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+	_ = readUntilType(t, conn, protocol.EventTypeSessionListResult)
+
+	if err := conn.WriteJSON(protocol.SessionListRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_list"},
+		CWD:         "",
+	}); err != nil {
+		t.Fatalf("write warm session_list request: %v", err)
+	}
+	_ = readUntilType(t, conn, protocol.EventTypeSessionListResult)
+	beforeCreate := counting.listCallCount()
+
+	if err := conn.WriteJSON(protocol.SessionCreateRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_create"},
+		Title:       "cache-created",
+	}); err != nil {
+		t.Fatalf("write session create request: %v", err)
+	}
+	created := readUntilSessionCreated(t, conn)
+	summary, ok := created["summary"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected summary payload, got %#v", created)
+	}
+	sessionID, _ := summary["id"].(string)
+	if sessionID == "" {
+		t.Fatalf("expected created session id, got %#v", created)
+	}
+	listEvent := readUntilType(t, conn, protocol.EventTypeSessionListResult)
+	if afterCreate := counting.listCallCount(); afterCreate <= beforeCreate {
+		t.Fatalf("expected session_create to invalidate cache and rescan, calls before=%d after=%d", beforeCreate, afterCreate)
+	}
+
+	items, ok := listEvent["items"].([]any)
+	if !ok {
+		t.Fatalf("expected session list items, got %#v", listEvent)
+	}
+	for _, raw := range items {
+		item, _ := raw.(map[string]any)
+		if item["id"] == sessionID {
+			return
+		}
+	}
+	t.Fatalf("expected created session %q in invalidated list, got %#v", sessionID, items)
+}
+
 func TestHandlerSessionListMergesNativeCodexSessionsByCWD(t *testing.T) {
 	homeDir := t.TempDir()
 	projectDir := filepath.Join(homeDir, "workspace", "MobileVC")
@@ -5743,6 +5938,34 @@ func TestHandlerSessionLoadMirrorsNativeCodexSession(t *testing.T) {
 	}
 	if !strings.Contains(record.Summary.LastPreview, "Mobile labels aligned") {
 		t.Fatalf("expected mirrored preview to include assistant reply, got %#v", record.Summary)
+	}
+}
+
+func TestLoadSessionRecordReturnsCodexMirrorAfterUpsertWithoutSecondRead(t *testing.T) {
+	homeDir := t.TempDir()
+	projectDir := filepath.Join(homeDir, "workspace", "MobileVC")
+	if err := os.MkdirAll(projectDir, 0o755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
+	}
+	t.Setenv("HOME", homeDir)
+	threadID := seedNativeCodexSessionFixture(t, homeDir, projectDir)
+
+	fileStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	store := &countingStore{inner: fileStore}
+	mirrorID := "codex-thread:" + threadID
+
+	record, err := loadSessionRecord(context.Background(), store, mirrorID)
+	if err != nil {
+		t.Fatalf("load codex mirror session: %v", err)
+	}
+	if record.Summary.ID != mirrorID {
+		t.Fatalf("expected mirror record %q, got %#v", mirrorID, record.Summary)
+	}
+	if got := store.getCallCount(); got != 1 {
+		t.Fatalf("expected only the initial cache lookup GetSession call, got %d", got)
 	}
 }
 
