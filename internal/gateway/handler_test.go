@@ -1082,6 +1082,10 @@ func TestHandlerSkillCatalogLifecycle(t *testing.T) {
 		filepath.Join(homeDir, ".claude", "skills", "image-generation", "SKILL.md"),
 		"---\nname: image-generation\ndescription: Generate images from text.\n---\n# Image Generation\n\nUse the image model.\n",
 	)
+	writeTestFile(t,
+		filepath.Join(homeDir, ".agents", "skills", "shared-agent-skill", "SKILL.md"),
+		"---\nname: shared-agent-skill\ndescription: Shared agent skill.\n---\n# Shared Agent Skill\n\nUse the shared agent skill.\n",
+	)
 	h := newTestHandler()
 	tempStore, err := data.NewFileStore(t.TempDir())
 	if err != nil {
@@ -1160,6 +1164,7 @@ func TestHandlerSkillCatalogLifecycle(t *testing.T) {
 		t.Fatalf("unexpected skill catalog meta: %#v", meta)
 	}
 	foundExternal := false
+	foundAgentSkill := false
 	for _, raw := range syncedItems {
 		item, _ := raw.(map[string]any)
 		if item["name"] == "image-generation" {
@@ -1174,9 +1179,18 @@ func TestHandlerSkillCatalogLifecycle(t *testing.T) {
 				t.Fatalf("expected synced external skill editable, got %#v", item)
 			}
 		}
+		if item["name"] == "shared-agent-skill" {
+			foundAgentSkill = true
+			if item["source"] != string(data.SkillSourceExternal) || item["sourceOfTruth"] != string(data.CatalogSourceTruthClaude) {
+				t.Fatalf("expected shared agent skill to sync as claude external skill, got %#v", item)
+			}
+		}
 	}
 	if !foundExternal {
 		t.Fatalf("expected external synced skill, got %#v", syncedItems)
+	}
+	if !foundAgentSkill {
+		t.Fatalf("expected shared agent skill, got %#v", syncedItems)
 	}
 }
 
@@ -1186,6 +1200,14 @@ func TestHandlerSkillCatalogLifecycleUsesCodexSkillsForCodexSession(t *testing.T
 	writeTestFile(t,
 		filepath.Join(homeDir, ".codex", "skills", "mobilevc-release", "SKILL.md"),
 		"---\nname: mobilevc-release\ndescription: Publish MobileVC.\n---\n# MobileVC Release\n\nDo release work.\n",
+	)
+	writeTestFile(t,
+		filepath.Join(homeDir, ".agents", "skills", "shared-agent-skill", "SKILL.md"),
+		"---\nname: shared-agent-skill\ndescription: Shared agent skill.\n---\n# Shared Agent Skill\n\nUse the shared agent skill.\n",
+	)
+	writeTestFile(t,
+		filepath.Join(homeDir, ".agents", "skills", "mobilevc-release", "SKILL.md"),
+		"---\nname: mobilevc-release\ndescription: Shared duplicate.\n---\n# Shared Duplicate\n\nThis should not replace the codex-specific skill.\n",
 	)
 	h := newTestHandler()
 	tempStore, err := data.NewFileStore(t.TempDir())
@@ -1221,12 +1243,22 @@ func TestHandlerSkillCatalogLifecycleUsesCodexSkillsForCodexSession(t *testing.T
 		t.Fatalf("expected synced skill catalog items, got %#v", syncedCatalog)
 	}
 	foundCodexSkill := false
+	foundAgentSkill := false
 	for _, raw := range items {
 		item, _ := raw.(map[string]any)
 		if item["name"] == "mobilevc-release" {
 			foundCodexSkill = true
 			if item["sourceOfTruth"] != string(data.CatalogSourceTruthCodex) {
 				t.Fatalf("expected codex skill item, got %#v", item)
+			}
+			if item["description"] != "Publish MobileVC." {
+				t.Fatalf("expected codex skill to win over shared duplicate, got %#v", item)
+			}
+		}
+		if item["name"] == "shared-agent-skill" {
+			foundAgentSkill = true
+			if item["sourceOfTruth"] != string(data.CatalogSourceTruthCodex) {
+				t.Fatalf("expected shared agent skill to sync under codex source of truth, got %#v", item)
 			}
 		}
 		if item["name"] == "image-generation" {
@@ -1236,6 +1268,32 @@ func TestHandlerSkillCatalogLifecycleUsesCodexSkillsForCodexSession(t *testing.T
 	if !foundCodexSkill {
 		t.Fatalf("expected codex synced skill, got %#v", items)
 	}
+	if !foundAgentSkill {
+		t.Fatalf("expected shared agent skill, got %#v", items)
+	}
+}
+
+func TestLoadSkillDefinitionsIncludesSingularAgentSkillsDir(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	writeTestFile(t,
+		filepath.Join(homeDir, ".agent", "skills", "singular-agent-skill", "SKILL.md"),
+		"---\nname: singular-agent-skill\ndescription: Singular agent skill dir.\n---\n# Singular Agent Skill\n\nUse the singular agent skill.\n",
+	)
+
+	items, err := loadCodexSkillDefinitions(time.Now().UTC())
+	if err != nil {
+		t.Fatalf("load codex skill definitions: %v", err)
+	}
+	for _, item := range items {
+		if item.Name == "singular-agent-skill" {
+			if item.SourceOfTruth != data.CatalogSourceTruthCodex {
+				t.Fatalf("expected codex source of truth for singular agent skill, got %#v", item)
+			}
+			return
+		}
+	}
+	t.Fatalf("expected singular agent skill, got %#v", items)
 }
 
 func TestHandlerCatalogAuthoringSkillAutoUpsertsAndEmitsCatalog(t *testing.T) {
@@ -4616,6 +4674,8 @@ func TestHandlerPermissionDecisionWithManagedFreshClaudeSessionUsesDirectPermiss
 	if runnerIndex != 1 {
 		t.Fatalf("expected no runner restart, got runner count=%d", runnerIndex)
 	}
+	_ = conn.Close()
+	h.runtimeSessions.CleanupAll()
 }
 
 func TestHandlerPermissionDecisionWithoutPermissionResponseSupportReturnsError(t *testing.T) {
@@ -4875,8 +4935,8 @@ func TestHandlerReviewDecisionSendsPromptToRunner(t *testing.T) {
 	if thinking["source"] != "review-decision" {
 		t.Fatalf("expected review-decision source, got %#v", thinking)
 	}
-	if thinking["permissionMode"] != "default" {
-		t.Fatalf("expected default permission mode, got %#v", thinking)
+	if thinking["permissionMode"] != "auto" {
+		t.Fatalf("expected review permission mode, got %#v", thinking)
 	}
 }
 
@@ -5017,7 +5077,7 @@ func TestHandlerSetPermissionModeUpdatesRunner(t *testing.T) {
 	h.NewPtyRunner = func() engine.Runner { return ptyRunner }
 	conn := newTestConn(t, h)
 	_, _ = readInitialEvents(t, conn)
-	_ = createHistorySessionForHandlerTest(t, h, conn, "permission-mode-session")
+	sessionID := createHistorySessionForHandlerTest(t, h, conn, "permission-mode-session")
 
 	if err := conn.WriteJSON(protocol.ExecRequestEvent{ClientEvent: protocol.ClientEvent{Action: "exec"}, Command: "claude", Mode: "pty", PermissionMode: "auto"}); err != nil {
 		t.Fatalf("write exec request: %v", err)
@@ -5045,7 +5105,7 @@ func TestHandlerSetPermissionModeUpdatesRunner(t *testing.T) {
 	if ptyRunner.lastPermissionMode != "default" {
 		t.Fatalf("expected runner permission mode to update, got %q", ptyRunner.lastPermissionMode)
 	}
-	record, err := tempStore.GetSession(context.Background(), "permission-mode-session")
+	record, err := tempStore.GetSession(context.Background(), sessionID)
 	if err != nil {
 		t.Fatalf("get session projection: %v", err)
 	}
@@ -6222,6 +6282,190 @@ func TestHandlerSessionDeleteCurrentSessionCleansRuntimeAndFallsBack(t *testing.
 	textsA := sessionLogTexts(recordA)
 	if containsText(textsA, "late output from deleted session B") || containsText(textsA, "late step from deleted session B") {
 		t.Fatalf("did not expect deleted session events to leak into fallback session, got %#v", textsA)
+	}
+}
+
+func TestHandlerSessionDeleteCurrentSessionSkipsNativeCodexFallback(t *testing.T) {
+	homeDir := t.TempDir()
+	projectDir := filepath.Join(homeDir, "workspace", "MobileVC")
+	if err := os.MkdirAll(projectDir, 0o755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
+	}
+	t.Setenv("HOME", homeDir)
+	seedNativeCodexSessionFixture(t, homeDir, projectDir)
+
+	h := newTestHandler()
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	h.SessionStore = tempStore
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+
+	sessionID := createHistorySessionForHandlerTest(t, h, conn, "delete-me")
+	if err := conn.WriteJSON(protocol.SessionListRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_list"},
+		CWD:         projectDir,
+	}); err != nil {
+		t.Fatalf("write session_list request: %v", err)
+	}
+	_ = readUntilType(t, conn, protocol.EventTypeSessionListResult)
+
+	if err := conn.WriteJSON(protocol.SessionDeleteRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_delete"},
+		SessionID:   sessionID,
+	}); err != nil {
+		t.Fatalf("write session_delete request: %v", err)
+	}
+
+	_ = readUntilType(t, conn, protocol.EventTypeSessionListResult)
+	state := readUntilType(t, conn, protocol.EventTypeSessionState)
+	if sessionID, _ := state["sessionId"].(string); sessionID != "" {
+		t.Fatalf("expected empty session state instead of native codex fallback, got %#v", state)
+	}
+	if state["msg"] != "session cleared" {
+		t.Fatalf("expected session cleared state, got %#v", state)
+	}
+}
+
+func TestHandlerSessionDeltaRefreshesNativeCodexMirror(t *testing.T) {
+	homeDir := t.TempDir()
+	projectDir := filepath.Join(homeDir, "workspace", "MobileVC")
+	if err := os.MkdirAll(projectDir, 0o755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
+	}
+	t.Setenv("HOME", homeDir)
+	threadID := seedNativeCodexSessionFixture(t, homeDir, projectDir)
+
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	mirrorID := "codex-thread:" + threadID
+	record, err := loadSessionRecord(context.Background(), tempStore, mirrorID)
+	if err != nil {
+		t.Fatalf("load codex mirror session: %v", err)
+	}
+
+	rolloutPath := ""
+	if strings.TrimPrefix(record.Summary.Runtime.ResumeSessionID, "codex-thread:") != "" {
+		thread, err := codexsync.FindNativeThread(context.Background(), mirrorID)
+		if err != nil {
+			t.Fatalf("find native thread: %v", err)
+		}
+		rolloutPath = thread.RolloutPath
+	}
+	if rolloutPath == "" {
+		t.Fatal("expected native rollout path")
+	}
+	h := newTestHandler()
+	h.SessionStore = tempStore
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+
+	if err := conn.WriteJSON(protocol.SessionLoadRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_load"},
+		SessionID:   mirrorID,
+		CWD:         projectDir,
+	}); err != nil {
+		t.Fatalf("write session_load request: %v", err)
+	}
+	_ = readUntilSessionHistory(t, conn)
+	_ = readUntilType(t, conn, protocol.EventTypeReviewState)
+	_ = readUntilType(t, conn, protocol.EventTypeAgentState)
+
+	file, err := os.OpenFile(rolloutPath, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open rollout fixture: %v", err)
+	}
+	encoder := json.NewEncoder(file)
+	if err := encoder.Encode(map[string]any{
+		"timestamp": "2026-04-04T02:06:00Z",
+		"type":      "event_msg",
+		"payload": map[string]any{
+			"type":    "agent_message",
+			"message": "Fresh native Codex delta",
+			"phase":   "final_answer",
+		},
+	}); err != nil {
+		_ = file.Close()
+		t.Fatalf("append rollout fixture: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close rollout fixture: %v", err)
+	}
+
+	if err := conn.WriteJSON(protocol.SessionDeltaRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_delta_get"},
+		SessionID:   mirrorID,
+		Known: protocol.SessionDeltaKnown{
+			LogEntryCount: len(record.Projection.LogEntries),
+		},
+	}); err != nil {
+		t.Fatalf("write session_delta_get request: %v", err)
+	}
+	delta := readUntilType(t, conn, protocol.EventTypeSessionDelta)
+	if delta["requiresFullSync"] == true {
+		t.Fatalf("expected incremental delta, got full sync request: %#v", delta)
+	}
+	entries, ok := delta["appendLogEntries"].([]any)
+	if !ok || len(entries) == 0 {
+		t.Fatalf("expected appended cached entries, got %#v", delta)
+	}
+	foundFresh := false
+	for _, raw := range entries {
+		entry, _ := raw.(map[string]any)
+		if entry["message"] == "Fresh native Codex delta" {
+			foundFresh = true
+			break
+		}
+	}
+	if !foundFresh {
+		t.Fatalf("expected fresh native mirror log entry in delta, got %#v", entries)
+	}
+}
+
+func TestHandlerSessionDeltaRequiresFullSyncForMismatchedTarget(t *testing.T) {
+	h := newTestHandler()
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	h.SessionStore = tempStore
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+
+	activeID := createHistorySessionForHandlerTest(t, h, conn, "active-session")
+	if err := conn.WriteJSON(protocol.SessionCreateRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_create"},
+		Title:       "other-session",
+	}); err != nil {
+		t.Fatalf("write other session create request: %v", err)
+	}
+	createdOther := readUntilSessionCreated(t, conn)
+	_ = readUntilType(t, conn, protocol.EventTypeSessionListResult)
+	otherSummary, _ := createdOther["summary"].(map[string]any)
+	otherID, _ := otherSummary["id"].(string)
+	if activeID == "" || otherID == "" || activeID == otherID {
+		t.Fatalf("expected distinct sessions, active=%q other=%q", activeID, otherID)
+	}
+
+	if err := conn.WriteJSON(protocol.SessionDeltaRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_delta_get"},
+		SessionID:   activeID,
+		Known: protocol.SessionDeltaKnown{
+			LogEntryCount: 1,
+		},
+	}); err != nil {
+		t.Fatalf("write stale target session_delta_get request: %v", err)
+	}
+	delta := readUntilType(t, conn, protocol.EventTypeSessionDelta)
+	if delta["sessionId"] != activeID {
+		t.Fatalf("expected full sync delta for stale target %q, got %#v", activeID, delta)
+	}
+	if delta["requiresFullSync"] != true {
+		t.Fatalf("expected requiresFullSync for non-selected target, got %#v", delta)
 	}
 }
 

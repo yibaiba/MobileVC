@@ -1362,6 +1362,9 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			}
 			fallbackSessionID := ""
 			for _, item := range items {
+				if isExternalNativeSessionSummary(item) {
+					continue
+				}
 				if strings.TrimSpace(item.ID) != "" {
 					fallbackSessionID = item.ID
 					break
@@ -1431,6 +1434,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 					emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
 					continue
 				}
+				invalidateSessionListCache()
 			}
 			emitPermissionRuleList(emit, h.SessionStore, ctx, selectedSessionID)
 		case "permission_rule_delete":
@@ -1461,6 +1465,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 					emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
 					continue
 				}
+				invalidateSessionListCache()
 			}
 			emitPermissionRuleList(emit, h.SessionStore, ctx, selectedSessionID)
 		case "permission_rules_set_enabled":
@@ -1491,6 +1496,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 					emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
 					continue
 				}
+				invalidateSessionListCache()
 			}
 			emitPermissionRuleList(emit, h.SessionStore, ctx, selectedSessionID)
 		case "review_state_get":
@@ -1790,6 +1796,8 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 					message = "当前没有 resume id，无法恢复 AI 会话，请重新发起命令"
 				} else if errors.Is(err, session.ErrResumeConversationNotFound) {
 					message = "当前 AI 会话的 resume id 已失效或不存在，请重新发起命令"
+				} else if errors.Is(err, session.ErrRunnerStartTimeout) {
+					message = "AI 会话恢复超时，请稍后重试或重新发起命令"
 				} else if errors.Is(err, session.ErrRunnerNotInteractive) {
 					message = "AI 恢复后未进入可输入状态，请稍后重试"
 				}
@@ -2064,6 +2072,8 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 					message = "当前没有 resume id，无法恢复 Claude 会话，请重新发起命令"
 				} else if errors.Is(err, session.ErrResumeConversationNotFound) {
 					message = "当前 Claude 会话的 resume id 已失效或不存在，请重新发起命令"
+				} else if errors.Is(err, session.ErrRunnerStartTimeout) {
+					message = "Claude 会话恢复超时，请稍后重试或重新发起命令"
 				} else if errors.Is(err, session.ErrRunnerNotInteractive) {
 					message = "Claude 恢复后未进入可输入状态，请稍后重试"
 				}
@@ -2135,7 +2145,9 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 						record.Projection = session.NormalizeProjectionSnapshot(record.Projection)
 						record.Projection.PermissionRulesEnabled = true
 						record.Projection.PermissionRules = upsertPermissionRule(record.Projection.PermissionRules, rule)
-						_, _ = h.SessionStore.SaveProjection(ctx, sessionID, record.Projection)
+						if _, err := h.SessionStore.SaveProjection(ctx, sessionID, record.Projection); err == nil {
+							invalidateSessionListCache()
+						}
 					}
 				}
 				emitPermissionRuleList(emit, h.SessionStore, ctx, sessionID)
@@ -2160,6 +2172,8 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				message = "当前没有可恢复的 Claude 会话，无法继续此次权限批准"
 			} else if errors.Is(err, session.ErrResumeConversationNotFound) {
 				message = "当前 Claude 会话的 resume id 已失效或不存在，无法继续此次权限批准"
+			} else if errors.Is(err, session.ErrRunnerStartTimeout) {
+				message = "Claude 会话恢复超时，无法继续此次权限批准"
 			} else if errors.Is(err, session.ErrRunnerNotInteractive) {
 				message = "Claude 恢复后未进入可输入状态，无法继续刚才的操作"
 			}
@@ -2230,6 +2244,8 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 					message = "当前会话不支持交互输入，请先恢复 Claude PTY 会话"
 				} else if errors.Is(err, session.ErrNoActiveRunner) {
 					message = "当前没有可交互会话，请先恢复会话后再审核 diff"
+				} else if errors.Is(err, session.ErrRunnerStartTimeout) {
+					message = "当前会话恢复超时，请稍后重试再审核 diff"
 				} else if errors.Is(err, session.ErrRunnerNotInteractive) {
 					message = "当前 Claude 会话尚未进入可直接确认的交互阶段，请先等待当前会话就绪后再提交审核决策"
 				}
@@ -2274,6 +2290,8 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				message := err.Error()
 				if errors.Is(err, session.ErrNoActiveRunner) {
 					message = "当前没有可交互的 Claude 会话，无法继续处理该 plan 请求"
+				} else if errors.Is(err, session.ErrRunnerStartTimeout) {
+					message = "当前 Claude 会话恢复超时，无法继续处理该 plan 请求"
 				} else if errors.Is(err, session.ErrRunnerNotInteractive) {
 					message = "当前 Claude 会话尚未进入可提交 plan 的交互阶段，请先等待当前会话就绪后再提交"
 				}
@@ -3173,7 +3191,15 @@ func loadClaudeSkillDefinitions(now time.Time) ([]data.SkillDefinition, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolve home dir for skill sync: %w", err)
 	}
-	return loadSkillsFromRoot(filepath.Join(homeDir, ".claude", "skills"), now, data.CatalogSourceTruthClaude)
+	return loadSkillsFromRoots(
+		[]string{
+			filepath.Join(homeDir, ".claude", "skills"),
+			filepath.Join(homeDir, ".agents", "skills"),
+			filepath.Join(homeDir, ".agent", "skills"),
+		},
+		now,
+		data.CatalogSourceTruthClaude,
+	)
 }
 
 func loadCodexSkillDefinitions(now time.Time) ([]data.SkillDefinition, error) {
@@ -3181,7 +3207,37 @@ func loadCodexSkillDefinitions(now time.Time) ([]data.SkillDefinition, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolve home dir for codex skill sync: %w", err)
 	}
-	return loadSkillsFromRoot(filepath.Join(homeDir, ".codex", "skills"), now, data.CatalogSourceTruthCodex)
+	return loadSkillsFromRoots(
+		[]string{
+			filepath.Join(homeDir, ".codex", "skills"),
+			filepath.Join(homeDir, ".agents", "skills"),
+			filepath.Join(homeDir, ".agent", "skills"),
+		},
+		now,
+		data.CatalogSourceTruthCodex,
+	)
+}
+
+func loadSkillsFromRoots(roots []string, now time.Time, sourceOfTruth data.CatalogSourceOfTruth) ([]data.SkillDefinition, error) {
+	entries := make([]data.SkillDefinition, 0)
+	seen := make(map[string]struct{})
+	for _, root := range roots {
+		rootEntries, err := loadSkillsFromRoot(root, now, sourceOfTruth)
+		if err != nil {
+			return nil, err
+		}
+		for _, item := range rootEntries {
+			if _, ok := seen[item.Name]; ok {
+				continue
+			}
+			seen[item.Name] = struct{}{}
+			entries = append(entries, item)
+		}
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].Name < entries[j].Name
+	})
+	return entries, nil
 }
 
 func loadSkillsFromRoot(root string, now time.Time, sourceOfTruth data.CatalogSourceOfTruth) ([]data.SkillDefinition, error) {
@@ -3955,6 +4011,14 @@ func filterStoreSessionsByCWD(items []data.SessionSummary, filterCWD string) []d
 
 func isExternalCodexSummary(item data.SessionSummary) bool {
 	return item.External || strings.EqualFold(strings.TrimSpace(item.Source), "codex-native")
+}
+
+func isExternalNativeSessionSummary(item data.SessionSummary) bool {
+	return item.External ||
+		strings.EqualFold(strings.TrimSpace(item.Source), "codex-native") ||
+		strings.EqualFold(strings.TrimSpace(item.Source), "claude-native") ||
+		claudesync.IsMirrorSessionID(item.ID) ||
+		codexsync.IsMirrorSessionID(item.ID)
 }
 
 func summaryCodexThreadID(item data.SessionSummary) string {

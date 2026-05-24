@@ -17,11 +17,14 @@ import (
 
 var ErrNoActiveRunner = errors.New("no active runner")
 var ErrRunnerNotInteractive = errors.New("runner is not ready for interactive input")
+var ErrRunnerStartTimeout = errors.New("runner did not become ready before timeout")
 var ErrResumeSessionUnavailable = errors.New("resume session id is unavailable")
 var ErrResumeConversationNotFound = errors.New("resume conversation not found")
 var ErrPermissionRequestExpired = errors.New("permission request expired")
 
 const claudeSessionIDFlag = "--session-id"
+
+var resumedInputReadyTimeout = 30 * time.Second
 
 func deriveClaudeLifecycleLocked(activeRunner engine.Runner, meta protocol.RuntimeMeta, activeSession string, resumeSessionID string) string {
 	if lifecycle := normalizeClaudeLifecycle(meta.ClaudeLifecycle); lifecycle != "" {
@@ -725,7 +728,7 @@ func (s *Service) buildDetachedResumeRequest(req ExecuteRequest, targetPermissio
 }
 
 func (s *Service) sendInputWhenRunnerReady(ctx context.Context, sessionID string, req InputRequest, emit func(any)) error {
-	deadlineCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	deadlineCtx, cancel := context.WithTimeout(ctx, resumedInputReadyTimeout)
 	defer cancel()
 	ticker := time.NewTicker(25 * time.Millisecond)
 	defer ticker.Stop()
@@ -734,11 +737,17 @@ func (s *Service) sendInputWhenRunnerReady(ctx context.Context, sessionID string
 		if err == nil {
 			return nil
 		}
+		if errors.Is(err, context.DeadlineExceeded) && errors.Is(deadlineCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
+			return ErrRunnerStartTimeout
+		}
 		if !errors.Is(err, ErrNoActiveRunner) && !errors.Is(err, ErrRunnerNotInteractive) {
 			return err
 		}
 		select {
 		case <-deadlineCtx.Done():
+			if errors.Is(deadlineCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
+				return ErrRunnerStartTimeout
+			}
 			if errors.Is(err, ErrRunnerNotInteractive) {
 				return ErrRunnerNotInteractive
 			}

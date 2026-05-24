@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -217,6 +220,33 @@ func TestPtyRunnerEmitsCarriageReturnUpdates(t *testing.T) {
 	}
 	if !sawHello || !sawHelloWorld {
 		t.Fatalf("expected carriage return updates, got %#v", events)
+	}
+}
+
+func TestCodexAppServerCommandResolvesExecutableFromUserShell(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("posix shell resolution only")
+	}
+	tempDir := t.TempDir()
+	codexPath := filepath.Join(tempDir, "codex")
+	if err := os.WriteFile(codexPath, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write fake codex: %v", err)
+	}
+	shellPath := filepath.Join(tempDir, "shell")
+	script := "#!/bin/sh\nif [ \"$1\" = \"-ic\" ]; then PATH=\"" + tempDir + ":$PATH\"; export PATH; /bin/sh -c \"$2\"; exit $?; fi\n/bin/sh \"$@\"\n"
+	if err := os.WriteFile(shellPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake shell: %v", err)
+	}
+	t.Setenv("SHELL", shellPath)
+	t.Setenv("PATH", "/usr/bin:/bin")
+	t.Setenv("MOBILEVC_CODEX_EXECUTABLE", "")
+
+	cmd := newCodexAppServerCommand(context.Background(), "codex")
+	if cmd.Path != codexPath {
+		t.Fatalf("expected codex resolved from shell PATH, got %q", cmd.Path)
+	}
+	if !strings.Contains(strings.Join(cmd.Env, "\n"), "PATH="+tempDir) {
+		t.Fatalf("expected command env PATH to include fake codex dir, got %#v", cmd.Env)
 	}
 }
 
@@ -1139,8 +1169,10 @@ func TestPtyRunnerStructuredRuntimePhaseTextBecomesEvent(t *testing.T) {
 	var phaseEvent *protocol.RuntimePhaseEvent
 	for _, event := range events {
 		if v, ok := event.(protocol.RuntimePhaseEvent); ok {
-			phaseEvent = &v
-			break
+			if v.Phase == "permission_blocked" {
+				phaseEvent = &v
+				break
+			}
 		}
 	}
 	if phaseEvent == nil {
@@ -1177,8 +1209,10 @@ func TestPtyRunnerStructuredRuntimePhaseToolResultBecomesEvent(t *testing.T) {
 	var phaseEvent *protocol.RuntimePhaseEvent
 	for _, event := range events {
 		if v, ok := event.(protocol.RuntimePhaseEvent); ok {
-			phaseEvent = &v
-			break
+			if v.Phase == "plan_active" {
+				phaseEvent = &v
+				break
+			}
 		}
 	}
 	if phaseEvent == nil {
@@ -1580,6 +1614,40 @@ done:
 	}
 	if len(prompts) != 1 || prompts[0].ResumeSessionID != "thread-123" {
 		t.Fatalf("expected invisible continue prompt with thread id, got %#v", prompts)
+	}
+}
+
+func TestCodexAppSessionEmitsHookAIStatus(t *testing.T) {
+	eventsCh := make(chan any, 4)
+	app := &codexAppSession{
+		runner:    NewPtyRunner(),
+		sessionID: "s-codex-hook",
+		sink:      func(event any) { eventsCh <- event },
+	}
+	params, err := json.Marshal(map[string]any{
+		"threadId": "thread-123",
+		"turnId":   "turn-1",
+		"run": map[string]any{
+			"id":        "user-prompt-submit:0:/workspace/.codex/hooks.json",
+			"eventName": "userPromptSubmit",
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal hook params: %v", err)
+	}
+	app.handleNotification(codexRPCMessage{Method: "hook/started", Params: params})
+
+	select {
+	case event := <-eventsCh:
+		status, ok := event.(protocol.AIStatusEvent)
+		if !ok {
+			t.Fatalf("expected ai status event, got %#v", event)
+		}
+		if !status.Visible || status.Label != "Running hook: userPromptSubmit" || status.Phase != "running_hook" {
+			t.Fatalf("unexpected hook status: %#v", status)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for hook ai status")
 	}
 }
 

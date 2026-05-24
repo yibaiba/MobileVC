@@ -35,7 +35,8 @@ const MESSAGES = {
       '用法：',
       '  mobilevc           交互式配置并启动 MobileVC 后端',
       '  mobilevc start     启动 MobileVC 后端（默认）',
-      '  mobilevc public --relay wss://relay.example.com  保存并启动 Relay 公网模式',
+      '  mobilevc public --relay wss://relay.example.com  保存并启动 LAN + Relay 模式',
+      '  mobilevc public --relay wss://relay.example.com --network-exposure-mode relay-only  仅开放 Relay',
       '  mobilevc public    使用已保存 Relay，或本地开发 Relay',
       '  mobilevc restart   重启 MobileVC 后端',
       '  mobilevc stop      停止已保存的后端进程',
@@ -90,6 +91,7 @@ const MESSAGES = {
     relayQrTitle: '扫码连接 MobileVC Relay',
     relayQrHint: '二维码包含一次性配对 secret，请在过期前使用',
     relayAccess: 'Relay 连接',
+    relayLanAccess: '局域网直连仍可用',
     aiCliMissing: '当前启动器未检测到可用的 Claude/Codex CLI；请确认 claude 或 codex 命令可在终端中直接执行。',
     portInUse: (port) => `端口 ${port} 已被其他进程占用`,
     startupFailed: '启动失败，请检查日志和 preflight 提示',
@@ -103,7 +105,8 @@ const MESSAGES = {
       'Usage:',
       '  mobilevc           Configure interactively and start the MobileVC backend',
       '  mobilevc start     Start the MobileVC backend (default)',
-      '  mobilevc public --relay wss://relay.example.com  Save and start Relay public mode',
+      '  mobilevc public --relay wss://relay.example.com  Save and start LAN + Relay mode',
+      '  mobilevc public --relay wss://relay.example.com --network-exposure-mode relay-only  Relay-only exposure',
       '  mobilevc public    Start with the saved Relay, or the local development Relay',
       '  mobilevc restart   Restart the MobileVC backend',
       '  mobilevc stop      Stop the saved backend process',
@@ -158,6 +161,7 @@ const MESSAGES = {
     relayQrTitle: 'Scan to connect MobileVC Relay',
     relayQrHint: 'The QR contains a one-time pairing secret. Use it before it expires.',
     relayAccess: 'Relay access',
+    relayLanAccess: 'LAN direct access is still available',
     aiCliMissing: 'The launcher could not find Claude/Codex CLI. Make sure `claude` or `codex` runs directly in your terminal.',
     portInUse: (port) => `Port ${port} is already in use`,
     startupFailed: 'Startup failed. Check the log and preflight output.',
@@ -229,7 +233,14 @@ function parseInvocation(args) {
 }
 
 function parseOptions(args) {
-  const options = { help: false, follow: false, guided: false, public: false, relay: '' };
+  const options = {
+    help: false,
+    follow: false,
+    guided: false,
+    public: false,
+    relay: '',
+    networkExposureMode: '',
+  };
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];
     if (arg === '--help' || arg === '-h') options.help = true;
@@ -242,9 +253,30 @@ function parseOptions(args) {
       options.relay = args[i];
     } else if (arg.startsWith('--relay=')) {
       options.relay = arg.slice('--relay='.length);
+    } else if (arg === '--network-exposure-mode') {
+      i += 1;
+      if (!args[i]) {
+        throw new Error('--network-exposure-mode requires a value');
+      }
+      options.networkExposureMode = normalizeNetworkExposureModeOption(args[i]);
+    } else if (arg.startsWith('--network-exposure-mode=')) {
+      options.networkExposureMode = normalizeNetworkExposureModeOption(
+        arg.slice('--network-exposure-mode='.length),
+      );
     }
   }
   return options;
+}
+
+function normalizeNetworkExposureModeOption(raw) {
+  const value = String(raw || '').trim().toLowerCase();
+  if (value === '' || value === 'lan' || value === 'lan-enabled') {
+    return 'lan';
+  }
+  if (value === 'relay' || value === 'relay-only') {
+    return 'relay-only';
+  }
+  throw new Error('--network-exposure-mode must be lan or relay-only');
 }
 
 function printHelp() {
@@ -365,6 +397,7 @@ async function runStart(options = {}) {
     serverVersionRaw: startup.versionInfo,
     relayMode: relayAccess.enabled,
     relayUrl: relayAccess.url || '',
+    networkExposureMode: relayAccess.networkExposureMode || '',
   };
   writeJson(STATE_PATH, state);
 
@@ -376,6 +409,11 @@ async function runStart(options = {}) {
     throw new Error(message(language, 'startupFailed'));
   }
   if (relayAccess.enabled) {
+    if (relayAccess.networkExposureMode === 'lan') {
+      await printLanQr(language, state.port, state.authToken, state.cwd || process.cwd());
+      console.log('');
+      console.log(message(language, 'relayLanAccess'));
+    }
     printRelayQr(language, pairing);
   } else {
     await printLanQr(language, state.port, state.authToken, state.cwd || process.cwd());
@@ -613,15 +651,18 @@ function formatList(items, language) {
 function buildRelayAccessConfig(config, options) {
   const url = String(options.relay || '').trim();
   if (!url) {
-    return { enabled: false, env: {}, url: '' };
+    return { enabled: false, env: {}, url: '', networkExposureMode: '' };
   }
   assertValidRelayURL(url);
+  const networkExposureMode = options.networkExposureMode || 'lan';
   return {
     enabled: true,
     url,
+    networkExposureMode,
     env: {
       RELAY_MODE: 'true',
       RELAY_URL: url,
+      NETWORK_EXPOSURE_MODE: networkExposureMode,
     },
   };
 }
@@ -1128,12 +1169,13 @@ function buildLaunchUrl(host, port, authToken = '', cwd = '') {
 function isStateConfigMatch(
   state,
   config,
-  relayAccess = { enabled: false, url: '' },
+  relayAccess = { enabled: false, url: '', networkExposureMode: '' },
 ) {
   return String(state?.port || '') === String(config?.port || '') &&
     String(state?.authToken || '') === String(config?.authToken || '') &&
     Boolean(state?.relayMode) === Boolean(relayAccess.enabled) &&
-    String(state?.relayUrl || '') === String(relayAccess.url || '');
+    String(state?.relayUrl || '') === String(relayAccess.url || '') &&
+    String(state?.networkExposureMode || '') === String(relayAccess.networkExposureMode || '');
 }
 
 function formatStartupFailure(language, startup, logPath) {
@@ -1332,6 +1374,7 @@ if (require.main === module) {
   module.exports = {
     buildLaunchUrl,
     assertValidRelayURL,
+    buildRelayAccessConfig,
     buildRelayPairingUri,
     readRelayPairingEventFile,
     isPortOccupied,

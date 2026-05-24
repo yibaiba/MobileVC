@@ -9,6 +9,7 @@ const net = require('net');
 const {
   isPortOccupied,
   assertValidRelayURL,
+  buildRelayAccessConfig,
   buildRelayPairingUri,
   parseInvocation,
   readRelayPairingEventFile,
@@ -33,6 +34,39 @@ test('parseInvocation supports public command relay shorthand', () => {
   assert.equal(invocation.command, 'public');
   assert.equal(invocation.options.public, true);
   assert.equal(invocation.options.relay, 'wss://relay.example.test');
+});
+
+test('parseInvocation supports explicit relay-only exposure', () => {
+  const invocation = parseInvocation([
+    'public',
+    'wss://relay.example.test',
+    '--network-exposure-mode',
+    'relay-only',
+  ]);
+  assert.equal(invocation.command, 'public');
+  assert.equal(invocation.options.relay, 'wss://relay.example.test');
+  assert.equal(invocation.options.networkExposureMode, 'relay-only');
+});
+
+test('buildRelayAccessConfig defaults public relay to LAN plus Relay', () => {
+  const relay = buildRelayAccessConfig({}, { relay: 'wss://relay.example.test' });
+  assert.equal(relay.enabled, true);
+  assert.equal(relay.networkExposureMode, 'lan');
+  assert.equal(relay.env.RELAY_MODE, 'true');
+  assert.equal(relay.env.RELAY_URL, 'wss://relay.example.test');
+  assert.equal(relay.env.NETWORK_EXPOSURE_MODE, 'lan');
+});
+
+test('buildRelayAccessConfig allows explicit relay-only exposure', () => {
+  const relay = buildRelayAccessConfig(
+    {},
+    {
+      relay: 'wss://relay.example.test',
+      networkExposureMode: 'relay-only',
+    },
+  );
+  assert.equal(relay.networkExposureMode, 'relay-only');
+  assert.equal(relay.env.NETWORK_EXPOSURE_MODE, 'relay-only');
 });
 
 test('assertValidRelayURL rejects http and public ws relay urls', () => {

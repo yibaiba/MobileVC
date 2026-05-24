@@ -145,6 +145,15 @@ type codexItemNotification struct {
 	Item     map[string]any `json:"item"`
 }
 
+type codexHookNotification struct {
+	ThreadID string `json:"threadId"`
+	TurnID   string `json:"turnId"`
+	Run      struct {
+		ID        string `json:"id"`
+		EventName string `json:"eventName"`
+	} `json:"run"`
+}
+
 type codexCommandApprovalRequest struct {
 	ThreadID string `json:"threadId"`
 	TurnID   string `json:"turnId"`
@@ -477,6 +486,10 @@ func (s *codexAppSession) handleNotification(message codexRPCMessage) {
 				s.runtimeMeta("active"),
 			))
 		}
+	case "hook/started":
+		s.handleHookEvent(message.Params, "running")
+	case "hook/completed":
+		s.handleHookEvent(message.Params, "done")
 	case "turn/completed":
 		s.handleTurnCompleted(message.Params)
 	case "item/agentMessage/delta":
@@ -516,6 +529,20 @@ func (s *codexAppSession) handleNotification(message codexRPCMessage) {
 		// Ignore Codex CLI feature flag upgrade banners in the chat timeline.
 	default:
 	}
+}
+
+func (s *codexAppSession) handleHookEvent(raw json.RawMessage, status string) {
+	var payload codexHookNotification
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return
+	}
+	label := codexHookStatusLabel(payload.Run.EventName, status)
+	if label == "" {
+		return
+	}
+	meta := s.runtimeMeta("active")
+	meta.ContextID = "codex-hook:" + strings.TrimSpace(payload.Run.ID)
+	sendEvent(s.sink, protocol.NewAIStatusEvent(s.sessionID, status == "running", label, "running_hook", meta))
 }
 
 func (s *codexAppSession) handleServerRequest(ctx context.Context, message codexRPCMessage) {
@@ -1110,6 +1137,17 @@ func codexCommandPromptMessage(payload codexCommandApprovalRequest) string {
 	default:
 		return "Codex 请求执行命令"
 	}
+}
+
+func codexHookStatusLabel(eventName string, status string) string {
+	eventName = strings.TrimSpace(eventName)
+	if eventName == "" {
+		eventName = "hook"
+	}
+	if status == "done" {
+		return "Hook completed: " + eventName
+	}
+	return "Running hook: " + eventName
 }
 
 func codexItemStepSummary(item map[string]any, status string) (string, string) {
