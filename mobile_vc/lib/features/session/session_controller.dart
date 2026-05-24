@@ -366,6 +366,7 @@ class SessionController extends ChangeNotifier {
 
   AppConfig get config => _config;
   SessionConnectionStage get connectionStage => _connectionStage;
+  String get configuredAiEngine => _resolvedConfiguredAiEngine(_config.engine);
   String get currentAiEngine => _resolvedAiEngine(
         command: currentMeta.command,
         engine: currentMeta.engine,
@@ -378,8 +379,8 @@ class SessionController extends ChangeNotifier {
             : _configuredModelForEngine(currentAiEngine),
       );
   String get configuredAiModel => _resolvedAiModel(
-        currentAiEngine,
-        _configuredModelForEngine(currentAiEngine),
+        configuredAiEngine,
+        _configuredModelForEngine(configuredAiEngine),
       );
   String get selectedAiReasoningEffort => _resolvedAiReasoningEffort(
         currentAiEngine,
@@ -388,24 +389,24 @@ class SessionController extends ChangeNotifier {
             : _configuredReasoningEffortForEngine(currentAiEngine),
       );
   String get configuredAiReasoningEffort => _resolvedAiReasoningEffort(
-        currentAiEngine,
-        _configuredReasoningEffortForEngine(currentAiEngine),
+        configuredAiEngine,
+        _configuredReasoningEffortForEngine(configuredAiEngine),
       );
   bool get supportsAiModelSwitch =>
-      currentAiEngine == 'claude' || currentAiEngine == 'codex';
+      configuredAiEngine == 'claude' || configuredAiEngine == 'codex';
   String get currentAiModelSummary => _displayAiModelSummary(
       currentAiEngine, selectedAiModel, selectedAiReasoningEffort);
   String get commandBarEngine =>
       shouldShowClaudeMode ? displayAiEngine : 'shell';
   String get commandBarModelSummary => _displayAiModelSummary(
-        displayAiEngine,
+        configuredAiEngine,
         _resolvedAiModel(
-          displayAiEngine,
-          _configuredModelForEngine(displayAiEngine),
+          configuredAiEngine,
+          _configuredModelForEngine(configuredAiEngine),
         ),
         _resolvedAiReasoningEffort(
-          displayAiEngine,
-          _configuredReasoningEffortForEngine(displayAiEngine),
+          configuredAiEngine,
+          _configuredReasoningEffortForEngine(configuredAiEngine),
         ),
       );
   bool get connecting => _connecting;
@@ -2534,31 +2535,38 @@ class SessionController extends ChangeNotifier {
   Future<void> updateAiModelSelection({
     required String model,
     String reasoningEffort = '',
+    String engine = '',
   }) async {
-    final engine = currentAiEngine;
-    if (!(engine == 'claude' || engine == 'codex')) {
+    final targetEngine = engine.trim().isNotEmpty
+        ? _resolvedConfiguredAiEngine(engine)
+        : configuredAiEngine;
+    if (!(targetEngine == 'claude' || targetEngine == 'codex')) {
       _pushSystem('session', '当前模式暂不支持快捷切换模型');
       return;
     }
     final normalizedModel =
-        engine == 'codex' && model.trim().toLowerCase() == 'default'
+        targetEngine == 'codex' && model.trim().toLowerCase() == 'default'
             ? ''
-            : _resolvedAiModel(engine, model);
+            : _resolvedAiModel(targetEngine, model);
     final normalizedEffort =
-        _resolvedAiReasoningEffort(engine, reasoningEffort);
-    _pendingAiPreferences[engine] = _PendingAiPreference(
+        _resolvedAiReasoningEffort(targetEngine, reasoningEffort);
+    _pendingAiPreferences[targetEngine] = _PendingAiPreference(
       model: normalizedModel,
       reasoningEffort: normalizedEffort,
     );
     await saveConfig(_config.copyWith(
-      claudeModel: engine == 'claude' ? normalizedModel : _config.claudeModel,
-      codexModel: engine == 'codex' ? normalizedModel : _config.codexModel,
-      codexReasoningEffort:
-          engine == 'codex' ? normalizedEffort : _config.codexReasoningEffort,
+      engine: targetEngine,
+      claudeModel:
+          targetEngine == 'claude' ? normalizedModel : _config.claudeModel,
+      codexModel:
+          targetEngine == 'codex' ? normalizedModel : _config.codexModel,
+      codexReasoningEffort: targetEngine == 'codex'
+          ? normalizedEffort
+          : _config.codexReasoningEffort,
     ));
     _pushSystem(
       'session',
-      engine == 'codex'
+      targetEngine == 'codex'
           ? 'Codex 模型已切换为 ${normalizedModel.isEmpty ? 'Default' : _codexModelDisplayLabel(normalizedModel)} · ${normalizedEffort.toUpperCase()}，将对下一次 Codex 启动生效'
           : 'Claude 模型已切换为 ${_claudeModelLabel(normalizedModel)}，将对下一次 Claude 启动生效',
     );
@@ -8388,6 +8396,14 @@ String _resolvedAiEngine({
     return 'gemini';
   }
   return 'claude';
+}
+
+String _resolvedConfiguredAiEngine(String engine) {
+  final normalized = engine.trim().toLowerCase();
+  return switch (normalized) {
+    'codex' || 'gemini' => normalized,
+    _ => 'claude',
+  };
 }
 
 String _resolvedAiModel(String engine, String configured) {
