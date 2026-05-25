@@ -477,14 +477,28 @@ func TestListNativeSessionsAndFind(t *testing.T) {
 	}
 }
 
-func TestListNativeSessions_EmptyCWDReturnsEmpty(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+func TestListNativeSessions_EmptyCWDListsAllProjects(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	projectA := filepath.Join(home, "workspace", "A")
+	projectB := filepath.Join(home, "workspace", "B")
+	if err := WriteSessionToJSONL(projectA, "uuid-a", []JSONLEvent{{Type: "user", Text: "A"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteSessionToJSONL(projectB, "uuid-b", []JSONLEvent{{Type: "user", Text: "B"}}); err != nil {
+		t.Fatal(err)
+	}
+
 	got, err := ListNativeSessions(context.Background(), "  ")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 0 {
-		t.Errorf("expected empty, got %+v", got)
+	ids := map[string]bool{}
+	for _, item := range got {
+		ids[item.SessionID] = true
+	}
+	if !ids["uuid-a"] || !ids["uuid-b"] {
+		t.Errorf("expected sessions from both projects, got %+v", got)
 	}
 }
 

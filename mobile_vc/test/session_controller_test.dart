@@ -4857,7 +4857,7 @@ void main() {
   });
 
   group('SessionController auto session binding', () {
-    test('connect 会主动请求当前目录 session_list，用于同步可恢复会话', () async {
+    test('connect 会主动请求全局 session_list，用于同步可恢复项目', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);
       await controller.initialize();
@@ -4868,7 +4868,33 @@ void main() {
       final sessionListRequest = service.sentPayloads.firstWhere(
         (item) => item['action'] == 'session_list',
       );
-      expect(sessionListRequest['cwd'], controller.effectiveCwd);
+      expect(sessionListRequest, isNot(contains('cwd')));
+    });
+
+    test('loadSessionFromSummary 会先切换到会话 cwd 再加载', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.sentPayloads.clear();
+
+      await controller.loadSessionFromSummary(const SessionSummary(
+        id: 'session-target',
+        title: 'Target',
+        runtime: RuntimeMeta(cwd: '/workspace/Target'),
+      ));
+      await _flushEvents();
+
+      expect(controller.effectiveCwd, '/workspace/Target');
+      expect(service.sentPayloads.first['action'], 'fs_list');
+      expect(service.sentPayloads.first['path'], '/workspace/Target');
+      final load = service.sentPayloads.firstWhere(
+        (payload) => payload['action'] == 'session_load',
+      );
+      expect(load['sessionId'], 'session-target');
+      expect(load['cwd'], '/workspace/Target');
     });
 
     test('连接后收到非空 session 列表时，仅刷新列表，不自动 load 历史会话', () async {
@@ -10064,8 +10090,8 @@ void main() {
         service.sentPayloads
             .any((payload) => payload['action'] == 'session_list'),
         isTrue,
-        reason: 'switchWorkingDirectory should refresh the session list for '
-            'the restored cwd immediately',
+        reason: 'switchWorkingDirectory should refresh the global session list '
+            'after restoring cwd immediately',
       );
 
       await Future<void>.delayed(const Duration(milliseconds: 520));

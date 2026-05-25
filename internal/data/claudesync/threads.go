@@ -94,7 +94,7 @@ func EncodeCWDToProjectDir(cwd string) string {
 }
 
 // ListNativeSessions 列出 cwdFilter 对应目录下所有原生 Claude 会话。
-// cwdFilter 为空时不扫（遵循 codexsync 语义），避免跨项目扫描耗时。
+// cwdFilter 为空时扫描所有 Claude 项目目录，用于项目总览。
 //
 // Claude CLI 自己不 resolve symlink（用 Node process.cwd() 原样编码），
 // 而这里的 normalizePath 会 filepath.EvalSymlinks。在 Windows 下 EvalSymlinks
@@ -104,7 +104,7 @@ func EncodeCWDToProjectDir(cwd string) string {
 func ListNativeSessions(ctx context.Context, cwdFilter string) ([]NativeSession, error) {
 	candidates := candidateProjectCWDs(cwdFilter)
 	if len(candidates) == 0 {
-		return []NativeSession{}, nil
+		return listAllNativeSessions(ctx)
 	}
 	projectsDir, err := ClaudeProjectsDir()
 	if err != nil {
@@ -147,6 +147,47 @@ func ListNativeSessions(ctx context.Context, cwdFilter string) ([]NativeSession,
 	}
 	if aggregated == nil {
 		return []NativeSession{}, nil
+	}
+	sort.Slice(aggregated, func(i, j int) bool {
+		return aggregated[i].UpdatedAt.After(aggregated[j].UpdatedAt)
+	})
+	return aggregated, nil
+}
+
+func listAllNativeSessions(ctx context.Context) ([]NativeSession, error) {
+	projectsDir, err := ClaudeProjectsDir()
+	if err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(projectsDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []NativeSession{}, nil
+		}
+		return nil, fmt.Errorf("read claude projects dir failed: %w", err)
+	}
+	aggregated := make([]NativeSession, 0)
+	seenSession := map[string]struct{}{}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+		sessions, scanErr := scanDir(ctx, filepath.Join(projectsDir, entry.Name()), "")
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		for _, session := range sessions {
+			if _, ok := seenSession[session.SessionID]; ok {
+				continue
+			}
+			seenSession[session.SessionID] = struct{}{}
+			aggregated = append(aggregated, session)
+		}
 	}
 	sort.Slice(aggregated, func(i, j int) bool {
 		return aggregated[i].UpdatedAt.After(aggregated[j].UpdatedAt)

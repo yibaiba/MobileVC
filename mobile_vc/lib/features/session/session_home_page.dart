@@ -177,6 +177,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
                               Expanded(
                                 child: ChatTimeline(
                                   items: controller.timeline,
+                                  sessionId: controller.selectedSessionId,
                                   activeReviewDiff:
                                       controller.currentReviewDiff,
                                   activeReviewGroup:
@@ -898,8 +899,8 @@ class _SessionHomePageState extends State<SessionHomePage> {
               selectedSessionId: controller.selectedSessionId,
               cwd: controller.effectiveCwd,
               onCreate: controller.createSession,
-              onLoad: (id) {
-                controller.loadSession(id);
+              onLoad: (summary) {
+                controller.loadSessionFromSummary(summary);
                 Navigator.pop(context);
               },
               onDelete: controller.deleteSession,

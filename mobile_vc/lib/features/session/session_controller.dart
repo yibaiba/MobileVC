@@ -2374,7 +2374,7 @@ class SessionController extends ChangeNotifier {
   }
 
   void requestSessionList() {
-    _service.send({'action': 'session_list', 'cwd': effectiveCwd});
+    _service.send({'action': 'session_list'});
   }
 
   void _handleAutoSessionBinding(List<SessionSummary> items) {
@@ -2461,6 +2461,19 @@ class SessionController extends ChangeNotifier {
       'sessionId': targetId,
       'cwd': effectiveCwd,
     });
+  }
+
+  Future<void> loadSessionFromSummary(SessionSummary summary) async {
+    final targetId = summary.id.trim();
+    if (targetId.isEmpty) {
+      return;
+    }
+    final targetCwd = summary.runtime.cwd.trim();
+    if (targetCwd.isNotEmpty &&
+        _normalizePath(targetCwd) != _normalizePath(effectiveCwd)) {
+      await switchWorkingDirectory(targetCwd);
+    }
+    loadSession(targetId);
   }
 
   void deleteSession(String sessionId) {

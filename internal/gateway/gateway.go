@@ -973,7 +973,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			logx.Info("ws", "incoming session_create: connectionID=%s sessionID=%s remoteAddr=%s title=%q cwd=%q reason=%q", connectionID, selectedSessionID, remoteAddr, req.Title, req.CWD, req.Reason)
 			if strings.TrimSpace(req.Reason) == "auto_bind" && strings.TrimSpace(selectedSessionID) != "" {
 				logx.Info("ws", "ignore auto_bind session_create because session already selected: connectionID=%s sessionID=%s remoteAddr=%s", connectionID, selectedSessionID, remoteAddr)
-				emitSessionList(req.CWD)
+				emitSessionList(sessionListFilterCWD)
 				continue
 			}
 			if h.SessionStore == nil {
@@ -1003,7 +1003,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			switchRuntimeSession(created.ID)
 			emit(protocol.NewSessionCreatedEvent(selectedSessionID, toProtocolSummary(created)))
 			emit(protocol.NewSessionStateEvent(selectedSessionID, string(session.StateActive), "session selected"))
-			emitSessionList(req.CWD)
+			emitSessionList(sessionListFilterCWD)
 		case "ping":
 			emit(map[string]any{
 				"type":      "pong",
@@ -1046,7 +1046,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			logx.Info("ws", "incoming session_load: connectionID=%s sessionID=%s remoteAddr=%s requestedSessionID=%s cwd=%q reason=%q", connectionID, selectedSessionID, remoteAddr, req.SessionID, req.CWD, req.Reason)
 			if strings.TrimSpace(req.Reason) == "auto_bind" && strings.TrimSpace(selectedSessionID) != "" {
 				logx.Info("ws", "ignore auto_bind session_load because session already selected: connectionID=%s sessionID=%s requestedSessionID=%s remoteAddr=%s", connectionID, selectedSessionID, req.SessionID, remoteAddr)
-				emitSessionList(req.CWD)
+				emitSessionList(sessionListFilterCWD)
 				continue
 			}
 			if h.SessionStore == nil {
@@ -4098,7 +4098,7 @@ func dedupeCodexThreadSummaries(items []data.SessionSummary) []data.SessionSumma
 	order := make([]string, 0, len(items))
 	for _, item := range items {
 		key := item.ID
-		if threadID := summaryCodexThreadID(item); threadID != "" && isCodexRuntime(item.Runtime) {
+		if threadID := summaryCodexThreadID(item); threadID != "" && isCodexRuntime(item.Runtime) && isCodexNativeSummary(item) {
 			key = "codex-thread:" + threadID
 		}
 		if existing, ok := selected[key]; ok {
@@ -4209,28 +4209,9 @@ func mergeSessionSummaries(ctx context.Context, sessionStore data.Store, items [
 	filteredStoreItems = filterHiddenCodexSummaries(filteredStoreItems, hiddenThreadIDs)
 	trackedThreads := trackedMobileVCCodexThreads(ctx, sessionStore, filteredStoreItems)
 	trackedClaudeSessions := trackedMobileVCClaudeSessions(ctx, sessionStore, filteredStoreItems)
-	if normalizeSessionCWD(filterCWD) == "" {
-		if len(trackedThreads) == 0 && len(trackedClaudeSessions) == 0 {
-			return dedupeCodexThreadSummaries(filteredStoreItems), nil
-		}
-		filtered := make([]data.SessionSummary, 0, len(filteredStoreItems))
-		for _, item := range filteredStoreItems {
-			if isExternalCodexSummary(item) {
-				if _, ok := trackedThreads[summaryCodexThreadID(item)]; ok {
-					continue
-				}
-			}
-			if isExternalClaudeSummary(item) {
-				if _, ok := trackedClaudeSessions[summaryClaudeSessionID(item)]; ok {
-					continue
-				}
-			}
-			filtered = append(filtered, item)
-		}
-		return dedupeCodexThreadSummaries(filtered), nil
-	}
 	nativeThreads, err := codexsync.ListNativeThreads(ctx, filterCWD)
 	if err != nil {
+		logx.Warn("ws", "list codex native sessions failed: cwd=%q err=%v", filterCWD, err)
 		nativeThreads = nil
 	}
 	nativeClaude, err := claudesync.ListNativeSessions(ctx, filterCWD)
@@ -4261,9 +4242,6 @@ func mergeSessionSummaries(ctx context.Context, sessionStore data.Store, items [
 		seen[item.ID] = struct{}{}
 	}
 	for _, thread := range nativeThreads {
-		if _, ok := trackedThreads[strings.TrimSpace(thread.ThreadID)]; ok {
-			continue
-		}
 		record := codexsync.MirrorRecord(thread)
 		if _, ok := seen[record.Summary.ID]; ok {
 			continue

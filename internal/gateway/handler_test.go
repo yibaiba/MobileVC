@@ -20,6 +20,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"mobilevc/internal/data"
+	"mobilevc/internal/data/claudesync"
 	"mobilevc/internal/data/codexsync"
 	"mobilevc/internal/engine"
 	"mobilevc/internal/protocol"
@@ -662,6 +663,15 @@ func sessionLogTexts(record data.SessionRecord) []string {
 func containsText(items []string, want string) bool {
 	for _, item := range items {
 		if strings.Contains(item, want) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsSessionSummaryID(items []data.SessionSummary, want string) bool {
+	for _, item := range items {
+		if item.ID == want {
 			return true
 		}
 	}
@@ -5505,7 +5515,7 @@ func TestHandlerSessionDeleteRemovesHistorySessionFromList(t *testing.T) {
 	}
 }
 
-func TestHandlerInitialSessionListDoesNotMergeNativeCodexSessions(t *testing.T) {
+func TestHandlerInitialSessionListIncludesNativeCodexSessions(t *testing.T) {
 	homeDir := t.TempDir()
 	projectDir := filepath.Join(homeDir, "workspace", "MobileVC")
 	if err := os.MkdirAll(projectDir, 0o755); err != nil {
@@ -5532,8 +5542,81 @@ func TestHandlerInitialSessionListDoesNotMergeNativeCodexSessions(t *testing.T) 
 	for _, raw := range items {
 		item, _ := raw.(map[string]any)
 		if item["id"] == "codex-thread:"+threadID {
-			t.Fatalf("did not expect native Codex mirror in initial session list, got %#v", items)
+			return
 		}
+	}
+	t.Fatalf("expected native Codex mirror in initial session list, got %#v", items)
+}
+
+func TestHandlerSessionListWithoutCWDIncludesAllStoreProjects(t *testing.T) {
+	homeDir := t.TempDir()
+	projectDir := filepath.Join(homeDir, "workspace", "MobileVC")
+	otherDir := filepath.Join(homeDir, "workspace", "Other")
+	if err := os.MkdirAll(projectDir, 0o755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
+	}
+	if err := os.MkdirAll(otherDir, 0o755); err != nil {
+		t.Fatalf("mkdir other dir: %v", err)
+	}
+	t.Setenv("HOME", homeDir)
+
+	h := newTestHandler()
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	h.SessionStore = tempStore
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+	_ = readUntilType(t, conn, protocol.EventTypeSessionListResult)
+
+	if err := conn.WriteJSON(protocol.SessionCreateRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_create"},
+		Title:       "mobile-project",
+		CWD:         projectDir,
+	}); err != nil {
+		t.Fatalf("write project session create request: %v", err)
+	}
+	projectCreated := readUntilSessionCreated(t, conn)
+	projectSummary, _ := projectCreated["summary"].(map[string]any)
+	projectSessionID, _ := projectSummary["id"].(string)
+	_ = readUntilType(t, conn, protocol.EventTypeSessionListResult)
+
+	if err := conn.WriteJSON(protocol.SessionCreateRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_create"},
+		Title:       "mobile-other",
+		CWD:         otherDir,
+	}); err != nil {
+		t.Fatalf("write other session create request: %v", err)
+	}
+	otherCreated := readUntilSessionCreated(t, conn)
+	otherSummary, _ := otherCreated["summary"].(map[string]any)
+	otherSessionID, _ := otherSummary["id"].(string)
+	_ = readUntilType(t, conn, protocol.EventTypeSessionListResult)
+
+	if err := conn.WriteJSON(protocol.SessionListRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_list"},
+	}); err != nil {
+		t.Fatalf("write global session list request: %v", err)
+	}
+
+	listEvent := readUntilType(t, conn, protocol.EventTypeSessionListResult)
+	items, ok := listEvent["items"].([]any)
+	if !ok {
+		t.Fatalf("expected session list items, got %#v", listEvent)
+	}
+	var foundProject, foundOther bool
+	for _, raw := range items {
+		item, _ := raw.(map[string]any)
+		switch item["id"] {
+		case projectSessionID:
+			foundProject = true
+		case otherSessionID:
+			foundOther = true
+		}
+	}
+	if !foundProject || !foundOther {
+		t.Fatalf("expected global session_list to include both projects project=%v other=%v items=%#v", foundProject, foundOther, items)
 	}
 }
 
@@ -5731,7 +5814,7 @@ func TestHandlerSessionListMergesNativeCodexSessionsByCWD(t *testing.T) {
 	}
 }
 
-func TestHandlerSessionListHidesNativeCodexMirrorWhenTrackedByMobileVC(t *testing.T) {
+func TestHandlerSessionListKeepsNativeCodexMirrorWhenTrackedByMobileVC(t *testing.T) {
 	homeDir := t.TempDir()
 	projectDir := filepath.Join(homeDir, "workspace", "MobileVC")
 	if err := os.MkdirAll(projectDir, 0o755); err != nil {
@@ -5817,8 +5900,8 @@ func TestHandlerSessionListHidesNativeCodexMirrorWhenTrackedByMobileVC(t *testin
 	if !foundLocal {
 		t.Fatalf("expected managed MobileVC Codex session in list, got %#v", items)
 	}
-	if foundNative {
-		t.Fatalf("did not expect duplicate native Codex mirror when MobileVC already tracks the thread, got %#v", items)
+	if !foundNative {
+		t.Fatalf("expected native Codex mirror to stay visible beside MobileVC session, got %#v", items)
 	}
 }
 
@@ -5916,7 +5999,7 @@ func TestFilterStoreSessionsByCWDAcceptsSymlinkEquivalentPaths(t *testing.T) {
 	}
 }
 
-func TestDedupeCodexThreadSummariesPrefersMobileVCSession(t *testing.T) {
+func TestDedupeCodexThreadSummariesKeepsMobileVCAndNativeThread(t *testing.T) {
 	threadID := "thread-1"
 	projectDir := "/tmp/project"
 	local := data.SessionSummary{
@@ -5948,11 +6031,15 @@ func TestDedupeCodexThreadSummariesPrefersMobileVCSession(t *testing.T) {
 	}
 
 	items := dedupeCodexThreadSummaries([]data.SessionSummary{local, external})
-	if len(items) != 1 {
-		t.Fatalf("expected one deduped session, got %#v", items)
+	if len(items) != 2 {
+		t.Fatalf("expected MobileVC and native Codex entries to remain distinct, got %#v", items)
 	}
-	if items[0].ID != local.ID {
-		t.Fatalf("expected MobileVC summary to win dedupe, got %#v", items)
+	ids := map[string]bool{}
+	for _, item := range items {
+		ids[item.ID] = true
+	}
+	if !ids[local.ID] || !ids[external.ID] {
+		t.Fatalf("expected both MobileVC and native Codex entries, got %#v", items)
 	}
 }
 
@@ -6031,6 +6118,128 @@ func TestMergeSessionSummariesExcludesStoredCodexSubagentMirrors(t *testing.T) {
 	}
 	if len(merged) != 1 || merged[0].ID != "codex-thread:main-thread" {
 		t.Fatalf("expected only main native thread, got %#v", merged)
+	}
+}
+
+func TestMergeSessionSummariesEmptyCWDIncludesNativeProjects(t *testing.T) {
+	homeDir := t.TempDir()
+	projectA := filepath.Join(homeDir, "workspace", "MobileVC")
+	projectB := filepath.Join(homeDir, "workspace", "ClaudeProject")
+	if err := os.MkdirAll(projectA, 0o755); err != nil {
+		t.Fatalf("mkdir project A: %v", err)
+	}
+	if err := os.MkdirAll(projectB, 0o755); err != nil {
+		t.Fatalf("mkdir project B: %v", err)
+	}
+	t.Setenv("HOME", homeDir)
+	seedNativeCodexThreadsFixture(t, homeDir, []nativeCodexThreadFixture{
+		{ID: "codex-main", CWD: projectA, Title: "Desktop Codex"},
+	})
+	if err := claudesync.WriteSessionToJSONL(projectB, "claude-main", []claudesync.JSONLEvent{
+		{Type: "user", Text: "Claude project prompt"},
+	}); err != nil {
+		t.Fatalf("write claude fixture: %v", err)
+	}
+
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	merged, err := mergeSessionSummaries(context.Background(), tempStore, nil, "")
+	if err != nil {
+		t.Fatalf("merge session summaries: %v", err)
+	}
+
+	ids := map[string]data.SessionSummary{}
+	for _, item := range merged {
+		ids[item.ID] = item
+	}
+	if item, ok := ids["codex-thread:codex-main"]; !ok || item.Runtime.CWD != projectA {
+		t.Fatalf("expected native codex project session, got %#v", merged)
+	}
+	if item, ok := ids["claude-session:claude-main"]; !ok || item.Runtime.CWD != projectB {
+		t.Fatalf("expected native claude project session, got %#v", merged)
+	}
+}
+
+func TestMergeSessionSummariesListsAllVisibleCodexTUIThreads(t *testing.T) {
+	homeDir := t.TempDir()
+	projectDir := filepath.Join(homeDir, "workspace", "MobileVC")
+	if err := os.MkdirAll(projectDir, 0o755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
+	}
+	t.Setenv("HOME", homeDir)
+	seedNativeCodexThreadsFixture(t, homeDir, []nativeCodexThreadFixture{
+		{ID: "visible-cli-user", CWD: projectDir, Title: "CLI user", Source: "cli", ThreadSource: "user"},
+		{ID: "visible-vscode-user", CWD: projectDir, Title: "VS Code user", Source: "vscode", ThreadSource: "user"},
+		{ID: "visible-vscode-blank-1", CWD: projectDir, Title: "VS Code blank 1", Source: "vscode"},
+		{ID: "visible-vscode-blank-2", CWD: projectDir, Title: "VS Code blank 2", Source: "vscode"},
+		{ID: "visible-cli-blank", CWD: projectDir, Title: "CLI blank", Source: "cli"},
+		{ID: "visible-cli-user-2", CWD: projectDir, Title: "CLI user 2", Source: "cli", ThreadSource: "user"},
+		{ID: "hidden-subagent", CWD: projectDir, Title: "Worker", Source: "cli", ThreadSource: "subagent"},
+		{ID: "hidden-exec", CWD: projectDir, Title: "Exec", Source: "exec"},
+	})
+
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	createdAt := time.Date(2026, 3, 30, 12, 0, 0, 0, time.UTC)
+	if _, err := tempStore.UpsertSession(context.Background(), data.SessionRecord{
+		Summary: data.SessionSummary{
+			ID:        "mobilevc-codex",
+			Title:     "MobileVC tracked",
+			CreatedAt: createdAt,
+			UpdatedAt: createdAt,
+			Runtime: data.SessionRuntime{
+				ResumeSessionID: "visible-cli-user",
+				Command:         "codex",
+				Engine:          "codex",
+				CWD:             projectDir,
+				Source:          "mobilevc",
+			},
+			Source: "mobilevc",
+		},
+		Projection: data.ProjectionSnapshot{
+			Runtime: data.SessionRuntime{
+				ResumeSessionID: "visible-cli-user",
+				Command:         "codex",
+				Engine:          "codex",
+				CWD:             projectDir,
+				Source:          "mobilevc",
+			},
+		},
+	}); err != nil {
+		t.Fatalf("upsert tracked MobileVC session: %v", err)
+	}
+
+	items, err := tempStore.ListSessions(context.Background())
+	if err != nil {
+		t.Fatalf("list stored sessions: %v", err)
+	}
+	merged, err := mergeSessionSummaries(context.Background(), tempStore, items, projectDir)
+	if err != nil {
+		t.Fatalf("merge session summaries: %v", err)
+	}
+
+	visibleIDs := []string{
+		"visible-cli-user",
+		"visible-vscode-user",
+		"visible-vscode-blank-1",
+		"visible-vscode-blank-2",
+		"visible-cli-blank",
+		"visible-cli-user-2",
+	}
+	for _, threadID := range visibleIDs {
+		if !containsSessionSummaryID(merged, "codex-thread:"+threadID) {
+			t.Fatalf("expected visible Codex thread %q in merged list, got %#v", threadID, merged)
+		}
+	}
+	if !containsSessionSummaryID(merged, "mobilevc-codex") {
+		t.Fatalf("expected MobileVC tracked Codex session to remain, got %#v", merged)
+	}
+	if containsSessionSummaryID(merged, "codex-thread:hidden-subagent") || containsSessionSummaryID(merged, "codex-thread:hidden-exec") {
+		t.Fatalf("did not expect hidden Codex threads in merged list, got %#v", merged)
 	}
 }
 

@@ -16,6 +16,7 @@ class ChatTimeline extends StatefulWidget {
   const ChatTimeline({
     super.key,
     required this.items,
+    required this.sessionId,
     this.activeReviewDiff,
     this.activeReviewGroup,
     this.pendingDiffCount = 0,
@@ -39,6 +40,7 @@ class ChatTimeline extends StatefulWidget {
   });
 
   final List<TimelineItem> items;
+  final String sessionId;
   final HistoryContext? activeReviewDiff;
   final ReviewGroup? activeReviewGroup;
   final int pendingDiffCount;
@@ -76,6 +78,9 @@ class _ChatTimelineState extends State<ChatTimeline> {
   void initState() {
     super.initState();
     _lastCount = widget.items.length;
+    if (widget.items.isNotEmpty) {
+      _scrollToBottomAfterFrame();
+    }
   }
 
   @override
@@ -91,13 +96,15 @@ class _ChatTimelineState extends State<ChatTimeline> {
                 oldWidget.pendingPrompt?.hasVisiblePrompt == true)
             ? 1
             : 0);
-    if (currentCount > previousCount || widget.items.length > _lastCount) {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (!_scrollController.hasClients) {
-          return;
-        }
-        _scrollController.jumpTo(_scrollController.position.maxScrollExtent);
-      });
+    final switchedHistory = _timelineHistoryKey(widget.items) !=
+        _timelineHistoryKey(oldWidget.items);
+    final switchedSession =
+        widget.sessionId.trim() != oldWidget.sessionId.trim();
+    if (currentCount > previousCount ||
+        widget.items.length > _lastCount ||
+        switchedHistory ||
+        switchedSession) {
+      _scrollToBottomAfterFrame();
     }
     _lastCount = widget.items.length;
   }
@@ -106,6 +113,20 @@ class _ChatTimelineState extends State<ChatTimeline> {
   void dispose() {
     _scrollController.dispose();
     super.dispose();
+  }
+
+  void _scrollToBottomAfterFrame() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _jumpToBottom();
+      WidgetsBinding.instance.addPostFrameCallback((_) => _jumpToBottom());
+    });
+  }
+
+  void _jumpToBottom() {
+    if (!_scrollController.hasClients) {
+      return;
+    }
+    _scrollController.jumpTo(_scrollController.position.maxScrollExtent);
   }
 
   @override
@@ -373,6 +394,13 @@ class _ChatTimelineState extends State<ChatTimeline> {
       return 'id:${diff.id}';
     }
     return 'path:${diff.path}';
+  }
+
+  String _timelineHistoryKey(List<TimelineItem> items) {
+    if (items.isEmpty) {
+      return '';
+    }
+    return '${items.first.id}\n${items.last.id}\n${items.length}';
   }
 
   bool _shouldHidePassiveReadyPrompt(PromptRequestEvent prompt) {

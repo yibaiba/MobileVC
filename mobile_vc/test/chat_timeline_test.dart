@@ -13,6 +13,7 @@ void main() {
       MaterialApp(
         home: Scaffold(
           body: ChatTimeline(
+            sessionId: 'test-session',
             items: const [],
             pendingInteraction: InteractionRequestEvent(
               timestamp: DateTime(2026),
@@ -53,6 +54,7 @@ void main() {
       MaterialApp(
         home: Scaffold(
           body: ChatTimeline(
+            sessionId: 'test-session',
             items: const [],
             pendingInteraction: InteractionRequestEvent(
               timestamp: DateTime(2026),
@@ -80,6 +82,7 @@ void main() {
       MaterialApp(
         home: Scaffold(
           body: ChatTimeline(
+            sessionId: 'test-session',
             items: [
               TimelineItem(
                 id: 'item-1',
@@ -104,6 +107,7 @@ void main() {
       MaterialApp(
         home: Scaffold(
           body: ChatTimeline(
+            sessionId: 'test-session',
             items: [
               TimelineItem(
                 id: 'item-1',
@@ -157,6 +161,7 @@ void main() {
       MaterialApp(
         home: Scaffold(
           body: ChatTimeline(
+            sessionId: 'test-session',
             items: [
               TimelineItem(
                 id: 'item-1',
@@ -206,6 +211,7 @@ void main() {
       MaterialApp(
         home: Scaffold(
           body: ChatTimeline(
+            sessionId: 'test-session',
             items: items,
             activeReviewDiff: diff,
             pendingDiffCount: 1,
@@ -222,6 +228,7 @@ void main() {
       MaterialApp(
         home: Scaffold(
           body: ChatTimeline(
+            sessionId: 'test-session',
             items: items,
             activeReviewDiff: diff,
             pendingDiffCount: 1,
@@ -241,5 +248,69 @@ void main() {
     expect(find.text('README.md'), findsOneWidget);
     expect(find.text('请输入确认'), findsNothing,
         reason: 'review choices mode hides generic prompt card');
+  });
+
+  testWidgets('切换到较短历史会话时自动滚到最新消息', (tester) async {
+    final longItems = List<TimelineItem>.generate(
+      30,
+      (index) => TimelineItem(
+        id: 'long-$index',
+        kind: 'markdown',
+        timestamp: DateTime(2026, 1, 1, 0, index),
+        body: '长会话消息 $index',
+      ),
+    );
+    final shortItems = List<TimelineItem>.generate(
+      10,
+      (index) => TimelineItem(
+        id: 'short-$index',
+        kind: 'markdown',
+        timestamp: DateTime(2026, 1, 2, 0, index),
+        body: '短会话消息 $index',
+      ),
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SizedBox(
+            height: 320,
+            child: ChatTimeline(
+              sessionId: 'long-session',
+              items: longItems,
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.pump();
+    final scrollableState =
+        tester.state<ScrollableState>(find.byType(Scrollable));
+    expect(
+      scrollableState.position.pixels,
+      scrollableState.position.maxScrollExtent,
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SizedBox(
+            height: 320,
+            child: ChatTimeline(
+              sessionId: 'short-session',
+              items: shortItems,
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.pump();
+
+    expect(
+      scrollableState.position.pixels,
+      scrollableState.position.maxScrollExtent,
+    );
   });
 }
