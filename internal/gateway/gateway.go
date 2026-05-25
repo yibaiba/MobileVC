@@ -4067,6 +4067,28 @@ func trackedMobileVCCodexThreads(ctx context.Context, sessionStore data.Store, i
 	return tracked
 }
 
+func filterCodexSubagentSummaries(items []data.SessionSummary, subagentThreadIDs map[string]struct{}) []data.SessionSummary {
+	if len(items) == 0 || len(subagentThreadIDs) == 0 {
+		return items
+	}
+	filtered := make([]data.SessionSummary, 0, len(items))
+	for _, item := range items {
+		if isCodexNativeSummary(item) {
+			if _, ok := subagentThreadIDs[summaryCodexThreadID(item)]; ok {
+				continue
+			}
+		}
+		filtered = append(filtered, item)
+	}
+	return filtered
+}
+
+func isCodexNativeSummary(item data.SessionSummary) bool {
+	return codexsync.IsMirrorSessionID(item.ID) ||
+		strings.EqualFold(strings.TrimSpace(item.Source), "codex-native") ||
+		strings.EqualFold(strings.TrimSpace(item.Runtime.Source), "codex-native")
+}
+
 func preferCodexThreadSummary(current, candidate data.SessionSummary) data.SessionSummary {
 	currentExternal := isExternalCodexSummary(current)
 	candidateExternal := isExternalCodexSummary(candidate)
@@ -4196,6 +4218,12 @@ func trackedMobileVCClaudeSessions(ctx context.Context, sessionStore data.Store,
 
 func mergeSessionSummaries(ctx context.Context, sessionStore data.Store, items []data.SessionSummary, filterCWD string) ([]data.SessionSummary, error) {
 	filteredStoreItems := filterStoreSessionsByCWD(items, filterCWD)
+	subagentThreadIDs, err := codexsync.ListNativeSubagentThreadIDs(ctx, filterCWD)
+	if err != nil {
+		logx.Warn("ws", "list codex subagent sessions failed: cwd=%q err=%v", filterCWD, err)
+		subagentThreadIDs = nil
+	}
+	filteredStoreItems = filterCodexSubagentSummaries(filteredStoreItems, subagentThreadIDs)
 	trackedThreads := trackedMobileVCCodexThreads(ctx, sessionStore, filteredStoreItems)
 	trackedClaudeSessions := trackedMobileVCClaudeSessions(ctx, sessionStore, filteredStoreItems)
 	if normalizeSessionCWD(filterCWD) == "" {

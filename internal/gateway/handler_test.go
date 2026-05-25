@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -697,65 +696,103 @@ func writeTestFile(t *testing.T, path, content string) {
 	}
 }
 
+type nativeCodexThreadFixture struct {
+	ID           string
+	CWD          string
+	Title        string
+	ThreadSource string
+}
+
 func seedNativeCodexSessionFixture(t *testing.T, homeDir, cwd string) string {
 	t.Helper()
+	threadID := "019d3c6b-c538-7420-8028-345f7dd70d63"
+	seedNativeCodexThreadsFixture(t, homeDir, []nativeCodexThreadFixture{{
+		ID:    threadID,
+		CWD:   cwd,
+		Title: "Desktop Codex Session",
+	}})
+	return threadID
+}
 
+func seedNativeCodexThreadsFixture(t *testing.T, homeDir string, fixtures []nativeCodexThreadFixture) {
+	t.Helper()
+	if len(fixtures) == 0 {
+		t.Fatal("expected at least one native codex fixture")
+	}
 	codexDir := filepath.Join(homeDir, ".codex")
 	if err := os.MkdirAll(codexDir, 0o755); err != nil {
 		t.Fatalf("mkdir codex dir: %v", err)
 	}
-
-	threadID := "019d3c6b-c538-7420-8028-345f7dd70d63"
-	createdAt := time.Date(2026, 3, 29, 10, 0, 0, 0, time.UTC).Unix()
-	updatedAt := time.Date(2026, 3, 30, 11, 30, 0, 0, time.UTC).Unix()
-	rolloutPath := filepath.Join(
-		codexDir,
-		"sessions",
-		"2026",
-		"03",
-		"30",
-		"rollout-2026-03-30T11-30-00-"+threadID+".jsonl",
-	)
-	if err := os.MkdirAll(filepath.Dir(rolloutPath), 0o755); err != nil {
-		t.Fatalf("mkdir rollout dir: %v", err)
-	}
-	dbPath := filepath.Join(codexDir, "state_5.sqlite")
-
-	db, err := sql.Open("sqlite", dbPath)
+	db, err := sql.Open("sqlite", filepath.Join(codexDir, "state_5.sqlite"))
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
 	defer db.Close()
-
-	statements := []string{
-		"create table if not exists threads (id text primary key, cwd text, title text, model text, source text, model_provider text, created_at integer, updated_at integer, first_user_message text, rollout_path text, archived integer default 0);",
-		"delete from threads;",
-		"insert into threads (id, cwd, title, model, source, model_provider, created_at, updated_at, first_user_message, rollout_path, archived) values ('019d3c6b-c538-7420-8028-345f7dd70d63', '" + strings.ReplaceAll(cwd, "'", "''") + "', 'Desktop Codex Session', 'gpt-5-codex', 'codex', 'openai', " + int64String(createdAt) + ", " + int64String(updatedAt) + ", 'Fix the README wording', '" + strings.ReplaceAll(rolloutPath, "'", "''") + "', 0);",
+	if _, err := db.Exec("create table if not exists threads (id text primary key, cwd text, title text, model text, source text, model_provider text, thread_source text, created_at integer, updated_at integer, first_user_message text, rollout_path text, archived integer default 0);"); err != nil {
+		t.Fatalf("create native codex threads table: %v", err)
 	}
-	for _, stmt := range statements {
-		if _, err := db.Exec(stmt); err != nil {
-			t.Fatalf("seed sqlite fixture: %v (stmt: %s)", err, stmt[:min(len(stmt), 80)])
+	if _, err := db.Exec("delete from threads;"); err != nil {
+		t.Fatalf("clear native codex threads table: %v", err)
+	}
+
+	createdAt := time.Date(2026, 3, 29, 10, 0, 0, 0, time.UTC).Unix()
+	updatedAt := time.Date(2026, 3, 30, 11, 30, 0, 0, time.UTC).Unix()
+	for i, fixture := range fixtures {
+		threadID := strings.TrimSpace(fixture.ID)
+		if threadID == "" {
+			t.Fatalf("native codex fixture %d missing id", i)
 		}
+		cwd := strings.TrimSpace(fixture.CWD)
+		if cwd == "" {
+			t.Fatalf("native codex fixture %s missing cwd", threadID)
+		}
+		title := firstNonEmptyString(strings.TrimSpace(fixture.Title), "Desktop Codex Session")
+		rolloutPath := filepath.Join(codexDir, "sessions", "2026", "03", "30", "rollout-2026-03-30T11-30-00-"+threadID+".jsonl")
+		if err := os.MkdirAll(filepath.Dir(rolloutPath), 0o755); err != nil {
+			t.Fatalf("mkdir rollout dir: %v", err)
+		}
+		if _, err := db.Exec(
+			`insert into threads (id, cwd, title, model, source, model_provider, thread_source, created_at, updated_at, first_user_message, rollout_path, archived) values (?, ?, ?, 'gpt-5-codex', 'codex', 'openai', ?, ?, ?, ?, ?, 0)`,
+			threadID,
+			cwd,
+			title,
+			strings.TrimSpace(fixture.ThreadSource),
+			createdAt+int64(i),
+			updatedAt+int64(i),
+			"Fix the README wording",
+			rolloutPath,
+		); err != nil {
+			t.Fatalf("insert native codex fixture: %v", err)
+		}
+		writeNativeCodexRolloutFixture(t, rolloutPath, createdAt, updatedAt)
 	}
+	writeNativeCodexHistoryFixture(t, filepath.Join(codexDir, "history.jsonl"), fixtures, createdAt, updatedAt)
+}
 
-	historyPath := filepath.Join(codexDir, "history.jsonl")
-	historyLines := []map[string]any{
-		{"session_id": threadID, "ts": createdAt, "text": "Fix the README wording"},
-		{"session_id": threadID, "ts": updatedAt, "text": "Also align the mobile labels"},
-	}
-	file, err := os.Create(historyPath)
+func writeNativeCodexHistoryFixture(t *testing.T, path string, fixtures []nativeCodexThreadFixture, createdAt, updatedAt int64) {
+	t.Helper()
+	file, err := os.Create(path)
 	if err != nil {
 		t.Fatalf("create history fixture: %v", err)
 	}
 	defer file.Close()
 	encoder := json.NewEncoder(file)
-	for _, line := range historyLines {
-		if err := encoder.Encode(line); err != nil {
-			t.Fatalf("write history fixture: %v", err)
+	for _, fixture := range fixtures {
+		threadID := strings.TrimSpace(fixture.ID)
+		for _, line := range []map[string]any{
+			{"session_id": threadID, "ts": createdAt, "text": "Fix the README wording"},
+			{"session_id": threadID, "ts": updatedAt, "text": "Also align the mobile labels"},
+		} {
+			if err := encoder.Encode(line); err != nil {
+				t.Fatalf("write history fixture: %v", err)
+			}
 		}
 	}
+}
 
-	rolloutFile, err := os.Create(rolloutPath)
+func writeNativeCodexRolloutFixture(t *testing.T, path string, createdAt, updatedAt int64) {
+	t.Helper()
+	rolloutFile, err := os.Create(path)
 	if err != nil {
 		t.Fatalf("create rollout fixture: %v", err)
 	}
@@ -802,11 +839,6 @@ func seedNativeCodexSessionFixture(t *testing.T, homeDir, cwd string) string {
 			t.Fatalf("write rollout fixture: %v", err)
 		}
 	}
-	return threadID
-}
-
-func int64String(value int64) string {
-	return strconv.FormatInt(value, 10)
 }
 
 func TestApplyEventToProjectionPersistsAgentAndPromptState(t *testing.T) {
@@ -5918,6 +5950,61 @@ func TestDedupeCodexThreadSummariesPrefersMobileVCSession(t *testing.T) {
 	}
 	if items[0].ID != local.ID {
 		t.Fatalf("expected MobileVC summary to win dedupe, got %#v", items)
+	}
+}
+
+func TestMergeSessionSummariesExcludesStoredCodexSubagentMirrors(t *testing.T) {
+	homeDir := t.TempDir()
+	projectDir := filepath.Join(homeDir, "workspace", "MobileVC")
+	if err := os.MkdirAll(projectDir, 0o755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
+	}
+	t.Setenv("HOME", homeDir)
+	seedNativeCodexThreadsFixture(t, homeDir, []nativeCodexThreadFixture{
+		{ID: "main-thread", CWD: projectDir, Title: "Main desktop session"},
+		{ID: "subagent-thread", CWD: projectDir, Title: "Worker session", ThreadSource: "subagent"},
+	})
+
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	createdAt := time.Date(2026, 3, 30, 10, 0, 0, 0, time.UTC)
+	if _, err := tempStore.UpsertSession(context.Background(), data.SessionRecord{
+		Summary: data.SessionSummary{
+			ID:        "codex-thread:subagent-thread",
+			Title:     "Stored worker mirror",
+			CreatedAt: createdAt,
+			UpdatedAt: createdAt,
+			Runtime: data.SessionRuntime{
+				ResumeSessionID: "subagent-thread",
+				Command:         "codex",
+				Engine:          "codex",
+				CWD:             projectDir,
+				Source:          "codex-native",
+			},
+			Source:   "codex-native",
+			External: true,
+		},
+	}); err != nil {
+		t.Fatalf("upsert stored subagent mirror: %v", err)
+	}
+
+	items, err := tempStore.ListSessions(context.Background())
+	if err != nil {
+		t.Fatalf("list stored sessions: %v", err)
+	}
+	merged, err := mergeSessionSummaries(context.Background(), tempStore, items, projectDir)
+	if err != nil {
+		t.Fatalf("merge session summaries: %v", err)
+	}
+	for _, item := range merged {
+		if item.ID == "codex-thread:subagent-thread" {
+			t.Fatalf("did not expect stored subagent mirror in list, got %#v", merged)
+		}
+	}
+	if len(merged) != 1 || merged[0].ID != "codex-thread:main-thread" {
+		t.Fatalf("expected only main native thread, got %#v", merged)
 	}
 }
 

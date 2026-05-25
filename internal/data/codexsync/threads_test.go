@@ -69,7 +69,94 @@ func TestListNativeThreadsDoesNotLoadRolloutHistory(t *testing.T) {
 	}
 }
 
+func TestListNativeThreadsExcludesSubagentThreads(t *testing.T) {
+	_, db := setupCodexThreadsStore(t)
+	now := time.Date(2026, 5, 24, 1, 0, 0, 0, time.UTC).Unix()
+	insertThreadWithSource(t, db, "main-thread", "/workspace", "Main", "", now, "")
+	insertThreadWithSource(t, db, "subagent-thread", "/workspace", "Worker", "", now+1, "subagent")
+
+	threads, err := ListNativeThreads(context.Background(), "/workspace")
+	if err != nil {
+		t.Fatalf("list native threads: %v", err)
+	}
+	if len(threads) != 1 || threads[0].ThreadID != "main-thread" {
+		t.Fatalf("expected only main thread, got %#v", threads)
+	}
+
+	subagents, err := ListNativeSubagentThreadIDs(context.Background(), "/workspace")
+	if err != nil {
+		t.Fatalf("list subagent thread ids: %v", err)
+	}
+	if _, ok := subagents["subagent-thread"]; !ok || len(subagents) != 1 {
+		t.Fatalf("expected subagent thread id, got %#v", subagents)
+	}
+}
+
+func TestListNativeThreadsSupportsLegacySchemaWithoutThreadSource(t *testing.T) {
+	codexDir, db := setupCodexThreadsStoreWithoutThreadSource(t)
+	now := time.Date(2026, 5, 24, 1, 0, 0, 0, time.UTC).Unix()
+	rolloutPath := filepath.Join(codexDir, "sessions", "legacy.jsonl")
+	writeRolloutFixture(t, rolloutPath, "legacy reply")
+	if _, err := db.Exec(
+		`insert into threads (id, cwd, title, model, source, model_provider, created_at, updated_at, first_user_message, rollout_path, archived)
+		values ('legacy-thread', '/workspace', 'Legacy', 'gpt-5.5', 'codex', 'openai', ?, ?, 'Legacy', ?, 0)`,
+		now,
+		now,
+		rolloutPath,
+	); err != nil {
+		t.Fatalf("insert legacy thread: %v", err)
+	}
+
+	threads, err := ListNativeThreads(context.Background(), "/workspace")
+	if err != nil {
+		t.Fatalf("list native threads: %v", err)
+	}
+	if len(threads) != 1 || threads[0].ThreadID != "legacy-thread" {
+		t.Fatalf("expected legacy thread, got %#v", threads)
+	}
+
+	subagents, err := ListNativeSubagentThreadIDs(context.Background(), "/workspace")
+	if err != nil {
+		t.Fatalf("list subagent thread ids: %v", err)
+	}
+	if len(subagents) != 0 {
+		t.Fatalf("legacy schema should not infer subagents, got %#v", subagents)
+	}
+}
+
 func setupCodexThreadsStore(t *testing.T) (string, *sql.DB) {
+	t.Helper()
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	codexDir := filepath.Join(homeDir, ".codex")
+	if err := os.MkdirAll(filepath.Join(codexDir, "sessions"), 0o755); err != nil {
+		t.Fatalf("mkdir codex sessions: %v", err)
+	}
+	db, err := sql.Open("sqlite", filepath.Join(codexDir, "state_5.sqlite"))
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if _, err := db.Exec(`create table threads (
+		id text primary key,
+		cwd text,
+		title text,
+		model text,
+		source text,
+		model_provider text,
+		thread_source text,
+		created_at integer,
+		updated_at integer,
+		first_user_message text,
+		rollout_path text,
+		archived integer default 0
+	)`); err != nil {
+		t.Fatalf("create threads table: %v", err)
+	}
+	return codexDir, db
+}
+
+func setupCodexThreadsStoreWithoutThreadSource(t *testing.T) (string, *sql.DB) {
 	t.Helper()
 	homeDir := t.TempDir()
 	t.Setenv("HOME", homeDir)
@@ -95,7 +182,7 @@ func setupCodexThreadsStore(t *testing.T) (string, *sql.DB) {
 		rollout_path text,
 		archived integer default 0
 	)`); err != nil {
-		t.Fatalf("create threads table: %v", err)
+		t.Fatalf("create legacy threads table: %v", err)
 	}
 	return codexDir, db
 }
@@ -115,12 +202,18 @@ func seedTwoCodexThreads(t *testing.T, codexDir string, db *sql.DB) (string, str
 
 func insertThread(t *testing.T, db *sql.DB, id, cwd, title, rolloutPath string, updatedAt int64) {
 	t.Helper()
+	insertThreadWithSource(t, db, id, cwd, title, rolloutPath, updatedAt, "")
+}
+
+func insertThreadWithSource(t *testing.T, db *sql.DB, id, cwd, title, rolloutPath string, updatedAt int64, threadSource string) {
+	t.Helper()
 	if _, err := db.Exec(
-		`insert into threads (id, cwd, title, model, source, model_provider, created_at, updated_at, first_user_message, rollout_path, archived)
-		values (?, ?, ?, 'gpt-5.5', 'codex', 'openai', ?, ?, ?, ?, 0)`,
+		`insert into threads (id, cwd, title, model, source, model_provider, thread_source, created_at, updated_at, first_user_message, rollout_path, archived)
+		values (?, ?, ?, 'gpt-5.5', 'codex', 'openai', ?, ?, ?, ?, ?, 0)`,
 		id,
 		cwd,
 		title,
+		threadSource,
 		updatedAt,
 		updatedAt,
 		title,
