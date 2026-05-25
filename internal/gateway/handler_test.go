@@ -700,6 +700,7 @@ type nativeCodexThreadFixture struct {
 	ID           string
 	CWD          string
 	Title        string
+	Source       string
 	ThreadSource string
 }
 
@@ -747,15 +748,17 @@ func seedNativeCodexThreadsFixture(t *testing.T, homeDir string, fixtures []nati
 			t.Fatalf("native codex fixture %s missing cwd", threadID)
 		}
 		title := firstNonEmptyString(strings.TrimSpace(fixture.Title), "Desktop Codex Session")
+		source := firstNonEmptyString(strings.TrimSpace(fixture.Source), "cli")
 		rolloutPath := filepath.Join(codexDir, "sessions", "2026", "03", "30", "rollout-2026-03-30T11-30-00-"+threadID+".jsonl")
 		if err := os.MkdirAll(filepath.Dir(rolloutPath), 0o755); err != nil {
 			t.Fatalf("mkdir rollout dir: %v", err)
 		}
 		if _, err := db.Exec(
-			`insert into threads (id, cwd, title, model, source, model_provider, thread_source, created_at, updated_at, first_user_message, rollout_path, archived) values (?, ?, ?, 'gpt-5-codex', 'codex', 'openai', ?, ?, ?, ?, ?, 0)`,
+			`insert into threads (id, cwd, title, model, source, model_provider, thread_source, created_at, updated_at, first_user_message, rollout_path, archived) values (?, ?, ?, 'gpt-5-codex', ?, 'openai', ?, ?, ?, ?, ?, 0)`,
 			threadID,
 			cwd,
 			title,
+			source,
 			strings.TrimSpace(fixture.ThreadSource),
 			createdAt+int64(i),
 			updatedAt+int64(i),
@@ -5962,6 +5965,7 @@ func TestMergeSessionSummariesExcludesStoredCodexSubagentMirrors(t *testing.T) {
 	t.Setenv("HOME", homeDir)
 	seedNativeCodexThreadsFixture(t, homeDir, []nativeCodexThreadFixture{
 		{ID: "main-thread", CWD: projectDir, Title: "Main desktop session"},
+		{ID: "exec-thread", CWD: projectDir, Title: "Exec session", Source: "exec"},
 		{ID: "subagent-thread", CWD: projectDir, Title: "Worker session", ThreadSource: "subagent"},
 	})
 
@@ -5989,6 +5993,25 @@ func TestMergeSessionSummariesExcludesStoredCodexSubagentMirrors(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("upsert stored subagent mirror: %v", err)
 	}
+	if _, err := tempStore.UpsertSession(context.Background(), data.SessionRecord{
+		Summary: data.SessionSummary{
+			ID:        "codex-thread:exec-thread",
+			Title:     "Stored exec mirror",
+			CreatedAt: createdAt,
+			UpdatedAt: createdAt,
+			Runtime: data.SessionRuntime{
+				ResumeSessionID: "exec-thread",
+				Command:         "codex",
+				Engine:          "codex",
+				CWD:             projectDir,
+				Source:          "codex-native",
+			},
+			Source:   "codex-native",
+			External: true,
+		},
+	}); err != nil {
+		t.Fatalf("upsert stored exec mirror: %v", err)
+	}
 
 	items, err := tempStore.ListSessions(context.Background())
 	if err != nil {
@@ -6001,6 +6024,9 @@ func TestMergeSessionSummariesExcludesStoredCodexSubagentMirrors(t *testing.T) {
 	for _, item := range merged {
 		if item.ID == "codex-thread:subagent-thread" {
 			t.Fatalf("did not expect stored subagent mirror in list, got %#v", merged)
+		}
+		if item.ID == "codex-thread:exec-thread" {
+			t.Fatalf("did not expect stored exec mirror in list, got %#v", merged)
 		}
 	}
 	if len(merged) != 1 || merged[0].ID != "codex-thread:main-thread" {

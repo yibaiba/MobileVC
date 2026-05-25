@@ -72,8 +72,8 @@ func TestListNativeThreadsDoesNotLoadRolloutHistory(t *testing.T) {
 func TestListNativeThreadsExcludesSubagentThreads(t *testing.T) {
 	_, db := setupCodexThreadsStore(t)
 	now := time.Date(2026, 5, 24, 1, 0, 0, 0, time.UTC).Unix()
-	insertThreadWithSource(t, db, "main-thread", "/workspace", "Main", "", now, "")
-	insertThreadWithSource(t, db, "subagent-thread", "/workspace", "Worker", "", now+1, "subagent")
+	insertThreadWithSources(t, db, "main-thread", "/workspace", "Main", "", now, "cli", "")
+	insertThreadWithSources(t, db, "subagent-thread", "/workspace", "Worker", "", now+1, "cli", "subagent")
 
 	threads, err := ListNativeThreads(context.Background(), "/workspace")
 	if err != nil {
@@ -92,6 +92,51 @@ func TestListNativeThreadsExcludesSubagentThreads(t *testing.T) {
 	}
 }
 
+func TestListNativeThreadsMatchesCodexTUIVisibleSources(t *testing.T) {
+	_, db := setupCodexThreadsStore(t)
+	now := time.Date(2026, 5, 24, 1, 0, 0, 0, time.UTC).Unix()
+	insertThreadWithSources(t, db, "legacy-cli", "/workspace", "Legacy CLI", "", now, "cli", "")
+	insertThreadWithSources(t, db, "legacy-vscode", "/workspace", "Legacy VSCode", "", now+1, "vscode", "")
+	insertThreadWithSources(t, db, "new-user", "/workspace", "New user", "", now+2, "cli", "user")
+	insertThreadWithSources(t, db, "exec-thread", "/workspace", "Exec", "", now+3, "exec", "")
+	insertThreadWithSources(t, db, "subagent-thread", "/workspace", "Worker", "", now+4, "vscode", "subagent")
+	insertThreadWithSources(t, db, "metadata-thread", "/workspace", "Metadata", "", now+5, "cli", "metadata")
+
+	threads, err := ListNativeThreads(context.Background(), "/workspace")
+	if err != nil {
+		t.Fatalf("list native threads: %v", err)
+	}
+	got := make(map[string]bool)
+	for _, thread := range threads {
+		got[thread.ThreadID] = true
+	}
+	for _, id := range []string{"legacy-cli", "legacy-vscode", "new-user"} {
+		if !got[id] {
+			t.Fatalf("expected visible codex thread %q, got %#v", id, threads)
+		}
+	}
+	for _, id := range []string{"exec-thread", "subagent-thread", "metadata-thread"} {
+		if got[id] {
+			t.Fatalf("did not expect hidden codex thread %q, got %#v", id, threads)
+		}
+	}
+
+	hidden, err := ListNativeHiddenThreadIDs(context.Background(), "/workspace")
+	if err != nil {
+		t.Fatalf("list hidden native threads: %v", err)
+	}
+	for _, id := range []string{"exec-thread", "subagent-thread", "metadata-thread"} {
+		if _, ok := hidden[id]; !ok {
+			t.Fatalf("expected hidden thread id %q, got %#v", id, hidden)
+		}
+	}
+	for _, id := range []string{"legacy-cli", "legacy-vscode", "new-user"} {
+		if _, ok := hidden[id]; ok {
+			t.Fatalf("did not expect visible thread id %q in hidden set %#v", id, hidden)
+		}
+	}
+}
+
 func TestListNativeThreadsSupportsLegacySchemaWithoutThreadSource(t *testing.T) {
 	codexDir, db := setupCodexThreadsStoreWithoutThreadSource(t)
 	now := time.Date(2026, 5, 24, 1, 0, 0, 0, time.UTC).Unix()
@@ -99,12 +144,21 @@ func TestListNativeThreadsSupportsLegacySchemaWithoutThreadSource(t *testing.T) 
 	writeRolloutFixture(t, rolloutPath, "legacy reply")
 	if _, err := db.Exec(
 		`insert into threads (id, cwd, title, model, source, model_provider, created_at, updated_at, first_user_message, rollout_path, archived)
-		values ('legacy-thread', '/workspace', 'Legacy', 'gpt-5.5', 'codex', 'openai', ?, ?, 'Legacy', ?, 0)`,
+		values ('legacy-thread', '/workspace', 'Legacy', 'gpt-5.5', 'cli', 'openai', ?, ?, 'Legacy', ?, 0)`,
 		now,
 		now,
 		rolloutPath,
 	); err != nil {
 		t.Fatalf("insert legacy thread: %v", err)
+	}
+	if _, err := db.Exec(
+		`insert into threads (id, cwd, title, model, source, model_provider, created_at, updated_at, first_user_message, rollout_path, archived)
+		values ('legacy-exec-thread', '/workspace', 'Legacy exec', 'gpt-5.5', 'exec', 'openai', ?, ?, 'Legacy exec', ?, 0)`,
+		now+1,
+		now+1,
+		rolloutPath,
+	); err != nil {
+		t.Fatalf("insert legacy exec thread: %v", err)
 	}
 
 	threads, err := ListNativeThreads(context.Background(), "/workspace")
@@ -113,6 +167,13 @@ func TestListNativeThreadsSupportsLegacySchemaWithoutThreadSource(t *testing.T) 
 	}
 	if len(threads) != 1 || threads[0].ThreadID != "legacy-thread" {
 		t.Fatalf("expected legacy thread, got %#v", threads)
+	}
+	hidden, err := ListNativeHiddenThreadIDs(context.Background(), "/workspace")
+	if err != nil {
+		t.Fatalf("list hidden legacy threads: %v", err)
+	}
+	if _, ok := hidden["legacy-exec-thread"]; !ok || len(hidden) != 1 {
+		t.Fatalf("expected legacy exec thread hidden, got %#v", hidden)
 	}
 
 	subagents, err := ListNativeSubagentThreadIDs(context.Background(), "/workspace")
@@ -207,12 +268,18 @@ func insertThread(t *testing.T, db *sql.DB, id, cwd, title, rolloutPath string, 
 
 func insertThreadWithSource(t *testing.T, db *sql.DB, id, cwd, title, rolloutPath string, updatedAt int64, threadSource string) {
 	t.Helper()
+	insertThreadWithSources(t, db, id, cwd, title, rolloutPath, updatedAt, "cli", threadSource)
+}
+
+func insertThreadWithSources(t *testing.T, db *sql.DB, id, cwd, title, rolloutPath string, updatedAt int64, source, threadSource string) {
+	t.Helper()
 	if _, err := db.Exec(
 		`insert into threads (id, cwd, title, model, source, model_provider, thread_source, created_at, updated_at, first_user_message, rollout_path, archived)
-		values (?, ?, ?, 'gpt-5.5', 'codex', 'openai', ?, ?, ?, ?, ?, 0)`,
+		values (?, ?, ?, 'gpt-5.5', ?, 'openai', ?, ?, ?, ?, ?, 0)`,
 		id,
 		cwd,
 		title,
+		source,
 		threadSource,
 		updatedAt,
 		updatedAt,

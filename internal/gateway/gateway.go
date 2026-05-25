@@ -751,23 +751,6 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 		return merged
 	}
 
-	emitStoredSessionList := func(filterCWD string) []data.SessionSummary {
-		if h.SessionStore == nil {
-			logx.Warn("ws", "stored session list requested but session store unavailable: connectionID=%s sessionID=%s remoteAddr=%s", connectionID, selectedSessionID, remoteAddr)
-			return nil
-		}
-		sessionListFilterCWD = normalizeSessionCWD(filterCWD)
-		items, err := h.SessionStore.ListSessions(ctx)
-		if err != nil {
-			logx.Error("ws", "list stored sessions failed: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
-			emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
-			return nil
-		}
-		filtered := filterStoreSessionsByCWD(items, sessionListFilterCWD)
-		emit(protocol.NewSessionListResultEvent(selectedSessionID, toProtocolSummaries(filtered)))
-		return filtered
-	}
-
 	emitEmptySessionState := func() {
 		emit(protocol.NewSessionStateEvent(selectedSessionID, string(session.StateActive), "session cleared"))
 	}
@@ -882,7 +865,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 	if h.SessionStore != nil {
 		emitSkillCatalogResult(emit, h.SessionStore, ctx, selectedSessionID)
 		emitMemoryListResult(emit, h.SessionStore, ctx, selectedSessionID)
-		if emitStoredSessionList(sessionListFilterCWD) != nil {
+		if emitSessionList(sessionListFilterCWD) != nil {
 			if strings.TrimSpace(selectedSessionID) != "" {
 				record, err := h.SessionStore.GetSession(ctx, selectedSessionID)
 				if err != nil {
@@ -4025,7 +4008,7 @@ func summaryCodexThreadID(item data.SessionSummary) string {
 	if resumeID := strings.TrimSpace(item.Runtime.ResumeSessionID); resumeID != "" {
 		return resumeID
 	}
-	if isExternalCodexSummary(item) {
+	if codexsync.IsMirrorSessionID(item.ID) {
 		return codexsync.ThreadIDFromMirror(item.ID)
 	}
 	return ""
@@ -4067,14 +4050,14 @@ func trackedMobileVCCodexThreads(ctx context.Context, sessionStore data.Store, i
 	return tracked
 }
 
-func filterCodexSubagentSummaries(items []data.SessionSummary, subagentThreadIDs map[string]struct{}) []data.SessionSummary {
-	if len(items) == 0 || len(subagentThreadIDs) == 0 {
+func filterHiddenCodexSummaries(items []data.SessionSummary, hiddenThreadIDs map[string]struct{}) []data.SessionSummary {
+	if len(items) == 0 || len(hiddenThreadIDs) == 0 {
 		return items
 	}
 	filtered := make([]data.SessionSummary, 0, len(items))
 	for _, item := range items {
 		if isCodexNativeSummary(item) {
-			if _, ok := subagentThreadIDs[summaryCodexThreadID(item)]; ok {
+			if _, ok := hiddenThreadIDs[summaryCodexThreadID(item)]; ok {
 				continue
 			}
 		}
@@ -4218,12 +4201,12 @@ func trackedMobileVCClaudeSessions(ctx context.Context, sessionStore data.Store,
 
 func mergeSessionSummaries(ctx context.Context, sessionStore data.Store, items []data.SessionSummary, filterCWD string) ([]data.SessionSummary, error) {
 	filteredStoreItems := filterStoreSessionsByCWD(items, filterCWD)
-	subagentThreadIDs, err := codexsync.ListNativeSubagentThreadIDs(ctx, filterCWD)
+	hiddenThreadIDs, err := codexsync.ListNativeHiddenThreadIDs(ctx, filterCWD)
 	if err != nil {
-		logx.Warn("ws", "list codex subagent sessions failed: cwd=%q err=%v", filterCWD, err)
-		subagentThreadIDs = nil
+		logx.Warn("ws", "list hidden codex sessions failed: cwd=%q err=%v", filterCWD, err)
+		hiddenThreadIDs = nil
 	}
-	filteredStoreItems = filterCodexSubagentSummaries(filteredStoreItems, subagentThreadIDs)
+	filteredStoreItems = filterHiddenCodexSummaries(filteredStoreItems, hiddenThreadIDs)
 	trackedThreads := trackedMobileVCCodexThreads(ctx, sessionStore, filteredStoreItems)
 	trackedClaudeSessions := trackedMobileVCClaudeSessions(ctx, sessionStore, filteredStoreItems)
 	if normalizeSessionCWD(filterCWD) == "" {

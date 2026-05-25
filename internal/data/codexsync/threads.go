@@ -101,7 +101,7 @@ func ListNativeThreads(ctx context.Context, cwdFilter string) ([]NativeThread, e
 	normalizedFilter := normalizePath(cwdFilter)
 	result := make([]NativeThread, 0, len(threads))
 	for _, thread := range threads {
-		if IsSubagentThread(thread) {
+		if !IsUserVisibleThread(thread) {
 			continue
 		}
 		if normalizedFilter != "" && normalizePath(thread.CWD) != normalizedFilter {
@@ -112,6 +112,28 @@ func ListNativeThreads(ctx context.Context, cwdFilter string) ([]NativeThread, e
 	sort.Slice(result, func(i, j int) bool {
 		return result[i].UpdatedAt.After(result[j].UpdatedAt)
 	})
+	return result, nil
+}
+
+func ListNativeHiddenThreadIDs(ctx context.Context, cwdFilter string) (map[string]struct{}, error) {
+	threads, err := loadNativeThreadRows(ctx)
+	if err != nil {
+		return nil, err
+	}
+	normalizedFilter := normalizePath(cwdFilter)
+	result := make(map[string]struct{})
+	for _, thread := range threads {
+		if IsUserVisibleThread(thread) {
+			continue
+		}
+		if normalizedFilter != "" && normalizePath(thread.CWD) != normalizedFilter {
+			continue
+		}
+		threadID := strings.TrimSpace(thread.ThreadID)
+		if threadID != "" {
+			result[threadID] = struct{}{}
+		}
+	}
 	return result, nil
 }
 
@@ -139,6 +161,26 @@ func ListNativeSubagentThreadIDs(ctx context.Context, cwdFilter string) (map[str
 
 func IsSubagentThread(thread NativeThread) bool {
 	return strings.EqualFold(strings.TrimSpace(thread.ThreadSource), "subagent")
+}
+
+func IsUserVisibleThread(thread NativeThread) bool {
+	source := strings.ToLower(strings.TrimSpace(thread.Source))
+	if source == "exec" || IsSubagentThread(thread) {
+		return false
+	}
+	threadSource := strings.ToLower(strings.TrimSpace(thread.ThreadSource))
+	if threadSource == "user" {
+		return true
+	}
+	if threadSource != "" {
+		return false
+	}
+	switch source {
+	case "cli", "vscode":
+		return true
+	default:
+		return false
+	}
 }
 
 func loadNativeThreadRows(ctx context.Context) ([]NativeThread, error) {
