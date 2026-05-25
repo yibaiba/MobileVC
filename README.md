@@ -76,6 +76,33 @@ mobilevc config          # 重新配置
 mobilevc stop            # 停止服务
 ```
 
+### 公网 Relay 连接
+
+公网 Relay 分成两端：
+
+- 云服务器/VPS 只运行 relay Docker 服务，负责公网中继。
+- 你的本地电脑运行 `mobilevc public --relay ...`，把本机 MobileVC 后端注册到公网 relay，并打印手机配对二维码。
+
+VPS relay 部署完成后，在本地电脑执行：
+
+```bash
+mobilevc public --relay wss://relay.example.com:9443
+```
+
+如果只想通过 relay 连接，不开放局域网监听：
+
+```bash
+mobilevc public --relay wss://relay.example.com:9443 --network-exposure-mode relay-only
+```
+
+`mobilevc` 命令由 npm 包提供：
+
+```bash
+npm install -g @justprove/mobilevc
+```
+
+完整部署步骤见 [docs/guides/relay-deployment.md](docs/guides/relay-deployment.md)。
+
 ## Documentation
 
 The root directory now keeps only entry-point docs and release notes. Topic docs live under `docs/`:

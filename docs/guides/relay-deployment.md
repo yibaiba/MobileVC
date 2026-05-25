@@ -4,6 +4,24 @@ This guide describes how to deploy the public MobileVC relay and connect a local
 
 The relay is a public transport broker, not the local MobileVC backend. It only accepts relay agent/client websocket connections and forwards encrypted relay envelopes. It does not need `AUTH_TOKEN`, does not run Codex or Claude, and does not store trusted device identities. Device trust, file authorization, runner state, and decrypted MobileVC traffic remain on the local node.
 
+## What Runs Where
+
+There are two separate runtime roles:
+
+| Machine | Run this | Why |
+| --- | --- | --- |
+| VPS / cloud server | `deploy/relay/docker-compose.yml` | Hosts the public relay endpoint such as `wss://relay.example.com:9443` |
+| Local development computer | `mobilevc public --relay wss://relay.example.com:9443` | Starts the local MobileVC backend, connects it to the public relay, and prints the phone pairing QR |
+| Phone | MobileVC app | Scans/imports the relay pairing link and connects through the relay |
+
+The `mobilevc` command is the Node.js launcher from the npm package:
+
+```bash
+npm install -g @justprove/mobilevc
+```
+
+Do not run the Node launcher on the VPS unless that VPS is also the computer that owns the Codex/Claude workspace. The public relay Docker service does not need Node, `AUTH_TOKEN`, Codex, Claude, or project files.
+
 ## Architecture
 
 ```text

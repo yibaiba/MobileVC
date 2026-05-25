@@ -124,6 +124,14 @@ ok
 mobilevc public --relay wss://relay.example.com:9443
 ```
 
+`mobilevc` 是 npm 安装的 Node.js launcher：
+
+```bash
+npm install -g @justprove/mobilevc
+```
+
+这条命令在你的本地电脑上运行，不是在 VPS 上运行。它会启动本地 MobileVC 后端，连接公网 relay，并打印手机扫码用的 relay 配对二维码。VPS 上只需要运行上面的 relay Docker Compose 服务。
+
 这个模式会同时保留局域网直连和 relay 连接。
 
 如果你只想让本地后端监听 `127.0.0.1`，只通过 relay 给手机连：
