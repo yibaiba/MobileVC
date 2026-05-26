@@ -67,6 +67,19 @@ func TestToProtocolSessionContext(t *testing.T) {
 	}
 }
 
+func TestToProtocolContextWindowUsage(t *testing.T) {
+	got := ToProtocolContextWindowUsage(data.ContextWindowUsage{
+		TokensUsed: 250,
+		TokenLimit: 200,
+	})
+	if got.TokenLimit != 200 {
+		t.Fatalf("expected token limit 200, got %d", got.TokenLimit)
+	}
+	if got.TokensUsed != 200 {
+		t.Fatalf("expected clamped tokens used 200, got %d", got.TokensUsed)
+	}
+}
+
 func TestToProtocolCatalogMetadata(t *testing.T) {
 	t.Run("zero time omitted", func(t *testing.T) {
 		got := ToProtocolCatalogMetadata(data.CatalogMetadata{})
@@ -257,6 +270,10 @@ func TestSessionHistoryEventFromRecord(t *testing.T) {
 		Projection: data.ProjectionSnapshot{
 			LogEntries: []data.SnapshotLogEntry{{Kind: "markdown", Message: "hi"}},
 			Diffs:      []DiffContext{{ContextID: "f1", PendingReview: true}},
+			ContextWindowUsage: data.ContextWindowUsage{
+				TokensUsed: 1200,
+				TokenLimit: 2000,
+			},
 			Runtime: data.SessionRuntime{
 				ResumeSessionID: "r1",
 				Command:         "claude",
@@ -274,6 +291,10 @@ func TestSessionHistoryEventFromRecord(t *testing.T) {
 	if len(got.LogEntries) != 1 {
 		t.Errorf("expected 1 log entry, got %d", len(got.LogEntries))
 	}
+	if got.ContextWindowUsage.TokensUsed != 1200 ||
+		got.ContextWindowUsage.TokenLimit != 2000 {
+		t.Fatalf("unexpected context window usage: %+v", got.ContextWindowUsage)
+	}
 	if !got.CanResume {
 		t.Errorf("expected CanResume=true")
 	}
@@ -290,6 +311,10 @@ func TestSessionDeltaEventFromRecord_FullDeliveryWhenKnownEmpty(t *testing.T) {
 				{Kind: "markdown", Message: "a"},
 				{Kind: "markdown", Message: "b"},
 			},
+			ContextWindowUsage: data.ContextWindowUsage{
+				TokensUsed: 300,
+				TokenLimit: 1000,
+			},
 			RawTerminalByStream: map[string]string{"stdout": "stdout-content"},
 			Runtime:             data.SessionRuntime{Command: "claude"},
 		},
@@ -303,6 +328,10 @@ func TestSessionDeltaEventFromRecord_FullDeliveryWhenKnownEmpty(t *testing.T) {
 	}
 	if got.RawTerminalByStream["stdout"] != "stdout-content" {
 		t.Errorf("expected terminal content delivered, got %q", got.RawTerminalByStream["stdout"])
+	}
+	if got.ContextWindowUsage.TokensUsed != 300 ||
+		got.ContextWindowUsage.TokenLimit != 1000 {
+		t.Fatalf("unexpected context window usage: %+v", got.ContextWindowUsage)
 	}
 	if got.Latest.LogEntryCount != 2 {
 		t.Errorf("latest log entry count: %d", got.Latest.LogEntryCount)

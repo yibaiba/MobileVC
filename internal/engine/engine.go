@@ -62,6 +62,13 @@ type InteractiveStateProvider interface {
 	CanAcceptInteractiveInput() bool
 }
 
+// TurnStateProvider reports whether the current AI turn is still actively
+// generating output, which is distinct from merely having a writable input
+// channel.
+type TurnStateProvider interface {
+	HasActiveTurn() bool
+}
+
 // PermissionResponseWriter handles permission decisions via stdio.
 type PermissionResponseWriter interface {
 	WritePermissionResponse(ctx context.Context, decision string) error
@@ -72,4 +79,16 @@ type PermissionResponseWriter interface {
 // ClaudeSessionProvider exposes the underlying Claude session ID.
 type ClaudeSessionProvider interface {
 	ClaudeSessionID() string
+}
+
+// ContextCompactor exposes first-class context compaction for runtimes that
+// support it directly, instead of routing through a textual slash command.
+type ContextCompactor interface {
+	Compact(ctx context.Context) error
+}
+
+// ContextWindowUsageProvider exposes the latest known context window usage for
+// runtimes that can resolve it from their native transport.
+type ContextWindowUsageProvider interface {
+	ContextWindowUsage(ctx context.Context) (protocol.ContextWindowUsage, bool, error)
 }

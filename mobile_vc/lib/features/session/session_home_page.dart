@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../core/config/app_config.dart';
 import '../../core/config/app_connection_endpoint.dart';
@@ -27,6 +28,7 @@ import '../../features/runtime_info/runtime_info_sheet.dart';
 import '../../features/skills/skill_management_sheet.dart';
 import '../../features/status/status_detail_sheet.dart';
 import '../../features/status/terminal_log_sheet.dart';
+import 'context_window_usage_sheet.dart';
 import 'claude_model_utils.dart';
 import 'connection_scan_sheet.dart';
 import 'session_controller.dart';
@@ -52,8 +54,184 @@ class _SessionHomePageState extends State<SessionHomePage> {
   static const int _maxImageAttachmentBytes = 4 * 1024 * 1024;
 
   final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
+  int _lastCompactFeedbackId = 0;
+  static const String _tipCommandModePrefsKey = 'tip_command_mode_shown_v2';
+  bool _lastConnected = false;
+  bool _checkingTipShown = false;
 
   SessionController get controller => widget.controller;
+
+  @override
+  void initState() {
+    super.initState();
+    controller.addListener(_handleControllerSignals);
+  }
+
+  @override
+  void dispose() {
+    controller.removeListener(_handleControllerSignals);
+    super.dispose();
+  }
+
+  @override
+  void didUpdateWidget(covariant SessionHomePage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.controller == widget.controller) {
+      return;
+    }
+    oldWidget.controller.removeListener(_handleControllerSignals);
+    widget.controller.addListener(_handleControllerSignals);
+    _lastCompactFeedbackId = 0;
+  }
+
+  void _handleControllerSignals() {
+    if (!mounted) {
+      return;
+    }
+    final justConnected = !_lastConnected && controller.connected;
+    _lastConnected = controller.connected;
+    if (justConnected && !_checkingTipShown) {
+      _checkingTipShown = true;
+      _maybeShowCommandModeTip();
+    }
+    final signal = controller.compactFeedbackSignal;
+    if (signal == null || signal.id == _lastCompactFeedbackId) {
+      return;
+    }
+    _lastCompactFeedbackId = signal.id;
+    final messenger = ScaffoldMessenger.of(context);
+    final scheme = Theme.of(context).colorScheme;
+    final isSuccess = signal.tone == CompactFeedbackTone.success;
+    messenger
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          content: Row(
+            children: [
+              Icon(
+                isSuccess ? Icons.check_circle_rounded : Icons.error_rounded,
+                size: 18,
+                color: Colors.white,
+              ),
+              const SizedBox(width: 10),
+              Expanded(child: Text(signal.message)),
+            ],
+          ),
+          backgroundColor: isSuccess ? const Color(0xFF0F766E) : scheme.error,
+          duration: Duration(milliseconds: isSuccess ? 1600 : 3200),
+        ),
+      );
+  }
+
+  Future<void> _maybeShowCommandModeTip() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      if (prefs.getBool(_tipCommandModePrefsKey) ?? false) {
+        return;
+      }
+      if (!mounted) {
+        return;
+      }
+      await showDialog<void>(
+        context: context,
+        builder: (ctx) => Dialog(
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 400, maxHeight: 560),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(24, 24, 24, 0),
+                  child: Row(
+                    children: [
+                      Icon(Icons.check_circle_rounded,
+                          color: Theme.of(ctx).colorScheme.primary, size: 22),
+                      const SizedBox(width: 10),
+                      const Expanded(
+                        child: Text('连接成功',
+                            style: TextStyle(
+                                fontSize: 17, fontWeight: FontWeight.w700)),
+                      ),
+                    ],
+                  ),
+                ),
+                Flexible(
+                  child: SingleChildScrollView(
+                    padding: const EdgeInsets.fromLTRB(24, 12, 24, 4),
+                    child: _buildTipContent(),
+                  ),
+                ),
+                Padding(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                  child: Align(
+                    alignment: Alignment.centerRight,
+                    child: TextButton(
+                      onPressed: () => Navigator.of(ctx).pop(),
+                      child: const Text('知道了'),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+      await prefs.setBool(_tipCommandModePrefsKey, true);
+    } finally {
+      _checkingTipShown = false;
+    }
+  }
+
+  static Widget _buildTipContent() {
+    return const _TipSection(children: [
+      _TipItem(
+        number: '一',
+        title: '命令行模式切换',
+        body:
+            '默认是命令行模式（Shell）。如需进入 Claude 模式，请在输入框输入 claude；如需进入 Codex 模式，请在输入框输入 codex。',
+      ),
+      _TipItem(
+        number: '二',
+        title: '连接成功判断标准',
+        body: '点击左上角文件图标，页面成功展示文件树，即代表服务连接成功。',
+      ),
+      _TipItem(
+        number: '三',
+        title: 'API 接入配置说明',
+        body: '当你使用 Claude Code 或 Codex 接入自己的 API 时，请务必完成以下关键配置：\n'
+            '1. 成功连接 API 后，立即前往输入框上方的「模型设置」\n'
+            '2. 将当前模型修改为 default\n'
+            '3. 完成设置后，再进行后续操作，避免因模型不匹配导致功能异常',
+      ),
+      _TipItem(
+        number: '四',
+        title: 'Claude / Codex 会话启动方式',
+        body: '1. 连接成功出现文件树之后，系统会自动在界面上弹出「Claude 会话」或「Codex 会话」的启动提示\n'
+            '2. 点击提示，即可直接进入对应的 AI 对话界面\n'
+            '3. 进入会话后，直接输入你的问题或指令，即可与 AI 交互',
+      ),
+      _TipItem(
+        number: '五',
+        title: '会话记录异常刷新方法',
+        body: '会话记录加载异常、显示异常时，可在文件树里回退到上级目录，再重新进入当前目录即可刷新，多数为缓存问题。',
+      ),
+      _TipItem(
+        number: '六',
+        title: '工作目录配置建议',
+        body: '初始连接时建议将工作目录配置为根目录，再通过文件树进入子工作目录，可减少目录与会话加载异常。',
+      ),
+      _TipItem(
+        number: '七',
+        title: '注意事项',
+        body: '• 接入自定义 API 时，模型修改为 default 是必做步骤，否则可能无法正常调用\n'
+            '• 没有弹出会话提示、看不到文件树，优先检查网络和 API 连接状态\n'
+            '• 会话记录加载异常，用「回退上级目录→重新进入」刷新\n'
+            '• 初始工作目录推荐设为根目录，再通过文件树进入子目录\n'
+            '• 如遇功能异常、连接失败等问题，可随时反馈给项目维护者',
+      ),
+    ]);
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -226,6 +404,11 @@ class _SessionHomePageState extends State<SessionHomePage> {
         awaitInput: controller.awaitInput,
         isBusy: controller.isSessionBusy,
         canStop: controller.canStopCurrentRun,
+        canCompact: controller.shouldShowCompactButton,
+        isCompacting: controller.isCompacting,
+        compactStatusLabel: controller.compactStatusLabel,
+        contextWindowUsage: controller.contextWindowUsage,
+        onOpenContextWindowUsage: () => _openContextWindowUsage(context),
         hasPendingReview: controller.hasPendingReview,
         fastMode: controller.fastMode,
         permissionMode: controller.displayPermissionMode,
@@ -235,6 +418,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
         onSubmit: controller.sendInputTextWithImages,
         onAttachImage: () => _pickImageAttachment(context),
         onStop: controller.stopCurrentRun,
+        onCompact: controller.compactCurrentSession,
         onOpenSessions: () => _openSessions(context),
         onOpenRuntimeInfo: () => _openRuntimeInfo(context),
         onOpenLogs: () => _openLogs(context),
@@ -251,6 +435,28 @@ class _SessionHomePageState extends State<SessionHomePage> {
         canSendToContinuedSameSession: controller.canSendToContinuedSameSession,
         isExternallyLocked: controller.isSessionReadOnly,
         externalLockedHint: controller.sessionReadOnlyHint,
+      ),
+    );
+  }
+
+  Future<void> _openContextWindowUsage(BuildContext context) async {
+    await showModalBottomSheet<void>(
+      context: context,
+      useSafeArea: true,
+      showDragHandle: true,
+      isScrollControlled: true,
+      builder: (context) => ListenableBuilder(
+        listenable: controller,
+        builder: (context, _) {
+          final engine = controller.commandBarEngine.trim();
+          final engineLabel = engine.isEmpty
+              ? 'AI'
+              : '${engine[0].toUpperCase()}${engine.substring(1)}';
+          return ContextWindowUsageSheet(
+            usage: controller.contextWindowUsage,
+            engineLabel: engineLabel,
+          );
+        },
       ),
     );
   }
@@ -2855,7 +3061,90 @@ String _portForHostInput(String rawHost, String rawPort) {
       secureTransportFromScheme(uri.scheme) == null) {
     return rawPort.trim();
   }
-  return uri.hasPort && uri.port > 0 ? uri.port.toString() : '';
+  if (uri.hasPort && uri.port > 0) {
+    return uri.port.toString();
+  }
+  return rawPort.trim();
+}
+
+class _TipSection extends StatelessWidget {
+  const _TipSection({required this.children});
+
+  final List<_TipItem> children;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: children,
+    );
+  }
+}
+
+class _TipItem extends StatelessWidget {
+  const _TipItem({
+    required this.number,
+    required this.title,
+    required this.body,
+  });
+
+  final String number;
+  final String title;
+  final String body;
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 16),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Container(
+            width: 22,
+            height: 22,
+            alignment: Alignment.center,
+            decoration: BoxDecoration(
+              color: cs.primary.withValues(alpha: 0.12),
+              borderRadius: BorderRadius.circular(6),
+            ),
+            child: Text(
+              number,
+              style: TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.w700,
+                color: cs.primary,
+              ),
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  title,
+                  style: const TextStyle(
+                    fontSize: 14,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  body,
+                  style: TextStyle(
+                    fontSize: 13,
+                    height: 1.55,
+                    color: cs.onSurface.withValues(alpha: 0.72),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 }
 
 String _shortFingerprint(String value) {

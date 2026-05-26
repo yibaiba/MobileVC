@@ -29,13 +29,14 @@ const (
 	scenarioCodexChatOnce         smokeScenario = "codex-chat-once"
 	scenarioCodexFileCreateReview smokeScenario = "codex-file-create-review"
 	scenarioCodexReadmeWrite      smokeScenario = "codex-readme-write"
+	scenarioCodexCompactOnly      smokeScenario = "codex-compact-only"
 )
 
 func main() {
 	var (
 		baseURL   = flag.String("url", "", "websocket url")
 		timeout   = flag.Duration("timeout", defaultSmokeTimeout, "overall smoke timeout")
-		scenario  = flag.String("scenario", string(scenarioFull), "smoke scenario: full, permission-diff-review, terminal-logs, codex-basic, codex-chat-once, codex-file-create-review, or codex-readme-write")
+		scenario  = flag.String("scenario", string(scenarioFull), "smoke scenario: full, permission-diff-review, terminal-logs, codex-basic, codex-chat-once, codex-file-create-review, codex-readme-write, or codex-compact-only")
 		aiCommand = flag.String("ai-command", strings.TrimSpace(os.Getenv("SMOKE_AI_COMMAND")), "AI command for codex-basic scenario")
 		engine    = flag.String("engine", strings.TrimSpace(os.Getenv("SMOKE_ENGINE")), "engine for codex-basic scenario")
 	)
@@ -145,6 +146,14 @@ func runSmoke(ctx context.Context, wsURL string, scenario smokeScenario, aiComma
 		}
 		tr.section("done")
 		tr.line("done scenario=%s", scenarioCodexReadmeWrite)
+		return nil
+	}
+	if scenario == scenarioCodexCompactOnly {
+		if err := runner.codexCompactOnlyFlow(); err != nil {
+			return err
+		}
+		tr.section("done")
+		tr.line("done scenario=%s", scenarioCodexCompactOnly)
 		return nil
 	}
 	if err := runner.chatFlow(); err != nil {
@@ -1170,6 +1179,82 @@ VERIFY:
 	}
 	r.transcript.line("codex_readme_write_verified phrase=%q", expectedPhrase)
 	return nil
+}
+
+func (r *smokeRunner) codexCompactOnlyFlow() error {
+	r.transcript.section("codex-compact-only")
+	cwd, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	cmd := strings.TrimSpace(r.aiCommand)
+	if cmd == "" {
+		cmd = "codex"
+	}
+	engine := strings.TrimSpace(r.engine)
+	if engine == "" {
+		engine = "codex"
+	}
+	token := fmt.Sprintf("COMPACT_READY_%d", time.Now().UnixNano())
+	if err := r.send(protocol.AITurnRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "ai_turn"},
+		Engine:      engine,
+		Data:        "Reply with exactly " + token + " and then stop.\n",
+		CWD:         cwd,
+		PermissionMode: "default",
+		RuntimeMeta: protocol.RuntimeMeta{
+			Source: "smoke-codex-compact-only",
+		},
+	}); err != nil {
+		return err
+	}
+
+	sawToken := false
+	for {
+		evt, err := r.waitForAnyType(90*time.Second, []string{
+			protocol.EventTypeLog,
+			protocol.EventTypeAgentState,
+			protocol.EventTypePromptRequest,
+			protocol.EventTypeError,
+		}, nil)
+		if err != nil {
+			return err
+		}
+		switch evt.stringField("type") {
+		case protocol.EventTypeError:
+			return fmt.Errorf("codex compact preflight error: %s", evt.stringField("msg"))
+		case protocol.EventTypeLog:
+			if strings.EqualFold(strings.TrimSpace(evt.stringField("stream")), "stdout") &&
+				strings.Contains(strings.TrimSpace(evt.stringField("msg")), token) {
+				sawToken = true
+				r.transcript.line("codex_compact_ready_token=%q", token)
+			}
+		case protocol.EventTypePromptRequest:
+			if !sawToken {
+				continue
+			}
+			if err := r.send(protocol.CompactRequestEvent{
+				ClientEvent: protocol.ClientEvent{
+					Action:    "compact",
+					SessionID: r.transcript.sessionID,
+				},
+				CWD:         cwd,
+				Engine:      "codex",
+				PermissionMode: "default",
+			}); err != nil {
+				return err
+			}
+			result, err := r.waitForType(protocol.EventTypeCompactResult, 45*time.Second, nil)
+			if err != nil {
+				return err
+			}
+			if !result.boolField("accepted") {
+				return fmt.Errorf("compact rejected: %s", result.stringField("error"))
+			}
+			r.transcript.line("codex_compact_result accepted=%v", result.boolField("accepted"))
+			return nil
+		}
+	}
 }
 
 func shellSingleQuote(text string) string {

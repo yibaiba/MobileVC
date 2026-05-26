@@ -88,6 +88,85 @@ class ClientActionAckEvent extends AppEvent {
       );
 }
 
+class CompactResultEvent extends AppEvent {
+  const CompactResultEvent({
+    required super.timestamp,
+    required super.sessionId,
+    required super.runtimeMeta,
+    required super.raw,
+    this.accepted = false,
+    this.error = '',
+  }) : super(type: 'compact_result');
+
+  final bool accepted;
+  final String error;
+
+  factory CompactResultEvent.fromJson(Map<String, dynamic> json) =>
+      CompactResultEvent(
+        timestamp: _readTimestamp(json),
+        sessionId: (json['sessionId'] ?? '').toString(),
+        runtimeMeta: RuntimeMeta.fromJson(json),
+        raw: json,
+        accepted: json['accepted'] == true,
+        error: (json['error'] ?? '').toString(),
+      );
+}
+
+class CompactionEvent extends AppEvent {
+  const CompactionEvent({
+    required super.timestamp,
+    required super.sessionId,
+    required super.runtimeMeta,
+    required super.raw,
+    this.contextId = '',
+    this.status = '',
+    this.trigger = '',
+    this.message = '',
+  }) : super(type: 'compaction');
+
+  final String contextId;
+  final String status;
+  final String trigger;
+  final String message;
+
+  factory CompactionEvent.fromJson(Map<String, dynamic> json) =>
+      CompactionEvent(
+        timestamp: _readTimestamp(json),
+        sessionId: (json['sessionId'] ?? '').toString(),
+        runtimeMeta: RuntimeMeta.fromJson(json),
+        raw: json,
+        contextId: (json['contextId'] ?? '').toString(),
+        status: (json['status'] ?? '').toString(),
+        trigger: (json['trigger'] ?? '').toString(),
+        message: (json['msg'] ?? '').toString(),
+      );
+}
+
+class ContextWindowUsageEvent extends AppEvent {
+  const ContextWindowUsageEvent({
+    required super.timestamp,
+    required super.sessionId,
+    required super.runtimeMeta,
+    required super.raw,
+    this.usage = const ContextWindowUsage(),
+  }) : super(type: 'context_window_usage');
+
+  final ContextWindowUsage usage;
+
+  factory ContextWindowUsageEvent.fromJson(Map<String, dynamic> json) =>
+      ContextWindowUsageEvent(
+        timestamp: _readTimestamp(json),
+        sessionId: (json['sessionId'] ?? '').toString(),
+        runtimeMeta: RuntimeMeta.fromJson(json),
+        raw: json,
+        usage: json['usage'] is Map<String, dynamic>
+            ? ContextWindowUsage.fromJson(
+                json['usage'] as Map<String, dynamic>,
+              )
+            : const ContextWindowUsage(),
+      );
+}
+
 class LogEvent extends AppEvent {
   const LogEvent({
     required super.timestamp,
@@ -1158,6 +1237,7 @@ class SessionHistoryEvent extends AppEvent {
     this.memoryCatalogMeta = const CatalogMetadata(domain: 'memory'),
     this.rawTerminalByStream = const {},
     this.terminalExecutions = const [],
+    this.contextWindowUsage = const ContextWindowUsage(),
     this.canResume = false,
     this.runtimeAlive = false,
     this.resumeRuntimeMeta = const RuntimeMeta(),
@@ -1176,6 +1256,7 @@ class SessionHistoryEvent extends AppEvent {
   final CatalogMetadata memoryCatalogMeta;
   final Map<String, String> rawTerminalByStream;
   final List<TerminalExecution> terminalExecutions;
+  final ContextWindowUsage contextWindowUsage;
   final bool canResume;
   final bool runtimeAlive;
   final RuntimeMeta resumeRuntimeMeta;
@@ -1234,6 +1315,11 @@ class SessionHistoryEvent extends AppEvent {
             .whereType<Map<String, dynamic>>()
             .map(TerminalExecution.fromJson)
             .toList(),
+        contextWindowUsage: json['contextWindowUsage'] is Map<String, dynamic>
+            ? ContextWindowUsage.fromJson(
+                json['contextWindowUsage'] as Map<String, dynamic>,
+              )
+            : const ContextWindowUsage(),
         canResume: json['canResume'] == true,
         runtimeAlive: json['runtimeAlive'] == true,
         resumeRuntimeMeta: json['resumeRuntimeMeta'] is Map<String, dynamic>
@@ -1306,6 +1392,7 @@ class SessionDeltaEvent extends AppEvent {
     this.memoryCatalogMeta = const CatalogMetadata(domain: 'memory'),
     this.rawTerminalByStream = const {},
     this.terminalExecutions = const [],
+    this.contextWindowUsage = const ContextWindowUsage(),
     this.canResume = false,
     this.runtimeAlive = false,
     this.resumeRuntimeMeta = const RuntimeMeta(),
@@ -1327,6 +1414,7 @@ class SessionDeltaEvent extends AppEvent {
   final CatalogMetadata memoryCatalogMeta;
   final Map<String, String> rawTerminalByStream;
   final List<TerminalExecution> terminalExecutions;
+  final ContextWindowUsage contextWindowUsage;
   final bool canResume;
   final bool runtimeAlive;
   final RuntimeMeta resumeRuntimeMeta;
@@ -1392,6 +1480,11 @@ class SessionDeltaEvent extends AppEvent {
             .whereType<Map<String, dynamic>>()
             .map(TerminalExecution.fromJson)
             .toList(),
+        contextWindowUsage: json['contextWindowUsage'] is Map<String, dynamic>
+            ? ContextWindowUsage.fromJson(
+                json['contextWindowUsage'] as Map<String, dynamic>,
+              )
+            : const ContextWindowUsage(),
         canResume: json['canResume'] == true,
         runtimeAlive: json['runtimeAlive'] == true,
         resumeRuntimeMeta: json['resumeRuntimeMeta'] is Map<String, dynamic>
@@ -1954,6 +2047,7 @@ class TimelineItem {
     this.body = '',
     this.stream = '',
     this.status = '',
+    this.trigger = '',
     this.meta = const RuntimeMeta(),
     this.context,
     this.animateBody = true,
@@ -1966,7 +2060,36 @@ class TimelineItem {
   final String body;
   final String stream;
   final String status;
+  final String trigger;
   final RuntimeMeta meta;
   final HistoryContext? context;
   final bool animateBody;
+
+  TimelineItem copyWith({
+    String? id,
+    String? kind,
+    DateTime? timestamp,
+    String? title,
+    String? body,
+    String? stream,
+    String? status,
+    String? trigger,
+    RuntimeMeta? meta,
+    HistoryContext? context,
+    bool? animateBody,
+  }) {
+    return TimelineItem(
+      id: id ?? this.id,
+      kind: kind ?? this.kind,
+      timestamp: timestamp ?? this.timestamp,
+      title: title ?? this.title,
+      body: body ?? this.body,
+      stream: stream ?? this.stream,
+      status: status ?? this.status,
+      trigger: trigger ?? this.trigger,
+      meta: meta ?? this.meta,
+      context: context ?? this.context,
+      animateBody: animateBody ?? this.animateBody,
+    );
+  }
 }

@@ -238,6 +238,20 @@ void main() {
       expect(field.decoration?.hintText, '会话切换中...');
       expect(button.onPressed, isNull);
     });
+
+    testWidgets('底部工具栏常驻显示上下文圆形入口', (tester) async {
+      await tester.pumpWidget(
+        _buildTestApp(
+          contextWindowUsage: const ContextWindowUsage(
+            tokensUsed: 120000,
+            tokenLimit: 200000,
+          ),
+        ),
+      );
+
+      expect(
+          find.byKey(const ValueKey('context-window-button')), findsOneWidget);
+    });
   });
 }
 
@@ -250,6 +264,7 @@ Widget _buildTestApp({
   bool showClaudeMode = true,
   String currentEngine = 'claude',
   bool isSessionLoading = false,
+  ContextWindowUsage contextWindowUsage = const ContextWindowUsage(),
   void Function(String text, List<ChatImageAttachment> imageAttachments)?
       onSubmit,
   Future<ChatImageAttachment?> Function()? onAttachImage,
@@ -261,6 +276,11 @@ Widget _buildTestApp({
         awaitInput: awaitInput,
         isBusy: isBusy,
         canStop: canStop,
+        canCompact: false,
+        isCompacting: false,
+        compactStatusLabel: '',
+        contextWindowUsage: contextWindowUsage,
+        onOpenContextWindowUsage: () {},
         hasPendingReview: false,
         fastMode: false,
         permissionMode: 'default',
@@ -269,6 +289,7 @@ Widget _buildTestApp({
         onSubmit: onSubmit ?? (text, images) {},
         onAttachImage: onAttachImage ?? () async => null,
         onStop: onStop ?? () {},
+        onCompact: () {},
         onOpenSessions: () {},
         onOpenRuntimeInfo: () {},
         onOpenLogs: () {},

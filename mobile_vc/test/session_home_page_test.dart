@@ -102,7 +102,7 @@ void main() {
     );
     await _pumpFrames(tester);
 
-    await tester.tap(find.text('模型 · Sonnet'));
+    await _tapCommandBarModel(tester, '模型 · Sonnet');
     await _pumpFrames(tester);
 
     expect(controller.configuredAiModel, 'sonnet');
@@ -145,7 +145,7 @@ void main() {
     );
     await _pumpFrames(tester);
 
-    await tester.tap(find.text('模型 · Default · MEDIUM'));
+    await _tapCommandBarModel(tester, '模型 · Default · MEDIUM');
     await _pumpFrames(tester);
 
     expect(controller.catalogRequestCount, 1);
@@ -225,6 +225,13 @@ Future<void> _flushEvents() async {
 Future<void> _useTallSurface(WidgetTester tester) async {
   await tester.binding.setSurfaceSize(const Size(900, 1100));
   addTearDown(() => tester.binding.setSurfaceSize(null));
+}
+
+Future<void> _tapCommandBarModel(WidgetTester tester, String label) async {
+  final finder = find.text(label);
+  await tester.ensureVisible(finder);
+  await tester.pump();
+  await tester.tap(finder);
 }
 
 Future<void> _pumpFrames(

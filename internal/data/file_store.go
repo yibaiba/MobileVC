@@ -539,6 +539,7 @@ func normalizeProjection(projection ProjectionSnapshot) ProjectionSnapshot {
 		projection.PermissionRules = []PermissionRule{}
 	}
 	projection.PermissionRules = normalizePermissionRules(projection.PermissionRules)
+	projection.ContextWindowUsage = normalizeContextWindowUsage(projection.ContextWindowUsage)
 	projection.SessionContext = normalizeSessionContext(projection.SessionContext)
 	projection.SkillCatalogMeta = normalizeCatalogMetadata(projection.SkillCatalogMeta, CatalogDomainSkill)
 	projection.MemoryCatalogMeta = normalizeCatalogMetadata(projection.MemoryCatalogMeta, CatalogDomainMemory)
@@ -597,6 +598,22 @@ func mergeSessionRuntime(base SessionRuntime, overlay SessionRuntime) SessionRun
 		ClaudeLifecycle: firstNonEmptyString(overlay.ClaudeLifecycle, base.ClaudeLifecycle),
 		Source:          firstNonEmptyString(overlay.Source, base.Source),
 	}
+}
+
+func normalizeContextWindowUsage(usage ContextWindowUsage) ContextWindowUsage {
+	if usage.TokenLimit < 0 {
+		usage.TokenLimit = 0
+	}
+	if usage.TokensUsed < 0 {
+		usage.TokensUsed = 0
+	}
+	if usage.TokenLimit > 0 && usage.TokensUsed > usage.TokenLimit {
+		usage.TokensUsed = usage.TokenLimit
+	}
+	if usage.TokenLimit == 0 {
+		usage.TokensUsed = 0
+	}
+	return usage
 }
 
 func normalizeSessionContext(ctx SessionContext) SessionContext {

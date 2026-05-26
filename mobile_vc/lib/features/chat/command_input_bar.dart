@@ -8,12 +8,18 @@ class CommandInputBar extends StatefulWidget {
     required this.awaitInput,
     required this.isBusy,
     required this.canStop,
+    required this.canCompact,
+    required this.isCompacting,
+    required this.compactStatusLabel,
+    required this.contextWindowUsage,
+    required this.onOpenContextWindowUsage,
     required this.hasPendingReview,
     required this.fastMode,
     required this.permissionMode,
     required this.onSubmit,
     required this.onAttachImage,
     required this.onStop,
+    required this.onCompact,
     required this.onOpenSessions,
     required this.onOpenRuntimeInfo,
     required this.onOpenLogs,
@@ -38,6 +44,11 @@ class CommandInputBar extends StatefulWidget {
   final bool awaitInput;
   final bool isBusy;
   final bool canStop;
+  final bool canCompact;
+  final bool isCompacting;
+  final String compactStatusLabel;
+  final ContextWindowUsage contextWindowUsage;
+  final VoidCallback onOpenContextWindowUsage;
   final bool hasPendingReview;
   final bool fastMode;
   final String permissionMode;
@@ -45,6 +56,7 @@ class CommandInputBar extends StatefulWidget {
       onSubmit;
   final Future<ChatImageAttachment?> Function() onAttachImage;
   final VoidCallback onStop;
+  final VoidCallback onCompact;
   final VoidCallback onOpenSessions;
   final VoidCallback onOpenRuntimeInfo;
   final VoidCallback onOpenLogs;
@@ -189,10 +201,16 @@ class _CommandInputBarState extends State<CommandInputBar> {
 
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
     final scheme = Theme.of(context).colorScheme;
     final bottomInset = MediaQuery.of(context).viewInsets.bottom;
     final engineLabel =
         _engineLabel(widget.currentEngine, widget.showClaudeMode);
+    final compactChipLabel = widget.isCompacting
+        ? (widget.compactStatusLabel.trim().isEmpty
+            ? '压缩中'
+            : widget.compactStatusLabel.trim())
+        : '压缩';
     final hintText = _inputLocked
         ? _lockedHintText
         : widget.awaitInput
@@ -205,9 +223,10 @@ class _CommandInputBarState extends State<CommandInputBar> {
                         : 'Shell 运行中')
                     : (widget.showClaudeMode ? '给 $engineLabel 发送消息' : '输入命令');
     final panelColor = scheme.surfaceContainerLow.withValues(alpha: 0.96);
+    final railColor = scheme.surfaceContainerLowest.withValues(alpha: 0.88);
     final inputColor = scheme.surfaceContainerHighest.withValues(alpha: 0.72);
     final shadowColor = scheme.shadow.withValues(
-      alpha: Theme.of(context).brightness == Brightness.dark ? 0.28 : 0.07,
+      alpha: theme.brightness == Brightness.dark ? 0.28 : 0.07,
     );
 
     return Padding(
@@ -242,99 +261,136 @@ class _CommandInputBarState extends State<CommandInputBar> {
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                SizedBox(
-                  width: double.infinity,
-                  child: SingleChildScrollView(
-                    scrollDirection: Axis.horizontal,
-                    child: Row(
-                      children: [
-                        _ToolChip(
-                          icon: Icons.history,
-                          label: '会话',
-                          onPressed: widget.onOpenSessions,
-                        ),
-                        const SizedBox(width: 8),
-                        _ToolChip(
-                          icon: Icons.terminal,
-                          label: '日志',
-                          onPressed: widget.onOpenLogs,
-                        ),
-                        const SizedBox(width: 8),
-                        _ToolChip(
-                          icon: Icons.extension_outlined,
-                          label: 'Skill',
-                          onPressed: widget.onOpenSkills,
-                        ),
-                        const SizedBox(width: 8),
-                        _ToolChip(
-                          icon: Icons.psychology_alt_outlined,
-                          label: 'Memory',
-                          onPressed: widget.onOpenMemory,
-                        ),
-                        const SizedBox(width: 8),
-                        _ToolChip(
-                          icon: Icons.verified_user_outlined,
-                          label: '权限 · ${widget.permissionRuleSummary}',
-                          onPressed: widget.onOpenPermissions,
-                        ),
-                        const SizedBox(width: 8),
-                        _ToolChip(
-                          icon: Icons.model_training_outlined,
-                          label: '模型 · ${widget.modelSummary}',
-                          onPressed: widget.onOpenModels,
-                        ),
-                        const SizedBox(width: 8),
-                        DecoratedBox(
-                          decoration: BoxDecoration(
-                            color: inputColor,
-                            borderRadius: BorderRadius.circular(999),
-                            border: Border.all(
-                              color:
-                                  scheme.outlineVariant.withValues(alpha: 0.4),
-                            ),
-                          ),
-                          child: Padding(
-                            padding: const EdgeInsets.symmetric(horizontal: 12),
-                            child: DropdownButtonHideUnderline(
-                              child: DropdownButton<String>(
-                                value: widget.permissionMode,
-                                borderRadius: BorderRadius.circular(16),
-                                style: Theme.of(context)
-                                    .textTheme
-                                    .bodySmall
-                                    ?.copyWith(fontWeight: FontWeight.w600),
-                                items: const [
-                                  DropdownMenuItem(
-                                    value: 'auto',
-                                    child: Text('自动模式'),
-                                  ),
-                                  DropdownMenuItem(
-                                    value: 'default',
-                                    child: Text('手动审核'),
-                                  ),
-                                  DropdownMenuItem(
-                                    value: 'bypassPermissions',
-                                    child: Text('跳过权限确认'),
-                                  ),
-                                ],
-                                onChanged: (value) {
-                                  if (value != null) {
-                                    widget.onPermissionModeChanged(value);
-                                  }
-                                },
-                              ),
-                            ),
-                          ),
-                        ),
-                      ],
+                Container(
+                  padding: const EdgeInsets.fromLTRB(8, 8, 8, 8),
+                  decoration: BoxDecoration(
+                    color: railColor,
+                    borderRadius: BorderRadius.circular(24),
+                    border: Border.all(
+                      color: scheme.outlineVariant.withValues(alpha: 0.26),
                     ),
+                  ),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: SingleChildScrollView(
+                          scrollDirection: Axis.horizontal,
+                          child: Row(
+                            children: [
+                              _ToolChip(
+                                icon: Icons.history,
+                                label: '会话',
+                                onPressed: widget.onOpenSessions,
+                              ),
+                              const SizedBox(width: 8),
+                              if (widget.canCompact || widget.isCompacting) ...[
+                                _ToolChip(
+                                  icon: widget.isCompacting
+                                      ? Icons.hourglass_top_rounded
+                                      : Icons.content_cut_rounded,
+                                  label: compactChipLabel,
+                                  onPressed: widget.isCompacting
+                                      ? null
+                                      : widget.onCompact,
+                                  highlighted: widget.isCompacting,
+                                  showSpinner: widget.isCompacting,
+                                ),
+                                const SizedBox(width: 8),
+                              ],
+                              _ToolChip(
+                                icon: Icons.terminal,
+                                label: '日志',
+                                onPressed: widget.onOpenLogs,
+                              ),
+                              const SizedBox(width: 8),
+                              _ToolChip(
+                                icon: Icons.extension_outlined,
+                                label: 'Skill',
+                                onPressed: widget.onOpenSkills,
+                              ),
+                              const SizedBox(width: 8),
+                              _ToolChip(
+                                icon: Icons.psychology_alt_outlined,
+                                label: 'Memory',
+                                onPressed: widget.onOpenMemory,
+                              ),
+                              const SizedBox(width: 8),
+                              _ToolChip(
+                                icon: Icons.verified_user_outlined,
+                                label: '权限 · ${widget.permissionRuleSummary}',
+                                onPressed: widget.onOpenPermissions,
+                              ),
+                              const SizedBox(width: 8),
+                              _ToolChip(
+                                icon: Icons.model_training_outlined,
+                                label: '模型 · ${widget.modelSummary}',
+                                onPressed: widget.onOpenModels,
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      _ContextWindowUsageButton(
+                        usage: widget.contextWindowUsage,
+                        onPressed: widget.onOpenContextWindowUsage,
+                      ),
+                      const SizedBox(width: 8),
+                      DecoratedBox(
+                        decoration: BoxDecoration(
+                          color: inputColor,
+                          borderRadius: BorderRadius.circular(999),
+                          border: Border.all(
+                            color: scheme.outlineVariant.withValues(alpha: 0.4),
+                          ),
+                        ),
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 12),
+                          child: DropdownButtonHideUnderline(
+                            child: DropdownButton<String>(
+                              value: widget.permissionMode,
+                              borderRadius: BorderRadius.circular(16),
+                              style: theme.textTheme.bodySmall?.copyWith(
+                                fontWeight: FontWeight.w600,
+                              ),
+                              items: const [
+                                DropdownMenuItem(
+                                  value: 'auto',
+                                  child: Text('自动模式'),
+                                ),
+                                DropdownMenuItem(
+                                  value: 'default',
+                                  child: Text('手动审核'),
+                                ),
+                                DropdownMenuItem(
+                                  value: 'bypassPermissions',
+                                  child: Text('跳过权限确认'),
+                                ),
+                              ],
+                              onChanged: (value) {
+                                if (value != null) {
+                                  widget.onPermissionModeChanged(value);
+                                }
+                              },
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
                   ),
                 ),
                 const SizedBox(height: 10),
                 Container(
                   constraints: const BoxConstraints(minHeight: 56),
                   decoration: BoxDecoration(
-                    color: inputColor,
+                    gradient: LinearGradient(
+                      colors: [
+                        inputColor,
+                        scheme.surface.withValues(alpha: 0.94),
+                      ],
+                      begin: Alignment.topLeft,
+                      end: Alignment.bottomRight,
+                    ),
                     borderRadius: BorderRadius.circular(28),
                     border: Border.all(
                       color: scheme.outlineVariant.withValues(alpha: 0.24),
@@ -475,6 +531,103 @@ class _CommandInputBarState extends State<CommandInputBar> {
   }
 }
 
+class _ContextWindowUsageButton extends StatelessWidget {
+  const _ContextWindowUsageButton({
+    required this.usage,
+    required this.onPressed,
+  });
+
+  final ContextWindowUsage usage;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final percent = usage.percentUsed;
+    final progressColor = percent > 90
+        ? scheme.error
+        : percent >= 70
+            ? const Color(0xFFF59E0B)
+            : scheme.primary;
+    final tooltipMessage = usage.isAvailable
+        ? '上下文已使用 $percent%，剩余 ${formatTokenCountCompact(usage.tokensRemaining)}'
+        : '上下文用量暂不可用';
+    final backgroundColor = usage.isAvailable
+        ? progressColor.withValues(alpha: 0.10)
+        : scheme.surfaceContainerHigh.withValues(alpha: 0.78);
+    final borderColor = usage.isAvailable
+        ? progressColor.withValues(alpha: 0.24)
+        : scheme.outlineVariant.withValues(alpha: 0.34);
+
+    return Tooltip(
+      message: tooltipMessage,
+      waitDuration: const Duration(milliseconds: 250),
+      child: Semantics(
+        button: true,
+        label: tooltipMessage,
+        child: Material(
+          color: Colors.transparent,
+          child: InkWell(
+            key: const ValueKey('context-window-button'),
+            onTap: onPressed,
+            borderRadius: BorderRadius.circular(999),
+            child: Ink(
+              width: 40,
+              height: 40,
+              decoration: BoxDecoration(
+                color: backgroundColor,
+                shape: BoxShape.circle,
+                border: Border.all(color: borderColor),
+              ),
+              child: Center(
+                child: SizedBox(
+                  width: 24,
+                  height: 24,
+                  child: Stack(
+                    alignment: Alignment.center,
+                    children: [
+                      if (usage.isAvailable)
+                        CircularProgressIndicator(
+                          value: usage.fractionUsed,
+                          strokeWidth: 2.4,
+                          backgroundColor: scheme.surfaceContainerHighest
+                              .withValues(alpha: 0.9),
+                          valueColor:
+                              AlwaysStoppedAnimation<Color>(progressColor),
+                        )
+                      else
+                        DecoratedBox(
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            border: Border.all(
+                              color:
+                                  scheme.outlineVariant.withValues(alpha: 0.58),
+                              width: 1.9,
+                            ),
+                          ),
+                        ),
+                      Container(
+                        width: 5,
+                        height: 5,
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          color: usage.isAvailable
+                              ? progressColor
+                              : scheme.outlineVariant.withValues(alpha: 0.82),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 String _engineLabel(String currentEngine, bool showClaudeMode) {
   switch (currentEngine.trim().toLowerCase()) {
     case 'codex':
@@ -597,17 +750,24 @@ class _ToolChip extends StatelessWidget {
     required this.icon,
     required this.label,
     required this.onPressed,
+    this.highlighted = false,
+    this.showSpinner = false,
   });
 
   final IconData icon;
   final String label;
-  final VoidCallback onPressed;
+  final VoidCallback? onPressed;
+  final bool highlighted;
+  final bool showSpinner;
 
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
+    final enabled = onPressed != null;
     return Material(
-      color: scheme.surfaceContainerHigh.withValues(alpha: 0.82),
+      color: highlighted
+          ? scheme.primaryContainer.withValues(alpha: 0.94)
+          : scheme.surfaceContainerHigh.withValues(alpha: enabled ? 0.82 : 0.5),
       borderRadius: BorderRadius.circular(999),
       child: InkWell(
         onTap: onPressed,
@@ -617,19 +777,48 @@ class _ToolChip extends StatelessWidget {
           decoration: BoxDecoration(
             borderRadius: BorderRadius.circular(999),
             border: Border.all(
-              color: scheme.outlineVariant.withValues(alpha: 0.38),
+              color: highlighted
+                  ? scheme.primary.withValues(alpha: 0.42)
+                  : scheme.outlineVariant
+                      .withValues(alpha: enabled ? 0.38 : 0.22),
             ),
           ),
           child: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
-              Icon(icon, size: 16, color: scheme.onSurfaceVariant),
+              if (showSpinner)
+                SizedBox(
+                  width: 16,
+                  height: 16,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2.1,
+                    valueColor: AlwaysStoppedAnimation<Color>(
+                      highlighted
+                          ? scheme.onPrimaryContainer
+                          : scheme.onSurfaceVariant,
+                    ),
+                  ),
+                )
+              else
+                Icon(
+                  icon,
+                  size: 16,
+                  color: highlighted
+                      ? scheme.onPrimaryContainer
+                      : enabled
+                          ? scheme.onSurfaceVariant
+                          : scheme.onSurfaceVariant.withValues(alpha: 0.56),
+                ),
               const SizedBox(width: 6),
               Text(
                 label,
                 style: Theme.of(context).textTheme.bodySmall?.copyWith(
                       fontWeight: FontWeight.w600,
-                      color: scheme.onSurface,
+                      color: highlighted
+                          ? scheme.onPrimaryContainer
+                          : enabled
+                              ? scheme.onSurface
+                              : scheme.onSurface.withValues(alpha: 0.56),
                     ),
               ),
             ],

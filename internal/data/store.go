@@ -139,6 +139,11 @@ type SessionRuntime struct {
 	Source          string `json:"source,omitempty"`
 }
 
+type ContextWindowUsage struct {
+	TokensUsed int `json:"tokensUsed,omitempty"`
+	TokenLimit int `json:"tokenLimit,omitempty"`
+}
+
 type ControllerState string
 
 const (
@@ -169,6 +174,7 @@ type SnapshotContext struct {
 	Type          string `json:"type,omitempty"`
 	Message       string `json:"message,omitempty"`
 	Status        string `json:"status,omitempty"`
+	Trigger       string `json:"trigger,omitempty"`
 	Target        string `json:"target,omitempty"`
 	TargetPath    string `json:"targetPath,omitempty"`
 	Tool          string `json:"tool,omitempty"`
@@ -281,6 +287,7 @@ type ProjectionSnapshot struct {
 	TerminalExecutions     []TerminalExecution `json:"terminalExecutions,omitempty"`
 	Controller             ControllerSnapshot  `json:"controller,omitempty"`
 	Runtime                SessionRuntime      `json:"runtime,omitempty"`
+	ContextWindowUsage     ContextWindowUsage  `json:"contextWindowUsage,omitempty"`
 	SessionContext         SessionContext      `json:"sessionContext,omitempty"`
 	SessionContextSet      bool                `json:"sessionContextSet,omitempty"`
 	PermissionRulesEnabled bool                `json:"permissionRulesEnabled,omitempty"`

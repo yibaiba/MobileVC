@@ -10,6 +10,9 @@ const (
 	EventTypeProgress                  = "progress"
 	EventTypeError                     = "error"
 	EventTypeClientActionAck           = "client_action_ack"
+	EventTypeCompactResult             = "compact_result"
+	EventTypeCompaction                = "compaction"
+	EventTypeContextWindowUsage        = "context_window_usage"
 	EventTypePromptRequest             = "prompt_request"
 	EventTypeInteractionRequest        = "interaction_request"
 	EventTypeSessionResumeResult       = "session_resume_result"
@@ -278,6 +281,13 @@ type SkillRequestEvent struct {
 	TargetStack  string `json:"targetStack,omitempty"`
 }
 
+type CompactRequestEvent struct {
+	ClientEvent
+	CWD            string `json:"cwd,omitempty"`
+	Engine         string `json:"engine,omitempty"`
+	PermissionMode string `json:"permissionMode,omitempty"`
+}
+
 type SkillCatalogRequestEvent struct {
 	ClientEvent
 	Skill SkillDefinition `json:"skill,omitempty"`
@@ -293,6 +303,12 @@ type SessionContextUpdateRequestEvent struct {
 	ClientEvent
 	EnabledSkillNames []string `json:"enabledSkillNames,omitempty"`
 	EnabledMemoryIDs  []string `json:"enabledMemoryIds,omitempty"`
+}
+
+type ContextWindowUsageRequestEvent struct {
+	ClientEvent
+	SessionID string `json:"sessionId,omitempty"`
+	CWD       string `json:"cwd,omitempty"`
 }
 
 type SkillDefinition struct {
@@ -336,6 +352,11 @@ type CatalogMetadata struct {
 type SessionContext struct {
 	EnabledSkillNames []string `json:"enabledSkillNames,omitempty"`
 	EnabledMemoryIDs  []string `json:"enabledMemoryIds,omitempty"`
+}
+
+type ContextWindowUsage struct {
+	TokensUsed int `json:"tokensUsed,omitempty"`
+	TokenLimit int `json:"tokenLimit,omitempty"`
 }
 
 type ADBDevice struct {
@@ -524,6 +545,7 @@ type HistoryContext struct {
 	Type          string `json:"type,omitempty"`
 	Message       string `json:"message,omitempty"`
 	Status        string `json:"status,omitempty"`
+	Trigger       string `json:"trigger,omitempty"`
 	Target        string `json:"target,omitempty"`
 	TargetPath    string `json:"targetPath,omitempty"`
 	Tool          string `json:"tool,omitempty"`
@@ -617,6 +639,7 @@ type SessionHistoryEvent struct {
 	LatestError         *HistoryContext     `json:"latestError,omitempty"`
 	RawTerminalByStream map[string]string   `json:"rawTerminalByStream,omitempty"`
 	TerminalExecutions  []TerminalExecution `json:"terminalExecutions,omitempty"`
+	ContextWindowUsage  ContextWindowUsage  `json:"contextWindowUsage,omitempty"`
 	SessionContext      SessionContext      `json:"sessionContext,omitempty"`
 	SkillCatalogMeta    CatalogMetadata     `json:"skillCatalogMeta,omitempty"`
 	MemoryCatalogMeta   CatalogMetadata     `json:"memoryCatalogMeta,omitempty"`
@@ -639,6 +662,7 @@ type SessionDeltaEvent struct {
 	LatestError         *HistoryContext     `json:"latestError,omitempty"`
 	RawTerminalByStream map[string]string   `json:"rawTerminalByStream,omitempty"`
 	TerminalExecutions  []TerminalExecution `json:"terminalExecutions,omitempty"`
+	ContextWindowUsage  ContextWindowUsage  `json:"contextWindowUsage,omitempty"`
 	SessionContext      SessionContext      `json:"sessionContext,omitempty"`
 	SkillCatalogMeta    CatalogMetadata     `json:"skillCatalogMeta,omitempty"`
 	MemoryCatalogMeta   CatalogMetadata     `json:"memoryCatalogMeta,omitempty"`
@@ -800,6 +824,25 @@ type ClientActionAckEvent struct {
 	Duplicate      bool   `json:"duplicate,omitempty"`
 }
 
+type CompactResultEvent struct {
+	Event
+	Accepted bool   `json:"accepted"`
+	Error    string `json:"error,omitempty"`
+}
+
+type CompactionEvent struct {
+	Event
+	ContextID string `json:"contextId,omitempty"`
+	Status    string `json:"status,omitempty"`
+	Trigger   string `json:"trigger,omitempty"`
+	Message   string `json:"msg,omitempty"`
+}
+
+type ContextWindowUsageEvent struct {
+	Event
+	Usage ContextWindowUsage `json:"usage"`
+}
+
 type PromptRequestEvent struct {
 	Event
 	Message string   `json:"msg,omitempty"`
@@ -860,6 +903,10 @@ type AIStatusEvent struct {
 }
 
 func (e AIStatusEvent) GetRuntimeMeta() RuntimeMeta { return e.RuntimeMeta }
+
+func (e CompactionEvent) GetRuntimeMeta() RuntimeMeta { return e.RuntimeMeta }
+
+func (e ContextWindowUsageEvent) GetRuntimeMeta() RuntimeMeta { return e.RuntimeMeta }
 
 type RuntimePhaseEvent struct {
 	Event
@@ -1058,6 +1105,31 @@ func NewClientActionAckEvent(sessionID, action, clientActionID, status string, d
 	}
 }
 
+func NewCompactResultEvent(sessionID string, accepted bool, errText string) CompactResultEvent {
+	return CompactResultEvent{
+		Event:    NewBaseEvent(EventTypeCompactResult, sessionID),
+		Accepted: accepted,
+		Error:    strings.TrimSpace(errText),
+	}
+}
+
+func NewCompactionEvent(sessionID, contextID, status, trigger, message string) CompactionEvent {
+	return CompactionEvent{
+		Event:     NewBaseEvent(EventTypeCompaction, sessionID),
+		ContextID: strings.TrimSpace(contextID),
+		Status:    strings.TrimSpace(status),
+		Trigger:   strings.TrimSpace(trigger),
+		Message:   strings.TrimSpace(message),
+	}
+}
+
+func NewContextWindowUsageEvent(sessionID string, usage ContextWindowUsage) ContextWindowUsageEvent {
+	return ContextWindowUsageEvent{
+		Event: NewBaseEvent(EventTypeContextWindowUsage, sessionID),
+		Usage: NormalizeContextWindowUsage(usage),
+	}
+}
+
 func NewRelayDeviceRegisterResultEvent(sessionID, deviceID, fingerprintHex, status string) RelayDeviceRegisterResultEvent {
 	return RelayDeviceRegisterResultEvent{
 		Event:          NewBaseEvent(EventTypeRelayDeviceRegisterResult, sessionID),
@@ -1223,7 +1295,7 @@ func NewSessionListResultEvent(sessionID string, items []SessionSummary) Session
 	}
 }
 
-func NewSessionHistoryEvent(sessionID string, summary SessionSummary, logEntries []HistoryLogEntry, diffs []HistoryContext, currentDiff *HistoryContext, reviewGroups []ReviewGroup, activeReviewGroup *ReviewGroup, currentStep, latestError *HistoryContext, rawTerminalByStream map[string]string, terminalExecutions []TerminalExecution, sessionContext SessionContext, skillCatalogMeta, memoryCatalogMeta CatalogMetadata, canResume, runtimeAlive bool, resumeRuntimeMeta RuntimeMeta) SessionHistoryEvent {
+func NewSessionHistoryEvent(sessionID string, summary SessionSummary, logEntries []HistoryLogEntry, diffs []HistoryContext, currentDiff *HistoryContext, reviewGroups []ReviewGroup, activeReviewGroup *ReviewGroup, currentStep, latestError *HistoryContext, rawTerminalByStream map[string]string, terminalExecutions []TerminalExecution, contextWindowUsage ContextWindowUsage, sessionContext SessionContext, skillCatalogMeta, memoryCatalogMeta CatalogMetadata, canResume, runtimeAlive bool, resumeRuntimeMeta RuntimeMeta) SessionHistoryEvent {
 	return SessionHistoryEvent{
 		Event:               NewBaseEvent(EventTypeSessionHistory, sessionID),
 		Summary:             summary,
@@ -1236,6 +1308,7 @@ func NewSessionHistoryEvent(sessionID string, summary SessionSummary, logEntries
 		LatestError:         latestError,
 		RawTerminalByStream: rawTerminalByStream,
 		TerminalExecutions:  terminalExecutions,
+		ContextWindowUsage:  NormalizeContextWindowUsage(contextWindowUsage),
 		SessionContext:      sessionContext,
 		SkillCatalogMeta:    skillCatalogMeta,
 		MemoryCatalogMeta:   memoryCatalogMeta,
@@ -1245,7 +1318,7 @@ func NewSessionHistoryEvent(sessionID string, summary SessionSummary, logEntries
 	}
 }
 
-func NewSessionDeltaEvent(sessionID string, summary SessionSummary, base, latest SessionDeltaKnown, appendLogEntries []HistoryLogEntry, upsertDiffs []HistoryContext, currentDiff *HistoryContext, reviewGroups []ReviewGroup, activeReviewGroup *ReviewGroup, currentStep, latestError *HistoryContext, rawTerminalByStream map[string]string, terminalExecutions []TerminalExecution, sessionContext SessionContext, skillCatalogMeta, memoryCatalogMeta CatalogMetadata, canResume, runtimeAlive bool, resumeRuntimeMeta RuntimeMeta, requiresFullSync bool) SessionDeltaEvent {
+func NewSessionDeltaEvent(sessionID string, summary SessionSummary, base, latest SessionDeltaKnown, appendLogEntries []HistoryLogEntry, upsertDiffs []HistoryContext, currentDiff *HistoryContext, reviewGroups []ReviewGroup, activeReviewGroup *ReviewGroup, currentStep, latestError *HistoryContext, rawTerminalByStream map[string]string, terminalExecutions []TerminalExecution, contextWindowUsage ContextWindowUsage, sessionContext SessionContext, skillCatalogMeta, memoryCatalogMeta CatalogMetadata, canResume, runtimeAlive bool, resumeRuntimeMeta RuntimeMeta, requiresFullSync bool) SessionDeltaEvent {
 	return SessionDeltaEvent{
 		Event:               NewBaseEvent(EventTypeSessionDelta, sessionID),
 		Summary:             summary,
@@ -1260,6 +1333,7 @@ func NewSessionDeltaEvent(sessionID string, summary SessionSummary, base, latest
 		LatestError:         latestError,
 		RawTerminalByStream: rawTerminalByStream,
 		TerminalExecutions:  terminalExecutions,
+		ContextWindowUsage:  NormalizeContextWindowUsage(contextWindowUsage),
 		SessionContext:      sessionContext,
 		SkillCatalogMeta:    skillCatalogMeta,
 		MemoryCatalogMeta:   memoryCatalogMeta,
@@ -1578,6 +1652,12 @@ func ApplyRuntimeMeta(event any, meta RuntimeMeta) any {
 	case ErrorEvent:
 		e.RuntimeMeta = MergeRuntimeMeta(e.RuntimeMeta, meta)
 		return e
+	case CompactionEvent:
+		e.RuntimeMeta = MergeRuntimeMeta(e.RuntimeMeta, meta)
+		return e
+	case ContextWindowUsageEvent:
+		e.RuntimeMeta = MergeRuntimeMeta(e.RuntimeMeta, meta)
+		return e
 	case InteractionRequestEvent:
 		e.RuntimeMeta = MergeRuntimeMeta(e.RuntimeMeta, meta)
 		return e
@@ -1690,6 +1770,12 @@ func ApplyEventCursor(event any, cursor int64) any {
 	case ErrorEvent:
 		e.EventCursor = cursor
 		return e
+	case CompactionEvent:
+		e.EventCursor = cursor
+		return e
+	case ContextWindowUsageEvent:
+		e.EventCursor = cursor
+		return e
 	case InteractionRequestEvent:
 		e.EventCursor = cursor
 		return e
@@ -1783,4 +1869,17 @@ func ApplyEventCursor(event any, cursor int64) any {
 	default:
 		return event
 	}
+}
+
+func NormalizeContextWindowUsage(usage ContextWindowUsage) ContextWindowUsage {
+	if usage.TokenLimit < 0 {
+		usage.TokenLimit = 0
+	}
+	if usage.TokensUsed < 0 {
+		usage.TokensUsed = 0
+	}
+	if usage.TokenLimit > 0 && usage.TokensUsed > usage.TokenLimit {
+		usage.TokensUsed = usage.TokenLimit
+	}
+	return usage
 }

@@ -38,6 +38,11 @@ class _EventCardState extends State<EventCard> {
     final compact = _isCompactKind(widget.item.kind);
     final isUser = widget.item.kind == 'user';
     final isMarkdown = widget.item.kind == 'markdown';
+    final isCompaction = widget.item.kind == 'compaction';
+
+    if (isCompaction) {
+      return _CompactionMarker(item: widget.item);
+    }
 
     if (isMarkdown) {
       final bubbleColor = Color.alphaBlend(
@@ -317,8 +322,7 @@ class _EventCardState extends State<EventCard> {
     final value = state.textEditingValue;
     final selection = value.selection;
     final hasSelection = selection.isValid && !selection.isCollapsed;
-    final selectedText =
-        hasSelection ? selection.textInside(value.text) : '';
+    final selectedText = hasSelection ? selection.textInside(value.text) : '';
     final fullText = widget.item.body;
 
     final items = <ContextMenuButtonItem>[];
@@ -406,7 +410,7 @@ class _EventCardState extends State<EventCard> {
   }
 
   bool _isCompactKind(String kind) {
-    return kind == 'session' || kind == 'system';
+    return kind == 'session' || kind == 'system' || kind == 'compaction';
   }
 
   _EventCardStyle _styleForKind(ColorScheme scheme, String kind) {
@@ -802,6 +806,95 @@ class _EventCardStyle {
       iconColor: iconColor ?? this.iconColor,
       shadow: shadow ?? this.shadow,
       radius: radius ?? this.radius,
+    );
+  }
+}
+
+class _CompactionMarker extends StatelessWidget {
+  const _CompactionMarker({required this.item});
+
+  final TimelineItem item;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final status = item.status.trim().toLowerCase();
+    final failed = status == 'failed';
+    final loading = status == 'loading';
+    final color = failed
+        ? scheme.error
+        : loading
+            ? scheme.primary
+            : scheme.onSurfaceVariant;
+    final lineColor = color.withValues(alpha: failed ? 0.28 : 0.22);
+    final label = switch (status) {
+      'loading' => '压缩中',
+      'failed' => '压缩失败',
+      _ => '已压缩',
+    };
+    final detail = failed ? item.body.trim() : '';
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 6),
+      child: Row(
+        children: [
+          Expanded(child: Divider(color: lineColor, height: 1)),
+          Container(
+            margin: const EdgeInsets.symmetric(horizontal: 12),
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+            decoration: BoxDecoration(
+              color: scheme.surfaceContainerLow,
+              borderRadius: BorderRadius.circular(999),
+              border: Border.all(color: lineColor),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                if (loading)
+                  SizedBox(
+                    width: 14,
+                    height: 14,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 1.8,
+                      valueColor: AlwaysStoppedAnimation<Color>(color),
+                    ),
+                  )
+                else
+                  Icon(
+                    failed
+                        ? Icons.error_outline_rounded
+                        : Icons.content_cut_rounded,
+                    size: 16,
+                    color: color,
+                  ),
+                const SizedBox(width: 8),
+                Text(
+                  label,
+                  style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                        color: color,
+                        fontWeight: FontWeight.w700,
+                      ),
+                ),
+                if (detail.isNotEmpty) ...[
+                  const SizedBox(width: 8),
+                  ConstrainedBox(
+                    constraints: const BoxConstraints(maxWidth: 220),
+                    child: Text(
+                      detail,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                            color: scheme.onSurfaceVariant,
+                          ),
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+          Expanded(child: Divider(color: lineColor, height: 1)),
+        ],
+      ),
     );
   }
 }
