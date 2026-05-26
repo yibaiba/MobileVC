@@ -621,6 +621,41 @@ func assertNoEventType(t *testing.T, conn *websocket.Conn, want string, timeout 
 	}
 }
 
+func closeConnAndCleanupRuntime(t *testing.T, conn *websocket.Conn, h *Handler, runners ...*stubRunner) {
+	t.Helper()
+	if conn != nil {
+		closeTestConnGracefully(t, conn)
+	}
+	if h != nil && h.runtimeSessions != nil {
+		h.runtimeSessions.CleanupAll()
+	}
+	for _, runner := range runners {
+		if runner != nil {
+			runner.WaitClosed(t)
+		}
+	}
+}
+
+func closeTestConnGracefully(t *testing.T, conn *websocket.Conn) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	if err := conn.WriteControl(
+		websocket.CloseMessage,
+		websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
+		deadline,
+	); err != nil {
+		t.Fatalf("write websocket close frame: %v", err)
+	}
+	if err := conn.SetReadDeadline(deadline); err != nil {
+		t.Fatalf("set websocket close read deadline: %v", err)
+	}
+	for {
+		if _, _, err := conn.ReadMessage(); err != nil {
+			return
+		}
+	}
+}
+
 func readUntilSessionHistory(t *testing.T, conn *websocket.Conn) map[string]any {
 	t.Helper()
 	return readUntilType(t, conn, protocol.EventTypeSessionHistory)
@@ -3083,10 +3118,7 @@ func TestHandlerPtyInputFlowSendsPushWhenTokenRegistered(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("write exec request: %v", err)
 	}
-	defer func() {
-		_ = conn.Close()
-		h.runtimeSessions.CleanupAll()
-	}()
+	defer closeConnAndCleanupRuntime(t, conn, h, ptyRunner)
 
 	requireAgentState(t, readUntilType(t, conn, protocol.EventTypeAgentState), "THINKING", false)
 	_ = readUntilType(t, conn, protocol.EventTypePromptRequest)
@@ -3117,11 +3149,6 @@ func TestHandlerPtyInputFlowSendsPushWhenTokenRegistered(t *testing.T) {
 	if mockPush.SentNotifications[0].Data["eventType"] != protocol.EventTypePromptRequest {
 		t.Fatalf("unexpected push eventType: %#v", mockPush.SentNotifications[0])
 	}
-	defer func() {
-		_ = conn.Close()
-		h.runtimeSessions.CleanupAll()
-	}()
-
 	if err := conn.WriteJSON(protocol.InputRequestEvent{
 		ClientEvent: protocol.ClientEvent{Action: "input"},
 		Data:        "y\n",
@@ -3390,9 +3417,7 @@ func TestHandlerInputInjectsEnabledSkillsIntoAIConversation(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("did not receive input payload")
 	}
-	// 主动收尾：避免 t.TempDir RemoveAll 与后台 SaveProjection 的竞争。
-	_ = conn.Close()
-	h.runtimeSessions.CleanupAll()
+	closeConnAndCleanupRuntime(t, conn, h, ptyRunner)
 }
 
 func TestHandlerInputInjectsEnabledMemoryIntoAIConversation(t *testing.T) {
@@ -3472,9 +3497,7 @@ func TestHandlerInputInjectsEnabledMemoryIntoAIConversation(t *testing.T) {
 		t.Fatal("did not receive input payload")
 	}
 
-	_ = conn.Close()
-	h.runtimeSessions.CleanupAll()
-	time.Sleep(50 * time.Millisecond)
+	closeConnAndCleanupRuntime(t, conn, h, ptyRunner)
 }
 
 func TestHandlerInputDoesNotInjectEmptySessionContextBeforeUserConfiguresIt(t *testing.T) {
@@ -3529,8 +3552,7 @@ func TestHandlerInputDoesNotInjectEmptySessionContextBeforeUserConfiguresIt(t *t
 		t.Fatal("did not receive input payload")
 	}
 
-	_ = conn.Close()
-	h.runtimeSessions.CleanupAll()
+	closeConnAndCleanupRuntime(t, conn, h, ptyRunner)
 }
 
 func TestHandlerInputInjectsEnabledSkillAndMemoryIntoAIConversation(t *testing.T) {
@@ -3705,8 +3727,7 @@ func TestHandlerInputInjectsEmptySessionContextToOverrideEarlierSkillAndMemorySt
 	case <-time.After(5 * time.Second):
 		t.Fatal("did not receive input payload")
 	}
-	_ = conn.Close()
-	h.runtimeSessions.CleanupAll()
+	closeConnAndCleanupRuntime(t, conn, h, ptyRunner)
 }
 
 func TestHandlerInputBlocksPendingPermissionRequest(t *testing.T) {
@@ -3753,8 +3774,7 @@ func TestHandlerInputBlocksPendingPermissionRequest(t *testing.T) {
 	case <-time.After(200 * time.Millisecond):
 	}
 
-	_ = conn.Close()
-	h.runtimeSessions.CleanupAll()
+	closeConnAndCleanupRuntime(t, conn, h, firstRunner)
 }
 
 func TestHandlerInputAutoResumesDetachedClaudeSession(t *testing.T) {
@@ -3832,8 +3852,7 @@ func TestHandlerInputAutoResumesDetachedClaudeSession(t *testing.T) {
 		t.Fatal("did not receive resumed input payload")
 	}
 
-	_ = conn.Close()
-	h.runtimeSessions.CleanupAll()
+	closeConnAndCleanupRuntime(t, conn, h, secondRunner)
 }
 
 func TestHandlerInputWithoutRunner(t *testing.T) {
@@ -4290,9 +4309,7 @@ func TestHandlerPermissionDecisionBeforeResumeBindsSelectedSession(t *testing.T)
 	firstRunner.WaitStarted(t)
 	_ = readUntilType(t, conn, protocol.EventTypePromptRequest)
 	_ = readUntilType(t, conn, protocol.EventTypeAgentState)
-	if err := conn.Close(); err != nil {
-		t.Fatalf("close first conn: %v", err)
-	}
+	closeTestConnGracefully(t, conn)
 
 	conn2 := newTestConn(t, h)
 	_, _ = readInitialEvents(t, conn2)
@@ -4317,10 +4334,7 @@ func TestHandlerPermissionDecisionBeforeResumeBindsSelectedSession(t *testing.T)
 	case <-time.After(5 * time.Second):
 		t.Fatal("did not receive direct permission response after reconnect")
 	}
-	// 主动收尾：先关 conn 让 read loop 退出，再 cleanup runtime sessions，
-	// 等任何后台 SaveProjection 完成后再让 t.TempDir 自动 RemoveAll，避免竞态。
-	_ = conn2.Close()
-	h.runtimeSessions.CleanupAll()
+	closeConnAndCleanupRuntime(t, conn2, h, firstRunner)
 }
 
 func TestHandlerPermissionDecisionApproveForCodexUsesDirectPermissionResponse(t *testing.T) {
@@ -4376,10 +4390,7 @@ func TestHandlerPermissionDecisionApproveForCodexUsesDirectPermissionResponse(t 
 	if runnerIndex != 1 {
 		t.Fatalf("expected no runner restart for codex, got runner count=%d", runnerIndex)
 	}
-	// 主动收尾：避免 t.TempDir RemoveAll 与后台 SaveProjection 的竞争。
-	_ = conn.Close()
-	h.runtimeSessions.CleanupAll()
-	time.Sleep(50 * time.Millisecond)
+	closeConnAndCleanupRuntime(t, conn, h, firstRunner)
 }
 
 func TestHandlerPermissionDecisionApproveForCodexWithExpiredPendingRequestReturnsError(t *testing.T) {
@@ -4732,8 +4743,7 @@ func TestHandlerPermissionDecisionWithManagedFreshClaudeSessionUsesDirectPermiss
 	if runnerIndex != 1 {
 		t.Fatalf("expected no runner restart, got runner count=%d", runnerIndex)
 	}
-	_ = conn.Close()
-	h.runtimeSessions.CleanupAll()
+	closeConnAndCleanupRuntime(t, conn, h, firstRunner)
 }
 
 func TestHandlerPermissionDecisionWithoutPermissionResponseSupportReturnsError(t *testing.T) {
@@ -4905,9 +4915,7 @@ func TestHandlerPermissionDecisionWithNonInteractiveRunnerUsesDirectPermissionRe
 	if thinking["state"] != "THINKING" {
 		t.Fatalf("expected THINKING state, got %#v", thinking)
 	}
-	_ = conn.Close()
-	h.runtimeSessions.CleanupAll()
-	time.Sleep(50 * time.Millisecond)
+	closeConnAndCleanupRuntime(t, conn, h, firstRunner)
 }
 
 func TestHandlerReviewDecisionWithNonInteractiveRunnerReturnsError(t *testing.T) {
@@ -5041,9 +5049,7 @@ func TestHandlerReviewDecisionRevertSendsPromptEvenWhenReviewOnly(t *testing.T) 
 	case <-time.After(5 * time.Second):
 		t.Fatal("did not receive revert review payload")
 	}
-	_ = conn.Close()
-	h.runtimeSessions.CleanupAll()
-	time.Sleep(50 * time.Millisecond)
+	closeConnAndCleanupRuntime(t, conn, h, ptyRunner)
 }
 
 func TestHandlerReviewDecisionUpdatesProjectionAndReviewState(t *testing.T) {
@@ -5176,9 +5182,7 @@ func TestHandlerSetPermissionModeUpdatesRunner(t *testing.T) {
 	if record.Projection.Runtime.PermissionMode != "default" {
 		t.Fatalf("expected persisted permission mode default, got %#v", record.Projection.Runtime)
 	}
-	_ = conn.Close()
-	h.runtimeSessions.CleanupAll()
-	time.Sleep(50 * time.Millisecond)
+	closeConnAndCleanupRuntime(t, conn, h, ptyRunner)
 }
 
 func TestHandlerSetPermissionModeUpdatesActiveRunner(t *testing.T) {
@@ -5228,6 +5232,7 @@ func TestHandlerSetPermissionModeUpdatesActiveRunner(t *testing.T) {
 	if ptyRunner.lastPermissionMode != "default" {
 		t.Fatalf("expected runner permission mode to update, got %q", ptyRunner.lastPermissionMode)
 	}
+	closeConnAndCleanupRuntime(t, conn, h, ptyRunner)
 }
 
 func TestHandlerReviewDecisionWithoutRunner(t *testing.T) {

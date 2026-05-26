@@ -322,6 +322,7 @@ class _CommandInputBarState extends State<CommandInputBar> {
                               ),
                               const SizedBox(width: 8),
                               _ToolChip(
+                                key: const ValueKey('command-bar-model-button'),
                                 icon: Icons.model_training_outlined,
                                 label: '模型 · ${widget.modelSummary}',
                                 onPressed: widget.onOpenModels,
@@ -747,6 +748,7 @@ class _AttachmentPreviewChip extends StatelessWidget {
 
 class _ToolChip extends StatelessWidget {
   const _ToolChip({
+    super.key,
     required this.icon,
     required this.label,
     required this.onPressed,

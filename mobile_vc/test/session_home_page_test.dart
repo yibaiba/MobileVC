@@ -22,6 +22,7 @@ void main() {
   test('主界面顶部上下文胶囊已完全移除', () async {
     final service = _FakeMobileVcWsService();
     final controller = SessionController(service: service);
+    addTearDown(controller.disposeController);
     await controller.initialize();
 
     await controller.saveConfig(
@@ -228,10 +229,12 @@ Future<void> _useTallSurface(WidgetTester tester) async {
 }
 
 Future<void> _tapCommandBarModel(WidgetTester tester, String label) async {
-  final finder = find.text(label);
-  await tester.ensureVisible(finder);
+  final buttonFinder = find.byKey(const ValueKey('command-bar-model-button'));
+  await tester.ensureVisible(buttonFinder);
   await tester.pump();
-  await tester.tap(finder);
+  expect(find.descendant(of: buttonFinder, matching: find.text(label)),
+      findsOneWidget);
+  await tester.tap(buttonFinder.first);
 }
 
 Future<void> _pumpFrames(
