@@ -2400,11 +2400,11 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				continue
 			}
 			emit(result)
-		case "context_window_usage_get":
+		case protocol.ActionContextWindowUsageGet, protocol.ActionContextWindowsUsageGetAlias:
 			var usageReq protocol.ContextWindowUsageRequestEvent
 			if err := json.Unmarshal(payloadBytes, &usageReq); err != nil {
-				logx.Warn("ws", "invalid context_window_usage_get request: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
-				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid context_window_usage_get request: %v", err), ""))
+				logx.Warn("ws", "invalid %s request: connectionID=%s sessionID=%s remoteAddr=%s err=%v", clientEvent.Action, connectionID, selectedSessionID, remoteAddr, err)
+				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid %s request: %v", clientEvent.Action, err), ""))
 				continue
 			}
 			targetSessionID := strings.TrimSpace(usageReq.SessionID)

@@ -50,6 +50,9 @@ type stubRunner struct {
 	lastReq                    engine.ExecRequest
 	currentPermissionRequestID string
 	closedCh                   chan struct{}
+	contextUsage               protocol.ContextWindowUsage
+	contextUsageOK             bool
+	contextUsageErr            error
 }
 
 func newStubRunner(events ...any) *stubRunner {
@@ -207,6 +210,15 @@ func (s *stubRunner) ProcessRef() engine.ProcessRef {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.processRef
+}
+
+func (s *stubRunner) ContextWindowUsage(ctx context.Context) (protocol.ContextWindowUsage, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.contextUsageErr != nil {
+		return protocol.ContextWindowUsage{}, false, s.contextUsageErr
+	}
+	return s.contextUsage, s.contextUsageOK, nil
 }
 
 type writeOnlyStubRunner struct {
@@ -5355,6 +5367,56 @@ func TestHandlerRuntimeInfoRejectsUnknownQuery(t *testing.T) {
 	if event["msg"] != "unsupported runtime_info query: mystery" {
 		t.Fatalf("unexpected error event: %#v", event)
 	}
+}
+
+func TestHandlerContextWindowsUsageAliasReturnsUsage(t *testing.T) {
+	ptyRunner := newInteractiveHoldingStubRunner()
+	ptyRunner.contextUsage = protocol.ContextWindowUsage{
+		TokensUsed: 1200,
+		TokenLimit: 8000,
+	}
+	ptyRunner.contextUsageOK = true
+	h := newTestHandler()
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	h.SessionStore = tempStore
+	h.NewPtyRunner = func() engine.Runner { return ptyRunner }
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+	sessionID := createHistorySessionForHandlerTest(t, h, conn, "context-window-usage-alias")
+
+	if err := conn.WriteJSON(protocol.ExecRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "exec"},
+		Command:     "codex",
+		Mode:        "pty",
+	}); err != nil {
+		t.Fatalf("write exec request: %v", err)
+	}
+	ptyRunner.WaitStarted(t)
+
+	if err := conn.WriteJSON(protocol.ContextWindowUsageRequestEvent{
+		ClientEvent: protocol.ClientEvent{
+			Action:    protocol.ActionContextWindowsUsageGetAlias,
+			SessionID: sessionID,
+		},
+	}); err != nil {
+		t.Fatalf("write context window usage alias request: %v", err)
+	}
+
+	event := readUntilType(t, conn, protocol.EventTypeContextWindowUsage)
+	if event["sessionId"] != sessionID {
+		t.Fatalf("expected session %q, got %#v", sessionID, event)
+	}
+	usage, ok := event["usage"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected usage map, got %#v", event)
+	}
+	if usage["tokensUsed"] != float64(1200) || usage["tokenLimit"] != float64(8000) {
+		t.Fatalf("unexpected context window usage: %#v", usage)
+	}
+	closeConnAndCleanupRuntime(t, conn, h, ptyRunner)
 }
 
 func TestHandlerSlashCommandRuntimeInfoQueries(t *testing.T) {

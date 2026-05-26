@@ -6,6 +6,9 @@ import (
 )
 
 const (
+	ActionContextWindowUsageGet       = "context_window_usage_get"
+	ActionContextWindowsUsageGetAlias = "context_windows_usage_get"
+
 	EventTypeLog                       = "log"
 	EventTypeProgress                  = "progress"
 	EventTypeError                     = "error"
