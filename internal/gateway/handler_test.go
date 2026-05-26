@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -21,6 +20,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"mobilevc/internal/data"
+	"mobilevc/internal/data/claudesync"
 	"mobilevc/internal/data/codexsync"
 	"mobilevc/internal/engine"
 	"mobilevc/internal/protocol"
@@ -50,6 +50,9 @@ type stubRunner struct {
 	lastReq                    engine.ExecRequest
 	currentPermissionRequestID string
 	closedCh                   chan struct{}
+	contextUsage               protocol.ContextWindowUsage
+	contextUsageOK             bool
+	contextUsageErr            error
 }
 
 func newStubRunner(events ...any) *stubRunner {
@@ -209,6 +212,15 @@ func (s *stubRunner) ProcessRef() engine.ProcessRef {
 	return s.processRef
 }
 
+func (s *stubRunner) ContextWindowUsage(ctx context.Context) (protocol.ContextWindowUsage, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.contextUsageErr != nil {
+		return protocol.ContextWindowUsage{}, false, s.contextUsageErr
+	}
+	return s.contextUsage, s.contextUsageOK, nil
+}
+
 type writeOnlyStubRunner struct {
 	base *stubRunner
 }
@@ -245,6 +257,112 @@ type localTestServer struct {
 	URL      string
 	server   *http.Server
 	listener net.Listener
+}
+
+type countingStore struct {
+	inner      data.Store
+	mu         sync.Mutex
+	getCalls   int
+	listCalls  int
+	upsertErr  error
+	upsertSeen []string
+}
+
+func (s *countingStore) CreateSession(ctx context.Context, title string) (data.SessionSummary, error) {
+	return s.inner.CreateSession(ctx, title)
+}
+
+func (s *countingStore) UpsertSession(ctx context.Context, record data.SessionRecord) (data.SessionSummary, error) {
+	s.mu.Lock()
+	s.upsertSeen = append(s.upsertSeen, record.Summary.ID)
+	err := s.upsertErr
+	s.mu.Unlock()
+	if err != nil {
+		return data.SessionSummary{}, err
+	}
+	return s.inner.UpsertSession(ctx, record)
+}
+
+func (s *countingStore) SaveProjection(ctx context.Context, sessionID string, projection data.ProjectionSnapshot) (data.SessionSummary, error) {
+	return s.inner.SaveProjection(ctx, sessionID, projection)
+}
+
+func (s *countingStore) GetSession(ctx context.Context, sessionID string) (data.SessionRecord, error) {
+	s.mu.Lock()
+	s.getCalls++
+	s.mu.Unlock()
+	return s.inner.GetSession(ctx, sessionID)
+}
+
+func (s *countingStore) ListSessions(ctx context.Context) ([]data.SessionSummary, error) {
+	s.mu.Lock()
+	s.listCalls++
+	s.mu.Unlock()
+	return s.inner.ListSessions(ctx)
+}
+
+func (s *countingStore) DeleteSession(ctx context.Context, sessionID string) error {
+	return s.inner.DeleteSession(ctx, sessionID)
+}
+
+func (s *countingStore) SavePushToken(ctx context.Context, sessionID, token, platform string) error {
+	return s.inner.SavePushToken(ctx, sessionID, token, platform)
+}
+
+func (s *countingStore) GetPushToken(ctx context.Context, sessionID string) (string, string, error) {
+	return s.inner.GetPushToken(ctx, sessionID)
+}
+
+func (s *countingStore) ListSkillCatalog(ctx context.Context) ([]data.SkillDefinition, error) {
+	return s.inner.ListSkillCatalog(ctx)
+}
+
+func (s *countingStore) SaveSkillCatalog(ctx context.Context, items []data.SkillDefinition) error {
+	return s.inner.SaveSkillCatalog(ctx, items)
+}
+
+func (s *countingStore) GetSkillCatalogSnapshot(ctx context.Context) (data.SkillCatalogSnapshot, error) {
+	return s.inner.GetSkillCatalogSnapshot(ctx)
+}
+
+func (s *countingStore) SaveSkillCatalogSnapshot(ctx context.Context, snapshot data.SkillCatalogSnapshot) error {
+	return s.inner.SaveSkillCatalogSnapshot(ctx, snapshot)
+}
+
+func (s *countingStore) ListMemoryCatalog(ctx context.Context) ([]data.MemoryItem, error) {
+	return s.inner.ListMemoryCatalog(ctx)
+}
+
+func (s *countingStore) SaveMemoryCatalog(ctx context.Context, items []data.MemoryItem) error {
+	return s.inner.SaveMemoryCatalog(ctx, items)
+}
+
+func (s *countingStore) GetMemoryCatalogSnapshot(ctx context.Context) (data.MemoryCatalogSnapshot, error) {
+	return s.inner.GetMemoryCatalogSnapshot(ctx)
+}
+
+func (s *countingStore) SaveMemoryCatalogSnapshot(ctx context.Context, snapshot data.MemoryCatalogSnapshot) error {
+	return s.inner.SaveMemoryCatalogSnapshot(ctx, snapshot)
+}
+
+func (s *countingStore) GetPermissionRuleSnapshot(ctx context.Context) (data.PermissionRuleSnapshot, error) {
+	return s.inner.GetPermissionRuleSnapshot(ctx)
+}
+
+func (s *countingStore) SavePermissionRuleSnapshot(ctx context.Context, snapshot data.PermissionRuleSnapshot) error {
+	return s.inner.SavePermissionRuleSnapshot(ctx, snapshot)
+}
+
+func (s *countingStore) getCallCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.getCalls
+}
+
+func (s *countingStore) listCallCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.listCalls
 }
 
 func (s *localTestServer) Close() {
@@ -297,6 +415,45 @@ func newTestConn(t *testing.T, h *Handler) *websocket.Conn {
 	return conn
 }
 
+func dialTestConn(t *testing.T, h *Handler, origin string) (*websocket.Conn, *http.Response) {
+	t.Helper()
+	server := newLocalHTTPServer(t, h)
+	if h != nil && h.runtimeSessions != nil {
+		t.Cleanup(func() {
+			h.runtimeSessions.CleanupAll()
+		})
+	}
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/?token=test"
+	headers := http.Header{}
+	if origin != "" {
+		headers.Set("Origin", origin)
+	}
+	conn, resp, err := websocket.DefaultDialer.Dial(wsURL, headers)
+	if err != nil {
+		return nil, resp
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	return conn, resp
+}
+
+func TestHandlerAllowsBrowserOrigin(t *testing.T) {
+	h := newTestHandler()
+
+	conn, resp := dialTestConn(t, h, "https://example.test")
+	if conn == nil {
+		t.Fatalf("expected websocket connection, status=%s", responseStatus(resp))
+	}
+}
+
+func responseStatus(resp *http.Response) string {
+	if resp == nil {
+		return "<nil>"
+	}
+	return resp.Status
+}
+
 func readEventMap(t *testing.T, conn *websocket.Conn) map[string]any {
 	t.Helper()
 	var event map[string]any
@@ -329,6 +486,27 @@ func requireAgentState(t *testing.T, event map[string]any, wantState string, wan
 	await, _ := event["awaitInput"].(bool)
 	if await != wantAwait {
 		t.Fatalf("expected awaitInput=%v, got %#v", wantAwait, event)
+	}
+}
+
+func TestHandlerFileAccessReadsAbsolutePath(t *testing.T) {
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "shared.txt")
+	if err := os.WriteFile(filePath, []byte("ok"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h := newTestHandler()
+	conn := newTestConn(t, h)
+
+	if err := conn.WriteJSON(protocol.FSReadRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "fs_read"},
+		Path:        filePath,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	readEvent := readUntilType(t, conn, protocol.EventTypeFSReadResult)
+	if readEvent["content"] != "ok" {
+		t.Fatalf("content: got %#v", readEvent["content"])
 	}
 }
 
@@ -455,6 +633,41 @@ func assertNoEventType(t *testing.T, conn *websocket.Conn, want string, timeout 
 	}
 }
 
+func closeConnAndCleanupRuntime(t *testing.T, conn *websocket.Conn, h *Handler, runners ...*stubRunner) {
+	t.Helper()
+	if conn != nil {
+		closeTestConnGracefully(t, conn)
+	}
+	if h != nil && h.runtimeSessions != nil {
+		h.runtimeSessions.CleanupAll()
+	}
+	for _, runner := range runners {
+		if runner != nil {
+			runner.WaitClosed(t)
+		}
+	}
+}
+
+func closeTestConnGracefully(t *testing.T, conn *websocket.Conn) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	if err := conn.WriteControl(
+		websocket.CloseMessage,
+		websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
+		deadline,
+	); err != nil {
+		t.Fatalf("write websocket close frame: %v", err)
+	}
+	if err := conn.SetReadDeadline(deadline); err != nil {
+		t.Fatalf("set websocket close read deadline: %v", err)
+	}
+	for {
+		if _, _, err := conn.ReadMessage(); err != nil {
+			return
+		}
+	}
+}
+
 func readUntilSessionHistory(t *testing.T, conn *websocket.Conn) map[string]any {
 	t.Helper()
 	return readUntilType(t, conn, protocol.EventTypeSessionHistory)
@@ -503,6 +716,15 @@ func containsText(items []string, want string) bool {
 	return false
 }
 
+func containsSessionSummaryID(items []data.SessionSummary, want string) bool {
+	for _, item := range items {
+		if item.ID == want {
+			return true
+		}
+	}
+	return false
+}
+
 func createHistorySessionForHandlerTest(t *testing.T, h *Handler, conn *websocket.Conn, title string) string {
 	t.Helper()
 	if err := conn.WriteJSON(protocol.SessionCreateRequestEvent{ClientEvent: protocol.ClientEvent{Action: "session_create"}, Title: title}); err != nil {
@@ -531,65 +753,106 @@ func writeTestFile(t *testing.T, path, content string) {
 	}
 }
 
+type nativeCodexThreadFixture struct {
+	ID           string
+	CWD          string
+	Title        string
+	Source       string
+	ThreadSource string
+}
+
 func seedNativeCodexSessionFixture(t *testing.T, homeDir, cwd string) string {
 	t.Helper()
+	threadID := "019d3c6b-c538-7420-8028-345f7dd70d63"
+	seedNativeCodexThreadsFixture(t, homeDir, []nativeCodexThreadFixture{{
+		ID:    threadID,
+		CWD:   cwd,
+		Title: "Desktop Codex Session",
+	}})
+	return threadID
+}
 
+func seedNativeCodexThreadsFixture(t *testing.T, homeDir string, fixtures []nativeCodexThreadFixture) {
+	t.Helper()
+	if len(fixtures) == 0 {
+		t.Fatal("expected at least one native codex fixture")
+	}
 	codexDir := filepath.Join(homeDir, ".codex")
 	if err := os.MkdirAll(codexDir, 0o755); err != nil {
 		t.Fatalf("mkdir codex dir: %v", err)
 	}
-
-	threadID := "019d3c6b-c538-7420-8028-345f7dd70d63"
-	createdAt := time.Date(2026, 3, 29, 10, 0, 0, 0, time.UTC).Unix()
-	updatedAt := time.Date(2026, 3, 30, 11, 30, 0, 0, time.UTC).Unix()
-	rolloutPath := filepath.Join(
-		codexDir,
-		"sessions",
-		"2026",
-		"03",
-		"30",
-		"rollout-2026-03-30T11-30-00-"+threadID+".jsonl",
-	)
-	if err := os.MkdirAll(filepath.Dir(rolloutPath), 0o755); err != nil {
-		t.Fatalf("mkdir rollout dir: %v", err)
-	}
-	dbPath := filepath.Join(codexDir, "state_5.sqlite")
-
-	db, err := sql.Open("sqlite", dbPath)
+	db, err := sql.Open("sqlite", filepath.Join(codexDir, "state_5.sqlite"))
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
 	defer db.Close()
-
-	statements := []string{
-		"create table if not exists threads (id text primary key, cwd text, title text, model text, source text, model_provider text, created_at integer, updated_at integer, first_user_message text, rollout_path text, archived integer default 0);",
-		"delete from threads;",
-		"insert into threads (id, cwd, title, model, source, model_provider, created_at, updated_at, first_user_message, rollout_path, archived) values ('019d3c6b-c538-7420-8028-345f7dd70d63', '" + strings.ReplaceAll(cwd, "'", "''") + "', 'Desktop Codex Session', 'gpt-5-codex', 'codex', 'openai', " + int64String(createdAt) + ", " + int64String(updatedAt) + ", 'Fix the README wording', '" + strings.ReplaceAll(rolloutPath, "'", "''") + "', 0);",
+	if _, err := db.Exec("create table if not exists threads (id text primary key, cwd text, title text, model text, source text, model_provider text, thread_source text, created_at integer, updated_at integer, first_user_message text, rollout_path text, archived integer default 0);"); err != nil {
+		t.Fatalf("create native codex threads table: %v", err)
 	}
-	for _, stmt := range statements {
-		if _, err := db.Exec(stmt); err != nil {
-			t.Fatalf("seed sqlite fixture: %v (stmt: %s)", err, stmt[:min(len(stmt), 80)])
+	if _, err := db.Exec("delete from threads;"); err != nil {
+		t.Fatalf("clear native codex threads table: %v", err)
+	}
+
+	createdAt := time.Date(2026, 3, 29, 10, 0, 0, 0, time.UTC).Unix()
+	updatedAt := time.Date(2026, 3, 30, 11, 30, 0, 0, time.UTC).Unix()
+	for i, fixture := range fixtures {
+		threadID := strings.TrimSpace(fixture.ID)
+		if threadID == "" {
+			t.Fatalf("native codex fixture %d missing id", i)
 		}
+		cwd := strings.TrimSpace(fixture.CWD)
+		if cwd == "" {
+			t.Fatalf("native codex fixture %s missing cwd", threadID)
+		}
+		title := firstNonEmptyString(strings.TrimSpace(fixture.Title), "Desktop Codex Session")
+		source := firstNonEmptyString(strings.TrimSpace(fixture.Source), "cli")
+		rolloutPath := filepath.Join(codexDir, "sessions", "2026", "03", "30", "rollout-2026-03-30T11-30-00-"+threadID+".jsonl")
+		if err := os.MkdirAll(filepath.Dir(rolloutPath), 0o755); err != nil {
+			t.Fatalf("mkdir rollout dir: %v", err)
+		}
+		if _, err := db.Exec(
+			`insert into threads (id, cwd, title, model, source, model_provider, thread_source, created_at, updated_at, first_user_message, rollout_path, archived) values (?, ?, ?, 'gpt-5-codex', ?, 'openai', ?, ?, ?, ?, ?, 0)`,
+			threadID,
+			cwd,
+			title,
+			source,
+			strings.TrimSpace(fixture.ThreadSource),
+			createdAt+int64(i),
+			updatedAt+int64(i),
+			"Fix the README wording",
+			rolloutPath,
+		); err != nil {
+			t.Fatalf("insert native codex fixture: %v", err)
+		}
+		writeNativeCodexRolloutFixture(t, rolloutPath, createdAt, updatedAt)
 	}
+	writeNativeCodexHistoryFixture(t, filepath.Join(codexDir, "history.jsonl"), fixtures, createdAt, updatedAt)
+}
 
-	historyPath := filepath.Join(codexDir, "history.jsonl")
-	historyLines := []map[string]any{
-		{"session_id": threadID, "ts": createdAt, "text": "Fix the README wording"},
-		{"session_id": threadID, "ts": updatedAt, "text": "Also align the mobile labels"},
-	}
-	file, err := os.Create(historyPath)
+func writeNativeCodexHistoryFixture(t *testing.T, path string, fixtures []nativeCodexThreadFixture, createdAt, updatedAt int64) {
+	t.Helper()
+	file, err := os.Create(path)
 	if err != nil {
 		t.Fatalf("create history fixture: %v", err)
 	}
 	defer file.Close()
 	encoder := json.NewEncoder(file)
-	for _, line := range historyLines {
-		if err := encoder.Encode(line); err != nil {
-			t.Fatalf("write history fixture: %v", err)
+	for _, fixture := range fixtures {
+		threadID := strings.TrimSpace(fixture.ID)
+		for _, line := range []map[string]any{
+			{"session_id": threadID, "ts": createdAt, "text": "Fix the README wording"},
+			{"session_id": threadID, "ts": updatedAt, "text": "Also align the mobile labels"},
+		} {
+			if err := encoder.Encode(line); err != nil {
+				t.Fatalf("write history fixture: %v", err)
+			}
 		}
 	}
+}
 
-	rolloutFile, err := os.Create(rolloutPath)
+func writeNativeCodexRolloutFixture(t *testing.T, path string, createdAt, updatedAt int64) {
+	t.Helper()
+	rolloutFile, err := os.Create(path)
 	if err != nil {
 		t.Fatalf("create rollout fixture: %v", err)
 	}
@@ -636,11 +899,6 @@ func seedNativeCodexSessionFixture(t *testing.T, homeDir, cwd string) string {
 			t.Fatalf("write rollout fixture: %v", err)
 		}
 	}
-	return threadID
-}
-
-func int64String(value int64) string {
-	return strconv.FormatInt(value, 10)
 }
 
 func TestApplyEventToProjectionPersistsAgentAndPromptState(t *testing.T) {
@@ -796,6 +1054,19 @@ func TestAIStatusSnapshotDoesNotHideProjectedBusyState(t *testing.T) {
 	}
 }
 
+func TestApplyAICommandPreferencesReplacesStaleCodexModel(t *testing.T) {
+	got := applyAICommandPreferences(
+		"codex -m gpt-5-codex --config model_reasoning_effort=medium",
+		"codex",
+		"gpt-5.5",
+		"high",
+	)
+	want := "codex -m gpt-5.5 --config model_reasoning_effort=high"
+	if got != want {
+		t.Fatalf("unexpected codex command: got %q want %q", got, want)
+	}
+}
+
 func TestAIStatusAssistantReplySettlesAndProjectionIdles(t *testing.T) {
 	sessionID := "session-1"
 	logEvent := protocol.NewLogEvent(sessionID, "我已经处理好了，可以继续。", "stdout")
@@ -903,6 +1174,10 @@ func TestHandlerSkillCatalogLifecycle(t *testing.T) {
 		filepath.Join(homeDir, ".claude", "skills", "image-generation", "SKILL.md"),
 		"---\nname: image-generation\ndescription: Generate images from text.\n---\n# Image Generation\n\nUse the image model.\n",
 	)
+	writeTestFile(t,
+		filepath.Join(homeDir, ".agents", "skills", "shared-agent-skill", "SKILL.md"),
+		"---\nname: shared-agent-skill\ndescription: Shared agent skill.\n---\n# Shared Agent Skill\n\nUse the shared agent skill.\n",
+	)
 	h := newTestHandler()
 	tempStore, err := data.NewFileStore(t.TempDir())
 	if err != nil {
@@ -981,6 +1256,7 @@ func TestHandlerSkillCatalogLifecycle(t *testing.T) {
 		t.Fatalf("unexpected skill catalog meta: %#v", meta)
 	}
 	foundExternal := false
+	foundAgentSkill := false
 	for _, raw := range syncedItems {
 		item, _ := raw.(map[string]any)
 		if item["name"] == "image-generation" {
@@ -995,9 +1271,18 @@ func TestHandlerSkillCatalogLifecycle(t *testing.T) {
 				t.Fatalf("expected synced external skill editable, got %#v", item)
 			}
 		}
+		if item["name"] == "shared-agent-skill" {
+			foundAgentSkill = true
+			if item["source"] != string(data.SkillSourceExternal) || item["sourceOfTruth"] != string(data.CatalogSourceTruthClaude) {
+				t.Fatalf("expected shared agent skill to sync as claude external skill, got %#v", item)
+			}
+		}
 	}
 	if !foundExternal {
 		t.Fatalf("expected external synced skill, got %#v", syncedItems)
+	}
+	if !foundAgentSkill {
+		t.Fatalf("expected shared agent skill, got %#v", syncedItems)
 	}
 }
 
@@ -1007,6 +1292,14 @@ func TestHandlerSkillCatalogLifecycleUsesCodexSkillsForCodexSession(t *testing.T
 	writeTestFile(t,
 		filepath.Join(homeDir, ".codex", "skills", "mobilevc-release", "SKILL.md"),
 		"---\nname: mobilevc-release\ndescription: Publish MobileVC.\n---\n# MobileVC Release\n\nDo release work.\n",
+	)
+	writeTestFile(t,
+		filepath.Join(homeDir, ".agents", "skills", "shared-agent-skill", "SKILL.md"),
+		"---\nname: shared-agent-skill\ndescription: Shared agent skill.\n---\n# Shared Agent Skill\n\nUse the shared agent skill.\n",
+	)
+	writeTestFile(t,
+		filepath.Join(homeDir, ".agents", "skills", "mobilevc-release", "SKILL.md"),
+		"---\nname: mobilevc-release\ndescription: Shared duplicate.\n---\n# Shared Duplicate\n\nThis should not replace the codex-specific skill.\n",
 	)
 	h := newTestHandler()
 	tempStore, err := data.NewFileStore(t.TempDir())
@@ -1042,12 +1335,22 @@ func TestHandlerSkillCatalogLifecycleUsesCodexSkillsForCodexSession(t *testing.T
 		t.Fatalf("expected synced skill catalog items, got %#v", syncedCatalog)
 	}
 	foundCodexSkill := false
+	foundAgentSkill := false
 	for _, raw := range items {
 		item, _ := raw.(map[string]any)
 		if item["name"] == "mobilevc-release" {
 			foundCodexSkill = true
 			if item["sourceOfTruth"] != string(data.CatalogSourceTruthCodex) {
 				t.Fatalf("expected codex skill item, got %#v", item)
+			}
+			if item["description"] != "Publish MobileVC." {
+				t.Fatalf("expected codex skill to win over shared duplicate, got %#v", item)
+			}
+		}
+		if item["name"] == "shared-agent-skill" {
+			foundAgentSkill = true
+			if item["sourceOfTruth"] != string(data.CatalogSourceTruthCodex) {
+				t.Fatalf("expected shared agent skill to sync under codex source of truth, got %#v", item)
 			}
 		}
 		if item["name"] == "image-generation" {
@@ -1057,6 +1360,32 @@ func TestHandlerSkillCatalogLifecycleUsesCodexSkillsForCodexSession(t *testing.T
 	if !foundCodexSkill {
 		t.Fatalf("expected codex synced skill, got %#v", items)
 	}
+	if !foundAgentSkill {
+		t.Fatalf("expected shared agent skill, got %#v", items)
+	}
+}
+
+func TestLoadSkillDefinitionsIncludesSingularAgentSkillsDir(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	writeTestFile(t,
+		filepath.Join(homeDir, ".agent", "skills", "singular-agent-skill", "SKILL.md"),
+		"---\nname: singular-agent-skill\ndescription: Singular agent skill dir.\n---\n# Singular Agent Skill\n\nUse the singular agent skill.\n",
+	)
+
+	items, err := loadCodexSkillDefinitions(time.Now().UTC())
+	if err != nil {
+		t.Fatalf("load codex skill definitions: %v", err)
+	}
+	for _, item := range items {
+		if item.Name == "singular-agent-skill" {
+			if item.SourceOfTruth != data.CatalogSourceTruthCodex {
+				t.Fatalf("expected codex source of truth for singular agent skill, got %#v", item)
+			}
+			return
+		}
+	}
+	t.Fatalf("expected singular agent skill, got %#v", items)
 }
 
 func TestHandlerCatalogAuthoringSkillAutoUpsertsAndEmitsCatalog(t *testing.T) {
@@ -2801,6 +3130,7 @@ func TestHandlerPtyInputFlowSendsPushWhenTokenRegistered(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("write exec request: %v", err)
 	}
+	defer closeConnAndCleanupRuntime(t, conn, h, ptyRunner)
 
 	requireAgentState(t, readUntilType(t, conn, protocol.EventTypeAgentState), "THINKING", false)
 	_ = readUntilType(t, conn, protocol.EventTypePromptRequest)
@@ -2831,7 +3161,6 @@ func TestHandlerPtyInputFlowSendsPushWhenTokenRegistered(t *testing.T) {
 	if mockPush.SentNotifications[0].Data["eventType"] != protocol.EventTypePromptRequest {
 		t.Fatalf("unexpected push eventType: %#v", mockPush.SentNotifications[0])
 	}
-
 	if err := conn.WriteJSON(protocol.InputRequestEvent{
 		ClientEvent: protocol.ClientEvent{Action: "input"},
 		Data:        "y\n",
@@ -3100,9 +3429,7 @@ func TestHandlerInputInjectsEnabledSkillsIntoAIConversation(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("did not receive input payload")
 	}
-	// 主动收尾：避免 t.TempDir RemoveAll 与后台 SaveProjection 的竞争。
-	_ = conn.Close()
-	h.runtimeSessions.CleanupAll()
+	closeConnAndCleanupRuntime(t, conn, h, ptyRunner)
 }
 
 func TestHandlerInputInjectsEnabledMemoryIntoAIConversation(t *testing.T) {
@@ -3181,6 +3508,8 @@ func TestHandlerInputInjectsEnabledMemoryIntoAIConversation(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("did not receive input payload")
 	}
+
+	closeConnAndCleanupRuntime(t, conn, h, ptyRunner)
 }
 
 func TestHandlerInputDoesNotInjectEmptySessionContextBeforeUserConfiguresIt(t *testing.T) {
@@ -3235,8 +3564,7 @@ func TestHandlerInputDoesNotInjectEmptySessionContextBeforeUserConfiguresIt(t *t
 		t.Fatal("did not receive input payload")
 	}
 
-	_ = conn.Close()
-	h.runtimeSessions.CleanupAll()
+	closeConnAndCleanupRuntime(t, conn, h, ptyRunner)
 }
 
 func TestHandlerInputInjectsEnabledSkillAndMemoryIntoAIConversation(t *testing.T) {
@@ -3411,8 +3739,7 @@ func TestHandlerInputInjectsEmptySessionContextToOverrideEarlierSkillAndMemorySt
 	case <-time.After(5 * time.Second):
 		t.Fatal("did not receive input payload")
 	}
-	_ = conn.Close()
-	h.runtimeSessions.CleanupAll()
+	closeConnAndCleanupRuntime(t, conn, h, ptyRunner)
 }
 
 func TestHandlerInputBlocksPendingPermissionRequest(t *testing.T) {
@@ -3459,8 +3786,7 @@ func TestHandlerInputBlocksPendingPermissionRequest(t *testing.T) {
 	case <-time.After(200 * time.Millisecond):
 	}
 
-	_ = conn.Close()
-	h.runtimeSessions.CleanupAll()
+	closeConnAndCleanupRuntime(t, conn, h, firstRunner)
 }
 
 func TestHandlerInputAutoResumesDetachedClaudeSession(t *testing.T) {
@@ -3538,8 +3864,7 @@ func TestHandlerInputAutoResumesDetachedClaudeSession(t *testing.T) {
 		t.Fatal("did not receive resumed input payload")
 	}
 
-	_ = conn.Close()
-	h.runtimeSessions.CleanupAll()
+	closeConnAndCleanupRuntime(t, conn, h, secondRunner)
 }
 
 func TestHandlerInputWithoutRunner(t *testing.T) {
@@ -3996,9 +4321,7 @@ func TestHandlerPermissionDecisionBeforeResumeBindsSelectedSession(t *testing.T)
 	firstRunner.WaitStarted(t)
 	_ = readUntilType(t, conn, protocol.EventTypePromptRequest)
 	_ = readUntilType(t, conn, protocol.EventTypeAgentState)
-	if err := conn.Close(); err != nil {
-		t.Fatalf("close first conn: %v", err)
-	}
+	closeTestConnGracefully(t, conn)
 
 	conn2 := newTestConn(t, h)
 	_, _ = readInitialEvents(t, conn2)
@@ -4023,10 +4346,7 @@ func TestHandlerPermissionDecisionBeforeResumeBindsSelectedSession(t *testing.T)
 	case <-time.After(5 * time.Second):
 		t.Fatal("did not receive direct permission response after reconnect")
 	}
-	// 主动收尾：先关 conn 让 read loop 退出，再 cleanup runtime sessions，
-	// 等任何后台 SaveProjection 完成后再让 t.TempDir 自动 RemoveAll，避免竞态。
-	_ = conn2.Close()
-	h.runtimeSessions.CleanupAll()
+	closeConnAndCleanupRuntime(t, conn2, h, firstRunner)
 }
 
 func TestHandlerPermissionDecisionApproveForCodexUsesDirectPermissionResponse(t *testing.T) {
@@ -4082,9 +4402,7 @@ func TestHandlerPermissionDecisionApproveForCodexUsesDirectPermissionResponse(t 
 	if runnerIndex != 1 {
 		t.Fatalf("expected no runner restart for codex, got runner count=%d", runnerIndex)
 	}
-	// 主动收尾：避免 t.TempDir RemoveAll 与后台 SaveProjection 的竞争。
-	_ = conn.Close()
-	h.runtimeSessions.CleanupAll()
+	closeConnAndCleanupRuntime(t, conn, h, firstRunner)
 }
 
 func TestHandlerPermissionDecisionApproveForCodexWithExpiredPendingRequestReturnsError(t *testing.T) {
@@ -4152,7 +4470,7 @@ func TestHandlerPermissionDecisionApproveForCodexWithExpiredPendingRequestReturn
 	}
 }
 
-func TestHandlerPermissionDecisionApproveForCodexWithMismatchedRequestIDAutoAppliesToCurrent(t *testing.T) {
+func TestHandlerPermissionDecisionApproveForCodexWithMismatchedRequestIDRefreshesPrompt(t *testing.T) {
 	firstRunner := newHoldingStubRunner(protocol.NewPromptRequestEvent("ignored", "需要权限确认", []string{"approve", "deny"}))
 	firstRunner.currentPermissionRequestID = "perm-codex-1"
 	h := newTestHandler()
@@ -4190,15 +4508,14 @@ func TestHandlerPermissionDecisionApproveForCodexWithMismatchedRequestIDAutoAppl
 		t.Fatalf("write permission decision request: %v", err)
 	}
 
-	// 客户端的 approve 用的是已经过期的 perm-codex-2，但当前 pending 是 perm-codex-1。
-	// 新行为：服务端把 approve 套到当前 pending 上直接执行，runner 应该收到 approve。
+	event := readUntilType(t, conn, protocol.EventTypePromptRequest)
+	if event["permissionRequestId"] != "perm-codex-1" {
+		t.Fatalf("expected refreshed prompt for current request, got %#v", event)
+	}
 	select {
 	case decision := <-firstRunner.permissionResponseWriteCh:
-		if decision != "approve" {
-			t.Fatalf("expected runner to receive approve, got %q", decision)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("runner did not receive auto-applied approve decision")
+		t.Fatalf("unexpected direct permission response: %q", decision)
+	case <-time.After(200 * time.Millisecond):
 	}
 }
 
@@ -4438,6 +4755,7 @@ func TestHandlerPermissionDecisionWithManagedFreshClaudeSessionUsesDirectPermiss
 	if runnerIndex != 1 {
 		t.Fatalf("expected no runner restart, got runner count=%d", runnerIndex)
 	}
+	closeConnAndCleanupRuntime(t, conn, h, firstRunner)
 }
 
 func TestHandlerPermissionDecisionWithoutPermissionResponseSupportReturnsError(t *testing.T) {
@@ -4609,6 +4927,7 @@ func TestHandlerPermissionDecisionWithNonInteractiveRunnerUsesDirectPermissionRe
 	if thinking["state"] != "THINKING" {
 		t.Fatalf("expected THINKING state, got %#v", thinking)
 	}
+	closeConnAndCleanupRuntime(t, conn, h, firstRunner)
 }
 
 func TestHandlerReviewDecisionWithNonInteractiveRunnerReturnsError(t *testing.T) {
@@ -4697,8 +5016,8 @@ func TestHandlerReviewDecisionSendsPromptToRunner(t *testing.T) {
 	if thinking["source"] != "review-decision" {
 		t.Fatalf("expected review-decision source, got %#v", thinking)
 	}
-	if thinking["permissionMode"] != "default" {
-		t.Fatalf("expected default permission mode, got %#v", thinking)
+	if thinking["permissionMode"] != "auto" {
+		t.Fatalf("expected review permission mode, got %#v", thinking)
 	}
 }
 
@@ -4742,6 +5061,7 @@ func TestHandlerReviewDecisionRevertSendsPromptEvenWhenReviewOnly(t *testing.T) 
 	case <-time.After(5 * time.Second):
 		t.Fatal("did not receive revert review payload")
 	}
+	closeConnAndCleanupRuntime(t, conn, h, ptyRunner)
 }
 
 func TestHandlerReviewDecisionUpdatesProjectionAndReviewState(t *testing.T) {
@@ -4839,7 +5159,7 @@ func TestHandlerSetPermissionModeUpdatesRunner(t *testing.T) {
 	h.NewPtyRunner = func() engine.Runner { return ptyRunner }
 	conn := newTestConn(t, h)
 	_, _ = readInitialEvents(t, conn)
-	_ = createHistorySessionForHandlerTest(t, h, conn, "permission-mode-session")
+	sessionID := createHistorySessionForHandlerTest(t, h, conn, "permission-mode-session")
 
 	if err := conn.WriteJSON(protocol.ExecRequestEvent{ClientEvent: protocol.ClientEvent{Action: "exec"}, Command: "claude", Mode: "pty", PermissionMode: "auto"}); err != nil {
 		t.Fatalf("write exec request: %v", err)
@@ -4867,13 +5187,14 @@ func TestHandlerSetPermissionModeUpdatesRunner(t *testing.T) {
 	if ptyRunner.lastPermissionMode != "default" {
 		t.Fatalf("expected runner permission mode to update, got %q", ptyRunner.lastPermissionMode)
 	}
-	record, err := tempStore.GetSession(context.Background(), "permission-mode-session")
+	record, err := tempStore.GetSession(context.Background(), sessionID)
 	if err != nil {
 		t.Fatalf("get session projection: %v", err)
 	}
 	if record.Projection.Runtime.PermissionMode != "default" {
 		t.Fatalf("expected persisted permission mode default, got %#v", record.Projection.Runtime)
 	}
+	closeConnAndCleanupRuntime(t, conn, h, ptyRunner)
 }
 
 func TestHandlerSetPermissionModeUpdatesActiveRunner(t *testing.T) {
@@ -4923,6 +5244,7 @@ func TestHandlerSetPermissionModeUpdatesActiveRunner(t *testing.T) {
 	if ptyRunner.lastPermissionMode != "default" {
 		t.Fatalf("expected runner permission mode to update, got %q", ptyRunner.lastPermissionMode)
 	}
+	closeConnAndCleanupRuntime(t, conn, h, ptyRunner)
 }
 
 func TestHandlerReviewDecisionWithoutRunner(t *testing.T) {
@@ -5045,6 +5367,56 @@ func TestHandlerRuntimeInfoRejectsUnknownQuery(t *testing.T) {
 	if event["msg"] != "unsupported runtime_info query: mystery" {
 		t.Fatalf("unexpected error event: %#v", event)
 	}
+}
+
+func TestHandlerContextWindowsUsageAliasReturnsUsage(t *testing.T) {
+	ptyRunner := newInteractiveHoldingStubRunner()
+	ptyRunner.contextUsage = protocol.ContextWindowUsage{
+		TokensUsed: 1200,
+		TokenLimit: 8000,
+	}
+	ptyRunner.contextUsageOK = true
+	h := newTestHandler()
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	h.SessionStore = tempStore
+	h.NewPtyRunner = func() engine.Runner { return ptyRunner }
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+	sessionID := createHistorySessionForHandlerTest(t, h, conn, "context-window-usage-alias")
+
+	if err := conn.WriteJSON(protocol.ExecRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "exec"},
+		Command:     "codex",
+		Mode:        "pty",
+	}); err != nil {
+		t.Fatalf("write exec request: %v", err)
+	}
+	ptyRunner.WaitStarted(t)
+
+	if err := conn.WriteJSON(protocol.ContextWindowUsageRequestEvent{
+		ClientEvent: protocol.ClientEvent{
+			Action:    protocol.ActionContextWindowsUsageGetAlias,
+			SessionID: sessionID,
+		},
+	}); err != nil {
+		t.Fatalf("write context window usage alias request: %v", err)
+	}
+
+	event := readUntilType(t, conn, protocol.EventTypeContextWindowUsage)
+	if event["sessionId"] != sessionID {
+		t.Fatalf("expected session %q, got %#v", sessionID, event)
+	}
+	usage, ok := event["usage"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected usage map, got %#v", event)
+	}
+	if usage["tokensUsed"] != float64(1200) || usage["tokenLimit"] != float64(8000) {
+		t.Fatalf("unexpected context window usage: %#v", usage)
+	}
+	closeConnAndCleanupRuntime(t, conn, h, ptyRunner)
 }
 
 func TestHandlerSlashCommandRuntimeInfoQueries(t *testing.T) {
@@ -5249,7 +5621,7 @@ func TestHandlerSessionDeleteRemovesHistorySessionFromList(t *testing.T) {
 	}
 }
 
-func TestHandlerInitialSessionListDoesNotMergeNativeCodexSessions(t *testing.T) {
+func TestHandlerInitialSessionListIncludesNativeCodexSessions(t *testing.T) {
 	homeDir := t.TempDir()
 	projectDir := filepath.Join(homeDir, "workspace", "MobileVC")
 	if err := os.MkdirAll(projectDir, 0o755); err != nil {
@@ -5279,12 +5651,13 @@ func TestHandlerInitialSessionListDoesNotMergeNativeCodexSessions(t *testing.T) 
 	for _, raw := range items {
 		item, _ := raw.(map[string]any)
 		if item["id"] == "codex-thread:"+threadID {
-			t.Fatalf("did not expect native Codex mirror in initial session list, got %#v", items)
+			return
 		}
 	}
+	t.Fatalf("expected native Codex mirror in initial session list, got %#v", items)
 }
 
-func TestHandlerSessionListMergesNativeCodexSessionsByCWD(t *testing.T) {
+func TestHandlerSessionListWithoutCWDIncludesAllStoreProjects(t *testing.T) {
 	homeDir := t.TempDir()
 	projectDir := filepath.Join(homeDir, "workspace", "MobileVC")
 	otherDir := filepath.Join(homeDir, "workspace", "Other")
@@ -5298,6 +5671,182 @@ func TestHandlerSessionListMergesNativeCodexSessionsByCWD(t *testing.T) {
 	t.Setenv("USERPROFILE", homeDir)
 	t.Setenv("HOMEDRIVE", "")
 	t.Setenv("HOMEPATH", "")
+
+	h := newTestHandler()
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	h.SessionStore = tempStore
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+	_ = readUntilType(t, conn, protocol.EventTypeSessionListResult)
+
+	if err := conn.WriteJSON(protocol.SessionCreateRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_create"},
+		Title:       "mobile-project",
+		CWD:         projectDir,
+	}); err != nil {
+		t.Fatalf("write project session create request: %v", err)
+	}
+	projectCreated := readUntilSessionCreated(t, conn)
+	projectSummary, _ := projectCreated["summary"].(map[string]any)
+	projectSessionID, _ := projectSummary["id"].(string)
+	_ = readUntilType(t, conn, protocol.EventTypeSessionListResult)
+
+	if err := conn.WriteJSON(protocol.SessionCreateRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_create"},
+		Title:       "mobile-other",
+		CWD:         otherDir,
+	}); err != nil {
+		t.Fatalf("write other session create request: %v", err)
+	}
+	otherCreated := readUntilSessionCreated(t, conn)
+	otherSummary, _ := otherCreated["summary"].(map[string]any)
+	otherSessionID, _ := otherSummary["id"].(string)
+	_ = readUntilType(t, conn, protocol.EventTypeSessionListResult)
+
+	if err := conn.WriteJSON(protocol.SessionListRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_list"},
+	}); err != nil {
+		t.Fatalf("write global session list request: %v", err)
+	}
+
+	listEvent := readUntilType(t, conn, protocol.EventTypeSessionListResult)
+	items, ok := listEvent["items"].([]any)
+	if !ok {
+		t.Fatalf("expected session list items, got %#v", listEvent)
+	}
+	var foundProject, foundOther bool
+	for _, raw := range items {
+		item, _ := raw.(map[string]any)
+		switch item["id"] {
+		case projectSessionID:
+			foundProject = true
+		case otherSessionID:
+			foundOther = true
+		}
+	}
+	if !foundProject || !foundOther {
+		t.Fatalf("expected global session_list to include both projects project=%v other=%v items=%#v", foundProject, foundOther, items)
+	}
+}
+
+func TestHandlerSessionListUsesShortTTLCache(t *testing.T) {
+	h := newTestHandler()
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	counting := &countingStore{inner: tempStore}
+	h.SessionStore = counting
+
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+	_ = readUntilType(t, conn, protocol.EventTypeSessionListResult)
+
+	if err := conn.WriteJSON(protocol.SessionListRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_list"},
+		CWD:         "",
+	}); err != nil {
+		t.Fatalf("write first session_list request: %v", err)
+	}
+	_ = readUntilType(t, conn, protocol.EventTypeSessionListResult)
+	afterFirst := counting.listCallCount()
+
+	if err := conn.WriteJSON(protocol.SessionListRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_list"},
+		CWD:         "",
+	}); err != nil {
+		t.Fatalf("write second session_list request: %v", err)
+	}
+	_ = readUntilType(t, conn, protocol.EventTypeSessionListResult)
+	if afterSecond := counting.listCallCount(); afterSecond != afterFirst {
+		t.Fatalf("expected cached session_list to avoid store rescan, calls before=%d after=%d", afterFirst, afterSecond)
+	}
+}
+
+func TestNormalizeSessionCWDTrimsWindowsDevicePrefix(t *testing.T) {
+	homeDir := t.TempDir()
+	projectDir := filepath.Join(homeDir, "workspace", "MobileVC")
+	if err := os.MkdirAll(projectDir, 0o755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
+	}
+
+	if got, want := normalizeSessionCWD(`\\?\`+projectDir), normalizeSessionCWD(projectDir); got != want {
+		t.Fatalf("expected Windows device path to normalize to %q, got %q", want, got)
+	}
+	if got, want := normalizeSessionCWD(`\\?\UNC\server\share\repo`), normalizeSessionCWD(`\\server\share\repo`); got != want {
+		t.Fatalf("expected Windows UNC device path to normalize to %q, got %q", want, got)
+	}
+}
+
+func TestHandlerSessionCreateInvalidatesSessionListCache(t *testing.T) {
+	h := newTestHandler()
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	counting := &countingStore{inner: tempStore}
+	h.SessionStore = counting
+
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+	_ = readUntilType(t, conn, protocol.EventTypeSessionListResult)
+
+	if err := conn.WriteJSON(protocol.SessionListRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_list"},
+		CWD:         "",
+	}); err != nil {
+		t.Fatalf("write warm session_list request: %v", err)
+	}
+	_ = readUntilType(t, conn, protocol.EventTypeSessionListResult)
+	beforeCreate := counting.listCallCount()
+
+	if err := conn.WriteJSON(protocol.SessionCreateRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_create"},
+		Title:       "cache-created",
+	}); err != nil {
+		t.Fatalf("write session create request: %v", err)
+	}
+	created := readUntilSessionCreated(t, conn)
+	summary, ok := created["summary"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected summary payload, got %#v", created)
+	}
+	sessionID, _ := summary["id"].(string)
+	if sessionID == "" {
+		t.Fatalf("expected created session id, got %#v", created)
+	}
+	listEvent := readUntilType(t, conn, protocol.EventTypeSessionListResult)
+	if afterCreate := counting.listCallCount(); afterCreate <= beforeCreate {
+		t.Fatalf("expected session_create to invalidate cache and rescan, calls before=%d after=%d", beforeCreate, afterCreate)
+	}
+
+	items, ok := listEvent["items"].([]any)
+	if !ok {
+		t.Fatalf("expected session list items, got %#v", listEvent)
+	}
+	for _, raw := range items {
+		item, _ := raw.(map[string]any)
+		if item["id"] == sessionID {
+			return
+		}
+	}
+	t.Fatalf("expected created session %q in invalidated list, got %#v", sessionID, items)
+}
+
+func TestHandlerSessionListMergesNativeCodexSessionsByCWD(t *testing.T) {
+	homeDir := t.TempDir()
+	projectDir := filepath.Join(homeDir, "workspace", "MobileVC")
+	otherDir := filepath.Join(homeDir, "workspace", "Other")
+	if err := os.MkdirAll(projectDir, 0o755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
+	}
+	if err := os.MkdirAll(otherDir, 0o755); err != nil {
+		t.Fatalf("mkdir other dir: %v", err)
+	}
+	t.Setenv("HOME", homeDir)
 	threadID := seedNativeCodexSessionFixture(t, homeDir, projectDir)
 
 	h := newTestHandler()
@@ -5392,64 +5941,13 @@ func TestHandlerSessionListMergesNativeCodexSessionsByCWD(t *testing.T) {
 	}
 }
 
-func TestHandlerSessionListMergesNativeCodexSessionsByWindowsDeviceCWD(t *testing.T) {
+func TestHandlerSessionListKeepsNativeCodexMirrorWhenTrackedByMobileVC(t *testing.T) {
 	homeDir := t.TempDir()
 	projectDir := filepath.Join(homeDir, "workspace", "MobileVC")
 	if err := os.MkdirAll(projectDir, 0o755); err != nil {
 		t.Fatalf("mkdir project dir: %v", err)
 	}
 	t.Setenv("HOME", homeDir)
-	t.Setenv("USERPROFILE", homeDir)
-	t.Setenv("HOMEDRIVE", "")
-	t.Setenv("HOMEPATH", "")
-	threadID := seedNativeCodexSessionFixture(t, homeDir, `\\?\`+projectDir)
-
-	h := newTestHandler()
-	tempStore, err := data.NewFileStore(t.TempDir())
-	if err != nil {
-		t.Fatalf("new temp store: %v", err)
-	}
-	h.SessionStore = tempStore
-	conn := newTestConn(t, h)
-	_, _ = readInitialEvents(t, conn)
-	_ = readUntilType(t, conn, protocol.EventTypeSessionListResult)
-
-	if err := conn.WriteJSON(protocol.SessionListRequestEvent{
-		ClientEvent: protocol.ClientEvent{Action: "session_list"},
-		CWD:         projectDir,
-	}); err != nil {
-		t.Fatalf("write session list request: %v", err)
-	}
-
-	listEvent := readUntilType(t, conn, protocol.EventTypeSessionListResult)
-	items, ok := listEvent["items"].([]any)
-	if !ok {
-		t.Fatalf("expected session list items, got %#v", listEvent)
-	}
-
-	for _, raw := range items {
-		item, _ := raw.(map[string]any)
-		if item["id"] == "codex-thread:"+threadID {
-			runtime, _ := item["runtime"].(map[string]any)
-			if normalizeSessionCWD(fmt.Sprint(runtime["cwd"])) != normalizeSessionCWD(projectDir) {
-				t.Fatalf("expected normalized runtime cwd %q, got %#v", normalizeSessionCWD(projectDir), runtime)
-			}
-			return
-		}
-	}
-	t.Fatalf("expected native Codex session in filtered list, got %#v", items)
-}
-
-func TestHandlerSessionListHidesNativeCodexMirrorWhenTrackedByMobileVC(t *testing.T) {
-	homeDir := t.TempDir()
-	projectDir := filepath.Join(homeDir, "workspace", "MobileVC")
-	if err := os.MkdirAll(projectDir, 0o755); err != nil {
-		t.Fatalf("mkdir project dir: %v", err)
-	}
-	t.Setenv("HOME", homeDir)
-	t.Setenv("USERPROFILE", homeDir)
-	t.Setenv("HOMEDRIVE", "")
-	t.Setenv("HOMEPATH", "")
 	threadID := seedNativeCodexSessionFixture(t, homeDir, projectDir)
 
 	h := newTestHandler()
@@ -5529,8 +6027,8 @@ func TestHandlerSessionListHidesNativeCodexMirrorWhenTrackedByMobileVC(t *testin
 	if !foundLocal {
 		t.Fatalf("expected managed MobileVC Codex session in list, got %#v", items)
 	}
-	if foundNative {
-		t.Fatalf("did not expect duplicate native Codex mirror when MobileVC already tracks the thread, got %#v", items)
+	if !foundNative {
+		t.Fatalf("expected native Codex mirror to stay visible beside MobileVC session, got %#v", items)
 	}
 }
 
@@ -5628,7 +6126,7 @@ func TestFilterStoreSessionsByCWDAcceptsSymlinkEquivalentPaths(t *testing.T) {
 	}
 }
 
-func TestDedupeCodexThreadSummariesPrefersMobileVCSession(t *testing.T) {
+func TestDedupeCodexThreadSummariesKeepsMobileVCAndNativeThread(t *testing.T) {
 	threadID := "thread-1"
 	projectDir := "/tmp/project"
 	local := data.SessionSummary{
@@ -5660,11 +6158,215 @@ func TestDedupeCodexThreadSummariesPrefersMobileVCSession(t *testing.T) {
 	}
 
 	items := dedupeCodexThreadSummaries([]data.SessionSummary{local, external})
-	if len(items) != 1 {
-		t.Fatalf("expected one deduped session, got %#v", items)
+	if len(items) != 2 {
+		t.Fatalf("expected MobileVC and native Codex entries to remain distinct, got %#v", items)
 	}
-	if items[0].ID != local.ID {
-		t.Fatalf("expected MobileVC summary to win dedupe, got %#v", items)
+	ids := map[string]bool{}
+	for _, item := range items {
+		ids[item.ID] = true
+	}
+	if !ids[local.ID] || !ids[external.ID] {
+		t.Fatalf("expected both MobileVC and native Codex entries, got %#v", items)
+	}
+}
+
+func TestMergeSessionSummariesExcludesStoredCodexSubagentMirrors(t *testing.T) {
+	homeDir := t.TempDir()
+	projectDir := filepath.Join(homeDir, "workspace", "MobileVC")
+	if err := os.MkdirAll(projectDir, 0o755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
+	}
+	t.Setenv("HOME", homeDir)
+	seedNativeCodexThreadsFixture(t, homeDir, []nativeCodexThreadFixture{
+		{ID: "main-thread", CWD: projectDir, Title: "Main desktop session"},
+		{ID: "exec-thread", CWD: projectDir, Title: "Exec session", Source: "exec"},
+		{ID: "subagent-thread", CWD: projectDir, Title: "Worker session", ThreadSource: "subagent"},
+	})
+
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	createdAt := time.Date(2026, 3, 30, 10, 0, 0, 0, time.UTC)
+	if _, err := tempStore.UpsertSession(context.Background(), data.SessionRecord{
+		Summary: data.SessionSummary{
+			ID:        "codex-thread:subagent-thread",
+			Title:     "Stored worker mirror",
+			CreatedAt: createdAt,
+			UpdatedAt: createdAt,
+			Runtime: data.SessionRuntime{
+				ResumeSessionID: "subagent-thread",
+				Command:         "codex",
+				Engine:          "codex",
+				CWD:             projectDir,
+				Source:          "codex-native",
+			},
+			Source:   "codex-native",
+			External: true,
+		},
+	}); err != nil {
+		t.Fatalf("upsert stored subagent mirror: %v", err)
+	}
+	if _, err := tempStore.UpsertSession(context.Background(), data.SessionRecord{
+		Summary: data.SessionSummary{
+			ID:        "codex-thread:exec-thread",
+			Title:     "Stored exec mirror",
+			CreatedAt: createdAt,
+			UpdatedAt: createdAt,
+			Runtime: data.SessionRuntime{
+				ResumeSessionID: "exec-thread",
+				Command:         "codex",
+				Engine:          "codex",
+				CWD:             projectDir,
+				Source:          "codex-native",
+			},
+			Source:   "codex-native",
+			External: true,
+		},
+	}); err != nil {
+		t.Fatalf("upsert stored exec mirror: %v", err)
+	}
+
+	items, err := tempStore.ListSessions(context.Background())
+	if err != nil {
+		t.Fatalf("list stored sessions: %v", err)
+	}
+	merged, err := mergeSessionSummaries(context.Background(), tempStore, items, projectDir)
+	if err != nil {
+		t.Fatalf("merge session summaries: %v", err)
+	}
+	for _, item := range merged {
+		if item.ID == "codex-thread:subagent-thread" {
+			t.Fatalf("did not expect stored subagent mirror in list, got %#v", merged)
+		}
+		if item.ID == "codex-thread:exec-thread" {
+			t.Fatalf("did not expect stored exec mirror in list, got %#v", merged)
+		}
+	}
+	if len(merged) != 1 || merged[0].ID != "codex-thread:main-thread" {
+		t.Fatalf("expected only main native thread, got %#v", merged)
+	}
+}
+
+func TestMergeSessionSummariesEmptyCWDIncludesNativeProjects(t *testing.T) {
+	homeDir := t.TempDir()
+	projectA := filepath.Join(homeDir, "workspace", "MobileVC")
+	projectB := filepath.Join(homeDir, "workspace", "ClaudeProject")
+	if err := os.MkdirAll(projectA, 0o755); err != nil {
+		t.Fatalf("mkdir project A: %v", err)
+	}
+	if err := os.MkdirAll(projectB, 0o755); err != nil {
+		t.Fatalf("mkdir project B: %v", err)
+	}
+	t.Setenv("HOME", homeDir)
+	seedNativeCodexThreadsFixture(t, homeDir, []nativeCodexThreadFixture{
+		{ID: "codex-main", CWD: projectA, Title: "Desktop Codex"},
+	})
+	if err := claudesync.WriteSessionToJSONL(projectB, "claude-main", []claudesync.JSONLEvent{
+		{Type: "user", Text: "Claude project prompt"},
+	}); err != nil {
+		t.Fatalf("write claude fixture: %v", err)
+	}
+
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	merged, err := mergeSessionSummaries(context.Background(), tempStore, nil, "")
+	if err != nil {
+		t.Fatalf("merge session summaries: %v", err)
+	}
+
+	ids := map[string]data.SessionSummary{}
+	for _, item := range merged {
+		ids[item.ID] = item
+	}
+	if item, ok := ids["codex-thread:codex-main"]; !ok || item.Runtime.CWD != projectA {
+		t.Fatalf("expected native codex project session, got %#v", merged)
+	}
+	if item, ok := ids["claude-session:claude-main"]; !ok || item.Runtime.CWD != projectB {
+		t.Fatalf("expected native claude project session, got %#v", merged)
+	}
+}
+
+func TestMergeSessionSummariesListsAllVisibleCodexTUIThreads(t *testing.T) {
+	homeDir := t.TempDir()
+	projectDir := filepath.Join(homeDir, "workspace", "MobileVC")
+	if err := os.MkdirAll(projectDir, 0o755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
+	}
+	t.Setenv("HOME", homeDir)
+	seedNativeCodexThreadsFixture(t, homeDir, []nativeCodexThreadFixture{
+		{ID: "visible-cli-user", CWD: projectDir, Title: "CLI user", Source: "cli", ThreadSource: "user"},
+		{ID: "visible-vscode-user", CWD: projectDir, Title: "VS Code user", Source: "vscode", ThreadSource: "user"},
+		{ID: "visible-vscode-blank-1", CWD: projectDir, Title: "VS Code blank 1", Source: "vscode"},
+		{ID: "visible-vscode-blank-2", CWD: projectDir, Title: "VS Code blank 2", Source: "vscode"},
+		{ID: "visible-cli-blank", CWD: projectDir, Title: "CLI blank", Source: "cli"},
+		{ID: "visible-cli-user-2", CWD: projectDir, Title: "CLI user 2", Source: "cli", ThreadSource: "user"},
+		{ID: "hidden-subagent", CWD: projectDir, Title: "Worker", Source: "cli", ThreadSource: "subagent"},
+		{ID: "hidden-exec", CWD: projectDir, Title: "Exec", Source: "exec"},
+	})
+
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	createdAt := time.Date(2026, 3, 30, 12, 0, 0, 0, time.UTC)
+	if _, err := tempStore.UpsertSession(context.Background(), data.SessionRecord{
+		Summary: data.SessionSummary{
+			ID:        "mobilevc-codex",
+			Title:     "MobileVC tracked",
+			CreatedAt: createdAt,
+			UpdatedAt: createdAt,
+			Runtime: data.SessionRuntime{
+				ResumeSessionID: "visible-cli-user",
+				Command:         "codex",
+				Engine:          "codex",
+				CWD:             projectDir,
+				Source:          "mobilevc",
+			},
+			Source: "mobilevc",
+		},
+		Projection: data.ProjectionSnapshot{
+			Runtime: data.SessionRuntime{
+				ResumeSessionID: "visible-cli-user",
+				Command:         "codex",
+				Engine:          "codex",
+				CWD:             projectDir,
+				Source:          "mobilevc",
+			},
+		},
+	}); err != nil {
+		t.Fatalf("upsert tracked MobileVC session: %v", err)
+	}
+
+	items, err := tempStore.ListSessions(context.Background())
+	if err != nil {
+		t.Fatalf("list stored sessions: %v", err)
+	}
+	merged, err := mergeSessionSummaries(context.Background(), tempStore, items, projectDir)
+	if err != nil {
+		t.Fatalf("merge session summaries: %v", err)
+	}
+
+	visibleIDs := []string{
+		"visible-cli-user",
+		"visible-vscode-user",
+		"visible-vscode-blank-1",
+		"visible-vscode-blank-2",
+		"visible-cli-blank",
+		"visible-cli-user-2",
+	}
+	for _, threadID := range visibleIDs {
+		if !containsSessionSummaryID(merged, "codex-thread:"+threadID) {
+			t.Fatalf("expected visible Codex thread %q in merged list, got %#v", threadID, merged)
+		}
+	}
+	if !containsSessionSummaryID(merged, "mobilevc-codex") {
+		t.Fatalf("expected MobileVC tracked Codex session to remain, got %#v", merged)
+	}
+	if containsSessionSummaryID(merged, "codex-thread:hidden-subagent") || containsSessionSummaryID(merged, "codex-thread:hidden-exec") {
+		t.Fatalf("did not expect hidden Codex threads in merged list, got %#v", merged)
 	}
 }
 
@@ -5748,6 +6450,34 @@ func TestHandlerSessionLoadMirrorsNativeCodexSession(t *testing.T) {
 	}
 	if !strings.Contains(record.Summary.LastPreview, "Mobile labels aligned") {
 		t.Fatalf("expected mirrored preview to include assistant reply, got %#v", record.Summary)
+	}
+}
+
+func TestLoadSessionRecordReturnsCodexMirrorAfterUpsertWithoutSecondRead(t *testing.T) {
+	homeDir := t.TempDir()
+	projectDir := filepath.Join(homeDir, "workspace", "MobileVC")
+	if err := os.MkdirAll(projectDir, 0o755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
+	}
+	t.Setenv("HOME", homeDir)
+	threadID := seedNativeCodexSessionFixture(t, homeDir, projectDir)
+
+	fileStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	store := &countingStore{inner: fileStore}
+	mirrorID := "codex-thread:" + threadID
+
+	record, err := loadSessionRecord(context.Background(), store, mirrorID)
+	if err != nil {
+		t.Fatalf("load codex mirror session: %v", err)
+	}
+	if record.Summary.ID != mirrorID {
+		t.Fatalf("expected mirror record %q, got %#v", mirrorID, record.Summary)
+	}
+	if got := store.getCallCount(); got != 1 {
+		t.Fatalf("expected only the initial cache lookup GetSession call, got %d", got)
 	}
 }
 
@@ -6077,7 +6807,6 @@ func TestHandlerCompactLoadedCodexMirrorIgnoresStaleClaudeRuntimeCache(t *testin
 	}
 }
 
-
 func TestHandlerSessionDeleteRejectsNativeCodexMirror(t *testing.T) {
 	homeDir := t.TempDir()
 	projectDir := filepath.Join(homeDir, "workspace", "MobileVC")
@@ -6120,6 +6849,9 @@ func TestHandlerSessionDeleteRejectsNativeCodexMirror(t *testing.T) {
 	errorEvent := readUntilType(t, conn, protocol.EventTypeError)
 	if errorEvent["msg"] != "Codex 原生会话仅支持恢复，不支持在 MobileVC 内删除" {
 		t.Fatalf("unexpected error event: %#v", errorEvent)
+	}
+	if errorEvent["code"] != "session_delete_failed" {
+		t.Fatalf("expected session_delete_failed code, got %#v", errorEvent)
 	}
 	if _, err := h.SessionStore.GetSession(context.Background(), mirrorID); err != nil {
 		t.Fatalf("expected mirrored native session to remain after delete rejection: %v", err)
@@ -6222,6 +6954,190 @@ func TestHandlerSessionDeleteCurrentSessionCleansRuntimeAndFallsBack(t *testing.
 	textsA := sessionLogTexts(recordA)
 	if containsText(textsA, "late output from deleted session B") || containsText(textsA, "late step from deleted session B") {
 		t.Fatalf("did not expect deleted session events to leak into fallback session, got %#v", textsA)
+	}
+}
+
+func TestHandlerSessionDeleteCurrentSessionSkipsNativeCodexFallback(t *testing.T) {
+	homeDir := t.TempDir()
+	projectDir := filepath.Join(homeDir, "workspace", "MobileVC")
+	if err := os.MkdirAll(projectDir, 0o755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
+	}
+	t.Setenv("HOME", homeDir)
+	seedNativeCodexSessionFixture(t, homeDir, projectDir)
+
+	h := newTestHandler()
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	h.SessionStore = tempStore
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+
+	sessionID := createHistorySessionForHandlerTest(t, h, conn, "delete-me")
+	if err := conn.WriteJSON(protocol.SessionListRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_list"},
+		CWD:         projectDir,
+	}); err != nil {
+		t.Fatalf("write session_list request: %v", err)
+	}
+	_ = readUntilType(t, conn, protocol.EventTypeSessionListResult)
+
+	if err := conn.WriteJSON(protocol.SessionDeleteRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_delete"},
+		SessionID:   sessionID,
+	}); err != nil {
+		t.Fatalf("write session_delete request: %v", err)
+	}
+
+	_ = readUntilType(t, conn, protocol.EventTypeSessionListResult)
+	state := readUntilType(t, conn, protocol.EventTypeSessionState)
+	if sessionID, _ := state["sessionId"].(string); sessionID != "" {
+		t.Fatalf("expected empty session state instead of native codex fallback, got %#v", state)
+	}
+	if state["msg"] != "session cleared" {
+		t.Fatalf("expected session cleared state, got %#v", state)
+	}
+}
+
+func TestHandlerSessionDeltaRefreshesNativeCodexMirror(t *testing.T) {
+	homeDir := t.TempDir()
+	projectDir := filepath.Join(homeDir, "workspace", "MobileVC")
+	if err := os.MkdirAll(projectDir, 0o755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
+	}
+	t.Setenv("HOME", homeDir)
+	threadID := seedNativeCodexSessionFixture(t, homeDir, projectDir)
+
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	mirrorID := "codex-thread:" + threadID
+	record, err := loadSessionRecord(context.Background(), tempStore, mirrorID)
+	if err != nil {
+		t.Fatalf("load codex mirror session: %v", err)
+	}
+
+	rolloutPath := ""
+	if strings.TrimPrefix(record.Summary.Runtime.ResumeSessionID, "codex-thread:") != "" {
+		thread, err := codexsync.FindNativeThread(context.Background(), mirrorID)
+		if err != nil {
+			t.Fatalf("find native thread: %v", err)
+		}
+		rolloutPath = thread.RolloutPath
+	}
+	if rolloutPath == "" {
+		t.Fatal("expected native rollout path")
+	}
+	h := newTestHandler()
+	h.SessionStore = tempStore
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+
+	if err := conn.WriteJSON(protocol.SessionLoadRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_load"},
+		SessionID:   mirrorID,
+		CWD:         projectDir,
+	}); err != nil {
+		t.Fatalf("write session_load request: %v", err)
+	}
+	_ = readUntilSessionHistory(t, conn)
+	_ = readUntilType(t, conn, protocol.EventTypeReviewState)
+	_ = readUntilType(t, conn, protocol.EventTypeAgentState)
+
+	file, err := os.OpenFile(rolloutPath, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open rollout fixture: %v", err)
+	}
+	encoder := json.NewEncoder(file)
+	if err := encoder.Encode(map[string]any{
+		"timestamp": "2026-04-04T02:06:00Z",
+		"type":      "event_msg",
+		"payload": map[string]any{
+			"type":    "agent_message",
+			"message": "Fresh native Codex delta",
+			"phase":   "final_answer",
+		},
+	}); err != nil {
+		_ = file.Close()
+		t.Fatalf("append rollout fixture: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close rollout fixture: %v", err)
+	}
+
+	if err := conn.WriteJSON(protocol.SessionDeltaRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_delta_get"},
+		SessionID:   mirrorID,
+		Known: protocol.SessionDeltaKnown{
+			LogEntryCount: len(record.Projection.LogEntries),
+		},
+	}); err != nil {
+		t.Fatalf("write session_delta_get request: %v", err)
+	}
+	delta := readUntilType(t, conn, protocol.EventTypeSessionDelta)
+	if delta["requiresFullSync"] == true {
+		t.Fatalf("expected incremental delta, got full sync request: %#v", delta)
+	}
+	entries, ok := delta["appendLogEntries"].([]any)
+	if !ok || len(entries) == 0 {
+		t.Fatalf("expected appended cached entries, got %#v", delta)
+	}
+	foundFresh := false
+	for _, raw := range entries {
+		entry, _ := raw.(map[string]any)
+		if entry["message"] == "Fresh native Codex delta" {
+			foundFresh = true
+			break
+		}
+	}
+	if !foundFresh {
+		t.Fatalf("expected fresh native mirror log entry in delta, got %#v", entries)
+	}
+}
+
+func TestHandlerSessionDeltaRequiresFullSyncForMismatchedTarget(t *testing.T) {
+	h := newTestHandler()
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	h.SessionStore = tempStore
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+
+	activeID := createHistorySessionForHandlerTest(t, h, conn, "active-session")
+	if err := conn.WriteJSON(protocol.SessionCreateRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_create"},
+		Title:       "other-session",
+	}); err != nil {
+		t.Fatalf("write other session create request: %v", err)
+	}
+	createdOther := readUntilSessionCreated(t, conn)
+	_ = readUntilType(t, conn, protocol.EventTypeSessionListResult)
+	otherSummary, _ := createdOther["summary"].(map[string]any)
+	otherID, _ := otherSummary["id"].(string)
+	if activeID == "" || otherID == "" || activeID == otherID {
+		t.Fatalf("expected distinct sessions, active=%q other=%q", activeID, otherID)
+	}
+
+	if err := conn.WriteJSON(protocol.SessionDeltaRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_delta_get"},
+		SessionID:   activeID,
+		Known: protocol.SessionDeltaKnown{
+			LogEntryCount: 1,
+		},
+	}); err != nil {
+		t.Fatalf("write stale target session_delta_get request: %v", err)
+	}
+	delta := readUntilType(t, conn, protocol.EventTypeSessionDelta)
+	if delta["sessionId"] != activeID {
+		t.Fatalf("expected full sync delta for stale target %q, got %#v", activeID, delta)
+	}
+	if delta["requiresFullSync"] != true {
+		t.Fatalf("expected requiresFullSync for non-selected target, got %#v", delta)
 	}
 }
 

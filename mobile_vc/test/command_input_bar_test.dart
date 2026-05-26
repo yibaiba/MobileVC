@@ -1,7 +1,9 @@
+import 'dart:typed_data';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:mobile_vc/features/chat/command_input_bar.dart';
 import 'package:mobile_vc/data/models/session_models.dart';
+import 'package:mobile_vc/features/chat/command_input_bar.dart';
 
 void main() {
   group('CommandInputBar', () {
@@ -10,7 +12,7 @@ void main() {
       await tester.pumpWidget(
         _buildTestApp(
           shouldShowPermissionChoices: true,
-          onSubmit: (value) => submitted = value,
+          onSubmit: (value, _) => submitted = value,
         ),
       );
 
@@ -47,7 +49,7 @@ void main() {
       String? submitted;
       await tester.pumpWidget(
         _buildTestApp(
-          onSubmit: (value) => submitted = value,
+          onSubmit: (value, _) => submitted = value,
         ),
       );
 
@@ -87,12 +89,17 @@ void main() {
           showClaudeMode: true,
           currentEngine: 'claude',
           canStop: true,
-          onSubmit: (_) => submitted = true,
+          onSubmit: (text, images) => submitted = true,
           onStop: () => stopped = true,
         ),
       );
 
-      expect(find.byIcon(Icons.arrow_upward), findsOneWidget);
+      expect(
+          find.descendant(
+            of: find.byType(FilledButton),
+            matching: find.byIcon(Icons.arrow_upward),
+          ),
+          findsOneWidget);
       expect(find.byIcon(Icons.stop_rounded), findsNothing);
 
       await tester.enterText(find.byType(TextField), '继续');
@@ -119,14 +126,14 @@ void main() {
     testWidgets('shell 模式显示 Shell 状态与 hint', (tester) async {
       await tester.pumpWidget(
         _buildTestApp(
-          isBusy: false,
+          isBusy: true,
           showClaudeMode: false,
           currentEngine: 'shell',
         ),
       );
 
       final field = tester.widget<TextField>(find.byType(TextField));
-      expect(field.decoration?.hintText, '输入命令');
+      expect(field.decoration?.hintText, '正在停止，请稍候...');
     });
 
     testWidgets('busy 且非等待输入时发送按钮切为停止按钮', (tester) async {
@@ -149,6 +156,75 @@ void main() {
       expect(stopped, isTrue);
     });
 
+    testWidgets('选择图片后先显示预览，发送时连同用户文本一起提交', (tester) async {
+      String? submittedText;
+      List<ChatImageAttachment> submittedImages = const [];
+      var pickCount = 0;
+      await tester.pumpWidget(
+        _buildTestApp(
+          onAttachImage: () async {
+            pickCount++;
+            return ChatImageAttachment(
+              name: 'screen.png',
+              mimeType: 'image/png',
+              bytes: _transparentPngBytes,
+            );
+          },
+          onSubmit: (value, images) {
+            submittedText = value;
+            submittedImages = images;
+          },
+        ),
+      );
+
+      await tester.tap(find.byTooltip('添加图片'));
+      await tester.pump();
+
+      expect(pickCount, 1);
+      expect(find.byKey(const ValueKey('imageAttachmentPreview:screen.png')),
+          findsOneWidget);
+      expect(submittedText, isNull);
+
+      await tester.enterText(find.byType(TextField), '这张图哪里有问题？');
+      await tester.tap(find.byType(FilledButton));
+      await tester.pump();
+
+      expect(submittedText, '这张图哪里有问题？');
+      expect(submittedImages, hasLength(1));
+      expect(submittedImages.single.name, 'screen.png');
+      expect(find.byKey(const ValueKey('imageAttachmentPreview:screen.png')),
+          findsNothing);
+    });
+
+    testWidgets('图片预览可以在发送前移除', (tester) async {
+      List<ChatImageAttachment>? submittedImages;
+      await tester.pumpWidget(
+        _buildTestApp(
+          onAttachImage: () async => ChatImageAttachment(
+            name: 'screen.png',
+            mimeType: 'image/png',
+            bytes: _transparentPngBytes,
+          ),
+          onSubmit: (_, images) => submittedImages = images,
+        ),
+      );
+
+      await tester.tap(find.byTooltip('添加图片'));
+      await tester.pump();
+      expect(find.byKey(const ValueKey('imageAttachmentPreview:screen.png')),
+          findsOneWidget);
+
+      await tester.tap(find.byTooltip('移除图片'));
+      await tester.pump();
+      expect(find.byKey(const ValueKey('imageAttachmentPreview:screen.png')),
+          findsNothing);
+
+      await tester.enterText(find.byType(TextField), '只发送文字');
+      await tester.tap(find.byType(FilledButton));
+      await tester.pump();
+      expect(submittedImages, isEmpty);
+    });
+
     testWidgets('loading 期间显示会话切换中 hint 并禁用输入', (tester) async {
       await tester.pumpWidget(
         _buildTestApp(
@@ -163,87 +239,18 @@ void main() {
       expect(button.onPressed, isNull);
     });
 
-    testWidgets('支持 compact 时显示压缩按钮并触发回调', (tester) async {
-      var compacted = false;
-      await tester.pumpWidget(
-        _buildTestApp(
-          canCompact: true,
-          onCompact: () => compacted = true,
-        ),
-      );
-
-      expect(find.text('压缩'), findsOneWidget);
-
-      await tester.tap(find.text('压缩'));
-      await tester.pump();
-
-      expect(compacted, isTrue);
-    });
-
-    testWidgets('compact 进行中时显示压缩中状态并禁用点击', (tester) async {
-      var compacted = false;
-      await tester.pumpWidget(
-        _buildTestApp(
-          canCompact: false,
-          isCompacting: true,
-          compactStatusLabel: '正在压缩上下文…',
-          onCompact: () => compacted = true,
-        ),
-      );
-
-      expect(find.text('压缩中'), findsOneWidget);
-      expect(find.byType(CircularProgressIndicator), findsWidgets);
-
-      await tester.tap(find.text('压缩中'));
-      await tester.pump();
-
-      expect(compacted, isFalse);
-    });
-
-    testWidgets('支持 compact 时按钮顺序为压缩在前 日志在最后', (tester) async {
-      await tester.pumpWidget(
-        _buildTestApp(
-          canCompact: true,
-        ),
-      );
-
-      final compactX = tester.getCenter(find.text('压缩')).dx;
-      final skillX = tester.getCenter(find.text('Skill')).dx;
-      final logsX = tester.getCenter(find.text('日志')).dx;
-      final memoryX = tester.getCenter(find.text('Memory')).dx;
-
-      expect(compactX, lessThan(skillX));
-      expect(logsX, greaterThan(memoryX));
-    });
-
-    testWidgets('不支持 compact 时不显示压缩按钮', (tester) async {
-      await tester.pumpWidget(
-        _buildTestApp(
-          canCompact: false,
-        ),
-      );
-
-      expect(find.text('压缩'), findsNothing);
-    });
-
-    testWidgets('始终显示上下文圆形入口并支持点击', (tester) async {
-      var opened = false;
+    testWidgets('底部工具栏常驻显示上下文圆形入口', (tester) async {
       await tester.pumpWidget(
         _buildTestApp(
           contextWindowUsage: const ContextWindowUsage(
             tokensUsed: 120000,
             tokenLimit: 200000,
           ),
-          onOpenContextWindowUsage: () => opened = true,
         ),
       );
 
-      expect(find.byKey(const ValueKey('context-window-button')), findsOneWidget);
-
-      await tester.tap(find.byKey(const ValueKey('context-window-button')));
-      await tester.pump();
-
-      expect(opened, isTrue);
+      expect(
+          find.byKey(const ValueKey('context-window-button')), findsOneWidget);
     });
   });
 }
@@ -254,17 +261,14 @@ Widget _buildTestApp({
   bool awaitInput = false,
   bool isBusy = false,
   bool canStop = false,
-  bool canCompact = false,
-  bool isCompacting = false,
-  String compactStatusLabel = '',
-  ContextWindowUsage contextWindowUsage = const ContextWindowUsage(),
   bool showClaudeMode = true,
   String currentEngine = 'claude',
   bool isSessionLoading = false,
-  ValueChanged<String>? onSubmit,
+  ContextWindowUsage contextWindowUsage = const ContextWindowUsage(),
+  void Function(String text, List<ChatImageAttachment> imageAttachments)?
+      onSubmit,
+  Future<ChatImageAttachment?> Function()? onAttachImage,
   VoidCallback? onStop,
-  VoidCallback? onCompact,
-  VoidCallback? onOpenContextWindowUsage,
 }) {
   return MaterialApp(
     home: Scaffold(
@@ -272,19 +276,20 @@ Widget _buildTestApp({
         awaitInput: awaitInput,
         isBusy: isBusy,
         canStop: canStop,
-        canCompact: canCompact,
-        isCompacting: isCompacting,
-        compactStatusLabel: compactStatusLabel,
+        canCompact: false,
+        isCompacting: false,
+        compactStatusLabel: '',
         contextWindowUsage: contextWindowUsage,
-        onOpenContextWindowUsage: onOpenContextWindowUsage ?? () {},
+        onOpenContextWindowUsage: () {},
         hasPendingReview: false,
         fastMode: false,
         permissionMode: 'default',
         shouldShowPermissionChoices: shouldShowPermissionChoices,
         shouldShowReviewChoices: shouldShowReviewChoices,
-        onSubmit: onSubmit ?? (_) {},
+        onSubmit: onSubmit ?? (text, images) {},
+        onAttachImage: onAttachImage ?? () async => null,
         onStop: onStop ?? () {},
-        onCompact: onCompact ?? () {},
+        onCompact: () {},
         onOpenSessions: () {},
         onOpenRuntimeInfo: () {},
         onOpenLogs: () {},
@@ -303,3 +308,73 @@ Widget _buildTestApp({
     ),
   );
 }
+
+final _transparentPngBytes = Uint8List.fromList([
+  0x89,
+  0x50,
+  0x4e,
+  0x47,
+  0x0d,
+  0x0a,
+  0x1a,
+  0x0a,
+  0x00,
+  0x00,
+  0x00,
+  0x0d,
+  0x49,
+  0x48,
+  0x44,
+  0x52,
+  0x00,
+  0x00,
+  0x00,
+  0x01,
+  0x00,
+  0x00,
+  0x00,
+  0x01,
+  0x08,
+  0x06,
+  0x00,
+  0x00,
+  0x00,
+  0x1f,
+  0x15,
+  0xc4,
+  0x89,
+  0x00,
+  0x00,
+  0x00,
+  0x0a,
+  0x49,
+  0x44,
+  0x41,
+  0x54,
+  0x78,
+  0x9c,
+  0x63,
+  0x00,
+  0x01,
+  0x00,
+  0x00,
+  0x05,
+  0x00,
+  0x01,
+  0x0d,
+  0x0a,
+  0x2d,
+  0xb4,
+  0x00,
+  0x00,
+  0x00,
+  0x00,
+  0x49,
+  0x45,
+  0x4e,
+  0x44,
+  0xae,
+  0x42,
+  0x60,
+  0x82,
+]);

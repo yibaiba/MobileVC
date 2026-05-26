@@ -1,0 +1,8 @@
+{$RELAY_DOMAIN}:{$CADDY_HTTPS_PORT} {
+	tls {
+		dns cloudflare {env.CF_API_TOKEN}
+	}
+
+	encode zstd gzip
+	reverse_proxy relay:9000
+}

@@ -1,0 +1,61 @@
+services:
+  relay:
+    build:
+      context: ../..
+      dockerfile: deploy/relay/Dockerfile
+      args:
+        VERSION: ${MOBILEVC_RELAY_VERSION:-dev}
+    restart: unless-stopped
+    environment:
+      RELAY_ADDR: ":9000"
+      RELAY_PUBLIC_URL: "${RELAY_PUBLIC_URL:?set RELAY_PUBLIC_URL, for example wss://relay.example.com:9443}"
+      RELAY_STATE_PATH: "/data/public_relay_state.json"
+      RELAY_REQUIRE_E2EE: "${RELAY_REQUIRE_E2EE:-true}"
+      RELAY_PLAINTEXT_TEST_MODE: "${RELAY_PLAINTEXT_TEST_MODE:-false}"
+      RELAY_PAIRING_TTL: "${RELAY_PAIRING_TTL:-5m}"
+      RELAY_AGENT_GRACE_PERIOD: "${RELAY_AGENT_GRACE_PERIOD:-60s}"
+      RELAY_PAIRING_HANDSHAKE_TIMEOUT: "${RELAY_PAIRING_HANDSHAKE_TIMEOUT:-10s}"
+      RELAY_AGENT_REGISTER_TIMEOUT: "${RELAY_AGENT_REGISTER_TIMEOUT:-10s}"
+      RELAY_PAIRING_MAX_FAILURES_PER_SESSION_IP: "${RELAY_PAIRING_MAX_FAILURES_PER_SESSION_IP:-5}"
+      RELAY_MAX_SESSIONS: "${RELAY_MAX_SESSIONS:-1000}"
+      RELAY_MAX_AGENT_CONNS: "${RELAY_MAX_AGENT_CONNS:-1000}"
+      RELAY_MAX_CLIENT_CONNS: "${RELAY_MAX_CLIENT_CONNS:-2000}"
+      RELAY_MAX_CONNS_PER_IP: "${RELAY_MAX_CONNS_PER_IP:-20}"
+      RELAY_PING_INTERVAL: "${RELAY_PING_INTERVAL:-30s}"
+      RELAY_PONG_TIMEOUT: "${RELAY_PONG_TIMEOUT:-10s}"
+      RELAY_MAX_CONTROL_FRAME_BYTES: "${RELAY_MAX_CONTROL_FRAME_BYTES:-16384}"
+      RELAY_MAX_PAYLOAD_BYTES: "${RELAY_MAX_PAYLOAD_BYTES:-8388608}"
+      RELAY_FORWARD_QUEUE_SIZE: "${RELAY_FORWARD_QUEUE_SIZE:-64}"
+      RELAY_TRUSTED_PROXY_CIDRS: "${RELAY_TRUSTED_PROXY_CIDRS:-172.16.0.0/12}"
+      RELAY_HTTP_ALLOWLIST: "${RELAY_HTTP_ALLOWLIST:-GET:/healthz,GET:/version,GET:/download}"
+      RELAY_WS_ALLOWLIST: "${RELAY_WS_ALLOWLIST:-GET:/ws}"
+    volumes:
+      - relay-data:/data
+    expose:
+      - "9000"
+
+  caddy:
+    build:
+      context: .
+      dockerfile: "${CADDY_DOCKERFILE:-Caddy.DNS.Dockerfile}"
+    restart: unless-stopped
+    depends_on:
+      - relay
+    environment:
+      RELAY_DOMAIN: "${RELAY_DOMAIN:?set RELAY_DOMAIN, for example relay.example.com}"
+      CADDY_HTTPS_PORT: "${CADDY_HTTPS_PORT:-9443}"
+      CF_API_TOKEN: "${CF_API_TOKEN:-}"
+      ALIYUN_ACCESS_KEY_ID: "${ALIYUN_ACCESS_KEY_ID:-}"
+      ALIYUN_ACCESS_KEY_SECRET: "${ALIYUN_ACCESS_KEY_SECRET:-}"
+      DNSPOD_TOKEN: "${DNSPOD_TOKEN:-}"
+    ports:
+      - "${CADDY_HTTPS_PORT:-9443}:${CADDY_HTTPS_PORT:-9443}"
+    volumes:
+      - "${CADDYFILE_PATH:-./Caddyfile.cloudflare}:/etc/caddy/Caddyfile:ro"
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  relay-data:
+  caddy-data:
+  caddy-config:

@@ -6,48 +6,55 @@ import (
 )
 
 const (
-	EventTypeLog                      = "log"
-	EventTypeProgress                 = "progress"
-	EventTypeError                    = "error"
-	EventTypeClientActionAck          = "client_action_ack"
-	EventTypeCompactResult            = "compact_result"
-	EventTypeCompaction               = "compaction"
-	EventTypeContextWindowUsage       = "context_window_usage"
-	EventTypePromptRequest            = "prompt_request"
-	EventTypeInteractionRequest       = "interaction_request"
-	EventTypeSessionResumeResult      = "session_resume_result"
-	EventTypeSessionResumeNotice      = "session_resume_notice"
-	EventTypeSessionState             = "session_state"
-	EventTypeAgentState               = "agent_state"
-	EventTypeAIStatus                 = "ai_status"
-	EventTypeRuntimePhase             = "runtime_phase"
-	EventTypeTaskSnapshot             = "task_snapshot"
-	EventTypeFSListResult             = "fs_list_result"
-	EventTypeFSReadResult             = "fs_read_result"
-	EventTypeStepUpdate               = "step_update"
-	EventTypeFileDiff                 = "file_diff"
-	EventTypeRuntimeInfoResult        = "runtime_info_result"
-	EventTypeRuntimeProcessList       = "runtime_process_list_result"
-	EventTypeRuntimeProcessLog        = "runtime_process_log_result"
-	EventTypeSessionCreated           = "session_created"
-	EventTypeSessionListResult        = "session_list_result"
-	EventTypeSessionHistory           = "session_history"
-	EventTypeSessionDelta             = "session_delta"
-	EventTypeReviewState              = "review_state"
-	EventTypeSkillCatalogResult       = "skill_catalog_result"
-	EventTypeMemoryListResult         = "memory_list_result"
-	EventTypeCatalogAuthoringResult   = "catalog_authoring_result"
-	EventTypeSessionContextResult     = "session_context_result"
-	EventTypePermissionRuleListResult = "permission_rule_list_result"
-	EventTypePermissionAutoApplied    = "permission_auto_applied"
-	EventTypeSkillSyncResult          = "skill_sync_result"
-	EventTypeCatalogSyncStatus        = "catalog_sync_status"
-	EventTypeCatalogSyncResult        = "catalog_sync_result"
-	EventTypeADBDevicesResult         = "adb_devices_result"
-	EventTypeADBStreamState           = "adb_stream_state"
-	EventTypeADBFrame                 = "adb_frame"
-	EventTypeADBWebRTCAnswer          = "adb_webrtc_answer"
-	EventTypeADBWebRTCState           = "adb_webrtc_state"
+	ActionContextWindowUsageGet       = "context_window_usage_get"
+	ActionContextWindowsUsageGetAlias = "context_windows_usage_get"
+
+	EventTypeLog                       = "log"
+	EventTypeProgress                  = "progress"
+	EventTypeError                     = "error"
+	EventTypeClientActionAck           = "client_action_ack"
+	EventTypeCompactResult             = "compact_result"
+	EventTypeCompaction                = "compaction"
+	EventTypeContextWindowUsage        = "context_window_usage"
+	EventTypePromptRequest             = "prompt_request"
+	EventTypeInteractionRequest        = "interaction_request"
+	EventTypeSessionResumeResult       = "session_resume_result"
+	EventTypeSessionResumeNotice       = "session_resume_notice"
+	EventTypeSessionState              = "session_state"
+	EventTypeAgentState                = "agent_state"
+	EventTypeAIStatus                  = "ai_status"
+	EventTypeRuntimePhase              = "runtime_phase"
+	EventTypeTaskSnapshot              = "task_snapshot"
+	EventTypeFSListResult              = "fs_list_result"
+	EventTypeFSReadResult              = "fs_read_result"
+	EventTypeStepUpdate                = "step_update"
+	EventTypeFileDiff                  = "file_diff"
+	EventTypeRuntimeInfoResult         = "runtime_info_result"
+	EventTypeRuntimeProcessList        = "runtime_process_list_result"
+	EventTypeRuntimeProcessLog         = "runtime_process_log_result"
+	EventTypeSessionCreated            = "session_created"
+	EventTypeSessionListResult         = "session_list_result"
+	EventTypeSessionHistory            = "session_history"
+	EventTypeSessionDelta              = "session_delta"
+	EventTypeReviewState               = "review_state"
+	EventTypeSkillCatalogResult        = "skill_catalog_result"
+	EventTypeMemoryListResult          = "memory_list_result"
+	EventTypeCatalogAuthoringResult    = "catalog_authoring_result"
+	EventTypeSessionContextResult      = "session_context_result"
+	EventTypePermissionRuleListResult  = "permission_rule_list_result"
+	EventTypePermissionAutoApplied     = "permission_auto_applied"
+	EventTypeSkillSyncResult           = "skill_sync_result"
+	EventTypeCatalogSyncStatus         = "catalog_sync_status"
+	EventTypeCatalogSyncResult         = "catalog_sync_result"
+	EventTypeADBDevicesResult          = "adb_devices_result"
+	EventTypeADBStreamState            = "adb_stream_state"
+	EventTypeADBFrame                  = "adb_frame"
+	EventTypeADBWebRTCAnswer           = "adb_webrtc_answer"
+	EventTypeADBWebRTCState            = "adb_webrtc_state"
+	EventTypeRelayDeviceRegisterResult = "relay_device_register_result"
+	EventTypeRelayDeviceListResult     = "relay_device_list_result"
+	EventTypeRelayDeviceRevokeResult   = "relay_device_revoke_result"
+	EventTypeRelayDeviceRotateResult   = "relay_device_rotate_result"
 )
 
 type RuntimeMeta struct {
@@ -90,6 +97,64 @@ type ClientEvent struct {
 	ClientActionID string `json:"clientActionId,omitempty"`
 }
 
+type RelayDeviceRegisterRequestEvent struct {
+	ClientEvent
+	DeviceID                string `json:"deviceId"`
+	DisplayName             string `json:"displayName"`
+	DeviceIdentityPublicKey string `json:"deviceIdentityPublicKey"`
+	DeviceCredential        string `json:"deviceCredential"`
+}
+
+type RelayDeviceRegisterResultEvent struct {
+	Event
+	DeviceID       string `json:"deviceId"`
+	FingerprintHex string `json:"fingerprintHex"`
+	Status         string `json:"status"`
+}
+
+type RelayDeviceListRequestEvent struct {
+	ClientEvent
+}
+
+type RelayDeviceRevokeRequestEvent struct {
+	ClientEvent
+	DeviceID string `json:"deviceId"`
+}
+
+type RelayDeviceRotateRequestEvent struct {
+	ClientEvent
+}
+
+type RelayTrustedDevice struct {
+	DeviceID        string `json:"deviceId"`
+	DisplayName     string `json:"displayName"`
+	FingerprintHex  string `json:"fingerprintHex"`
+	CreatedAt       string `json:"createdAt"`
+	LastSeenAt      string `json:"lastSeenAt"`
+	RevokedAt       string `json:"revokedAt,omitempty"`
+	ActiveSessionID string `json:"activeSessionId,omitempty"`
+	Connected       bool   `json:"connected"`
+	CurrentDevice   bool   `json:"currentDevice"`
+	Revoked         bool   `json:"revoked"`
+}
+
+type RelayDeviceListResultEvent struct {
+	Event
+	Devices []RelayTrustedDevice `json:"devices"`
+}
+
+type RelayDeviceRevokeResultEvent struct {
+	Event
+	DeviceID string `json:"deviceId"`
+	Status   string `json:"status"`
+}
+
+type RelayDeviceRotateResultEvent struct {
+	Event
+	NodeFingerprintHex string `json:"nodeFingerprintHex"`
+	Status             string `json:"status"`
+}
+
 type ExecRequestEvent struct {
 	ClientEvent
 	Command        string `json:"cmd"`
@@ -102,18 +167,26 @@ type ExecRequestEvent struct {
 
 type InputRequestEvent struct {
 	ClientEvent
-	Data           string `json:"data"`
-	PermissionMode string `json:"permissionMode,omitempty"`
+	Data             string            `json:"data"`
+	PermissionMode   string            `json:"permissionMode,omitempty"`
+	ImageAttachments []ImageAttachment `json:"imageAttachments,omitempty"`
 	RuntimeMeta
 }
 
 type AITurnRequestEvent struct {
 	ClientEvent
-	Engine         string `json:"engine,omitempty"`
-	Data           string `json:"data,omitempty"`
-	CWD            string `json:"cwd,omitempty"`
-	PermissionMode string `json:"permissionMode,omitempty"`
+	Engine           string            `json:"engine,omitempty"`
+	Data             string            `json:"data,omitempty"`
+	CWD              string            `json:"cwd,omitempty"`
+	PermissionMode   string            `json:"permissionMode,omitempty"`
+	ImageAttachments []ImageAttachment `json:"imageAttachments,omitempty"`
 	RuntimeMeta
+}
+
+type ImageAttachment struct {
+	Name     string `json:"name,omitempty"`
+	MIMEType string `json:"mimeType,omitempty"`
+	Data     string `json:"data"`
 }
 
 type ReviewDecisionRequestEvent struct {
@@ -211,6 +284,13 @@ type SkillRequestEvent struct {
 	TargetStack  string `json:"targetStack,omitempty"`
 }
 
+type CompactRequestEvent struct {
+	ClientEvent
+	CWD            string `json:"cwd,omitempty"`
+	Engine         string `json:"engine,omitempty"`
+	PermissionMode string `json:"permissionMode,omitempty"`
+}
+
 type SkillCatalogRequestEvent struct {
 	ClientEvent
 	Skill SkillDefinition `json:"skill,omitempty"`
@@ -226,6 +306,12 @@ type SessionContextUpdateRequestEvent struct {
 	ClientEvent
 	EnabledSkillNames []string `json:"enabledSkillNames,omitempty"`
 	EnabledMemoryIDs  []string `json:"enabledMemoryIds,omitempty"`
+}
+
+type ContextWindowUsageRequestEvent struct {
+	ClientEvent
+	SessionID string `json:"sessionId,omitempty"`
+	CWD       string `json:"cwd,omitempty"`
 }
 
 type SkillDefinition struct {
@@ -361,12 +447,6 @@ type RuntimeInfoRequestEvent struct {
 	CWD   string `json:"cwd,omitempty"`
 }
 
-type ContextWindowUsageRequestEvent struct {
-	ClientEvent
-	SessionID string `json:"sessionId,omitempty"`
-	CWD       string `json:"cwd,omitempty"`
-}
-
 type RuntimeProcessListRequestEvent struct {
 	ClientEvent
 }
@@ -390,13 +470,6 @@ type SlashCommandRequestEvent struct {
 	ContextTitle   string `json:"contextTitle,omitempty"`
 	TargetText     string `json:"targetText,omitempty"`
 	TargetStack    string `json:"targetStack,omitempty"`
-}
-
-type CompactRequestEvent struct {
-	ClientEvent
-	CWD            string `json:"cwd,omitempty"`
-	Engine         string `json:"engine,omitempty"`
-	PermissionMode string `json:"permissionMode,omitempty"`
 }
 
 type SessionCreateRequestEvent struct {
@@ -754,6 +827,25 @@ type ClientActionAckEvent struct {
 	Duplicate      bool   `json:"duplicate,omitempty"`
 }
 
+type CompactResultEvent struct {
+	Event
+	Accepted bool   `json:"accepted"`
+	Error    string `json:"error,omitempty"`
+}
+
+type CompactionEvent struct {
+	Event
+	ContextID string `json:"contextId,omitempty"`
+	Status    string `json:"status,omitempty"`
+	Trigger   string `json:"trigger,omitempty"`
+	Message   string `json:"msg,omitempty"`
+}
+
+type ContextWindowUsageEvent struct {
+	Event
+	Usage ContextWindowUsage `json:"usage"`
+}
+
 type PromptRequestEvent struct {
 	Event
 	Message string   `json:"msg,omitempty"`
@@ -958,25 +1050,6 @@ type ADBWebRTCStateEvent struct {
 	Message   string `json:"msg,omitempty"`
 }
 
-type CompactResultEvent struct {
-	Event
-	Accepted bool   `json:"accepted"`
-	Error    string `json:"error,omitempty"`
-}
-
-type CompactionEvent struct {
-	Event
-	ContextID string `json:"contextId,omitempty"`
-	Status    string `json:"status,omitempty"`
-	Trigger   string `json:"trigger,omitempty"`
-	Message   string `json:"msg,omitempty"`
-}
-
-type ContextWindowUsageEvent struct {
-	Event
-	Usage ContextWindowUsage `json:"usage"`
-}
-
 func NewBaseEvent(eventType, sessionID string) Event {
 	return Event{
 		Type:      eventType,
@@ -1019,6 +1092,12 @@ func NewErrorEvent(sessionID, message, stack string) ErrorEvent {
 	}
 }
 
+func NewErrorEventWithCode(sessionID, message, stack, code string) ErrorEvent {
+	event := NewErrorEvent(sessionID, message, stack)
+	event.Code = code
+	return event
+}
+
 func NewClientActionAckEvent(sessionID, action, clientActionID, status string, duplicate bool) ClientActionAckEvent {
 	return ClientActionAckEvent{
 		Event:          NewBaseEvent(EventTypeClientActionAck, sessionID),
@@ -1051,6 +1130,41 @@ func NewContextWindowUsageEvent(sessionID string, usage ContextWindowUsage) Cont
 	return ContextWindowUsageEvent{
 		Event: NewBaseEvent(EventTypeContextWindowUsage, sessionID),
 		Usage: NormalizeContextWindowUsage(usage),
+	}
+}
+
+func NewRelayDeviceRegisterResultEvent(sessionID, deviceID, fingerprintHex, status string) RelayDeviceRegisterResultEvent {
+	return RelayDeviceRegisterResultEvent{
+		Event:          NewBaseEvent(EventTypeRelayDeviceRegisterResult, sessionID),
+		DeviceID:       deviceID,
+		FingerprintHex: fingerprintHex,
+		Status:         status,
+	}
+}
+
+func NewRelayDeviceListResultEvent(sessionID string, devices []RelayTrustedDevice) RelayDeviceListResultEvent {
+	if devices == nil {
+		devices = []RelayTrustedDevice{}
+	}
+	return RelayDeviceListResultEvent{
+		Event:   NewBaseEvent(EventTypeRelayDeviceListResult, sessionID),
+		Devices: devices,
+	}
+}
+
+func NewRelayDeviceRevokeResultEvent(sessionID, deviceID, status string) RelayDeviceRevokeResultEvent {
+	return RelayDeviceRevokeResultEvent{
+		Event:    NewBaseEvent(EventTypeRelayDeviceRevokeResult, sessionID),
+		DeviceID: deviceID,
+		Status:   status,
+	}
+}
+
+func NewRelayDeviceRotateResultEvent(sessionID, nodeFingerprintHex, status string) RelayDeviceRotateResultEvent {
+	return RelayDeviceRotateResultEvent{
+		Event:              NewBaseEvent(EventTypeRelayDeviceRotateResult, sessionID),
+		NodeFingerprintHex: nodeFingerprintHex,
+		Status:             status,
 	}
 }
 
@@ -1769,9 +1883,6 @@ func NormalizeContextWindowUsage(usage ContextWindowUsage) ContextWindowUsage {
 	}
 	if usage.TokenLimit > 0 && usage.TokensUsed > usage.TokenLimit {
 		usage.TokensUsed = usage.TokenLimit
-	}
-	if usage.TokenLimit == 0 {
-		usage.TokensUsed = 0
 	}
 	return usage
 }

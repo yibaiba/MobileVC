@@ -16,6 +16,7 @@ type resumeStubRunner struct {
 	interactive   bool
 	claudeSession string
 	writeErr      error
+	writeDelay    time.Duration
 	started       chan struct{}
 	closed        chan struct{}
 	lastReq       engine.ExecRequest
@@ -46,6 +47,15 @@ func (s *resumeStubRunner) Run(ctx context.Context, req engine.ExecRequest, sink
 }
 
 func (s *resumeStubRunner) Write(ctx context.Context, data []byte) error {
+	if s.writeDelay > 0 {
+		timer := time.NewTimer(s.writeDelay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
 	if s.writeErr != nil {
 		return s.writeErr
 	}
@@ -367,6 +377,52 @@ func TestSendInputOrResumeRestartsDetachedResumeSession(t *testing.T) {
 	}
 	if len(resumed.writes) != 1 || string(resumed.writes[0]) != "hello again\n" {
 		t.Fatalf("unexpected resumed runner writes: %#v", resumed.writes)
+	}
+}
+
+func TestSendInputOrResumeAllowsSlowDetachedResumeStartup(t *testing.T) {
+	resumed := newResumeStubRunner("resume-detached", true)
+	resumed.writeDelay = 4500 * time.Millisecond
+	svc := NewService("s1", Dependencies{
+		NewExecRunner: func() engine.Runner { return newResumeStubRunner("", true) },
+		NewPtyRunner:  func() engine.Runner { return resumed },
+	})
+	svc.manager.updateResumeSessionID("resume-detached")
+
+	err := svc.SendInputOrResume(context.Background(), "s1", ExecuteRequest{
+		Command:        "claude",
+		CWD:            "/tmp",
+		Mode:           engine.ModePTY,
+		PermissionMode: "default",
+		RuntimeMeta:    protocol.RuntimeMeta{Command: "claude", CWD: "/tmp", PermissionMode: "default", ResumeSessionID: "resume-detached"},
+	}, InputRequest{Data: "slow hello\n", RuntimeMeta: protocol.RuntimeMeta{Source: "input"}}, func(any) {})
+	if err != nil {
+		t.Fatalf("send input or resume: %v", err)
+	}
+	if len(resumed.writes) != 1 || string(resumed.writes[0]) != "slow hello\n" {
+		t.Fatalf("unexpected resumed runner writes: %#v", resumed.writes)
+	}
+}
+
+func TestSendInputWhenRunnerReadyMapsInternalDeadlineToRunnerTimeout(t *testing.T) {
+	active := newResumeStubRunner("resume-active", true)
+	active.writeDelay = 50 * time.Millisecond
+	svc := NewService("s1", Dependencies{})
+	if err := svc.manager.start("s1", active, nil, protocol.RuntimeMeta{Command: "claude", CWD: "/tmp", ResumeSessionID: "resume-active"}); err != nil {
+		t.Fatalf("start manager: %v", err)
+	}
+	previousTimeout := resumedInputReadyTimeout
+	resumedInputReadyTimeout = 10 * time.Millisecond
+	defer func() {
+		resumedInputReadyTimeout = previousTimeout
+	}()
+
+	err := svc.sendInputWhenRunnerReady(context.Background(), "s1", InputRequest{Data: "hello\n"}, func(any) {})
+	if !errors.Is(err, ErrRunnerStartTimeout) {
+		t.Fatalf("expected ErrRunnerStartTimeout, got %v", err)
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("did not expect raw context deadline error, got %v", err)
 	}
 }
 

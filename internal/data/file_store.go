@@ -1159,7 +1159,7 @@ func (s *FileStore) SavePushToken(ctx context.Context, sessionID, token, platfor
 		return fmt.Errorf("marshal push tokens: %w", err)
 	}
 
-	return os.WriteFile(s.pushTokensPath, data, 0644)
+	return os.WriteFile(s.pushTokensPath, data, 0600)
 }
 
 func (s *FileStore) GetPushToken(ctx context.Context, sessionID string) (string, string, error) {

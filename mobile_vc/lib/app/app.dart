@@ -7,6 +7,7 @@ import '../features/session/session_controller.dart';
 import '../features/session/session_home_page.dart';
 import 'app_notification_coordinator.dart';
 import 'background_keep_alive_service.dart';
+import 'deep_link_service.dart';
 import 'local_notification_service.dart';
 import 'push_notification_service.dart';
 import 'theme.dart';
@@ -17,13 +18,16 @@ class MobileVcApp extends StatefulWidget {
     SessionController? controller,
     LocalNotificationService? notificationService,
     PushNotificationService? pushNotificationService,
+    DeepLinkService? deepLinkService,
   })  : _controller = controller,
         _notificationService = notificationService,
-        _pushNotificationService = pushNotificationService;
+        _pushNotificationService = pushNotificationService,
+        _deepLinkService = deepLinkService;
 
   final SessionController? _controller;
   final LocalNotificationService? _notificationService;
   final PushNotificationService? _pushNotificationService;
+  final DeepLinkService? _deepLinkService;
 
   @override
   State<MobileVcApp> createState() => _MobileVcAppState();
@@ -36,6 +40,7 @@ class _MobileVcAppState extends State<MobileVcApp> with WidgetsBindingObserver {
   late final AppNotificationCoordinator _notificationCoordinator;
   late final BackgroundKeepAliveService _backgroundKeepAliveService;
   late final PushNotificationService _pushNotificationService;
+  late final DeepLinkService _deepLinkService;
   bool _darkModeEnabled = false;
 
   @override
@@ -51,6 +56,7 @@ class _MobileVcAppState extends State<MobileVcApp> with WidgetsBindingObserver {
     _backgroundKeepAliveService = BackgroundKeepAliveService();
     _pushNotificationService =
         widget._pushNotificationService ?? createPushNotificationService();
+    _deepLinkService = widget._deepLinkService ?? DeepLinkService();
     _controller.addListener(_handleControllerChanged);
     _startApp();
   }
@@ -62,6 +68,7 @@ class _MobileVcAppState extends State<MobileVcApp> with WidgetsBindingObserver {
       debugPrint('[startup] controller init start');
       await _controller.initialize();
       debugPrint('[startup] controller init end');
+      await _deepLinkService.initialize(_handleDeepLink);
     } catch (error, stack) {
       debugPrint('[startup] controller init failed: $error');
       debugPrintStack(
@@ -75,6 +82,10 @@ class _MobileVcAppState extends State<MobileVcApp> with WidgetsBindingObserver {
     });
 
     debugPrint('[startup] app init end');
+  }
+
+  void _handleDeepLink(String raw) {
+    unawaited(_controller.importConnectionLink(raw));
   }
 
   Future<void> _loadThemeMode() async {
@@ -150,7 +161,7 @@ class _MobileVcAppState extends State<MobileVcApp> with WidgetsBindingObserver {
 
     try {
       _pushNotificationService.onTokenRefresh((token) {
-        debugPrint('[push] token refreshed: $token');
+        debugPrint('[push] token refreshed');
         _controller.setDevicePushToken(token);
       });
 
@@ -171,7 +182,7 @@ class _MobileVcAppState extends State<MobileVcApp> with WidgetsBindingObserver {
       await _pushNotificationService.initialize();
       final token = await _pushNotificationService.getDeviceToken();
       if (token != null && token.isNotEmpty) {
-        debugPrint('[push] device token: $token');
+        debugPrint('[push] device token available');
         _controller.setDevicePushToken(token);
       }
     } catch (error, stack) {

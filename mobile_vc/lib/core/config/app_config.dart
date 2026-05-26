@@ -3,6 +3,10 @@ import 'app_config_engine_models.dart';
 import 'app_connection_endpoint.dart';
 import 'app_connection_environment.dart';
 import 'app_connection_urls.dart';
+import '../relay_e2ee/relay_e2ee_capability.dart';
+import 'relay_config.dart';
+
+const Object _unchanged = Object();
 
 class AppConfig {
   static const String adbIcePort = AdbIceConfig.port;
@@ -22,6 +26,15 @@ class AppConfig {
     this.fastMode = false,
     this.adbIceServersJson = '',
     this.secureTransport,
+    this.connectionMode = 'direct',
+    this.relayUrl = '',
+    this.relaySessionId = '',
+    this.relayPairingSecret = '',
+    this.relayPairingExpiresAt = 0,
+    this.relayClientId = '',
+    this.relayClientReconnectSecret = '',
+    this.relayNodeFingerprintHex = '',
+    this.relayCapabilities,
   });
 
   final String host;
@@ -38,6 +51,17 @@ class AppConfig {
   final bool fastMode;
   final String adbIceServersJson;
   final bool? secureTransport;
+  final String connectionMode;
+  final String relayUrl;
+  final String relaySessionId;
+  final String relayPairingSecret;
+  final int relayPairingExpiresAt;
+  final String relayClientId;
+  final String relayClientReconnectSecret;
+  final String relayNodeFingerprintHex;
+  final RelayE2eeCapabilitySet? relayCapabilities;
+
+  bool get isRelayMode => connectionMode == ConnectionMode.relay.name;
 
   String get baseHttpUrl => baseHttpUrlFor();
 
@@ -97,6 +121,15 @@ class AppConfig {
     bool? fastMode,
     String? adbIceServersJson,
     bool? secureTransport,
+    String? connectionMode,
+    String? relayUrl,
+    String? relaySessionId,
+    String? relayPairingSecret,
+    int? relayPairingExpiresAt,
+    String? relayClientId,
+    String? relayClientReconnectSecret,
+    String? relayNodeFingerprintHex,
+    Object? relayCapabilities = _unchanged,
   }) {
     final nextEngine = engine ?? this.engine;
     final nextModels = AppConfigEngineModels.resolve(
@@ -132,6 +165,21 @@ class AppConfig {
       adbIceServersJson: adbIceServersJson ?? this.adbIceServersJson,
       secureTransport:
           secureTransport ?? endpoint.secureTransport ?? this.secureTransport,
+      connectionMode:
+          normalizeConnectionMode(connectionMode ?? this.connectionMode),
+      relayUrl: relayUrl ?? this.relayUrl,
+      relaySessionId: relaySessionId ?? this.relaySessionId,
+      relayPairingSecret: relayPairingSecret ?? this.relayPairingSecret,
+      relayPairingExpiresAt:
+          relayPairingExpiresAt ?? this.relayPairingExpiresAt,
+      relayClientId: relayClientId ?? this.relayClientId,
+      relayClientReconnectSecret:
+          relayClientReconnectSecret ?? this.relayClientReconnectSecret,
+      relayNodeFingerprintHex:
+          relayNodeFingerprintHex ?? this.relayNodeFingerprintHex,
+      relayCapabilities: identical(relayCapabilities, _unchanged)
+          ? this.relayCapabilities
+          : relayCapabilities as RelayE2eeCapabilitySet?,
     );
   }
 
@@ -185,6 +233,16 @@ class AppConfig {
         'permissionMode': permissionMode,
         'fastMode': fastMode,
         'adbIceServersJson': adbIceServersJson,
+        'connectionMode': connectionMode,
+        if (relayUrl.trim().isNotEmpty) 'relayUrl': relayUrl,
+        if (relaySessionId.trim().isNotEmpty) 'relaySessionId': relaySessionId,
+        if (relayClientId.trim().isNotEmpty) 'relayClientId': relayClientId,
+        if (relayClientReconnectSecret.trim().isNotEmpty)
+          'relayClientReconnectSecret': relayClientReconnectSecret,
+        if (relayNodeFingerprintHex.trim().isNotEmpty)
+          'relayNodeFingerprintHex': relayNodeFingerprintHex,
+        if (relayCapabilities != null)
+          'relayCapabilities': relayCapabilities!.toJson(),
         if (secureTransport != null) 'secureTransport': secureTransport!,
       };
 
@@ -222,6 +280,21 @@ class AppConfig {
       adbIceServersJson: (json['adbIceServersJson'] ?? '').toString(),
       secureTransport: endpoint.secureTransport ??
           parseSecureTransport(json['secureTransport']),
+      connectionMode: normalizeConnectionMode(json['connectionMode']),
+      relayUrl: (json['relayUrl'] ?? '').toString(),
+      relaySessionId: (json['relaySessionId'] ?? '').toString(),
+      relayClientId: (json['relayClientId'] ?? '').toString(),
+      relayClientReconnectSecret:
+          (json['relayClientReconnectSecret'] ?? '').toString(),
+      relayNodeFingerprintHex:
+          (json['relayNodeFingerprintHex'] ?? '').toString(),
+      relayCapabilities: _relayCapabilitiesFromJson(
+        json['relayCapabilities'],
+        hasRelayNodeFingerprint: (json['relayNodeFingerprintHex'] ?? '')
+            .toString()
+            .trim()
+            .isNotEmpty,
+      ),
     );
   }
 
@@ -243,6 +316,34 @@ class AppConfig {
     final trimmed = raw.trim();
     if (trimmed.isEmpty) {
       return null;
+    }
+    final relayPairing = parseRelayPairingUri(trimmed);
+    if (relayPairing != null) {
+      final sameRelaySession = fallback.isRelayMode &&
+          fallback.relayUrl.trim() == relayPairing.relayUrl.trim() &&
+          fallback.relaySessionId.trim() == relayPairing.sessionId.trim();
+      final hasReconnectCredentials =
+          fallback.relayClientId.trim().isNotEmpty &&
+              fallback.relayClientReconnectSecret.trim().isNotEmpty;
+      return fallback.copyWith(
+        connectionMode: ConnectionMode.relay.name,
+        relayUrl: relayPairing.relayUrl,
+        relaySessionId: relayPairing.sessionId,
+        relayPairingSecret: sameRelaySession && hasReconnectCredentials
+            ? ''
+            : relayPairing.pairingSecret,
+        relayPairingExpiresAt: sameRelaySession && hasReconnectCredentials
+            ? 0
+            : relayPairing.expiresAt,
+        relayClientId: sameRelaySession && hasReconnectCredentials
+            ? fallback.relayClientId
+            : '',
+        relayClientReconnectSecret: sameRelaySession && hasReconnectCredentials
+            ? fallback.relayClientReconnectSecret
+            : '',
+        relayNodeFingerprintHex: relayPairing.nodeFingerprintHex,
+        relayCapabilities: relayPairing.capabilities,
+      );
     }
     final uri = Uri.tryParse(trimmed);
     if (uri == null || uri.host.trim().isEmpty) {
@@ -282,6 +383,27 @@ class AppConfig {
 
   AdbIceConfig get _adbIceConfig =>
       AdbIceConfig(host: host, rawJson: adbIceServersJson);
+}
+
+RelayE2eeCapabilitySet? _relayCapabilitiesFromJson(
+  Object? value, {
+  required bool hasRelayNodeFingerprint,
+}) {
+  if (value == null) {
+    return hasRelayNodeFingerprint ? RelayE2eeCapabilitySet.production() : null;
+  }
+  if (value is! Map) {
+    return hasRelayNodeFingerprint ? RelayE2eeCapabilitySet.production() : null;
+  }
+  try {
+    return RelayE2eeCapabilitySet.fromJson(
+      Map<String, Object?>.from(value),
+    );
+  } on FormatException {
+    return hasRelayNodeFingerprint ? RelayE2eeCapabilitySet.production() : null;
+  } on ArgumentError {
+    return hasRelayNodeFingerprint ? RelayE2eeCapabilitySet.production() : null;
+  }
 }
 
 String _launchUriPort(Uri uri, String fallbackPort) {

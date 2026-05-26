@@ -17,6 +17,7 @@ class CommandInputBar extends StatefulWidget {
     required this.fastMode,
     required this.permissionMode,
     required this.onSubmit,
+    required this.onAttachImage,
     required this.onStop,
     required this.onCompact,
     required this.onOpenSessions,
@@ -51,7 +52,9 @@ class CommandInputBar extends StatefulWidget {
   final bool hasPendingReview;
   final bool fastMode;
   final String permissionMode;
-  final ValueChanged<String> onSubmit;
+  final void Function(String text, List<ChatImageAttachment> imageAttachments)
+      onSubmit;
+  final Future<ChatImageAttachment?> Function() onAttachImage;
   final VoidCallback onStop;
   final VoidCallback onCompact;
   final VoidCallback onOpenSessions;
@@ -81,6 +84,8 @@ class CommandInputBar extends StatefulWidget {
 class _CommandInputBarState extends State<CommandInputBar> {
   final TextEditingController _controller = TextEditingController();
   final FocusNode _focusNode = FocusNode();
+  final List<ChatImageAttachment> _imageAttachments = [];
+  bool _pickingImage = false;
 
   bool get _inputLocked =>
       widget.isExternallyLocked ||
@@ -94,7 +99,7 @@ class _CommandInputBarState extends State<CommandInputBar> {
           widget.isBusy);
 
   bool get _showStopAction =>
-      !_inputLocked && !widget.awaitInput && widget.canStop;
+      !_inputLocked && widget.canStop && !widget.awaitInput;
 
   String get _lockedHintText {
     if (widget.isExternallyLocked) {
@@ -146,15 +151,42 @@ class _CommandInputBarState extends State<CommandInputBar> {
 
     final text = _controller.text;
     final normalized = text.trim();
-    if (normalized.isEmpty) {
+    if (normalized.isEmpty && _imageAttachments.isEmpty) {
       return;
     }
     final keepKeyboard = _shouldKeepKeyboard(normalized);
-    widget.onSubmit(text);
+    widget.onSubmit(text, List.unmodifiable(_imageAttachments));
     _controller.clear();
+    setState(() => _imageAttachments.clear());
     if (!keepKeyboard) {
       _focusNode.unfocus();
     }
+  }
+
+  Future<void> _attachImage() async {
+    if (_inputLocked || _pickingImage) {
+      return;
+    }
+    setState(() => _pickingImage = true);
+    try {
+      final attachment = await widget.onAttachImage();
+      if (!mounted || attachment == null) {
+        return;
+      }
+      setState(() => _imageAttachments.add(attachment));
+      _focusNode.requestFocus();
+    } finally {
+      if (mounted) {
+        setState(() => _pickingImage = false);
+      }
+    }
+  }
+
+  void _removeImageAttachment(int index) {
+    if (index < 0 || index >= _imageAttachments.length) {
+      return;
+    }
+    setState(() => _imageAttachments.removeAt(index));
   }
 
   bool _shouldKeepKeyboard(String value) {
@@ -170,11 +202,15 @@ class _CommandInputBarState extends State<CommandInputBar> {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final scheme = theme.colorScheme;
+    final scheme = Theme.of(context).colorScheme;
     final bottomInset = MediaQuery.of(context).viewInsets.bottom;
     final engineLabel =
         _engineLabel(widget.currentEngine, widget.showClaudeMode);
-    final compactChipLabel = widget.isCompacting ? '压缩中' : '压缩';
+    final compactChipLabel = widget.isCompacting
+        ? (widget.compactStatusLabel.trim().isEmpty
+            ? '压缩中'
+            : widget.compactStatusLabel.trim())
+        : '压缩';
     final hintText = _inputLocked
         ? _lockedHintText
         : widget.awaitInput
@@ -186,9 +222,9 @@ class _CommandInputBarState extends State<CommandInputBar> {
                         ? '$engineLabel 处理中…'
                         : 'Shell 运行中')
                     : (widget.showClaudeMode ? '给 $engineLabel 发送消息' : '输入命令');
-    final panelColor = scheme.surfaceContainerLow.withValues(alpha: 0.95);
+    final panelColor = scheme.surfaceContainerLow.withValues(alpha: 0.96);
     final railColor = scheme.surfaceContainerLowest.withValues(alpha: 0.88);
-    final inputColor = scheme.surfaceContainerHighest.withValues(alpha: 0.68);
+    final inputColor = scheme.surfaceContainerHighest.withValues(alpha: 0.72);
     final shadowColor = scheme.shadow.withValues(
       alpha: theme.brightness == Brightness.dark ? 0.28 : 0.07,
     );
@@ -200,7 +236,7 @@ class _CommandInputBarState extends State<CommandInputBar> {
         child: Padding(
           padding: EdgeInsets.fromLTRB(10, 6, 10, bottomInset > 0 ? 8 : 10),
           child: Container(
-            padding: const EdgeInsets.fromLTRB(12, 12, 12, 12),
+            padding: const EdgeInsets.fromLTRB(10, 10, 10, 10),
             decoration: BoxDecoration(
               gradient: LinearGradient(
                 colors: [
@@ -212,7 +248,7 @@ class _CommandInputBarState extends State<CommandInputBar> {
               ),
               borderRadius: BorderRadius.circular(30),
               border: Border.all(
-                color: scheme.outlineVariant.withValues(alpha: 0.46),
+                color: scheme.outlineVariant.withValues(alpha: 0.5),
               ),
               boxShadow: [
                 BoxShadow(
@@ -262,6 +298,12 @@ class _CommandInputBarState extends State<CommandInputBar> {
                                 const SizedBox(width: 8),
                               ],
                               _ToolChip(
+                                icon: Icons.terminal,
+                                label: '日志',
+                                onPressed: widget.onOpenLogs,
+                              ),
+                              const SizedBox(width: 8),
+                              _ToolChip(
                                 icon: Icons.extension_outlined,
                                 label: 'Skill',
                                 onPressed: widget.onOpenSkills,
@@ -280,15 +322,10 @@ class _CommandInputBarState extends State<CommandInputBar> {
                               ),
                               const SizedBox(width: 8),
                               _ToolChip(
+                                key: const ValueKey('command-bar-model-button'),
                                 icon: Icons.model_training_outlined,
                                 label: '模型 · ${widget.modelSummary}',
                                 onPressed: widget.onOpenModels,
-                              ),
-                              const SizedBox(width: 8),
-                              _ToolChip(
-                                icon: Icons.terminal,
-                                label: '日志',
-                                onPressed: widget.onOpenLogs,
                               ),
                             ],
                           ),
@@ -305,11 +342,11 @@ class _CommandInputBarState extends State<CommandInputBar> {
                           color: inputColor,
                           borderRadius: BorderRadius.circular(999),
                           border: Border.all(
-                            color: scheme.outlineVariant.withValues(alpha: 0.36),
+                            color: scheme.outlineVariant.withValues(alpha: 0.4),
                           ),
                         ),
                         child: Padding(
-                          padding: const EdgeInsets.symmetric(horizontal: 10),
+                          padding: const EdgeInsets.symmetric(horizontal: 12),
                           child: DropdownButtonHideUnderline(
                             child: DropdownButton<String>(
                               value: widget.permissionMode,
@@ -345,7 +382,7 @@ class _CommandInputBarState extends State<CommandInputBar> {
                 ),
                 const SizedBox(height: 10),
                 Container(
-                  constraints: const BoxConstraints(minHeight: 58),
+                  constraints: const BoxConstraints(minHeight: 56),
                   decoration: BoxDecoration(
                     gradient: LinearGradient(
                       colors: [
@@ -360,77 +397,128 @@ class _CommandInputBarState extends State<CommandInputBar> {
                       color: scheme.outlineVariant.withValues(alpha: 0.24),
                     ),
                   ),
-                  child: Row(
-                    crossAxisAlignment: CrossAxisAlignment.end,
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
                     children: [
-                      Expanded(
-                        child: TextField(
-                          controller: _controller,
-                          focusNode: _focusNode,
-                          enabled: !_inputLocked,
-                          readOnly: _inputLocked,
-                          canRequestFocus: !_inputLocked,
-                          minLines: 1,
-                          maxLines: 6,
-                          textInputAction: TextInputAction.send,
-                          onTap:
-                              _inputLocked ? () => _focusNode.unfocus() : null,
-                          onSubmitted: _inputLocked ? null : (_) => _submit(),
-                          textAlignVertical: TextAlignVertical.center,
-                          style: theme.textTheme.bodyMedium?.copyWith(
-                            height: 1.45,
-                          ),
-                          decoration: InputDecoration(
-                            hintText: hintText,
-                            hintStyle: theme.textTheme.bodyMedium?.copyWith(
-                              color: scheme.onSurfaceVariant,
-                            ),
-                            filled: false,
-                            isCollapsed: false,
-                            contentPadding:
-                                const EdgeInsets.fromLTRB(18, 15, 8, 15),
-                            border: InputBorder.none,
-                            enabledBorder: InputBorder.none,
-                            focusedBorder: InputBorder.none,
-                            disabledBorder: InputBorder.none,
-                          ),
+                      if (_imageAttachments.isNotEmpty)
+                        _AttachmentPreviewStrip(
+                          attachments: _imageAttachments,
+                          onRemove:
+                              _inputLocked ? null : _removeImageAttachment,
                         ),
-                      ),
-                      Padding(
-                        padding: const EdgeInsets.fromLTRB(0, 0, 7, 7),
-                        child: SizedBox(
-                          width: 44,
-                          height: 44,
-                          child: FilledButton(
-                            onPressed: _inputLocked
-                                ? null
-                                : (_showStopAction ? widget.onStop : _submit),
-                            style: FilledButton.styleFrom(
-                              elevation: 0,
-                              backgroundColor: _inputLocked
-                                  ? scheme.surfaceContainerHighest
-                                  : _showStopAction
-                                      ? scheme.error
-                                      : scheme.primary,
-                              foregroundColor: _inputLocked
-                                  ? scheme.onSurfaceVariant
-                                  : _showStopAction
-                                      ? scheme.onError
-                                      : scheme.onPrimary,
-                              padding: EdgeInsets.zero,
-                              minimumSize: const Size(44, 44),
-                              shape: RoundedRectangleBorder(
-                                borderRadius: BorderRadius.circular(999),
+                      Row(
+                        crossAxisAlignment: CrossAxisAlignment.end,
+                        children: [
+                          Expanded(
+                            child: TextField(
+                              controller: _controller,
+                              focusNode: _focusNode,
+                              enabled: !_inputLocked,
+                              readOnly: _inputLocked,
+                              canRequestFocus: !_inputLocked,
+                              minLines: 1,
+                              maxLines: 6,
+                              textInputAction: TextInputAction.send,
+                              onTap: _inputLocked
+                                  ? () => _focusNode.unfocus()
+                                  : null,
+                              onSubmitted:
+                                  _inputLocked ? null : (_) => _submit(),
+                              textAlignVertical: TextAlignVertical.center,
+                              style: Theme.of(context)
+                                  .textTheme
+                                  .bodyMedium
+                                  ?.copyWith(
+                                    height: 1.45,
+                                  ),
+                              decoration: InputDecoration(
+                                hintText: hintText,
+                                hintStyle: Theme.of(context)
+                                    .textTheme
+                                    .bodyMedium
+                                    ?.copyWith(
+                                      color: scheme.onSurfaceVariant,
+                                    ),
+                                filled: false,
+                                isCollapsed: false,
+                                contentPadding: const EdgeInsets.fromLTRB(
+                                  18,
+                                  14,
+                                  8,
+                                  14,
+                                ),
+                                border: InputBorder.none,
+                                enabledBorder: InputBorder.none,
+                                focusedBorder: InputBorder.none,
+                                disabledBorder: InputBorder.none,
                               ),
                             ),
-                            child: Icon(
-                              _showStopAction
-                                  ? Icons.stop_rounded
-                                  : Icons.arrow_upward,
-                              size: 18,
+                          ),
+                          Padding(
+                            padding: const EdgeInsets.fromLTRB(0, 0, 4, 7),
+                            child: SizedBox(
+                              width: 42,
+                              height: 42,
+                              child: IconButton.filledTonal(
+                                onPressed: _inputLocked || _pickingImage
+                                    ? null
+                                    : _attachImage,
+                                tooltip: '添加图片',
+                                icon: _pickingImage
+                                    ? SizedBox(
+                                        width: 18,
+                                        height: 18,
+                                        child: CircularProgressIndicator(
+                                          strokeWidth: 2,
+                                          color: scheme.primary,
+                                        ),
+                                      )
+                                    : const Icon(
+                                        Icons.image_outlined,
+                                        size: 20,
+                                      ),
+                              ),
                             ),
                           ),
-                        ),
+                          Padding(
+                            padding: const EdgeInsets.fromLTRB(0, 0, 7, 7),
+                            child: SizedBox(
+                              width: 42,
+                              height: 42,
+                              child: FilledButton(
+                                onPressed: _inputLocked
+                                    ? null
+                                    : (_showStopAction
+                                        ? widget.onStop
+                                        : _submit),
+                                style: FilledButton.styleFrom(
+                                  elevation: 0,
+                                  backgroundColor: _inputLocked
+                                      ? scheme.surfaceContainerHighest
+                                      : _showStopAction
+                                          ? scheme.error
+                                          : scheme.primary,
+                                  foregroundColor: _inputLocked
+                                      ? scheme.onSurfaceVariant
+                                      : _showStopAction
+                                          ? scheme.onError
+                                          : scheme.onPrimary,
+                                  padding: EdgeInsets.zero,
+                                  minimumSize: const Size(42, 42),
+                                  shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(999),
+                                  ),
+                                ),
+                                child: Icon(
+                                  _showStopAction
+                                      ? Icons.stop_rounded
+                                      : Icons.arrow_upward,
+                                  size: 18,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ],
                       ),
                     ],
                   ),
@@ -554,8 +642,113 @@ String _engineLabel(String currentEngine, bool showClaudeMode) {
   }
 }
 
+class _AttachmentPreviewStrip extends StatelessWidget {
+  const _AttachmentPreviewStrip({
+    required this.attachments,
+    required this.onRemove,
+  });
+
+  final List<ChatImageAttachment> attachments;
+  final void Function(int index)? onRemove;
+
+  @override
+  Widget build(BuildContext context) {
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: SingleChildScrollView(
+        scrollDirection: Axis.horizontal,
+        padding: const EdgeInsets.fromLTRB(10, 10, 10, 2),
+        child: Row(
+          children: [
+            for (var index = 0; index < attachments.length; index++) ...[
+              _AttachmentPreviewChip(
+                attachment: attachments[index],
+                onRemove: onRemove == null ? null : () => onRemove!(index),
+              ),
+              if (index != attachments.length - 1) const SizedBox(width: 8),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _AttachmentPreviewChip extends StatelessWidget {
+  const _AttachmentPreviewChip({
+    required this.attachment,
+    required this.onRemove,
+  });
+
+  final ChatImageAttachment attachment;
+  final VoidCallback? onRemove;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Container(
+      key: ValueKey('imageAttachmentPreview:${attachment.name}'),
+      width: 150,
+      height: 56,
+      decoration: BoxDecoration(
+        color: scheme.surfaceContainerHigh.withValues(alpha: 0.92),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(
+          color: scheme.outlineVariant.withValues(alpha: 0.5),
+        ),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: Row(
+        children: [
+          AspectRatio(
+            aspectRatio: 1,
+            child: Image.memory(
+              attachment.bytes,
+              fit: BoxFit.cover,
+              errorBuilder: (context, error, stackTrace) => Container(
+                color: scheme.surfaceContainerHighest,
+                child: Icon(
+                  Icons.broken_image_outlined,
+                  size: 20,
+                  color: scheme.onSurfaceVariant,
+                ),
+              ),
+            ),
+          ),
+          Expanded(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 8),
+              child: Text(
+                attachment.name,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                      color: scheme.onSurface,
+                      fontWeight: FontWeight.w600,
+                      height: 1.15,
+                    ),
+              ),
+            ),
+          ),
+          SizedBox(
+            width: 30,
+            height: 56,
+            child: IconButton(
+              onPressed: onRemove,
+              tooltip: '移除图片',
+              padding: EdgeInsets.zero,
+              icon: const Icon(Icons.close_rounded, size: 16),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class _ToolChip extends StatelessWidget {
   const _ToolChip({
+    super.key,
     required this.icon,
     required this.label,
     required this.onPressed,
@@ -576,13 +769,13 @@ class _ToolChip extends StatelessWidget {
     return Material(
       color: highlighted
           ? scheme.primaryContainer.withValues(alpha: 0.94)
-          : scheme.surface.withValues(alpha: enabled ? 0.74 : 0.5),
+          : scheme.surfaceContainerHigh.withValues(alpha: enabled ? 0.82 : 0.5),
       borderRadius: BorderRadius.circular(999),
       child: InkWell(
         onTap: onPressed,
         borderRadius: BorderRadius.circular(999),
         child: Ink(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
           decoration: BoxDecoration(
             borderRadius: BorderRadius.circular(999),
             border: Border.all(
@@ -623,7 +816,6 @@ class _ToolChip extends StatelessWidget {
                 label,
                 style: Theme.of(context).textTheme.bodySmall?.copyWith(
                       fontWeight: FontWeight.w600,
-                      letterSpacing: 0.1,
                       color: highlighted
                           ? scheme.onPrimaryContainer
                           : enabled

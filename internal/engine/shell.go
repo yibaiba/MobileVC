@@ -2,11 +2,13 @@ package engine
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 )
 
 type shellSpec struct {
@@ -151,16 +153,13 @@ func newClaudePromptCommand(ctx context.Context, command string, prompt string, 
 
 func newCodexAppServerCommand(ctx context.Context, command string) *exec.Cmd {
 	spec := getShellSpec()
-	head := codexExecutable(command)
-	if head == "" {
-		head = "codex"
-	}
+	launch := codexAppServerLaunchSpec(command)
 	if runtime.GOOS != "windows" {
-		cmd := exec.CommandContext(ctx, head, "app-server", "--listen", "stdio://")
-		cmd.Env = shellEnvironment(spec, command)
+		cmd := exec.CommandContext(ctx, launch.executable, "app-server", "--listen", "stdio://")
+		cmd.Env = shellEnvironmentWithPath(spec, command, launch.pathEnv)
 		return cmd
 	}
-	return newShellCommand(ctx, head+" app-server --listen stdio://", ModeExec)
+	return newShellCommand(ctx, launch.executable+" app-server --listen stdio://", ModeExec)
 }
 
 func shouldUseWindowsClaudeEntry(command string, spec shellSpec) bool {
@@ -230,6 +229,85 @@ func codexExecutable(command string) string {
 		return head
 	}
 	return ""
+}
+
+type codexLaunchSpec struct {
+	executable string
+	pathEnv    string
+}
+
+func codexAppServerLaunchSpec(command string) codexLaunchSpec {
+	head := codexExecutable(command)
+	if head == "" {
+		head = "codex"
+	}
+	if override := strings.TrimSpace(os.Getenv("MOBILEVC_CODEX_EXECUTABLE")); override != "" {
+		return codexLaunchSpec{executable: override, pathEnv: prependExecutableDir(os.Getenv("PATH"), override)}
+	}
+	if strings.Contains(head, `/`) || strings.Contains(head, `\`) || filepath.IsAbs(head) {
+		return codexLaunchSpec{executable: head, pathEnv: prependExecutableDir(os.Getenv("PATH"), head)}
+	}
+	if resolved, err := exec.LookPath(head); err == nil && strings.TrimSpace(resolved) != "" {
+		return codexLaunchSpec{executable: resolved, pathEnv: os.Getenv("PATH")}
+	}
+	if resolved, pathEnv := resolveCodexFromUserShell(); resolved != "" {
+		return codexLaunchSpec{executable: resolved, pathEnv: pathEnv}
+	}
+	return codexLaunchSpec{executable: head, pathEnv: os.Getenv("PATH")}
+}
+
+func resolveCodexFromUserShell() (string, string) {
+	if runtime.GOOS == "windows" {
+		return "", ""
+	}
+	shell := strings.TrimSpace(os.Getenv("SHELL"))
+	if shell == "" {
+		shell = "/bin/zsh"
+	}
+	if info, err := os.Stat(shell); err != nil || info.IsDir() {
+		return "", ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, shell, "-ic", `printf '__MOBILEVC_CODEX__%s\n' "$(command -v codex)"; printf '__MOBILEVC_PATH__%s\n' "$PATH"`)
+	out, err := cmd.Output()
+	if err != nil {
+		return "", ""
+	}
+	resolved := ""
+	pathEnv := os.Getenv("PATH")
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(line, "__MOBILEVC_CODEX__"):
+			resolved = strings.TrimSpace(strings.TrimPrefix(line, "__MOBILEVC_CODEX__"))
+		case strings.HasPrefix(line, "__MOBILEVC_PATH__"):
+			if value := strings.TrimSpace(strings.TrimPrefix(line, "__MOBILEVC_PATH__")); value != "" {
+				pathEnv = value
+			}
+		}
+	}
+	if resolved == "" {
+		return "", ""
+	}
+	return resolved, prependExecutableDir(pathEnv, resolved)
+}
+
+func prependExecutableDir(pathEnv, executable string) string {
+	dir := filepath.Dir(strings.TrimSpace(executable))
+	if dir == "." || dir == "" {
+		return pathEnv
+	}
+	if pathEnv == "" {
+		return dir
+	}
+	for _, item := range filepath.SplitList(pathEnv) {
+		if item == dir {
+			return pathEnv
+		}
+	}
+	return fmt.Sprintf("%s%c%s", dir, os.PathListSeparator, pathEnv)
 }
 
 func extractCodexModelFlag(command string) string {
@@ -472,9 +550,16 @@ func getShellSpec() shellSpec {
 }
 
 func shellEnvironment(spec shellSpec, command string) []string {
+	return shellEnvironmentWithPath(spec, command, "")
+}
+
+func shellEnvironmentWithPath(spec shellSpec, command string, pathEnv string) []string {
 	env := os.Environ()
 	if isClaudeCommandName(command) {
 		env = removeEnv(env, "CLAUDECODE")
+	}
+	if strings.TrimSpace(pathEnv) != "" {
+		env = upsertEnv(env, "PATH", pathEnv)
 	}
 	if runtime.GOOS == "windows" && spec.gitBash != "" {
 		env = upsertEnv(env, "CLAUDE_CODE_GIT_BASH_PATH", spec.gitBash)

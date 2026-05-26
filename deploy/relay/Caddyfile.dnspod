@@ -1,0 +1,8 @@
+{$RELAY_DOMAIN}:{$CADDY_HTTPS_PORT} {
+	tls {
+		dns dnspod {env.DNSPOD_TOKEN}
+	}
+
+	encode zstd gzip
+	reverse_proxy relay:9000
+}

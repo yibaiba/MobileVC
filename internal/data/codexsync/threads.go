@@ -29,6 +29,7 @@ type NativeThread struct {
 	Model            string
 	Source           string
 	ModelProvider    string
+	ThreadSource     string
 	CreatedAt        time.Time
 	UpdatedAt        time.Time
 	FirstUserMessage string
@@ -90,7 +91,100 @@ func ThreadIDFromMirror(sessionID string) string {
 }
 
 func ListNativeThreads(ctx context.Context, cwdFilter string) ([]NativeThread, error) {
-	dbPath, historyPath, err := nativeCodexPaths()
+	threads, err := loadNativeThreadRows(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if len(threads) == 0 {
+		return []NativeThread{}, nil
+	}
+	normalizedFilter := normalizePath(cwdFilter)
+	result := make([]NativeThread, 0, len(threads))
+	for _, thread := range threads {
+		if !IsUserVisibleThread(thread) {
+			continue
+		}
+		if normalizedFilter != "" && normalizePath(thread.CWD) != normalizedFilter {
+			continue
+		}
+		result = append(result, hydrateNativeThreadSummary(thread))
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].UpdatedAt.After(result[j].UpdatedAt)
+	})
+	return result, nil
+}
+
+func ListNativeHiddenThreadIDs(ctx context.Context, cwdFilter string) (map[string]struct{}, error) {
+	threads, err := loadNativeThreadRows(ctx)
+	if err != nil {
+		return nil, err
+	}
+	normalizedFilter := normalizePath(cwdFilter)
+	result := make(map[string]struct{})
+	for _, thread := range threads {
+		if IsUserVisibleThread(thread) {
+			continue
+		}
+		if normalizedFilter != "" && normalizePath(thread.CWD) != normalizedFilter {
+			continue
+		}
+		threadID := strings.TrimSpace(thread.ThreadID)
+		if threadID != "" {
+			result[threadID] = struct{}{}
+		}
+	}
+	return result, nil
+}
+
+func ListNativeSubagentThreadIDs(ctx context.Context, cwdFilter string) (map[string]struct{}, error) {
+	threads, err := loadNativeThreadRows(ctx)
+	if err != nil {
+		return nil, err
+	}
+	normalizedFilter := normalizePath(cwdFilter)
+	result := make(map[string]struct{})
+	for _, thread := range threads {
+		if !IsSubagentThread(thread) {
+			continue
+		}
+		if normalizedFilter != "" && normalizePath(thread.CWD) != normalizedFilter {
+			continue
+		}
+		threadID := strings.TrimSpace(thread.ThreadID)
+		if threadID != "" {
+			result[threadID] = struct{}{}
+		}
+	}
+	return result, nil
+}
+
+func IsSubagentThread(thread NativeThread) bool {
+	return strings.EqualFold(strings.TrimSpace(thread.ThreadSource), "subagent")
+}
+
+func IsUserVisibleThread(thread NativeThread) bool {
+	source := strings.ToLower(strings.TrimSpace(thread.Source))
+	if source == "exec" || IsSubagentThread(thread) {
+		return false
+	}
+	threadSource := strings.ToLower(strings.TrimSpace(thread.ThreadSource))
+	if threadSource == "user" {
+		return true
+	}
+	if threadSource != "" {
+		return false
+	}
+	switch source {
+	case "cli", "vscode":
+		return true
+	default:
+		return false
+	}
+}
+
+func loadNativeThreadRows(ctx context.Context) ([]NativeThread, error) {
+	dbPath, _, err := codexNativePaths()
 	if err != nil {
 		return nil, err
 	}
@@ -100,32 +194,7 @@ func ListNativeThreads(ctx context.Context, cwdFilter string) ([]NativeThread, e
 		}
 		return nil, fmt.Errorf("stat codex sqlite failed: %w", err)
 	}
-
-	threads, err := queryThreads(ctx, dbPath)
-	if err != nil {
-		return nil, err
-	}
-	if len(threads) == 0 {
-		return []NativeThread{}, nil
-	}
-	prompts, err := loadHistory(historyPath)
-	if err != nil {
-		return nil, err
-	}
-
-	filterCandidates := candidateThreadCWDs(cwdFilter)
-	result := make([]NativeThread, 0, len(threads))
-	for _, thread := range threads {
-		normalizedThreadCWD := normalizePath(thread.CWD)
-		if len(filterCandidates) > 0 && !pathCandidateMatch(normalizedThreadCWD, filterCandidates) {
-			continue
-		}
-		result = append(result, hydrateNativeThread(thread, prompts[thread.ThreadID]))
-	}
-	sort.Slice(result, func(i, j int) bool {
-		return result[i].UpdatedAt.After(result[j].UpdatedAt)
-	})
-	return result, nil
+	return queryThreads(ctx, dbPath)
 }
 
 func FindNativeThread(ctx context.Context, sessionID string) (NativeThread, error) {
@@ -136,7 +205,7 @@ func FindNativeThread(ctx context.Context, sessionID string) (NativeThread, erro
 	if threadID == "" {
 		return NativeThread{}, fmt.Errorf("empty codex thread id")
 	}
-	dbPath, historyPath, err := nativeCodexPaths()
+	dbPath, historyPath, err := codexNativePaths()
 	if err != nil {
 		return NativeThread{}, err
 	}
@@ -146,18 +215,16 @@ func FindNativeThread(ctx context.Context, sessionID string) (NativeThread, erro
 		}
 		return NativeThread{}, fmt.Errorf("stat codex sqlite failed: %w", err)
 	}
-	thread, err := queryThreadByID(ctx, dbPath, threadID)
+	thread, err := queryThread(ctx, dbPath, threadID)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return NativeThread{}, fmt.Errorf("codex thread not found: %s", threadID)
-		}
 		return NativeThread{}, err
 	}
 	prompts, err := loadHistoryForSession(historyPath, threadID)
 	if err != nil {
 		return NativeThread{}, err
 	}
-	return hydrateNativeThread(thread, prompts), nil
+	thread.HistoryPrompts = prompts
+	return hydrateNativeThread(thread), nil
 }
 
 func MirrorRecord(thread NativeThread) data.SessionRecord {
@@ -241,40 +308,6 @@ func MirrorRecord(thread NativeThread) data.SessionRecord {
 	}
 }
 
-func nativeCodexPaths() (dbPath string, historyPath string, err error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", "", fmt.Errorf("resolve home dir failed: %w", err)
-	}
-	return filepath.Join(home, ".codex", "state_5.sqlite"),
-		filepath.Join(home, ".codex", "history.jsonl"),
-		nil
-}
-
-func hydrateNativeThread(thread NativeThread, prompts []NativePrompt) NativeThread {
-	thread.CWD = normalizePath(thread.CWD)
-	thread.MirrorSessionID = MirrorSessionID(thread.ThreadID)
-	thread.HistoryPrompts = append([]NativePrompt(nil), prompts...)
-	if rollout, err := loadRollout(thread.RolloutPath); err == nil {
-		thread.LogEntries = rollout.LogEntries
-		thread.ControllerState = rollout.ControllerState
-		thread.ClaudeLifecycle = rollout.ClaudeLifecycle
-	}
-	if !isMeaningfulPromptText(thread.Title) {
-		thread.Title = latestMeaningfulPrompt(thread.HistoryPrompts)
-	}
-	if !isMeaningfulPromptText(thread.Title) {
-		thread.Title = latestMeaningfulNativeLogText(thread.LogEntries)
-	}
-	if !isMeaningfulPromptText(thread.Title) {
-		thread.Title = strings.TrimSpace(thread.FirstUserMessage)
-	}
-	if !isMeaningfulPromptText(thread.Title) {
-		thread.Title = "Codex 会话"
-	}
-	return thread
-}
-
 func queryThreads(ctx context.Context, dbPath string) ([]NativeThread, error) {
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
@@ -282,53 +315,19 @@ func queryThreads(ctx context.Context, dbPath string) ([]NativeThread, error) {
 	}
 	defer db.Close()
 
-	queryWithRollout := `select id, cwd, title, coalesce(model,''), coalesce(source,''), coalesce(model_provider,''), created_at, updated_at, coalesce(first_user_message,''), coalesce(rollout_path,'') from threads where archived = 0 order by updated_at desc`
-	queryWithoutRollout := `select id, cwd, title, coalesce(model,''), coalesce(source,''), coalesce(model_provider,''), created_at, updated_at, coalesce(first_user_message,'') from threads where archived = 0 order by updated_at desc`
-
-	var (
-		rows           *sql.Rows
-		hasRolloutPath bool
-	)
-	rows, err = db.QueryContext(ctx, queryWithRollout)
+	rows, err := queryThreadRows(ctx, db)
 	if err != nil {
-		if strings.Contains(err.Error(), "no such column: rollout_path") {
-			rows, err = db.QueryContext(ctx, queryWithoutRollout)
-		}
-		if err != nil {
-			return nil, fmt.Errorf("query codex threads failed: %w", err)
-		}
-	} else {
-		hasRolloutPath = true
+		return nil, fmt.Errorf("query codex threads failed: %w", err)
 	}
 	defer rows.Close()
 
 	var items []NativeThread
 	for rows.Next() {
-		var (
-			id, cwd, title, model, source, modelProvider string
-			createdAt, updatedAt                         int64
-			firstUserMessage, rolloutPath                string
-		)
-		if hasRolloutPath {
-			err = rows.Scan(&id, &cwd, &title, &model, &source, &modelProvider, &createdAt, &updatedAt, &firstUserMessage, &rolloutPath)
-		} else {
-			err = rows.Scan(&id, &cwd, &title, &model, &source, &modelProvider, &createdAt, &updatedAt, &firstUserMessage)
-		}
+		thread, err := scanNativeThread(rows)
 		if err != nil {
 			return nil, fmt.Errorf("scan codex thread row: %w", err)
 		}
-		items = append(items, NativeThread{
-			ThreadID:         id,
-			CWD:              cwd,
-			Title:            title,
-			Model:            model,
-			Source:           source,
-			ModelProvider:    modelProvider,
-			CreatedAt:        time.Unix(createdAt, 0).UTC(),
-			UpdatedAt:        time.Unix(updatedAt, 0).UTC(),
-			FirstUserMessage: firstUserMessage,
-			RolloutPath:      rolloutPath,
-		})
+		items = append(items, thread)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate codex threads: %w", err)
@@ -339,52 +338,77 @@ func queryThreads(ctx context.Context, dbPath string) ([]NativeThread, error) {
 	return items, nil
 }
 
-func queryThreadByID(ctx context.Context, dbPath, threadID string) (NativeThread, error) {
+func queryThread(ctx context.Context, dbPath, threadID string) (NativeThread, error) {
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return NativeThread{}, fmt.Errorf("open codex sqlite failed: %w", err)
 	}
 	defer db.Close()
 
-	queryWithRollout := `select id, cwd, title, coalesce(model,''), coalesce(source,''), coalesce(model_provider,''), created_at, updated_at, coalesce(first_user_message,''), coalesce(rollout_path,'') from threads where archived = 0 and id = ? limit 1`
-	queryWithoutRollout := `select id, cwd, title, coalesce(model,''), coalesce(source,''), coalesce(model_provider,''), created_at, updated_at, coalesce(first_user_message,'') from threads where archived = 0 and id = ? limit 1`
+	thread, err := queryThreadByID(ctx, db, threadID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return NativeThread{}, fmt.Errorf("codex thread not found: %s", threadID)
+	}
+	if err != nil {
+		return NativeThread{}, fmt.Errorf("query codex thread failed: %w", err)
+	}
+	return thread, nil
+}
 
+func queryThreadRows(ctx context.Context, db *sql.DB) (*sql.Rows, error) {
+	const queryWithThreadSource = `select id, cwd, title, coalesce(model,''), coalesce(source,''), coalesce(model_provider,''), created_at, updated_at, coalesce(first_user_message,''), coalesce(rollout_path,''), coalesce(thread_source,'') from threads where archived = 0 order by updated_at desc`
+	const queryWithoutThreadSource = `select id, cwd, title, coalesce(model,''), coalesce(source,''), coalesce(model_provider,''), created_at, updated_at, coalesce(first_user_message,''), coalesce(rollout_path,''), '' from threads where archived = 0 order by updated_at desc`
+	const queryWithoutRollout = `select id, cwd, title, coalesce(model,''), coalesce(source,''), coalesce(model_provider,''), created_at, updated_at, coalesce(first_user_message,''), '', '' from threads where archived = 0 order by updated_at desc`
+
+	rows, err := db.QueryContext(ctx, queryWithThreadSource)
+	if err == nil {
+		return rows, nil
+	}
+	if isMissingColumn(err, "thread_source") {
+		rows, err = db.QueryContext(ctx, queryWithoutThreadSource)
+		if err == nil {
+			return rows, nil
+		}
+	}
+	if isMissingColumn(err, "rollout_path") {
+		return db.QueryContext(ctx, queryWithoutRollout)
+	}
+	return nil, err
+}
+
+func queryThreadByID(ctx context.Context, db *sql.DB, threadID string) (NativeThread, error) {
+	const queryWithThreadSource = `select id, cwd, title, coalesce(model,''), coalesce(source,''), coalesce(model_provider,''), created_at, updated_at, coalesce(first_user_message,''), coalesce(rollout_path,''), coalesce(thread_source,'') from threads where archived = 0 and id = ? limit 1`
+	const queryWithoutThreadSource = `select id, cwd, title, coalesce(model,''), coalesce(source,''), coalesce(model_provider,''), created_at, updated_at, coalesce(first_user_message,''), coalesce(rollout_path,''), '' from threads where archived = 0 and id = ? limit 1`
+	const queryWithoutRollout = `select id, cwd, title, coalesce(model,''), coalesce(source,''), coalesce(model_provider,''), created_at, updated_at, coalesce(first_user_message,''), '', '' from threads where archived = 0 and id = ? limit 1`
+
+	thread, err := scanNativeThread(db.QueryRowContext(ctx, queryWithThreadSource, threadID))
+	if err == nil {
+		return thread, nil
+	}
+	if isMissingColumn(err, "thread_source") {
+		thread, err = scanNativeThread(db.QueryRowContext(ctx, queryWithoutThreadSource, threadID))
+		if err == nil {
+			return thread, nil
+		}
+	}
+	if isMissingColumn(err, "rollout_path") {
+		return scanNativeThread(db.QueryRowContext(ctx, queryWithoutRollout, threadID))
+	}
+	return NativeThread{}, err
+}
+
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanNativeThread(scanner rowScanner) (NativeThread, error) {
 	var (
 		id, cwd, title, model, source, modelProvider string
 		createdAt, updatedAt                         int64
-		firstUserMessage, rolloutPath                string
+		firstUserMessage, rolloutPath, threadSource  string
 	)
-	err = db.QueryRowContext(ctx, queryWithRollout, threadID).Scan(
-		&id,
-		&cwd,
-		&title,
-		&model,
-		&source,
-		&modelProvider,
-		&createdAt,
-		&updatedAt,
-		&firstUserMessage,
-		&rolloutPath,
-	)
-	if err != nil && strings.Contains(err.Error(), "no such column: rollout_path") {
-		err = db.QueryRowContext(ctx, queryWithoutRollout, threadID).Scan(
-			&id,
-			&cwd,
-			&title,
-			&model,
-			&source,
-			&modelProvider,
-			&createdAt,
-			&updatedAt,
-			&firstUserMessage,
-		)
-		rolloutPath = ""
-	}
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return NativeThread{}, err
-		}
-		return NativeThread{}, fmt.Errorf("query codex thread failed: %w", err)
+	if err := scanner.Scan(&id, &cwd, &title, &model, &source, &modelProvider, &createdAt, &updatedAt, &firstUserMessage, &rolloutPath, &threadSource); err != nil {
+		return NativeThread{}, err
 	}
 	return NativeThread{
 		ThreadID:         id,
@@ -393,11 +417,16 @@ func queryThreadByID(ctx context.Context, dbPath, threadID string) (NativeThread
 		Model:            model,
 		Source:           source,
 		ModelProvider:    modelProvider,
+		ThreadSource:     threadSource,
 		CreatedAt:        time.Unix(createdAt, 0).UTC(),
 		UpdatedAt:        time.Unix(updatedAt, 0).UTC(),
 		FirstUserMessage: firstUserMessage,
 		RolloutPath:      rolloutPath,
 	}, nil
+}
+
+func isMissingColumn(err error, name string) bool {
+	return err != nil && strings.Contains(err.Error(), "no such column: "+name)
 }
 
 func loadHistory(path string) (map[string][]NativePrompt, error) {
@@ -432,8 +461,8 @@ func loadHistory(path string) (map[string][]NativePrompt, error) {
 	return items, nil
 }
 
-func loadHistoryForSession(path, sessionID string) ([]NativePrompt, error) {
-	targetSessionID := strings.TrimSpace(sessionID)
+func loadHistoryForSession(path, targetSessionID string) ([]NativePrompt, error) {
+	targetSessionID = strings.TrimSpace(targetSessionID)
 	if targetSessionID == "" {
 		return nil, nil
 	}
@@ -446,7 +475,7 @@ func loadHistoryForSession(path, sessionID string) ([]NativePrompt, error) {
 	}
 	defer file.Close()
 
-	items := make([]NativePrompt, 0, 8)
+	var items []NativePrompt
 	scanner := bufio.NewScanner(file)
 	buf := make([]byte, 0, 64*1024)
 	scanner.Buffer(buf, 1024*1024)
@@ -455,11 +484,9 @@ func loadHistoryForSession(path, sessionID string) ([]NativePrompt, error) {
 		if err := json.Unmarshal(scanner.Bytes(), &line); err != nil {
 			continue
 		}
-		if strings.TrimSpace(line.SessionID) != targetSessionID {
-			continue
-		}
+		sessionID := strings.TrimSpace(line.SessionID)
 		text := strings.TrimSpace(line.Text)
-		if text == "" {
+		if sessionID != targetSessionID || text == "" {
 			continue
 		}
 		items = append(items, NativePrompt{Text: text, Timestamp: time.Unix(line.TS, 0).UTC()})
@@ -467,7 +494,43 @@ func loadHistoryForSession(path, sessionID string) ([]NativePrompt, error) {
 	if err := scanner.Err(); err != nil {
 		return nil, fmt.Errorf("scan codex history failed: %w", err)
 	}
+	if items == nil {
+		return []NativePrompt{}, nil
+	}
 	return items, nil
+}
+
+func hydrateNativeThread(thread NativeThread) NativeThread {
+	thread.MirrorSessionID = MirrorSessionID(thread.ThreadID)
+	if rollout, err := loadRollout(thread.RolloutPath); err == nil {
+		thread.LogEntries = rollout.LogEntries
+		thread.ControllerState = rollout.ControllerState
+		thread.ClaudeLifecycle = rollout.ClaudeLifecycle
+	}
+	if !isMeaningfulPromptText(thread.Title) {
+		thread.Title = latestMeaningfulPrompt(thread.HistoryPrompts)
+	}
+	if !isMeaningfulPromptText(thread.Title) {
+		thread.Title = latestMeaningfulNativeLogText(thread.LogEntries)
+	}
+	if !isMeaningfulPromptText(thread.Title) {
+		thread.Title = strings.TrimSpace(thread.FirstUserMessage)
+	}
+	if !isMeaningfulPromptText(thread.Title) {
+		thread.Title = "Codex 会话"
+	}
+	return thread
+}
+
+func hydrateNativeThreadSummary(thread NativeThread) NativeThread {
+	thread.MirrorSessionID = MirrorSessionID(thread.ThreadID)
+	if !isMeaningfulPromptText(thread.Title) {
+		thread.Title = strings.TrimSpace(thread.FirstUserMessage)
+	}
+	if !isMeaningfulPromptText(thread.Title) {
+		thread.Title = "Codex 会话"
+	}
+	return thread
 }
 
 func loadRollout(path string) (nativeRolloutSnapshot, error) {
@@ -553,6 +616,15 @@ func loadRollout(path string) (nativeRolloutSnapshot, error) {
 	return snapshot, nil
 }
 
+func codexNativePaths() (string, string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", "", fmt.Errorf("resolve home dir failed: %w", err)
+	}
+	codexDir := filepath.Join(home, ".codex")
+	return filepath.Join(codexDir, "state_5.sqlite"), filepath.Join(codexDir, "history.jsonl"), nil
+}
+
 func appendNativeUserMessage(snapshot *nativeRolloutSnapshot, seen map[string]struct{}, message, timestamp string) {
 	message = strings.TrimSpace(message)
 	if message == "" {
@@ -621,68 +693,15 @@ func normalizePath(value string) string {
 	if trimmed == "" {
 		return ""
 	}
-	trimmed = trimWindowsDevicePathPrefix(trimmed)
 	absPath, err := filepath.Abs(trimmed)
 	if err == nil {
 		trimmed = absPath
 	}
 	if resolved, err := filepath.EvalSymlinks(trimmed); err == nil && strings.TrimSpace(resolved) != "" {
-		trimmed = trimWindowsDevicePathPrefix(resolved)
+		trimmed = resolved
 	}
 	cleaned := filepath.Clean(trimmed)
 	return strings.TrimSuffix(cleaned, string(filepath.Separator))
-}
-
-func candidateThreadCWDs(raw string) []string {
-	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" {
-		return nil
-	}
-	out := make([]string, 0, 5)
-	seen := map[string]struct{}{}
-	add := func(value string) {
-		normalized := normalizePath(value)
-		if normalized == "" {
-			return
-		}
-		if _, ok := seen[normalized]; ok {
-			return
-		}
-		seen[normalized] = struct{}{}
-		out = append(out, normalized)
-	}
-	add(trimmed)
-	add(trimWindowsDevicePathPrefix(trimmed))
-	if abs, err := filepath.Abs(trimWindowsDevicePathPrefix(trimmed)); err == nil {
-		add(abs)
-		if resolved, err := filepath.EvalSymlinks(abs); err == nil {
-			add(resolved)
-		}
-	}
-	if resolved, err := filepath.EvalSymlinks(trimWindowsDevicePathPrefix(trimmed)); err == nil {
-		add(resolved)
-	}
-	return out
-}
-
-func pathCandidateMatch(value string, candidates []string) bool {
-	for _, candidate := range candidates {
-		if value == candidate {
-			return true
-		}
-	}
-	return false
-}
-
-func trimWindowsDevicePathPrefix(value string) string {
-	trimmed := strings.TrimSpace(value)
-	if strings.HasPrefix(trimmed, `\\?\UNC\`) {
-		return `\\` + strings.TrimPrefix(trimmed, `\\?\UNC\`)
-	}
-	if strings.HasPrefix(trimmed, `\\?\`) {
-		return strings.TrimPrefix(trimmed, `\\?\`)
-	}
-	return trimmed
 }
 
 func latestMeaningfulPrompt(items []NativePrompt) string {

@@ -1,14 +1,15 @@
 package main
 
 import (
+	"context"
 	"embed"
 	"fmt"
 	"io/fs"
-	"mime"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"mobilevc/internal/config"
@@ -16,6 +17,9 @@ import (
 	"mobilevc/internal/gateway"
 	"mobilevc/internal/logx"
 	"mobilevc/internal/push"
+	"mobilevc/internal/relay"
+	"mobilevc/internal/relay/e2ee"
+	"mobilevc/internal/relayclient"
 	"mobilevc/internal/tts"
 )
 
@@ -35,7 +39,40 @@ var (
 func main() {
 	startedAt := time.Now()
 	defer logx.Recover("bootstrap", "server startup panic")
+	flags, err := parseServerFlags(os.Args[1:])
+	if err != nil {
+		panic(err)
+	}
+	if flags.showHelp {
+		return
+	}
+	cfg, sessionStore := bootstrap(flags.overrides)
+	summary := cfg.Summary()
+	addr := cfg.ListenAddress()
 
+	logConfigSummary(summary, cfg.AuthToken)
+	pushService := initPushService()
+	trustStore, err := relayDeviceTrustStore(cfg)
+	if err != nil {
+		logx.Error("bootstrap", "initialize relay device trust failed: %v", err)
+		panic(err)
+	}
+	nodeIdentityStore, err := relayNodeIdentityStore(cfg)
+	if err != nil {
+		logx.Error("bootstrap", "initialize relay node identity failed: %v", err)
+		panic(err)
+	}
+	wsHandler := initWebSocketHandler(cfg, sessionStore, pushService, trustStore, nodeIdentityStore)
+	if err := startRelayClient(cfg, wsHandler, trustStore, nodeIdentityStore); err != nil {
+		logx.Error("relay", "start relay client failed: %v", err)
+		panic(err)
+	}
+	ttsHandler := initTTSHandler(cfg)
+	mux := buildMux(cfg, wsHandler, ttsHandler)
+	startHTTPServer(addr, summary, mux, startedAt)
+}
+
+func bootstrap(overrides config.Overrides) (config.Config, *data.FileStore) {
 	logx.Info("bootstrap", "========================================")
 	logx.Info("bootstrap", "%s backend %s", appName, version)
 	logx.Info("bootstrap", "build metadata: commit=%s buildDate=%s", commit, buildDate)
@@ -43,18 +80,30 @@ func main() {
 	logx.Info("bootstrap", "Starting %s", appName)
 
 	logx.Info("bootstrap", "Loading configuration")
-	cfg, err := config.Load()
+	cfg, err := config.LoadWithOverrides(overrides)
 	if err != nil {
 		logx.Error("bootstrap", "load configuration failed: %v", err)
 		panic(err)
 	}
 
-	summary := cfg.Summary()
-	addr := ":" + cfg.Port
+	logx.Info("bootstrap", "Initializing session store")
+	sessionStore, err := data.NewFileStore("")
+	if err != nil {
+		logx.Error("bootstrap", "initialize session store failed: %v", err)
+		panic(err)
+	}
+	logx.Info("bootstrap", "Session store ready: driver=file dir=%s", sessionStore.BaseDir())
+	return cfg, sessionStore
+}
 
-	logx.Info("bootstrap", "Configuration summary: port=%s authToken=%s runtime.defaultCommand=%s runtime.defaultMode=%s runtime.debug=%v workspaceRoot=%s projection.enhanced=%v projection.step=%v projection.diff=%v projection.prompt=%v tts.enabled=%v tts.provider=%s tts.url=%s tts.timeout=%ds tts.maxTextLength=%d tts.format=%s",
+func logConfigSummary(summary config.Summary, authToken string) {
+	logx.Info("bootstrap", "Configuration summary: port=%s listen=%s exposureMode=%s authToken=%s relayMode=%v relayURL=%s runtime.defaultCommand=%s runtime.defaultMode=%s runtime.debug=%v workspaceRoot=%s projection.enhanced=%v projection.step=%v projection.diff=%v projection.prompt=%v tts.enabled=%v tts.provider=%s tts.url=%s tts.timeout=%ds tts.maxTextLength=%d tts.format=%s",
 		summary.Port,
-		logx.AuthTokenSummary(cfg.AuthToken),
+		summary.ListenAddress,
+		summary.ExposureMode,
+		logx.AuthTokenSummary(authToken),
+		summary.RelayMode,
+		fallback(summary.RelayURL, "-"),
 		summary.DefaultCommand,
 		summary.DefaultMode,
 		summary.Debug,
@@ -70,15 +119,9 @@ func main() {
 		summary.TTSMaxTextLength,
 		summary.TTSDefaultFormat,
 	)
+}
 
-	logx.Info("bootstrap", "Initializing session store")
-	sessionStore, err := data.NewFileStore("")
-	if err != nil {
-		logx.Error("bootstrap", "initialize session store failed: %v", err)
-		panic(err)
-	}
-	logx.Info("bootstrap", "Session store ready: driver=file dir=%s", sessionStore.BaseDir())
-
+func initPushService() push.Service {
 	logx.Info("bootstrap", "Initializing push service")
 	var pushService push.Service
 	apnsAuthKeyPath := os.Getenv("APNS_AUTH_KEY_PATH")
@@ -106,12 +149,103 @@ func main() {
 		logx.Info("bootstrap", "APNs not configured, push notifications disabled")
 		pushService = &push.NoopService{}
 	}
+	return pushService
+}
 
+func initWebSocketHandler(cfg config.Config, sessionStore *data.FileStore, pushService push.Service, trustStore *e2ee.DeviceTrustStore, nodeIdentityStore *e2ee.NodeIdentityStore) *gateway.Handler {
 	logx.Info("bootstrap", "Preparing websocket handler")
 	wsHandler := gateway.NewHandler(cfg.AuthToken, sessionStore)
 	wsHandler.PushService = pushService
+	if cfg.Relay.Enabled {
+		wsHandler.DeviceTrust = trustStore
+		wsHandler.NodeIdentity = nodeIdentityStore
+	}
 	logx.Info("bootstrap", "WebSocket handler ready")
+	return wsHandler
+}
 
+func relayDeviceTrustStore(cfg config.Config) (*e2ee.DeviceTrustStore, error) {
+	if !cfg.Relay.Enabled {
+		return nil, nil
+	}
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return nil, fmt.Errorf("resolve relay device trust home: %w", err)
+	}
+	return e2ee.LoadOrCreateDeviceTrustStore(e2ee.DefaultDeviceTrustPath(homeDir))
+}
+
+func relayNodeIdentityStore(cfg config.Config) (*e2ee.NodeIdentityStore, error) {
+	if !cfg.Relay.Enabled {
+		return nil, nil
+	}
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return nil, fmt.Errorf("resolve relay node identity home: %w", err)
+	}
+	return e2ee.LoadOrCreateNodeIdentityStore(e2ee.DefaultNodeIdentityPath(homeDir))
+}
+
+func startRelayClient(cfg config.Config, wsHandler *gateway.Handler, trustStore *e2ee.DeviceTrustStore, nodeIdentityStore *e2ee.NodeIdentityStore) error {
+	if !cfg.Relay.Enabled {
+		return nil
+	}
+	relayCfg, err := relayConfig(cfg, trustStore, nodeIdentityStore)
+	if err != nil {
+		return err
+	}
+	go func() {
+		err := relayclient.Run(context.Background(), relayCfg, wsHandler, relayclient.EmitPairingFile)
+		if err != nil {
+			logx.Error("relay", "relay client stopped: %v", err)
+		}
+	}()
+	return nil
+}
+
+func relayConfig(cfg config.Config, trustStore *e2ee.DeviceTrustStore, nodeIdentityStore *e2ee.NodeIdentityStore) (relayclient.Config, error) {
+	if nodeIdentityStore == nil {
+		return relayclient.Config{}, fmt.Errorf("relay node identity store is required")
+	}
+	identity, err := nodeIdentityStore.Current()
+	if err != nil {
+		return relayclient.Config{}, err
+	}
+	downloadRoot, err := relayclient.DefaultDownloadRoot(cfg.Runtime.WorkspaceRoot)
+	if err != nil {
+		return relayclient.Config{}, fmt.Errorf("resolve relay download root: %w", err)
+	}
+	selectedRoutes, err := localSelectedRoutePolicy(cfg)
+	if err != nil {
+		return relayclient.Config{}, err
+	}
+	return relayclient.Config{
+		RelayURL:           cfg.Relay.URL,
+		PairingTTL:         cfg.Relay.PairingTTL,
+		AgentGracePeriod:   cfg.Relay.AgentGracePeriod,
+		PairingEventPath:   cfg.Relay.PairingEventPath,
+		SessionStatePath:   cfg.Relay.SessionStatePath,
+		DownloadRoots:      []string{downloadRoot},
+		SelectedRoutes:     selectedRoutes,
+		Capabilities:       e2ee.ProductionCapabilities(),
+		NodeFingerprintHex: fmt.Sprintf("%x", identity.Fingerprint),
+		NodeIdentityStore:  nodeIdentityStore,
+		DeviceTrust:        trustStore,
+	}, nil
+}
+
+func localSelectedRoutePolicy(cfg config.Config) (relay.SelectedRoutePolicy, error) {
+	policy, err := relay.SelectedRoutePolicyFromAllowlists(
+		strings.TrimSpace(cfg.Relay.HTTPAllowlist),
+		strings.TrimSpace(cfg.Relay.WSAllowlist),
+	)
+	if err != nil {
+		return relay.SelectedRoutePolicy{}, fmt.Errorf("load relay selected route policy: %w", err)
+	}
+	return policy, nil
+}
+
+func initTTSHandler(cfg config.Config) *tts.HTTPHandler {
 	var ttsHandler *tts.HTTPHandler
 	if cfg.TTS.Enabled {
 		logx.Info("bootstrap", "Preparing TTS handler")
@@ -122,7 +256,10 @@ func main() {
 	} else {
 		logx.Info("bootstrap", "TTS handler disabled")
 	}
+	return ttsHandler
+}
 
+func buildMux(cfg config.Config, wsHandler *gateway.Handler, ttsHandler *tts.HTTPHandler) *http.ServeMux {
 	staticFS, err := fs.Sub(webAssets, "web")
 	if err != nil {
 		logx.Error("bootstrap", "prepare embedded web assets failed: %v", err)
@@ -141,36 +278,7 @@ func main() {
 		_, _ = fmt.Fprintf(w, "{\"version\":%q,\"commit\":%q,\"buildDate\":%q}", version, commit, buildDate)
 	})
 	mux.HandleFunc("/download", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Get("token") != cfg.AuthToken {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-		target := filepath.Clean(r.URL.Query().Get("path"))
-		if target == "" || target == "." {
-			http.Error(w, "path is required", http.StatusBadRequest)
-			return
-		}
-		absPath, err := filepath.Abs(target)
-		if err != nil {
-			http.Error(w, "invalid path", http.StatusBadRequest)
-			return
-		}
-		info, err := os.Stat(absPath)
-		if err != nil {
-			http.Error(w, "file not found", http.StatusNotFound)
-			return
-		}
-		if info.IsDir() {
-			http.Error(w, "path is a directory", http.StatusBadRequest)
-			return
-		}
-		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filepath.Base(absPath)))
-		if contentType := mime.TypeByExtension(filepath.Ext(absPath)); contentType != "" {
-			w.Header().Set("Content-Type", contentType)
-		} else {
-			w.Header().Set("Content-Type", "application/octet-stream")
-		}
-		http.ServeFile(w, r, absPath)
+		serveDownload(w, r, cfg.AuthToken)
 	})
 	if ttsHandler != nil {
 		mux.HandleFunc("/api/tts/synthesize", ttsHandler.HandleSynthesize)
@@ -188,7 +296,10 @@ func main() {
 		}
 		http.FileServer(http.FS(staticFS)).ServeHTTP(w, r)
 	})
+	return mux
+}
 
+func startHTTPServer(addr string, summary config.Summary, mux *http.ServeMux, startedAt time.Time) {
 	server := &http.Server{
 		Addr:    addr,
 		Handler: mux,
@@ -200,11 +311,12 @@ func main() {
 		logx.Error("bootstrap", "HTTP listen failed: %v", err)
 		panic(fmt.Errorf("listen tcp %s: %w", addr, err))
 	}
-	logx.Info("bootstrap", "Ready: addr=%s health=http://localhost%s/healthz version=http://localhost%s/version ws=ws://localhost%s/ws?token=<redacted> startup=%s",
+	logx.Info("bootstrap", "Ready: addr=%s exposureMode=%s health=%s version=%s ws=%s startup=%s",
 		addr,
-		addr,
-		addr,
-		addr,
+		summary.ExposureMode,
+		summary.HealthURL,
+		summary.VersionURL,
+		summary.WebSocketURL,
 		time.Since(startedAt).Round(time.Millisecond),
 	)
 
@@ -216,11 +328,4 @@ func main() {
 		logx.Error("bootstrap", "HTTP server stopped unexpectedly: %v", err)
 		panic(fmt.Errorf("serve http: %w", err))
 	}
-}
-
-func fallback(value, defaultValue string) string {
-	if value == "" {
-		return defaultValue
-	}
-	return value
 }

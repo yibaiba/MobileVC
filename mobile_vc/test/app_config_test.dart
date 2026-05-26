@@ -1,5 +1,6 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:mobile_vc/core/config/app_config.dart';
+import 'package:mobile_vc/core/config/relay_config.dart';
 
 void main() {
   group('AppConfig connection urls', () {
@@ -160,6 +161,247 @@ void main() {
       expect(
         () => config.wsUrlFor(secureTransport: false),
         throwsA(isA<FormatException>()),
+      );
+    });
+
+    test('relay pairing uri selects relay mode without changing direct fields',
+        () {
+      final config = AppConfig.fromLaunchUri(
+        'mobilevc://relay/v1?relay=wss%3A%2F%2Frelay.example.test&session=rs_test&secret=pair_secret&exp=1760000000&nodeFingerprint=$testNodeFingerprint',
+        fallback: const AppConfig(
+          host: '192.168.1.2',
+          port: '8001',
+          token: 'direct-token',
+        ),
+      );
+
+      expect(config, isNotNull);
+      expect(config!.isRelayMode, isTrue);
+      expect(config.host, '192.168.1.2');
+      expect(config.port, '8001');
+      expect(config.token, 'direct-token');
+      expect(config.relayUrl, 'wss://relay.example.test');
+      expect(config.relaySessionId, 'rs_test');
+      expect(config.relayPairingSecret, 'pair_secret');
+      expect(config.relayPairingExpiresAt, 1760000000);
+      expect(config.relayNodeFingerprintHex, testNodeFingerprint);
+    });
+
+    test('relay config persists reconnect fields but not pairing secret', () {
+      const config = AppConfig(
+        connectionMode: 'relay',
+        relayUrl: 'wss://relay.example.test',
+        relaySessionId: 'rs_test',
+        relayPairingSecret: 'pair_secret',
+        relayPairingExpiresAt: 1760000000,
+        relayClientId: 'rc_test',
+        relayClientReconnectSecret: 'reconnect_secret',
+        relayNodeFingerprintHex: testNodeFingerprint,
+      );
+
+      final json = config.toJson();
+      expect(json['relayUrl'], 'wss://relay.example.test');
+      expect(json['relaySessionId'], 'rs_test');
+      expect(json.containsKey('relayPairingSecret'), isFalse);
+      expect(json.containsKey('relayPairingExpiresAt'), isFalse);
+      expect(json['relayClientId'], 'rc_test');
+      expect(json['relayClientReconnectSecret'], 'reconnect_secret');
+      expect(json['relayNodeFingerprintHex'], testNodeFingerprint);
+
+      final restored = AppConfig.fromJson(json);
+      expect(restored.relaySessionId, 'rs_test');
+      expect(restored.relayClientId, 'rc_test');
+      expect(restored.relayClientReconnectSecret, 'reconnect_secret');
+      expect(restored.relayNodeFingerprintHex, testNodeFingerprint);
+    });
+
+    test('invalid persisted relay capabilities keep reconnect credentials', () {
+      final config = AppConfig.fromJson(const {
+        'connectionMode': 'relay',
+        'relayUrl': 'wss://relay.example.test',
+        'relaySessionId': 'rs_test',
+        'relayClientId': 'rc_test',
+        'relayClientReconnectSecret': 'reconnect_secret',
+        'relayNodeFingerprintHex': testNodeFingerprint,
+        'relayCapabilities': {
+          'relayProtocolVersion': 0,
+        },
+      });
+
+      expect(config.isRelayMode, isTrue);
+      expect(config.relayUrl, 'wss://relay.example.test');
+      expect(config.relaySessionId, 'rs_test');
+      expect(config.relayClientId, 'rc_test');
+      expect(config.relayClientReconnectSecret, 'reconnect_secret');
+      expect(config.relayNodeFingerprintHex, testNodeFingerprint);
+      config.relayCapabilities!.validateProduction();
+    });
+
+    test('same relay pairing import preserves existing reconnect credentials',
+        () {
+      final config = AppConfig.fromLaunchUri(
+        'mobilevc://relay/v1?relay=wss%3A%2F%2Frelay.example.test'
+        '&session=rs_test&secret=stale_pair_secret&exp=1760000000'
+        '&nodeFingerprint=$testNodeFingerprint',
+        fallback: const AppConfig(
+          connectionMode: 'relay',
+          relayUrl: 'wss://relay.example.test',
+          relaySessionId: 'rs_test',
+          relayClientId: 'rc_existing',
+          relayClientReconnectSecret: 'reconnect_existing',
+          relayNodeFingerprintHex: testNodeFingerprint,
+        ),
+      );
+
+      expect(config, isNotNull);
+      expect(config!.relayPairingSecret, isEmpty);
+      expect(config.relayPairingExpiresAt, 0);
+      expect(config.relayClientId, 'rc_existing');
+      expect(config.relayClientReconnectSecret, 'reconnect_existing');
+    });
+
+    test('relay url validation rejects public ws and http schemes', () {
+      expect(
+        () => AppConfig.fromLaunchUri(
+          'mobilevc://relay/v1?relay=ws%3A%2F%2Frelay.example.test&session=rs&secret=secret&nodeFingerprint=$testNodeFingerprint',
+        ),
+        throwsFormatException,
+      );
+      expect(
+        () => AppConfig.fromLaunchUri(
+          'mobilevc://relay/v1?relay=https%3A%2F%2Frelay.example.test&session=rs&secret=secret&nodeFingerprint=$testNodeFingerprint',
+        ),
+        throwsFormatException,
+      );
+    });
+
+    test('relay pairing uri validates capability hints', () {
+      final pairing = parseRelayPairingUri(
+        'mobilevc://relay/v1?relay=wss%3A%2F%2Frelay.example.test'
+        '&session=rs_test&secret=pair_secret&exp=1760000000'
+        '&nodeFingerprint=$testNodeFingerprint'
+        '&relayProtocolVersion=1&e2eeProtocolVersion=1'
+        '&cryptoSuite=p256-ecdsa%2Bp256-ecdh%2Bhkdf-sha256%2Baes-256-gcm'
+        '&tunnelProtocolVersion=1&supportsMultiplexStreams=true'
+        '&supportsFileDownloadStream=true&supportsDeviceManagement=true'
+        '&requiresE2EE=false&plaintextTestMode=true',
+      );
+
+      expect(pairing, isNotNull);
+      final parsedPairing = pairing!;
+      expect(parsedPairing.nodeFingerprintHex, testNodeFingerprint);
+      expect(parsedPairing.capabilities, isNotNull);
+      parsedPairing.capabilities!.validatePlaintextTestMode();
+    });
+
+    test('relay capability hints are stored as non-secret config', () {
+      final config = AppConfig.fromLaunchUri(
+        'mobilevc://relay/v1?relay=wss%3A%2F%2Frelay.example.test'
+        '&session=rs_test&secret=pair_secret&exp=1760000000'
+        '&nodeFingerprint=$testNodeFingerprint'
+        '&relayProtocolVersion=1&e2eeProtocolVersion=1'
+        '&cryptoSuite=p256-ecdsa%2Bp256-ecdh%2Bhkdf-sha256%2Baes-256-gcm'
+        '&tunnelProtocolVersion=1&supportsMultiplexStreams=true'
+        '&supportsFileDownloadStream=true&supportsDeviceManagement=true'
+        '&requiresE2EE=true&plaintextTestMode=false',
+      );
+
+      expect(config, isNotNull);
+      config!.relayCapabilities!.validateProduction();
+      final json = config.toJson();
+      expect(json.containsKey('relayPairingSecret'), isFalse);
+      expect(json['relayCapabilities'], isA<Map<String, Object>>());
+      final restored = AppConfig.fromJson(json);
+      restored.relayCapabilities!.validateProduction();
+    });
+
+    test('relay pairing uri rejects invalid capability hints', () {
+      expect(
+        () => parseRelayPairingUri(
+          'mobilevc://relay/v1?relay=wss%3A%2F%2Frelay.example.test'
+          '&session=rs_test&secret=pair_secret'
+          '&nodeFingerprint=$testNodeFingerprint'
+          '&relayProtocolVersion=1&e2eeProtocolVersion=1'
+          '&cryptoSuite=p256-ecdsa%2Bp256-ecdh%2Bhkdf-sha256%2Baes-256-gcm'
+          '&tunnelProtocolVersion=1&supportsMultiplexStreams=true'
+          '&supportsFileDownloadStream=true&supportsDeviceManagement=true'
+          '&requiresE2EE=true&plaintextTestMode=true',
+        ),
+        throwsArgumentError,
+      );
+    });
+
+    test('relay pairing uri requires node fingerprint', () {
+      expect(
+        () => parseRelayPairingUri(
+          'mobilevc://relay/v1?relay=wss%3A%2F%2Frelay.example.test'
+          '&session=rs_test&secret=pair_secret',
+        ),
+        throwsFormatException,
+      );
+    });
+
+    test('relay pairing uri reports specific missing fields', () {
+      expect(
+        () => parseRelayPairingUri('mobilevc://relay/v1'),
+        throwsA(
+          isA<FormatException>().having(
+            (error) => error.message,
+            'message',
+            contains('relay, session, secret'),
+          ),
+        ),
+      );
+    });
+
+    test('relay pairing event json imports as relay config', () {
+      final config = AppConfig.fromLaunchUri(
+        '''
+{
+  "type": "mobilevc.relay.pairing_ready",
+  "relayUrl": "wss://relay.example.test",
+  "sessionId": "rs_json",
+  "pairingSecret": "pair_secret",
+  "expiresAt": 1760000000,
+  "nodeFingerprintHex": "$testNodeFingerprint",
+  "capabilities": {
+    "relayProtocolVersion": 1,
+    "e2eeProtocolVersion": 1,
+    "cryptoSuite": "p256-ecdsa+p256-ecdh+hkdf-sha256+aes-256-gcm",
+    "tunnelProtocolVersion": 1,
+    "supportsMultiplexStreams": true,
+    "supportsFileDownloadStream": true,
+    "supportsDeviceManagement": true,
+    "requiresE2EE": true,
+    "plaintextTestMode": false
+  }
+}
+''',
+      );
+
+      expect(config, isNotNull);
+      expect(config!.isRelayMode, isTrue);
+      expect(config.relayUrl, 'wss://relay.example.test');
+      expect(config.relaySessionId, 'rs_json');
+      expect(config.relayPairingSecret, 'pair_secret');
+      expect(config.relayNodeFingerprintHex, testNodeFingerprint);
+      config.relayCapabilities!.validateProduction();
+    });
+
+    test('relay pairing uri rejects redacted secret', () {
+      expect(
+        () => parseRelayPairingUri(
+          'mobilevc://relay/v1?relay=wss%3A%2F%2Frelay.example.test'
+          '&session=rs_test&secret=%3Credacted%3E'
+          '&nodeFingerprint=$testNodeFingerprint',
+        ),
+        throwsA(
+          isA<FormatException>().having(
+            (error) => error.message,
+            'message',
+            contains('secret is redacted'),
+          ),
+        ),
       );
     });
   });
@@ -330,3 +572,6 @@ void main() {
     });
   });
 }
+
+const testNodeFingerprint =
+    '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';

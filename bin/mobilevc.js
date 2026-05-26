@@ -17,6 +17,8 @@ const CONFIG_PATH = path.join(STATE_DIR, 'config.json');
 const STATE_PATH = path.join(STATE_DIR, 'state.json');
 const DEFAULT_PORT = '8001';
 const DEFAULT_LANGUAGE = 'zh';
+const DEFAULT_RELAY_URL = 'ws://127.0.0.1:9000';
+const RELAY_PAIRING_EVENT_PREFIX = 'mobilevc-relay-pairing-';
 
 const PLATFORM_PACKAGES = {
   'darwin-arm64': '@justprove/mobilevc-server-darwin-arm64',
@@ -33,6 +35,9 @@ const MESSAGES = {
       '用法：',
       '  mobilevc           交互式配置并启动 MobileVC 后端',
       '  mobilevc start     启动 MobileVC 后端（默认）',
+      '  mobilevc public --relay wss://relay.example.com  保存并启动 LAN + Relay 模式',
+      '  mobilevc public --relay wss://relay.example.com --network-exposure-mode relay-only  仅开放 Relay',
+      '  mobilevc public    使用已保存 Relay，或本地开发 Relay',
       '  mobilevc restart   重启 MobileVC 后端',
       '  mobilevc stop      停止已保存的后端进程',
       '  mobilevc status    查看保存的状态和健康检查',
@@ -81,6 +86,12 @@ const MESSAGES = {
     binaryNotExecutable: (filePath) => `server binary 不可执行：${filePath}`,
     homeNotWritable: (homePath) => `HOME 不可写：${homePath}`,
     authTokenMissing: '未配置 AUTH_TOKEN，请先运行 mobilevc config',
+    relayURLInvalid: (detail) => `Relay URL 无效：${detail}`,
+    relayPairingTimedOut: (filePath) => `Relay 配对信息未就绪，请检查日志：${filePath}`,
+    relayQrTitle: '扫码连接 MobileVC Relay',
+    relayQrHint: '二维码包含一次性配对 secret，请在过期前使用',
+    relayAccess: 'Relay 连接',
+    relayLanAccess: '局域网直连仍可用',
     aiCliMissing: '当前启动器未检测到可用的 Claude/Codex CLI；请确认 claude 或 codex 命令可在终端中直接执行。',
     portInUse: (port) => `端口 ${port} 已被其他进程占用`,
     startupFailed: '启动失败，请检查日志和 preflight 提示',
@@ -94,6 +105,9 @@ const MESSAGES = {
       'Usage:',
       '  mobilevc           Configure interactively and start the MobileVC backend',
       '  mobilevc start     Start the MobileVC backend (default)',
+      '  mobilevc public --relay wss://relay.example.com  Save and start LAN + Relay mode',
+      '  mobilevc public --relay wss://relay.example.com --network-exposure-mode relay-only  Relay-only exposure',
+      '  mobilevc public    Start with the saved Relay, or the local development Relay',
       '  mobilevc restart   Restart the MobileVC backend',
       '  mobilevc stop      Stop the saved backend process',
       '  mobilevc status    Show saved launcher state and health',
@@ -142,6 +156,12 @@ const MESSAGES = {
     binaryNotExecutable: (filePath) => `Server binary is not executable: ${filePath}`,
     homeNotWritable: (homePath) => `HOME is not writable: ${homePath}`,
     authTokenMissing: 'AUTH_TOKEN is missing. Run mobilevc config first.',
+    relayURLInvalid: (detail) => `Invalid relay URL: ${detail}`,
+    relayPairingTimedOut: (filePath) => `Relay pairing data was not ready. Check the log: ${filePath}`,
+    relayQrTitle: 'Scan to connect MobileVC Relay',
+    relayQrHint: 'The QR contains a one-time pairing secret. Use it before it expires.',
+    relayAccess: 'Relay access',
+    relayLanAccess: 'LAN direct access is still available',
     aiCliMissing: 'The launcher could not find Claude/Codex CLI. Make sure `claude` or `codex` runs directly in your terminal.',
     portInUse: (port) => `Port ${port} is already in use`,
     startupFailed: 'Startup failed. Check the log and preflight output.',
@@ -184,6 +204,11 @@ function main() {
     return;
   }
 
+  if (command === 'public') {
+    runPublic(options).catch(exitWithError);
+    return;
+  }
+
   if (command === 'start') {
     runStart(options).catch(exitWithError);
     return;
@@ -195,7 +220,12 @@ function main() {
 function parseInvocation(args) {
   const hasExplicitCommand = Boolean(args[0] && !args[0].startsWith('-'));
   const command = hasExplicitCommand ? args[0] : 'start';
-  const options = parseOptions(args.slice(hasExplicitCommand ? 1 : 0));
+  const optionArgs = args.slice(hasExplicitCommand ? 1 : 0);
+  const options = parseOptions(optionArgs);
+  if (command === 'public' && optionArgs[0] && !optionArgs[0].startsWith('-')) {
+    options.public = true;
+    options.relay = optionArgs[0];
+  }
   if (!hasExplicitCommand) {
     options.guided = true;
   }
@@ -203,13 +233,50 @@ function parseInvocation(args) {
 }
 
 function parseOptions(args) {
-  const options = { help: false, follow: false, guided: false };
+  const options = {
+    help: false,
+    follow: false,
+    guided: false,
+    public: false,
+    relay: '',
+    networkExposureMode: '',
+  };
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];
     if (arg === '--help' || arg === '-h') options.help = true;
     else if (arg === '--follow' || arg === '-f') options.follow = true;
+    else if (arg === '--relay') {
+      i += 1;
+      if (!args[i]) {
+        throw new Error('--relay requires a value');
+      }
+      options.relay = args[i];
+    } else if (arg.startsWith('--relay=')) {
+      options.relay = arg.slice('--relay='.length);
+    } else if (arg === '--network-exposure-mode') {
+      i += 1;
+      if (!args[i]) {
+        throw new Error('--network-exposure-mode requires a value');
+      }
+      options.networkExposureMode = normalizeNetworkExposureModeOption(args[i]);
+    } else if (arg.startsWith('--network-exposure-mode=')) {
+      options.networkExposureMode = normalizeNetworkExposureModeOption(
+        arg.slice('--network-exposure-mode='.length),
+      );
+    }
   }
   return options;
+}
+
+function normalizeNetworkExposureModeOption(raw) {
+  const value = String(raw || '').trim().toLowerCase();
+  if (value === '' || value === 'lan' || value === 'lan-enabled') {
+    return 'lan';
+  }
+  if (value === 'relay' || value === 'relay-only') {
+    return 'relay-only';
+  }
+  throw new Error('--network-exposure-mode must be lan or relay-only');
 }
 
 function printHelp() {
@@ -245,9 +312,10 @@ async function runStart(options = {}) {
   }
 
   const language = config?.language || DEFAULT_LANGUAGE;
+  const relayAccess = buildRelayAccessConfig(config, options);
   const existingState = readJson(STATE_PATH, null);
   if (existingState?.pid && isPidAlive(existingState.pid)) {
-    if (isStateConfigMatch(existingState, config)) {
+    if (isStateConfigMatch(existingState, config, relayAccess)) {
       console.log(message(language, 'alreadyRunning', existingState.pid, existingState.port));
       if (options.guided) {
         await printLanQr(language, existingState.port, existingState.authToken, process.cwd());
@@ -269,6 +337,7 @@ async function runStart(options = {}) {
   }
 
   const logPath = path.join(LOG_DIR, `mobilevc-${timestampForFile()}.log`);
+  const pairingEventPath = relayAccess.enabled ? createRelayPairingEventPath() : '';
   fs.writeFileSync(logPath, '', { mode: 0o600 });
   try {
     fs.chmodSync(logPath, 0o600);
@@ -279,7 +348,11 @@ async function runStart(options = {}) {
     PORT: String(config.port),
     AUTH_TOKEN: String(config.authToken),
     RUNTIME_WORKSPACE_ROOT: process.cwd(),
+    ...relayAccess.env,
   };
+  if (relayAccess.enabled) {
+    env.RELAY_PAIRING_EVENT_PATH = pairingEventPath;
+  }
 
   fs.appendFileSync(logPath, `launcher starting binary=${binaryInfo.binaryPath} target=${platformTarget}\n`);
   const logFd = fs.openSync(logPath, 'a');
@@ -301,7 +374,19 @@ async function runStart(options = {}) {
       await waitForExit(child.pid, 2000);
     }
     clearState();
+    removeRelayPairingEventFile(pairingEventPath);
     throw new Error(formatStartupFailure(language, startup, logPath));
+  }
+
+  const pairing = relayAccess.enabled ? await waitForRelayPairing(pairingEventPath, 10000) : null;
+  if (relayAccess.enabled && !pairing) {
+    if (child.pid && isPidAlive(child.pid)) {
+      killProcessGroup(child.pid, 'SIGTERM');
+      await waitForExit(child.pid, 2000);
+    }
+    clearState();
+    removeRelayPairingEventFile(pairingEventPath);
+    throw new Error(message(language, 'relayPairingTimedOut', logPath));
   }
 
   const state = {
@@ -310,6 +395,9 @@ async function runStart(options = {}) {
     startedAt: new Date().toISOString(),
     serverVersion: formatVersionInfo(startup.versionInfo),
     serverVersionRaw: startup.versionInfo,
+    relayMode: relayAccess.enabled,
+    relayUrl: relayAccess.url || '',
+    networkExposureMode: relayAccess.networkExposureMode || '',
   };
   writeJson(STATE_PATH, state);
 
@@ -320,7 +408,31 @@ async function runStart(options = {}) {
   if (!await checkHealth(state.port)) {
     throw new Error(message(language, 'startupFailed'));
   }
-  await printLanQr(language, state.port, state.authToken, state.cwd || process.cwd());
+  if (relayAccess.enabled) {
+    if (relayAccess.networkExposureMode === 'lan') {
+      await printLanQr(language, state.port, state.authToken, state.cwd || process.cwd());
+      console.log('');
+      console.log(message(language, 'relayLanAccess'));
+    }
+    printRelayQr(language, pairing);
+  } else {
+    await printLanQr(language, state.port, state.authToken, state.cwd || process.cwd());
+  }
+}
+
+async function runPublic(options = {}) {
+  ensureDir(STATE_DIR, 0o700);
+  ensureDir(LOG_DIR, 0o700);
+
+  let config = readJson(CONFIG_PATH, null);
+  if (!config) {
+    await runSetup(true);
+    config = readJson(CONFIG_PATH, null);
+  }
+  const relayUrl = resolveRelayURL(config, options);
+  assertValidRelayURL(relayUrl);
+  writeJson(CONFIG_PATH, { ...config, relayUrl });
+  await runStart({ ...options, public: false, relay: relayUrl });
 }
 
 async function runStatus() {
@@ -534,6 +646,177 @@ function formatList(items, language) {
     return message(language, 'preflightOk');
   }
   return items.join(' | ');
+}
+
+function buildRelayAccessConfig(config, options) {
+  const url = String(options.relay || '').trim();
+  if (!url) {
+    return { enabled: false, env: {}, url: '', networkExposureMode: '' };
+  }
+  assertValidRelayURL(url);
+  const networkExposureMode = options.networkExposureMode || 'lan';
+  return {
+    enabled: true,
+    url,
+    networkExposureMode,
+    env: {
+      RELAY_MODE: 'true',
+      RELAY_URL: url,
+      NETWORK_EXPOSURE_MODE: networkExposureMode,
+    },
+  };
+}
+
+function resolveRelayURL(config, options) {
+  return String(options.relay || config.relayUrl || DEFAULT_RELAY_URL).trim();
+}
+
+function assertValidRelayURL(raw) {
+  const url = new URL(String(raw || '').trim());
+  if (url.protocol === 'wss:') {
+    validateRelayURLShape(url);
+    return;
+  }
+  if (url.protocol !== 'ws:') {
+    throw new Error(message(DEFAULT_LANGUAGE, 'relayURLInvalid', 'must use ws:// or wss://'));
+  }
+  validateRelayURLShape(url);
+  if (!isDevelopmentRelayHost(url.hostname)) {
+    throw new Error(message(DEFAULT_LANGUAGE, 'relayURLInvalid', 'ws:// is only allowed for loopback or LAN hosts'));
+  }
+}
+
+function validateRelayURLShape(url) {
+  if (!url.hostname || url.username || url.password) {
+    throw new Error(message(DEFAULT_LANGUAGE, 'relayURLInvalid', 'expected scheme://host[:port]'));
+  }
+  if (url.pathname !== '/' || url.search || url.hash) {
+    throw new Error(message(DEFAULT_LANGUAGE, 'relayURLInvalid', 'path, query, and fragment are not allowed'));
+  }
+}
+
+function isDevelopmentRelayHost(host) {
+  const normalized = String(host || '').toLowerCase();
+  if (normalized === 'localhost') {
+    return true;
+  }
+  if (net.isIP(normalized) === 0) {
+    return false;
+  }
+  if (normalized === '127.0.0.1' || normalized === '::1') {
+    return true;
+  }
+  return isPrivateIPv4(normalized) || normalized.startsWith('fc') || normalized.startsWith('fd') || normalized.startsWith('fe80');
+}
+
+function isPrivateIPv4(host) {
+  const parts = host.split('.').map((part) => Number(part));
+  if (parts.length !== 4 || parts.some((part) => Number.isNaN(part))) {
+    return false;
+  }
+  return parts[0] === 10 ||
+    (parts[0] === 192 && parts[1] === 168) ||
+    (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31);
+}
+
+function createRelayPairingEventPath() {
+  const suffix = `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return path.join(STATE_DIR, `${RELAY_PAIRING_EVENT_PREFIX}${suffix}.json`);
+}
+
+function waitForRelayPairing(eventPath, timeoutMs) {
+  return new Promise((resolve) => {
+    const started = Date.now();
+    const timer = setInterval(() => {
+      const pairing = readRelayPairingEventFile(eventPath);
+      if (pairing) {
+        clearInterval(timer);
+        removeRelayPairingEventFile(eventPath);
+        resolve(pairing);
+        return;
+      }
+      if (Date.now() - started >= timeoutMs) {
+        clearInterval(timer);
+        resolve(null);
+      }
+    }, 250);
+  });
+}
+
+function readRelayPairingEventFile(eventPath) {
+  if (!eventPath || !fs.existsSync(eventPath)) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(fs.readFileSync(eventPath, 'utf8'));
+    if (parsed.type === 'mobilevc.relay.pairing_ready') {
+      return parsed;
+    }
+  } catch (_) {
+    return null;
+  }
+  return null;
+}
+
+function removeRelayPairingEventFile(eventPath) {
+  if (!eventPath) {
+    return;
+  }
+  try {
+    fs.unlinkSync(eventPath);
+  } catch (_) {}
+}
+
+function printRelayQr(language, pairing) {
+  const uri = buildRelayPairingUri(pairing);
+  console.log('');
+  console.log(`${message(language, 'relayAccess')}: ${redactRelaySecret(uri)}`);
+  console.log('');
+  console.log(message(language, 'relayQrTitle'));
+  renderTerminalQr(uri);
+  console.log(message(language, 'relayQrHint'));
+}
+
+function buildRelayPairingUri(pairing) {
+  const uri = new URL('mobilevc://relay/v1');
+  uri.searchParams.set('relay', pairing.relayUrl);
+  uri.searchParams.set('session', pairing.sessionId);
+  uri.searchParams.set('secret', pairing.pairingSecret);
+  uri.searchParams.set('exp', String(pairing.expiresAt));
+  if (pairing.nodeFingerprintHex) {
+    uri.searchParams.set('nodeFingerprint', pairing.nodeFingerprintHex);
+  }
+  appendRelayCapabilityParams(uri, pairing.capabilities);
+  return uri.toString();
+}
+
+function appendRelayCapabilityParams(uri, capabilities) {
+  if (!capabilities || typeof capabilities !== 'object') {
+    return;
+  }
+  for (const key of [
+    'relayProtocolVersion',
+    'e2eeProtocolVersion',
+    'cryptoSuite',
+    'tunnelProtocolVersion',
+    'supportsMultiplexStreams',
+    'supportsFileDownloadStream',
+    'supportsDeviceManagement',
+    'requiresE2EE',
+    'plaintextTestMode',
+  ]) {
+    if (Object.prototype.hasOwnProperty.call(capabilities, key)) {
+      uri.searchParams.set(key, String(capabilities[key]));
+    }
+  }
+}
+
+function redactRelaySecret(rawUri) {
+  const uri = new URL(rawUri);
+  if (uri.searchParams.has('secret')) {
+    uri.searchParams.set('secret', '<redacted>');
+  }
+  return uri.toString();
 }
 
 function buildStateSkeleton(config, language, binaryInfo, platformTarget, preflight, logPath) {
@@ -883,9 +1166,16 @@ function buildLaunchUrl(host, port, authToken = '', cwd = '') {
   return url.toString();
 }
 
-function isStateConfigMatch(state, config) {
+function isStateConfigMatch(
+  state,
+  config,
+  relayAccess = { enabled: false, url: '', networkExposureMode: '' },
+) {
   return String(state?.port || '') === String(config?.port || '') &&
-    String(state?.authToken || '') === String(config?.authToken || '');
+    String(state?.authToken || '') === String(config?.authToken || '') &&
+    Boolean(state?.relayMode) === Boolean(relayAccess.enabled) &&
+    String(state?.relayUrl || '') === String(relayAccess.url || '') &&
+    String(state?.networkExposureMode || '') === String(relayAccess.networkExposureMode || '');
 }
 
 function formatStartupFailure(language, startup, logPath) {
@@ -1083,7 +1373,12 @@ if (require.main === module) {
 } else {
   module.exports = {
     buildLaunchUrl,
+    assertValidRelayURL,
+    buildRelayAccessConfig,
+    buildRelayPairingUri,
+    readRelayPairingEventFile,
     isPortOccupied,
+    removeRelayPairingEventFile,
     parseInvocation,
     resolveBinaryInfo,
     resolveBundledPackageRoot,

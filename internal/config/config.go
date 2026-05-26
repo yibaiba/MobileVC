@@ -2,10 +2,20 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
-	"strconv"
 	"strings"
+	"time"
 )
+
+const (
+	ExposureModeLAN       = "lan"
+	ExposureModeRelayOnly = "relay-only"
+)
+
+type NetworkConfig struct {
+	ExposureMode string
+}
 
 type RuntimeConfig struct {
 	DefaultCommand         string
@@ -27,11 +37,38 @@ type TTSConfig struct {
 	DefaultFormat         string
 }
 
+type RelayConfig struct {
+	Enabled          bool
+	URL              string
+	PairingTTL       time.Duration
+	AgentGracePeriod time.Duration
+	PairingEventPath string
+	SessionStatePath string
+	HTTPAllowlist    string
+	WSAllowlist      string
+}
+
+type Overrides struct {
+	Port                string
+	AuthToken           string
+	NetworkExposureMode string
+	RelayMode           *bool
+	RelayURL            string
+	RelayPairingTTL     time.Duration
+	RelayAgentGrace     time.Duration
+	RelayPairingPath    string
+	RelaySessionPath    string
+	RelayHTTPAllowlist  string
+	RelayWSAllowlist    string
+}
+
 type Config struct {
 	Port      string
 	AuthToken string
+	Network   NetworkConfig
 	Runtime   RuntimeConfig
 	TTS       TTSConfig
+	Relay     RelayConfig
 }
 
 type Summary struct {
@@ -51,31 +88,33 @@ type Summary struct {
 	TTSRequestTimeout      int
 	TTSMaxTextLength       int
 	TTSDefaultFormat       string
+	RelayMode              bool
+	RelayURL               string
+	ExposureMode           string
+	ListenAddress          string
+	HealthURL              string
+	VersionURL             string
+	WebSocketURL           string
 }
 
 func Load() (Config, error) {
+	return LoadWithOverrides(Overrides{})
+}
+
+func LoadWithOverrides(overrides Overrides) (Config, error) {
+	relayCfg, err := loadRelayConfig()
+	if err != nil {
+		return Config{}, err
+	}
 	cfg := Config{
 		Port:      getEnv("PORT", "8001"),
 		AuthToken: os.Getenv("AUTH_TOKEN"),
-		Runtime: RuntimeConfig{
-			DefaultCommand:         getEnv("RUNTIME_DEFAULT_COMMAND", "claude"),
-			DefaultMode:            getEnv("RUNTIME_DEFAULT_MODE", "pty"),
-			Debug:                  getEnvBool("RUNTIME_DEBUG", false),
-			WorkspaceRoot:          strings.TrimSpace(os.Getenv("RUNTIME_WORKSPACE_ROOT")),
-			EnhancedProjection:     getEnvBool("RUNTIME_ENHANCED_PROJECTION", true),
-			EnableStepProjection:   getEnvBool("RUNTIME_ENABLE_STEP_PROJECTION", true),
-			EnableDiffProjection:   getEnvBool("RUNTIME_ENABLE_DIFF_PROJECTION", true),
-			EnablePromptProjection: getEnvBool("RUNTIME_ENABLE_PROMPT_PROJECTION", true),
-		},
-		TTS: TTSConfig{
-			Enabled:               getEnvBool("TTS_ENABLED", false),
-			Provider:              strings.TrimSpace(getEnv("TTS_PROVIDER", "chattts-http")),
-			PythonServiceURL:      strings.TrimSpace(getEnv("TTS_PYTHON_SERVICE_URL", "http://127.0.0.1:9966")),
-			RequestTimeoutSeconds: getEnvInt("TTS_REQUEST_TIMEOUT_SECONDS", 30),
-			MaxTextLength:         getEnvInt("TTS_MAX_TEXT_LENGTH", 200),
-			DefaultFormat:         strings.TrimSpace(getEnv("TTS_DEFAULT_FORMAT", "wav")),
-		},
+		Network:   loadNetworkConfig(),
+		Runtime:   loadRuntimeConfig(),
+		TTS:       loadTTSConfig(),
+		Relay:     relayCfg,
 	}
+	applyOverrides(&cfg, overrides)
 
 	if cfg.AuthToken == "" {
 		return Config{}, fmt.Errorf("AUTH_TOKEN is required")
@@ -83,8 +122,77 @@ func Load() (Config, error) {
 	if err := cfg.validateTTS(); err != nil {
 		return Config{}, err
 	}
+	if err := cfg.validateRelay(); err != nil {
+		return Config{}, err
+	}
+	if err := cfg.validateNetwork(); err != nil {
+		return Config{}, err
+	}
 
 	return cfg, nil
+}
+
+func applyOverrides(cfg *Config, overrides Overrides) {
+	if strings.TrimSpace(overrides.Port) != "" {
+		cfg.Port = strings.TrimSpace(overrides.Port)
+	}
+	if strings.TrimSpace(overrides.AuthToken) != "" {
+		cfg.AuthToken = overrides.AuthToken
+	}
+	if strings.TrimSpace(overrides.NetworkExposureMode) != "" {
+		cfg.Network.ExposureMode = normalizeExposureMode(overrides.NetworkExposureMode)
+	}
+	if overrides.RelayMode != nil {
+		cfg.Relay.Enabled = *overrides.RelayMode
+	}
+	if strings.TrimSpace(overrides.RelayURL) != "" {
+		cfg.Relay.URL = strings.TrimSpace(overrides.RelayURL)
+	}
+	if overrides.RelayPairingTTL > 0 {
+		cfg.Relay.PairingTTL = overrides.RelayPairingTTL
+	}
+	if overrides.RelayAgentGrace > 0 {
+		cfg.Relay.AgentGracePeriod = overrides.RelayAgentGrace
+	}
+	if strings.TrimSpace(overrides.RelayPairingPath) != "" {
+		cfg.Relay.PairingEventPath = strings.TrimSpace(overrides.RelayPairingPath)
+	}
+	if strings.TrimSpace(overrides.RelaySessionPath) != "" {
+		cfg.Relay.SessionStatePath = strings.TrimSpace(overrides.RelaySessionPath)
+	}
+	if strings.TrimSpace(overrides.RelayHTTPAllowlist) != "" {
+		cfg.Relay.HTTPAllowlist = strings.TrimSpace(overrides.RelayHTTPAllowlist)
+	}
+	if strings.TrimSpace(overrides.RelayWSAllowlist) != "" {
+		cfg.Relay.WSAllowlist = strings.TrimSpace(overrides.RelayWSAllowlist)
+	}
+}
+
+func (c Config) ListenAddress() string {
+	host := ""
+	if c.Network.ExposureMode == ExposureModeRelayOnly {
+		host = "127.0.0.1"
+	}
+	return net.JoinHostPort(host, c.Port)
+}
+
+func (c Config) LocalEndpointHostPort() string {
+	if c.Network.ExposureMode == ExposureModeRelayOnly {
+		return c.ListenAddress()
+	}
+	return net.JoinHostPort("localhost", c.Port)
+}
+
+func (c Config) HealthURL() string {
+	return "http://" + c.LocalEndpointHostPort() + "/healthz"
+}
+
+func (c Config) VersionURL() string {
+	return "http://" + c.LocalEndpointHostPort() + "/version"
+}
+
+func (c Config) WebSocketURL() string {
+	return "ws://" + c.LocalEndpointHostPort() + "/ws?token=<redacted>"
 }
 
 func (c Config) Summary() Summary {
@@ -105,61 +213,12 @@ func (c Config) Summary() Summary {
 		TTSRequestTimeout:      c.TTS.RequestTimeoutSeconds,
 		TTSMaxTextLength:       c.TTS.MaxTextLength,
 		TTSDefaultFormat:       c.TTS.DefaultFormat,
+		RelayMode:              c.Relay.Enabled,
+		RelayURL:               c.Relay.URL,
+		ExposureMode:           c.Network.ExposureMode,
+		ListenAddress:          c.ListenAddress(),
+		HealthURL:              c.HealthURL(),
+		VersionURL:             c.VersionURL(),
+		WebSocketURL:           c.WebSocketURL(),
 	}
-}
-
-func (c Config) validateTTS() error {
-	if !c.TTS.Enabled {
-		return nil
-	}
-	if c.TTS.Provider != "chattts-http" {
-		return fmt.Errorf("TTS_PROVIDER must be chattts-http")
-	}
-	if strings.TrimSpace(c.TTS.PythonServiceURL) == "" {
-		return fmt.Errorf("TTS_PYTHON_SERVICE_URL is required when TTS is enabled")
-	}
-	if c.TTS.RequestTimeoutSeconds <= 0 {
-		return fmt.Errorf("TTS_REQUEST_TIMEOUT_SECONDS must be greater than 0")
-	}
-	if c.TTS.MaxTextLength <= 0 {
-		return fmt.Errorf("TTS_MAX_TEXT_LENGTH must be greater than 0")
-	}
-	if strings.ToLower(strings.TrimSpace(c.TTS.DefaultFormat)) != "wav" {
-		return fmt.Errorf("TTS_DEFAULT_FORMAT must be wav")
-	}
-	return nil
-}
-
-func getEnv(key, fallback string) string {
-	if value := os.Getenv(key); value != "" {
-		return value
-	}
-	return fallback
-}
-
-func getEnvBool(key string, fallback bool) bool {
-	value := strings.TrimSpace(os.Getenv(key))
-	if value == "" {
-		return fallback
-	}
-	switch strings.ToLower(value) {
-	case "1", "true", "yes", "on":
-		return true
-	case "0", "false", "no", "off":
-		return false
-	default:
-		return fallback
-	}
-}
-
-func getEnvInt(key string, fallback int) int {
-	value := strings.TrimSpace(os.Getenv(key))
-	if value == "" {
-		return fallback
-	}
-	parsed, err := strconv.Atoi(value)
-	if err != nil {
-		return fallback
-	}
-	return parsed
 }

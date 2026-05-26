@@ -361,7 +361,14 @@ func SessionDeltaEventFromRecord(record data.SessionRecord, known protocol.Sessi
 		rawTerminalByStream["stderr"] = stderr[stderrStart:]
 	}
 
-	executions := protocolTerminalExecutions(projection.TerminalExecutions)
+	allExecutions := protocolTerminalExecutions(projection.TerminalExecutions)
+	executions, terminalExecutionReset := terminalExecutionsForDelta(terminalExecutionDeltaInput{
+		all:                   allExecutions,
+		knownCount:            known.TerminalExecutionCount,
+		cursorCaughtUp:        latestCursor > 0 && known.EventCursor >= latestCursor,
+		entries:               appendEntries,
+		terminalOutputChanged: stdoutStart < len(stdout) || stderrStart < len(stderr),
+	})
 	resumeMeta := protocol.RuntimeMeta{
 		ResumeSessionID: projection.Runtime.ResumeSessionID,
 		Command:         projection.Runtime.Command,
@@ -374,7 +381,7 @@ func SessionDeltaEventFromRecord(record data.SessionRecord, known protocol.Sessi
 		EventCursor:            latestCursor,
 		LogEntryCount:          len(allEntries),
 		DiffCount:              len(allDiffs),
-		TerminalExecutionCount: len(executions),
+		TerminalExecutionCount: len(allExecutions),
 		TerminalStdoutLength:   len(stdout),
 		TerminalStderrLength:   len(stderr),
 	}
@@ -399,8 +406,79 @@ func SessionDeltaEventFromRecord(record data.SessionRecord, known protocol.Sessi
 		strings.TrimSpace(resumeMeta.ResumeSessionID) != "",
 		runtimeAlive,
 		resumeMeta,
-		(startLog == 0 && known.LogEntryCount > 0) || (stdoutStart == 0 && known.TerminalStdoutLength > 0) || (stderrStart == 0 && known.TerminalStderrLength > 0),
+		(startLog == 0 && known.LogEntryCount > 0) ||
+			(stdoutStart == 0 && known.TerminalStdoutLength > 0) ||
+			(stderrStart == 0 && known.TerminalStderrLength > 0) ||
+			terminalExecutionReset,
 	)
+}
+
+type terminalExecutionDeltaInput struct {
+	all                   []protocol.TerminalExecution
+	knownCount            int
+	cursorCaughtUp        bool
+	entries               []protocol.HistoryLogEntry
+	terminalOutputChanged bool
+}
+
+func terminalExecutionsForDelta(input terminalExecutionDeltaInput) ([]protocol.TerminalExecution, bool) {
+	all := input.all
+	start := input.knownCount
+	if input.cursorCaughtUp {
+		start = len(all)
+	}
+	reset := false
+	if start < 0 || start > len(all) {
+		start = 0
+		reset = input.knownCount != 0
+	}
+
+	indexByID := make(map[string]int, len(all))
+	for i, item := range all {
+		if id := strings.TrimSpace(item.ExecutionID); id != "" {
+			indexByID[id] = i
+		}
+	}
+
+	out := make([]protocol.TerminalExecution, 0, len(all)-start+1)
+	included := make(map[string]struct{}, len(all)-start+1)
+	addAt := func(index int) {
+		if index < 0 || index >= len(all) {
+			return
+		}
+		item := all[index]
+		id := strings.TrimSpace(item.ExecutionID)
+		if id != "" {
+			if _, ok := included[id]; ok {
+				return
+			}
+			included[id] = struct{}{}
+		}
+		out = append(out, item)
+	}
+
+	for i := start; i < len(all); i++ {
+		addAt(i)
+	}
+	for _, entry := range input.entries {
+		if index, ok := indexByID[strings.TrimSpace(entry.ExecutionID)]; ok {
+			addAt(index)
+		}
+	}
+	if input.terminalOutputChanged {
+		for i, item := range all {
+			if terminalExecutionStillRunning(item) {
+				addAt(i)
+			}
+		}
+	}
+	return out, reset
+}
+
+func terminalExecutionStillRunning(item protocol.TerminalExecution) bool {
+	return strings.TrimSpace(item.ExecutionID) != "" &&
+		strings.TrimSpace(item.FinishedAt) == "" &&
+		item.ExitCode == nil
 }
 
 func RestoredAgentStateEventFromRecord(record data.SessionRecord, hasActiveRunner bool, externalNativeActive bool) *protocol.AgentStateEvent {

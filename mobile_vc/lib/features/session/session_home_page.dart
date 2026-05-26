@@ -10,6 +10,10 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../../core/config/app_config.dart';
 import '../../core/config/app_connection_endpoint.dart';
 import '../../core/config/app_connection_environment.dart';
+import '../../core/config/relay_config.dart';
+import '../../core/relay_e2ee/relay_security_state.dart';
+import '../../data/services/mobilevc_ws_service.dart';
+import '../../data/models/events.dart';
 import '../../data/models/session_models.dart';
 import '../../features/adb/adb_debug_page.dart';
 import '../../features/chat/chat_timeline.dart';
@@ -47,6 +51,8 @@ class SessionHomePage extends StatefulWidget {
 }
 
 class _SessionHomePageState extends State<SessionHomePage> {
+  static const int _maxImageAttachmentBytes = 4 * 1024 * 1024;
+
   final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
   int _lastCompactFeedbackId = 0;
   static const String _tipCommandModePrefsKey = 'tip_command_mode_shown_v2';
@@ -182,7 +188,8 @@ class _SessionHomePageState extends State<SessionHomePage> {
       _TipItem(
         number: '一',
         title: '命令行模式切换',
-        body: '默认是命令行模式（Shell）。如需进入 Claude 模式，请在输入框输入 claude；如需进入 Codex 模式，请在输入框输入 codex。',
+        body:
+            '默认是命令行模式（Shell）。如需进入 Claude 模式，请在输入框输入 claude；如需进入 Codex 模式，请在输入框输入 codex。',
       ),
       _TipItem(
         number: '二',
@@ -348,6 +355,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
                               Expanded(
                                 child: ChatTimeline(
                                   items: controller.timeline,
+                                  sessionId: controller.selectedSessionId,
                                   activeReviewDiff:
                                       controller.currentReviewDiff,
                                   activeReviewGroup:
@@ -407,7 +415,8 @@ class _SessionHomePageState extends State<SessionHomePage> {
         shouldShowPermissionChoices: controller.shouldShowPermissionChoices,
         shouldShowReviewChoices: controller.shouldShowReviewChoices,
         shouldShowPlanChoices: controller.shouldShowPlanChoices,
-        onSubmit: controller.sendInputText,
+        onSubmit: controller.sendInputTextWithImages,
+        onAttachImage: () => _pickImageAttachment(context),
         onStop: controller.stopCurrentRun,
         onCompact: controller.compactCurrentSession,
         onOpenSessions: () => _openSessions(context),
@@ -457,6 +466,81 @@ class _SessionHomePageState extends State<SessionHomePage> {
     _scaffoldKey.currentState?.openDrawer();
   }
 
+  Future<ChatImageAttachment?> _pickImageAttachment(
+      BuildContext context) async {
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      final result = await FilePicker.platform.pickFiles(
+        type: FileType.custom,
+        allowedExtensions: const ['jpg', 'jpeg', 'png', 'webp', 'gif'],
+        allowMultiple: false,
+        withData: true,
+      );
+      if (!context.mounted || result == null || result.files.isEmpty) {
+        return null;
+      }
+      final file = result.files.single;
+      final bytes = file.bytes ?? await _readPickedFileBytes(file);
+      if (bytes == null || bytes.isEmpty) {
+        messenger
+          ..hideCurrentSnackBar()
+          ..showSnackBar(const SnackBar(content: Text('无法读取图片内容')));
+        return null;
+      }
+      if (bytes.length > _maxImageAttachmentBytes) {
+        messenger
+          ..hideCurrentSnackBar()
+          ..showSnackBar(const SnackBar(content: Text('图片不能超过 4 MiB')));
+        return null;
+      }
+      final mimeType = _imageMimeType(file.name);
+      if (mimeType.isEmpty) {
+        messenger
+          ..hideCurrentSnackBar()
+          ..showSnackBar(const SnackBar(content: Text('仅支持 JPG、PNG、WebP、GIF')));
+        return null;
+      }
+      return ChatImageAttachment(
+        name: file.name,
+        mimeType: mimeType,
+        bytes: bytes,
+      );
+    } catch (error) {
+      if (!context.mounted) {
+        return null;
+      }
+      messenger
+        ..hideCurrentSnackBar()
+        ..showSnackBar(SnackBar(content: Text('选择图片失败：$error')));
+      return null;
+    }
+  }
+
+  Future<Uint8List?> _readPickedFileBytes(PlatformFile file) async {
+    final path = file.path;
+    if (path == null || path.trim().isEmpty) {
+      return null;
+    }
+    return File(path).readAsBytes();
+  }
+
+  String _imageMimeType(String name) {
+    final lower = name.toLowerCase();
+    if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) {
+      return 'image/jpeg';
+    }
+    if (lower.endsWith('.png')) {
+      return 'image/png';
+    }
+    if (lower.endsWith('.webp')) {
+      return 'image/webp';
+    }
+    if (lower.endsWith('.gif')) {
+      return 'image/gif';
+    }
+    return '';
+  }
+
   Future<void> _openConnectionConfig(BuildContext context) async {
     final hostController =
         TextEditingController(text: controller.config.displayHost);
@@ -464,6 +548,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
     final tokenController =
         TextEditingController(text: controller.config.token);
     final cwdController = TextEditingController(text: controller.config.cwd);
+    final linkController = TextEditingController();
     final permissionController =
         TextEditingController(text: controller.config.permissionMode);
     final iceHostController = TextEditingController(
@@ -482,6 +567,8 @@ class _SessionHomePageState extends State<SessionHomePage> {
     var selectedEngine = controller.config.engine.trim().isEmpty
         ? 'claude'
         : controller.config.engine.trim();
+    var pendingConfig = controller.config;
+    var connectingFromSheet = false;
 
     await showModalBottomSheet<void>(
       context: context,
@@ -504,8 +591,81 @@ class _SessionHomePageState extends State<SessionHomePage> {
                       ? controller.config.host
                       : hostController.text.trim()),
             );
+            final relayModeSelected = pendingConfig.isRelayMode;
+            final connectionBusy = connectingFromSheet || controller.connecting;
+            final canConnectRelay = !relayModeSelected ||
+                pendingConfig.relayPairingSecret.trim().isNotEmpty ||
+                (pendingConfig.relayClientId.trim().isNotEmpty &&
+                    pendingConfig.relayClientReconnectSecret.trim().isNotEmpty);
+
+            void applyScannedConfig(AppConfig scanned) {
+              pendingConfig = scanned;
+              hostController.text = scanned.displayHost;
+              portController.text = scanned.port;
+              tokenController.text = scanned.token;
+              cwdController.text = scanned.cwd;
+              iceHostController.text = scanned.adbIceHostOverride;
+              iceUsernameController.text = scanned.adbIceUsername;
+              iceCredentialController.text = scanned.adbIceCredential;
+              selectedEngine = scanned.engine.trim().isEmpty
+                  ? selectedEngine
+                  : scanned.engine.trim();
+              scanHint = scanned.isRelayMode
+                  ? '已导入 Relay 配对，点击连接完成配对'
+                  : '已回填 ${scanned.displayHost}:${scanned.port}${scanned.token.isNotEmpty ? ' 与 token' : ''}';
+            }
+
+            void showImportSnackBar(String message) {
+              ScaffoldMessenger.of(context)
+                ..hideCurrentSnackBar()
+                ..showSnackBar(SnackBar(content: Text(message)));
+            }
+
+            AppConfig? parseConnectionLink(String raw) {
+              try {
+                return AppConfig.fromLaunchUri(
+                  raw,
+                  fallback: pendingConfig.copyWith(
+                    host: hostController.text.trim(),
+                    port: portController.text.trim(),
+                    token: tokenController.text.trim(),
+                    cwd: cwdController.text.trim(),
+                    engine: selectedEngine,
+                    permissionMode: permissionController.text.trim(),
+                    fastMode: controller.fastMode,
+                    adbIceServersJson: encodedIceConfig(),
+                  ),
+                );
+              } on FormatException catch (error) {
+                final message = error.message.toString().trim();
+                scanHint = message.isEmpty ? '链接格式错误' : '导入失败：$message';
+                return null;
+              }
+            }
+
+            Future<bool> handleRelayImport(
+              AppConfig scanned,
+              String raw,
+            ) async {
+              if (!scanned.isRelayMode) {
+                return false;
+              }
+              final imported = await controller.importConnectionLink(raw);
+              if (!context.mounted) {
+                return imported;
+              }
+              pendingConfig = controller.config;
+              applyScannedConfig(pendingConfig);
+              scanHint = imported
+                  ? '已导入 Relay 配对，点击连接完成配对'
+                  : controller.connectionMessage;
+              return true;
+            }
 
             Future<void> handleScan() async {
+              if (connectionBusy) {
+                return;
+              }
               final scannedRaw = await showModalBottomSheet<String>(
                 context: context,
                 isScrollControlled: true,
@@ -514,50 +674,66 @@ class _SessionHomePageState extends State<SessionHomePage> {
               if (!context.mounted || scannedRaw == null) {
                 return;
               }
-              final scanned = AppConfig.fromLaunchUri(
-                scannedRaw,
-                fallback: AppConfig(
-                  host: hostController.text.trim(),
-                  port: portController.text.trim(),
-                  token: tokenController.text.trim(),
-                  cwd: cwdController.text.trim(),
-                  engine: selectedEngine,
-                  claudeModel: controller.config.claudeModel,
-                  codexModel: controller.config.codexModel,
-                  codexReasoningEffort: controller.config.codexReasoningEffort,
-                  permissionMode: permissionController.text.trim(),
-                  fastMode: controller.fastMode,
-                  adbIceServersJson: encodedIceConfig(),
-                ),
-              );
+              final scanned = parseConnectionLink(scannedRaw);
               if (scanned == null) {
                 setSheetState(() {
-                  scanHint = '扫码内容无法识别，请确认二维码来自 MobileVC 启动器。';
+                  if (scanHint.trim().isEmpty) {
+                    scanHint = '扫码内容无法识别，请确认二维码来自 MobileVC 启动器。';
+                  }
                 });
+                showImportSnackBar(scanHint);
                 return;
               }
-              hostController.text = scanned.displayHost;
-              portController.text = scanned.port;
-              tokenController.text = scanned.token;
-              cwdController.text = scanned.cwd;
-              iceHostController.text = scanned.adbIceHostOverride;
-              iceUsernameController.text = scanned.adbIceUsername;
-              iceCredentialController.text = scanned.adbIceCredential;
+              final handledRelay = await handleRelayImport(scanned, scannedRaw);
+              if (!context.mounted) {
+                return;
+              }
               setSheetState(() {
-                selectedEngine = scanned.engine.trim().isEmpty
-                    ? selectedEngine
-                    : scanned.engine.trim();
-                scanHint =
-                    '已回填 ${scanned.displayHost}:${scanned.port}${scanned.token.isNotEmpty ? ' 与 token' : ''}';
+                linkController.text = scannedRaw.trim();
+                if (!handledRelay) {
+                  applyScannedConfig(scanned);
+                }
               });
+              showImportSnackBar(scanHint);
             }
 
-            Future<void> persistConfig({bool connect = false}) async {
+            Future<void> handlePasteLink() async {
+              if (connectionBusy) {
+                return;
+              }
+              final scanned = parseConnectionLink(linkController.text);
+              if (scanned == null) {
+                setSheetState(() {
+                  if (scanHint.trim().isEmpty) {
+                    scanHint = '链接无法识别，请粘贴 mobilevc://relay/v1 或启动器二维码内容。';
+                  }
+                });
+                showImportSnackBar(scanHint);
+                return;
+              }
+              final handledRelay =
+                  await handleRelayImport(scanned, linkController.text);
+              if (!context.mounted) {
+                return;
+              }
+              setSheetState(() {
+                if (!handledRelay) {
+                  applyScannedConfig(scanned);
+                }
+              });
+              showImportSnackBar(scanHint);
+            }
+
+            Future<bool> persistConfig({bool connect = false}) async {
               final hostText = hostController.text.trim();
-              final nextConfig = controller.config.copyWith(
-                host: hostText,
-                port: _portForHostInput(hostText, portController.text),
-                token: tokenController.text.trim(),
+              final nextConfig = pendingConfig.copyWith(
+                host: relayModeSelected ? pendingConfig.host : hostText,
+                port: relayModeSelected
+                    ? pendingConfig.port
+                    : _portForHostInput(hostText, portController.text),
+                token: relayModeSelected
+                    ? pendingConfig.token
+                    : tokenController.text.trim(),
                 cwd: cwdController.text.trim(),
                 engine: selectedEngine,
                 permissionMode: permissionController.text.trim(),
@@ -568,12 +744,15 @@ class _SessionHomePageState extends State<SessionHomePage> {
               if (connect) {
                 await controller.connect();
                 if (!controller.connected) {
-                  return;
+                  pendingConfig = controller.config;
+                  scanHint = controller.connectionMessage;
+                  return false;
                 }
               }
               if (context.mounted) {
                 Navigator.pop(context);
               }
+              return true;
             }
 
             return Padding(
@@ -587,17 +766,37 @@ class _SessionHomePageState extends State<SessionHomePage> {
                     Text('连接配置', style: Theme.of(context).textTheme.titleLarge),
                     const SizedBox(height: 6),
                     Text(
-                      '支持扫描 MobileVC 后端二维码自动回填，也保留手动输入方式。',
+                      '支持扫描局域网二维码或 Relay 配对二维码，也保留手动输入方式。',
                       style: Theme.of(context).textTheme.bodySmall,
                     ),
                     const SizedBox(height: 12),
                     SizedBox(
                       width: double.infinity,
                       child: OutlinedButton.icon(
-                        onPressed: handleScan,
+                        onPressed: connectionBusy ? null : handleScan,
                         icon: const Icon(Icons.qr_code_scanner),
                         label: const Text('扫码连接'),
                       ),
+                    ),
+                    const SizedBox(height: 10),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: TextField(
+                            controller: linkController,
+                            enabled: !connectionBusy,
+                            decoration: const InputDecoration(
+                              labelText: '连接链接',
+                              hintText: 'mobilevc://relay/v1?...',
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        FilledButton.tonal(
+                          onPressed: connectionBusy ? null : handlePasteLink,
+                          child: const Text('导入'),
+                        ),
+                      ],
                     ),
                     if (scanHint.isNotEmpty) ...[
                       const SizedBox(height: 8),
@@ -607,25 +806,89 @@ class _SessionHomePageState extends State<SessionHomePage> {
                       ),
                     ],
                     const SizedBox(height: 12),
-                    TextField(
-                      controller: hostController,
-                      decoration: const InputDecoration(
-                        labelText: 'Host / URL',
-                        hintText: 'https://host',
+                    if (relayModeSelected) ...[
+                      _RelayPairingSummary(config: pendingConfig),
+                    ] else ...[
+                      TextField(
+                        controller: hostController,
+                        enabled: !connectionBusy,
+                        decoration: const InputDecoration(
+                          labelText: 'Host / URL',
+                          hintText: 'https://host',
+                        ),
+                        onChanged: (_) => setSheetState(() {}),
                       ),
-                      onChanged: (_) => setSheetState(() {}),
+                      const SizedBox(height: 10),
+                      TextField(
+                          controller: portController,
+                          enabled: !connectionBusy,
+                          decoration: const InputDecoration(labelText: 'Port')),
+                      const SizedBox(height: 10),
+                      TextField(
+                          controller: tokenController,
+                          enabled: !connectionBusy,
+                          decoration:
+                              const InputDecoration(labelText: 'Token')),
+                    ],
+                    const SizedBox(height: 10),
+                    SegmentedButton<ConnectionMode>(
+                      segments: const [
+                        ButtonSegment(
+                          value: ConnectionMode.direct,
+                          icon: Icon(Icons.lan_outlined),
+                          label: Text('直连'),
+                        ),
+                        ButtonSegment(
+                          value: ConnectionMode.relay,
+                          icon: Icon(Icons.hub_outlined),
+                          label: Text('中继'),
+                        ),
+                      ],
+                      selected: {
+                        relayModeSelected
+                            ? ConnectionMode.relay
+                            : ConnectionMode.direct,
+                      },
+                      onSelectionChanged: connectionBusy
+                          ? null
+                          : (selection) {
+                              final mode = selection.first;
+                              setSheetState(() {
+                                if (mode == ConnectionMode.direct) {
+                                  pendingConfig = pendingConfig.copyWith(
+                                    connectionMode: ConnectionMode.direct.name,
+                                  );
+                                  scanHint = '已切换为局域网直连模式';
+                                  return;
+                                }
+                                if (pendingConfig.relayUrl.trim().isEmpty ||
+                                    pendingConfig.relaySessionId
+                                        .trim()
+                                        .isEmpty) {
+                                  scanHint = '请先导入 Relay 配对链接';
+                                  return;
+                                }
+                                pendingConfig = pendingConfig.copyWith(
+                                  connectionMode: ConnectionMode.relay.name,
+                                );
+                                scanHint = '已切换为 Relay 中继模式';
+                              });
+                            },
                     ),
-                    const SizedBox(height: 10),
-                    TextField(
-                        controller: portController,
-                        decoration: const InputDecoration(labelText: 'Port')),
-                    const SizedBox(height: 10),
-                    TextField(
-                        controller: tokenController,
-                        decoration: const InputDecoration(labelText: 'Token')),
+                    if (relayModeSelected &&
+                        pendingConfig.relayNodeFingerprintHex
+                            .trim()
+                            .isNotEmpty) ...[
+                      const SizedBox(height: 8),
+                      Text(
+                        '节点指纹：${_shortFingerprint(pendingConfig.relayNodeFingerprintHex)}',
+                        style: Theme.of(context).textTheme.bodySmall,
+                      ),
+                    ],
                     const SizedBox(height: 10),
                     TextField(
                         controller: cwdController,
+                        enabled: !connectionBusy,
                         decoration: const InputDecoration(labelText: 'CWD')),
                     const SizedBox(height: 10),
                     DropdownButtonFormField<String>(
@@ -645,18 +908,21 @@ class _SessionHomePageState extends State<SessionHomePage> {
                           child: Text('Gemini'),
                         ),
                       ],
-                      onChanged: (value) {
-                        if (value == null) {
-                          return;
-                        }
-                        setSheetState(() {
-                          selectedEngine = value;
-                        });
-                      },
+                      onChanged: connectionBusy
+                          ? null
+                          : (value) {
+                              if (value == null) {
+                                return;
+                              }
+                              setSheetState(() {
+                                selectedEngine = value;
+                              });
+                            },
                     ),
                     const SizedBox(height: 10),
                     TextField(
                         controller: permissionController,
+                        enabled: !connectionBusy,
                         decoration: const InputDecoration(
                             labelText: 'Permission Mode')),
                     const SizedBox(height: 10),
@@ -666,11 +932,13 @@ class _SessionHomePageState extends State<SessionHomePage> {
                         labelText: 'ADB TURN Host Override',
                         hintText: '留空则跟 Host 一致',
                       ),
+                      enabled: !relayModeSelected && !connectionBusy,
                       onChanged: (_) => setSheetState(() {}),
                     ),
                     const SizedBox(height: 10),
                     TextField(
                       controller: iceUsernameController,
+                      enabled: !connectionBusy,
                       decoration: const InputDecoration(
                         labelText: 'ADB TURN Username',
                         hintText: 'mobilevc',
@@ -679,6 +947,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
                     const SizedBox(height: 10),
                     TextField(
                       controller: iceCredentialController,
+                      enabled: !connectionBusy,
                       decoration: const InputDecoration(
                         labelText: 'ADB TURN Credential',
                         hintText: 'credential',
@@ -712,25 +981,71 @@ class _SessionHomePageState extends State<SessionHomePage> {
                       children: [
                         Expanded(
                           child: FilledButton.tonal(
-                            onPressed: () => persistConfig(),
+                            onPressed:
+                                connectionBusy ? null : () => persistConfig(),
                             child: const Text('保存'),
                           ),
                         ),
                         const SizedBox(width: 10),
                         Expanded(
                           child: FilledButton(
-                            onPressed: () async {
-                              await persistConfig(connect: true);
-                              if (!context.mounted || controller.connected) {
-                                return;
-                              }
-                              ScaffoldMessenger.of(context).showSnackBar(
-                                SnackBar(
-                                    content:
-                                        Text(controller.connectionMessage)),
-                              );
-                            },
-                            child: const Text('连接'),
+                            onPressed: connectionBusy || !canConnectRelay
+                                ? null
+                                : () async {
+                                    setSheetState(() {
+                                      connectingFromSheet = true;
+                                      scanHint = relayModeSelected
+                                          ? '正在连接 Relay：配对链接会一次性使用，请等待结果。'
+                                          : '正在连接...';
+                                    });
+                                    var connected = false;
+                                    try {
+                                      connected =
+                                          await persistConfig(connect: true);
+                                    } catch (error) {
+                                      if (!context.mounted) {
+                                        return;
+                                      }
+                                      setSheetState(() {
+                                        connectingFromSheet = false;
+                                        pendingConfig = controller.config;
+                                        scanHint = '连接配置失败：$error';
+                                      });
+                                    }
+                                    if (!context.mounted ||
+                                        connected ||
+                                        controller.connected) {
+                                      return;
+                                    }
+                                    setSheetState(() {
+                                      connectingFromSheet = false;
+                                      pendingConfig = controller.config;
+                                      scanHint = controller.connectionMessage;
+                                    });
+                                    ScaffoldMessenger.of(context).showSnackBar(
+                                      SnackBar(
+                                        content:
+                                            Text(controller.connectionMessage),
+                                      ),
+                                    );
+                                  },
+                            child: connectionBusy
+                                ? const Row(
+                                    mainAxisAlignment: MainAxisAlignment.center,
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      SizedBox(
+                                        width: 16,
+                                        height: 16,
+                                        child: CircularProgressIndicator(
+                                          strokeWidth: 2,
+                                        ),
+                                      ),
+                                      SizedBox(width: 8),
+                                      Text('连接中'),
+                                    ],
+                                  )
+                                : const Text('连接'),
                           ),
                         ),
                       ],
@@ -740,15 +1055,30 @@ class _SessionHomePageState extends State<SessionHomePage> {
                       SizedBox(
                         width: double.infinity,
                         child: OutlinedButton(
-                          onPressed: () async {
-                            await controller.disconnect();
-                            if (context.mounted) {
-                              Navigator.pop(context);
-                            }
-                          },
+                          onPressed: connectionBusy
+                              ? null
+                              : () async {
+                                  await controller.disconnect();
+                                  if (context.mounted) {
+                                    Navigator.pop(context);
+                                  }
+                                },
                           child: const Text('断开连接'),
                         ),
                       ),
+                    if (controller.config.isRelayMode) ...[
+                      const SizedBox(height: 10),
+                      SizedBox(
+                        width: double.infinity,
+                        child: OutlinedButton.icon(
+                          onPressed: connectionBusy
+                              ? null
+                              : () => _openRelaySecurity(context),
+                          icon: const Icon(Icons.verified_user_outlined),
+                          label: const Text('Relay 安全设备'),
+                        ),
+                      ),
+                    ],
                   ],
                 ),
               ),
@@ -775,8 +1105,8 @@ class _SessionHomePageState extends State<SessionHomePage> {
               selectedSessionId: controller.selectedSessionId,
               cwd: controller.effectiveCwd,
               onCreate: controller.createSession,
-              onLoad: (id) {
-                controller.loadSession(id);
+              onLoad: (summary) {
+                controller.loadSessionFromSummary(summary);
                 Navigator.pop(context);
               },
               onDelete: controller.deleteSession,
@@ -1061,8 +1391,82 @@ class _SessionHomePageState extends State<SessionHomePage> {
     );
   }
 
+  Future<void> _openRelaySecurity(BuildContext context) async {
+    if (controller.canManageRelayDevices) {
+      controller.requestRelayDeviceList();
+    }
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      showDragHandle: true,
+      backgroundColor: Colors.transparent,
+      builder: (context) => ListenableBuilder(
+        listenable: controller,
+        builder: (context, _) => _RelaySecuritySheet(
+          controller: controller,
+          onRefresh: controller.requestRelayDeviceList,
+          onRevoke: (device) => _confirmRelayDeviceRevoke(context, device),
+          onRotate: () => _confirmRelayDeviceRotate(context),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _confirmRelayDeviceRevoke(
+    BuildContext context,
+    RelayTrustedDevice device,
+  ) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('撤销 Relay 设备'),
+        content: Text('撤销后，${device.displayTitle} 需要重新配对才能连接。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('撤销'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true) {
+      controller.revokeRelayDevice(device.deviceId);
+    }
+  }
+
+  Future<void> _confirmRelayDeviceRotate(BuildContext context) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('全局轮换 Relay 身份'),
+        content: const Text('轮换会撤销所有已绑定设备，并断开当前连接。之后每台手机都需要导入新的中继链接重新配对。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('轮换'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true) {
+      controller.rotateRelayDevices();
+    }
+  }
+
   Future<void> _openModelSwitcher(BuildContext context) async {
-    final engine = controller.currentAiEngine;
+    final engine = controller.configuredAiEngine;
+    if (engine == 'codex') {
+      controller.requestCodexModelCatalog(force: true);
+    }
 
     // 先打开模态框，显示加载状态
     await showModalBottomSheet<void>(
@@ -1072,11 +1476,6 @@ class _SessionHomePageState extends State<SessionHomePage> {
       showDragHandle: true,
       backgroundColor: Colors.transparent,
       builder: (context) {
-        // 在打开时请求模型目录（移除 isEmpty 检查，总是请求）
-        if (engine == 'codex') {
-          controller.requestCodexModelCatalog(force: true);
-        }
-
         return _ModelSwitcherSheet(
           controller: controller,
           engine: engine,
@@ -1103,9 +1502,25 @@ class _SessionHomePageState extends State<SessionHomePage> {
     final fileName = _fileNameOf(path);
     messenger
       ..hideCurrentSnackBar()
-      ..showSnackBar(SnackBar(content: Text('开始下载：$path')));
+      ..showSnackBar(SnackBar(
+        content: Text(controller.config.isRelayMode
+            ? '开始 Relay 加密下载：$path'
+            : '开始下载：$path'),
+      ));
 
     try {
+      if (controller.config.isRelayMode) {
+        final savedFile = await _downloadRelayFileToDisk(
+          path: path,
+          fileName: fileName,
+          messenger: messenger,
+        );
+        if (!scaffoldContext.mounted || savedFile == null) {
+          return;
+        }
+        _showSavedSnackBar(savedFile);
+        return;
+      }
       final bytes = await _fetchFileBytes(path);
       final selectedPath = await _pickSavePath(fileName, bytes);
       if (!scaffoldContext.mounted) {
@@ -1131,6 +1546,88 @@ class _SessionHomePageState extends State<SessionHomePage> {
         ..hideCurrentSnackBar()
         ..showSnackBar(SnackBar(content: Text('下载失败：$error')));
     }
+  }
+
+  Future<File?> _downloadRelayFileToDisk({
+    required String path,
+    required String fileName,
+    required ScaffoldMessengerState messenger,
+  }) async {
+    final selectedPath = await _pickRelaySavePath(fileName);
+    if (selectedPath == null || selectedPath.trim().isEmpty) {
+      messenger
+        ..hideCurrentSnackBar()
+        ..showSnackBar(const SnackBar(content: Text('已取消保存')));
+      return null;
+    }
+    final targetFile = File(selectedPath);
+    final cancelToken = RelayFileDownloadCancelToken();
+    final parent = targetFile.parent;
+    if (!await parent.exists()) {
+      await parent.create(recursive: true);
+    }
+    void showProgressSnackBar(String text) {
+      messenger
+        ..hideCurrentSnackBar()
+        ..showSnackBar(SnackBar(
+          content: Text(text),
+          action: SnackBarAction(
+            label: '取消',
+            onPressed: cancelToken.cancel,
+          ),
+        ));
+    }
+
+    final sink = targetFile.openWrite();
+    try {
+      showProgressSnackBar('Relay 加密下载中：准备传输');
+      await controller.downloadRelayFile(
+        path,
+        onChunk: (chunk) async {
+          sink.add(chunk);
+          await sink.flush();
+        },
+        onProgress: (received, total) {
+          if (!mounted || total == null || total <= 0) {
+            return;
+          }
+          showProgressSnackBar(
+            'Relay 加密下载中：${_formatBytes(received)} / ${_formatBytes(total)}',
+          );
+        },
+        cancelToken: cancelToken,
+      );
+      await sink.close();
+      return targetFile;
+    } catch (error) {
+      try {
+        await sink.close();
+      } catch (closeError) {
+        Error.throwWithStackTrace(closeError, StackTrace.current);
+      }
+      if (cancelToken.isCancelled) {
+        if (await targetFile.exists()) {
+          await targetFile.delete();
+        }
+      }
+      Error.throwWithStackTrace(error, StackTrace.current);
+    }
+  }
+
+  Future<String?> _pickRelaySavePath(String fileName) async {
+    if (_shouldUseSystemSaveDialog) {
+      return FilePicker.platform.saveFile(
+        dialogTitle: '保存文件',
+        fileName: fileName,
+      );
+    }
+
+    final directory = await getApplicationDocumentsDirectory();
+    final downloadsDir = Directory('${directory.path}/downloads');
+    if (!await downloadsDir.exists()) {
+      await downloadsDir.create(recursive: true);
+    }
+    return '${downloadsDir.path}/$fileName';
   }
 
   Future<Uint8List> _fetchFileBytes(String path) async {
@@ -1230,6 +1727,16 @@ class _SessionHomePageState extends State<SessionHomePage> {
     final index = normalized.lastIndexOf('/');
     final fileName = index == -1 ? normalized : normalized.substring(index + 1);
     return fileName.isEmpty ? 'download.bin' : fileName;
+  }
+
+  String _formatBytes(int bytes) {
+    if (bytes >= 1024 * 1024) {
+      return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+    }
+    if (bytes >= 1024) {
+      return '${(bytes / 1024).toStringAsFixed(1)} KB';
+    }
+    return '$bytes B';
   }
 
   Future<void> _openStatusDetails(BuildContext context) async {
@@ -1734,8 +2241,12 @@ class _ModelSwitcherSheetState extends State<_ModelSwitcherSheet> {
                                                           selectedModel,
                                                           option.value,
                                                         )
-                                                      : selectedModel ==
-                                                          option.value,
+                                                      : option.value ==
+                                                              selectedModel ||
+                                                          (option.value ==
+                                                                  'default' &&
+                                                              selectedModel
+                                                                  .isEmpty),
                                                   onTap: () {
                                                     setState(() {
                                                       selectedModel =
@@ -1781,6 +2292,7 @@ class _ModelSwitcherSheetState extends State<_ModelSwitcherSheet> {
                                     await controller.updateAiModelSelection(
                                       model: selectedModel,
                                       reasoningEffort: selectedEffort,
+                                      engine: engine,
                                     );
                                     if (context.mounted) {
                                       Navigator.of(context).pop();
@@ -1801,6 +2313,7 @@ class _ModelSwitcherSheetState extends State<_ModelSwitcherSheet> {
                                         await controller.updateAiModelSelection(
                                           model: selectedModel,
                                           reasoningEffort: selectedEffort,
+                                          engine: engine,
                                         );
                                         if (context.mounted) {
                                           Navigator.of(context).pop();
@@ -2096,6 +2609,415 @@ class _SessionObservationBanner extends StatelessWidget {
   }
 }
 
+class _RelayPairingSummary extends StatelessWidget {
+  const _RelayPairingSummary({required this.config});
+
+  final AppConfig config;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final sessionId = config.relaySessionId.trim();
+    final relayUrl = config.relayUrl.trim();
+    final expiresAt = config.relayPairingExpiresAt;
+    return Material(
+      color: scheme.surfaceContainerHighest.withValues(alpha: 0.42),
+      borderRadius: BorderRadius.circular(16),
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(Icons.hub_outlined, color: scheme.primary),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    'Relay 中继已导入',
+                    style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                          fontWeight: FontWeight.w800,
+                        ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 10),
+            _RelaySummaryLine(label: 'Relay', value: relayUrl),
+            if (sessionId.isNotEmpty)
+              _RelaySummaryLine(label: 'Session', value: sessionId),
+            if (expiresAt > 0)
+              _RelaySummaryLine(
+                label: '有效期',
+                value: _formatRelayPairingExpiry(expiresAt),
+              ),
+            _RelaySummaryLine(
+              label: 'E2EE',
+              value: config.relayCapabilities?.requiresE2EE == true
+                  ? '需要端到端加密'
+                  : '未声明',
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _RelaySummaryLine extends StatelessWidget {
+  const _RelaySummaryLine({required this.label, required this.value});
+
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Padding(
+      padding: const EdgeInsets.only(top: 4),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 64,
+            child: Text(
+              label,
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: scheme.onSurfaceVariant,
+                  ),
+            ),
+          ),
+          Expanded(
+            child: Text(
+              value,
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                fontFeatures: const [FontFeature.tabularFigures()],
+                height: 1.35,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _RelaySecuritySheet extends StatelessWidget {
+  const _RelaySecuritySheet({
+    required this.controller,
+    required this.onRefresh,
+    required this.onRevoke,
+    required this.onRotate,
+  });
+
+  final SessionController controller;
+  final VoidCallback onRefresh;
+  final ValueChanged<RelayTrustedDevice> onRevoke;
+  final VoidCallback onRotate;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final devices = controller.relayDevices;
+    return DraggableScrollableSheet(
+      initialChildSize: 0.72,
+      minChildSize: 0.42,
+      maxChildSize: 0.92,
+      expand: false,
+      builder: (context, scrollController) {
+        return DecoratedBox(
+          decoration: BoxDecoration(
+            color: scheme.surface,
+            borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
+          ),
+          child: ListView(
+            controller: scrollController,
+            padding: const EdgeInsets.fromLTRB(16, 10, 16, 24),
+            children: [
+              Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      'Relay 安全设备',
+                      style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                            fontWeight: FontWeight.w800,
+                          ),
+                    ),
+                  ),
+                  IconButton(
+                    onPressed:
+                        controller.canManageRelayDevices ? onRefresh : null,
+                    icon: controller.relayDeviceListLoading
+                        ? const SizedBox.square(
+                            dimension: 18,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.refresh),
+                    tooltip: '刷新',
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              _RelaySecurityStatus(controller: controller),
+              if (controller.relayDeviceStatus.trim().isNotEmpty) ...[
+                const SizedBox(height: 10),
+                Text(
+                  controller.relayDeviceStatus,
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                        color: scheme.onSurfaceVariant,
+                      ),
+                ),
+              ],
+              const SizedBox(height: 14),
+              SizedBox(
+                width: double.infinity,
+                child: FilledButton.tonalIcon(
+                  onPressed: controller.canManageRelayDevices ? onRotate : null,
+                  icon: const Icon(Icons.restart_alt),
+                  label: const Text('全局轮换'),
+                ),
+              ),
+              const SizedBox(height: 14),
+              if (devices.isEmpty && !controller.relayDeviceListLoading)
+                _EmptyRelayDeviceState(
+                    canManage: controller.canManageRelayDevices)
+              else
+                for (final device in devices) ...[
+                  _RelayDeviceTile(
+                    device: device,
+                    onRevoke: device.revoked || device.currentDevice
+                        ? null
+                        : () => onRevoke(device),
+                  ),
+                  const SizedBox(height: 10),
+                ],
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _RelaySecurityStatus extends StatelessWidget {
+  const _RelaySecurityStatus({required this.controller});
+
+  final SessionController controller;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return FutureBuilder<RelaySecurityState>(
+      future: controller.relaySecurityState(),
+      builder: (context, snapshot) {
+        final state = snapshot.data ??
+            const RelaySecurityState(
+              mode: RelaySecurityMode.relayNotVerified,
+              title: 'Relay 未验证',
+              detail: '正在读取 Relay 安全状态。',
+              canShowVerified: false,
+            );
+        final verified = state.canShowVerified;
+        final blocking = state.isBlocking;
+        final color = verified
+            ? scheme.primary
+            : blocking
+                ? scheme.error
+                : scheme.tertiary;
+        final background = verified
+            ? scheme.primaryContainer.withValues(alpha: 0.62)
+            : blocking
+                ? scheme.errorContainer.withValues(alpha: 0.42)
+                : scheme.tertiaryContainer.withValues(alpha: 0.46);
+        return Container(
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            color: background,
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(color: color.withValues(alpha: 0.18)),
+          ),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Icon(
+                verified
+                    ? Icons.verified_user_outlined
+                    : blocking
+                        ? Icons.gpp_bad_outlined
+                        : Icons.shield_outlined,
+                color: color,
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      state.title,
+                      style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                            fontWeight: FontWeight.w800,
+                            color: verified
+                                ? scheme.onPrimaryContainer
+                                : blocking
+                                    ? scheme.onErrorContainer
+                                    : scheme.onTertiaryContainer,
+                          ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      state.detail,
+                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                            color: verified
+                                ? scheme.onPrimaryContainer
+                                : blocking
+                                    ? scheme.onErrorContainer
+                                    : scheme.onTertiaryContainer,
+                          ),
+                    ),
+                    if (state.shortFingerprint.trim().isNotEmpty) ...[
+                      const SizedBox(height: 6),
+                      Text(
+                        '节点指纹：${state.shortFingerprint}',
+                        style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                          color: verified
+                              ? scheme.onPrimaryContainer
+                              : blocking
+                                  ? scheme.onErrorContainer
+                                  : scheme.onTertiaryContainer,
+                          fontFeatures: const [FontFeature.tabularFigures()],
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _EmptyRelayDeviceState extends StatelessWidget {
+  const _EmptyRelayDeviceState({required this.canManage});
+
+  final bool canManage;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: scheme.surfaceContainerHighest.withValues(alpha: 0.42),
+        borderRadius: BorderRadius.circular(16),
+      ),
+      child: Text(
+        canManage ? '还没有绑定设备' : '当前连接不可管理 Relay 设备',
+        style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+              color: scheme.onSurfaceVariant,
+            ),
+      ),
+    );
+  }
+}
+
+class _RelayDeviceTile extends StatelessWidget {
+  const _RelayDeviceTile({
+    required this.device,
+    required this.onRevoke,
+  });
+
+  final RelayTrustedDevice device;
+  final VoidCallback? onRevoke;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final status = device.revoked
+        ? '已撤销'
+        : device.currentDevice
+            ? '当前设备'
+            : device.connected
+                ? '在线'
+                : '未连接';
+    final statusColor = device.revoked
+        ? scheme.error
+        : device.connected || device.currentDevice
+            ? const Color(0xFF15803D)
+            : scheme.onSurfaceVariant;
+    return Material(
+      color: scheme.surfaceContainerHighest.withValues(alpha: 0.34),
+      borderRadius: BorderRadius.circular(16),
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Expanded(
+                  child: Text(
+                    device.displayTitle,
+                    style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                          fontWeight: FontWeight.w800,
+                        ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Text(
+                  status,
+                  style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                        color: statusColor,
+                        fontWeight: FontWeight.w800,
+                      ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Text(
+              _shortFingerprint(device.fingerprintHex),
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                color: scheme.onSurfaceVariant,
+                fontFeatures: const [FontFeature.tabularFigures()],
+              ),
+            ),
+            const SizedBox(height: 6),
+            Text(
+              '最后连接：${_formatRelayDeviceTime(device.lastSeenAt)}',
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: scheme.onSurfaceVariant,
+                  ),
+            ),
+            if (device.revokedAt != null) ...[
+              const SizedBox(height: 4),
+              Text(
+                '撤销时间：${_formatRelayDeviceTime(device.revokedAt)}',
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                      color: scheme.error,
+                    ),
+              ),
+            ],
+            if (onRevoke != null) ...[
+              const SizedBox(height: 10),
+              Align(
+                alignment: Alignment.centerRight,
+                child: FilledButton.tonalIcon(
+                  onPressed: onRevoke,
+                  icon: const Icon(Icons.block),
+                  label: const Text('撤销'),
+                ),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 class _ConnectionDot extends StatelessWidget {
   const _ConnectionDot({required this.connected});
 
@@ -2223,4 +3145,33 @@ class _TipItem extends StatelessWidget {
       ),
     );
   }
+}
+
+String _shortFingerprint(String value) {
+  final normalized = value.trim();
+  if (normalized.isEmpty) {
+    return 'fingerprint unavailable';
+  }
+  final prefix = normalized.length <= 16
+      ? normalized
+      : '${normalized.substring(0, 8)} ${normalized.substring(8, 16)}';
+  return 'fp $prefix';
+}
+
+String _formatRelayPairingExpiry(int unixSeconds) {
+  final value = DateTime.fromMillisecondsSinceEpoch(
+    unixSeconds * 1000,
+    isUtc: true,
+  ).toLocal();
+  return _formatRelayDeviceTime(value);
+}
+
+String _formatRelayDeviceTime(DateTime? value) {
+  if (value == null) {
+    return '-';
+  }
+  final local = value.toLocal();
+  String two(int input) => input.toString().padLeft(2, '0');
+  return '${local.year}-${two(local.month)}-${two(local.day)} '
+      '${two(local.hour)}:${two(local.minute)}';
 }

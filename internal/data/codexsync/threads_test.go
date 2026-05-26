@@ -4,292 +4,327 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
-	"strings"
 	"testing"
 	"time"
 
 	_ "modernc.org/sqlite"
 )
 
-func TestListNativeThreadsMatchesWindowsDevicePathPrefix(t *testing.T) {
-	homeDir := t.TempDir()
-	projectDir := filepath.Join(homeDir, "workspace", "MobileVC")
-	if err := os.MkdirAll(projectDir, 0o755); err != nil {
-		t.Fatalf("mkdir project dir: %v", err)
+func TestFindNativeThreadLoadsOnlyRequestedRollout(t *testing.T) {
+	codexDir, db := setupCodexThreadsStore(t)
+	targetID, _, _ := seedTwoCodexThreads(t, codexDir, db)
+	writeHistoryFixture(t, filepath.Join(codexDir, "history.jsonl"), targetID, "target prompt")
+
+	thread, err := FindNativeThread(context.Background(), targetID)
+	if err != nil {
+		t.Fatalf("find target thread: %v", err)
 	}
-	t.Setenv("HOME", homeDir)
-	t.Setenv("USERPROFILE", homeDir)
-	t.Setenv("HOMEDRIVE", "")
-	t.Setenv("HOMEPATH", "")
+	if thread.ThreadID != targetID {
+		t.Fatalf("expected target thread, got %#v", thread)
+	}
+	if len(thread.HistoryPrompts) != 1 || thread.HistoryPrompts[0].Text != "target prompt" {
+		t.Fatalf("expected target history only, got %#v", thread.HistoryPrompts)
+	}
+	if len(thread.LogEntries) != 1 || thread.LogEntries[0].Message != "target reply" {
+		t.Fatalf("expected target rollout only, got %#v", thread.LogEntries)
+	}
+}
 
-	devicePath := `\\?\` + projectDir
-	threadID := seedNativeCodexThreadFixture(t, homeDir, devicePath)
+func TestListNativeThreadsDoesNotLoadRolloutHistory(t *testing.T) {
+	codexDir, db := setupCodexThreadsStore(t)
+	targetID, targetRollout, otherRollout := seedTwoCodexThreads(t, codexDir, db)
+	writeHistoryFixture(t, filepath.Join(codexDir, "history.jsonl"), targetID, "target prompt")
 
-	threads, err := ListNativeThreads(context.Background(), projectDir)
+	threads, err := ListNativeThreads(context.Background(), "/workspace")
 	if err != nil {
 		t.Fatalf("list native threads: %v", err)
 	}
-	if len(threads) != 1 {
-		t.Fatalf("expected one matched thread, got %#v", threads)
+	if len(threads) != 2 {
+		t.Fatalf("expected both workspace threads, got %#v", threads)
 	}
-	if threads[0].ThreadID != threadID {
-		t.Fatalf("expected thread %q, got %#v", threadID, threads[0])
+	for _, thread := range threads {
+		if len(thread.LogEntries) != 0 {
+			t.Fatalf("session list should not load rollout entries, got %#v", thread)
+		}
+		if len(thread.HistoryPrompts) != 0 {
+			t.Fatalf("session list should not scan history prompts, got %#v", thread)
+		}
 	}
-	if got := normalizePath(threads[0].CWD); got != normalizePath(projectDir) {
-		t.Fatalf("expected normalized cwd %q, got %q", normalizePath(projectDir), got)
-	}
-}
 
-func TestNormalizePathStripsWindowsDevicePrefix(t *testing.T) {
-	raw := `\\?\C:\Users\29573\Desktop\fsdownload\codexxm`
-	if got := normalizePath(raw); got == raw {
-		t.Fatalf("expected device prefix to be stripped, got %q", got)
+	if err := os.Remove(targetRollout); err != nil {
+		t.Fatalf("remove target rollout: %v", err)
 	}
-	if got := trimWindowsDevicePathPrefix(raw); got != `C:\Users\29573\Desktop\fsdownload\codexxm` {
-		t.Fatalf("expected trimmed device path, got %q", got)
+	if err := os.Remove(otherRollout); err != nil {
+		t.Fatalf("remove other rollout: %v", err)
 	}
-}
-
-func TestFindNativeThreadLoadsOnlyTargetSessionData(t *testing.T) {
-	homeDir := t.TempDir()
-	projectDir := filepath.Join(homeDir, "workspace", "MobileVC")
-	otherProjectDir := filepath.Join(homeDir, "workspace", "OtherProject")
-	if err := os.MkdirAll(projectDir, 0o755); err != nil {
-		t.Fatalf("mkdir project dir: %v", err)
-	}
-	if err := os.MkdirAll(otherProjectDir, 0o755); err != nil {
-		t.Fatalf("mkdir other project dir: %v", err)
-	}
-	t.Setenv("HOME", homeDir)
-	t.Setenv("USERPROFILE", homeDir)
-	t.Setenv("HOMEDRIVE", "")
-	t.Setenv("HOMEPATH", "")
-
-	targetThreadID := seedNativeCodexThreadFixture(t, homeDir, projectDir)
-	seedAdditionalNativeCodexThreadFixture(
-		t,
-		homeDir,
-		"019e9999-c538-7420-8028-345f7dd70d63",
-		otherProjectDir,
-		"Other thread title",
-		"Other history prompt",
-		"Other assistant output should not appear",
-	)
-
-	thread, err := FindNativeThread(context.Background(), targetThreadID)
+	threads, err = ListNativeThreads(context.Background(), "/workspace")
 	if err != nil {
-		t.Fatalf("find native thread: %v", err)
+		t.Fatalf("list native threads after rollout removal: %v", err)
 	}
-	if thread.ThreadID != targetThreadID {
-		t.Fatalf("expected target thread %q, got %#v", targetThreadID, thread)
+	if len(threads) != 2 {
+		t.Fatalf("expected list to survive missing rollout files, got %#v", threads)
 	}
-	if got := normalizePath(thread.CWD); got != normalizePath(projectDir) {
-		t.Fatalf("expected target cwd %q, got %q", normalizePath(projectDir), got)
+}
+
+func TestListNativeThreadsExcludesSubagentThreads(t *testing.T) {
+	_, db := setupCodexThreadsStore(t)
+	now := time.Date(2026, 5, 24, 1, 0, 0, 0, time.UTC).Unix()
+	insertThreadWithSources(t, db, "main-thread", "/workspace", "Main", "", now, "cli", "")
+	insertThreadWithSources(t, db, "subagent-thread", "/workspace", "Worker", "", now+1, "cli", "subagent")
+
+	threads, err := ListNativeThreads(context.Background(), "/workspace")
+	if err != nil {
+		t.Fatalf("list native threads: %v", err)
 	}
-	if len(thread.HistoryPrompts) == 0 {
-		t.Fatalf("expected target history prompts, got %#v", thread)
+	if len(threads) != 1 || threads[0].ThreadID != "main-thread" {
+		t.Fatalf("expected only main thread, got %#v", threads)
 	}
-	for _, prompt := range thread.HistoryPrompts {
-		if strings.Contains(prompt.Text, "Other history prompt") {
-			t.Fatalf("unexpected other-thread prompt leaked into target history: %#v", thread.HistoryPrompts)
+
+	subagents, err := ListNativeSubagentThreadIDs(context.Background(), "/workspace")
+	if err != nil {
+		t.Fatalf("list subagent thread ids: %v", err)
+	}
+	if _, ok := subagents["subagent-thread"]; !ok || len(subagents) != 1 {
+		t.Fatalf("expected subagent thread id, got %#v", subagents)
+	}
+}
+
+func TestListNativeThreadsMatchesCodexTUIVisibleSources(t *testing.T) {
+	_, db := setupCodexThreadsStore(t)
+	now := time.Date(2026, 5, 24, 1, 0, 0, 0, time.UTC).Unix()
+	insertThreadWithSources(t, db, "legacy-cli", "/workspace", "Legacy CLI", "", now, "cli", "")
+	insertThreadWithSources(t, db, "legacy-vscode", "/workspace", "Legacy VSCode", "", now+1, "vscode", "")
+	insertThreadWithSources(t, db, "new-user", "/workspace", "New user", "", now+2, "cli", "user")
+	insertThreadWithSources(t, db, "exec-thread", "/workspace", "Exec", "", now+3, "exec", "")
+	insertThreadWithSources(t, db, "subagent-thread", "/workspace", "Worker", "", now+4, "vscode", "subagent")
+	insertThreadWithSources(t, db, "metadata-thread", "/workspace", "Metadata", "", now+5, "cli", "metadata")
+
+	threads, err := ListNativeThreads(context.Background(), "/workspace")
+	if err != nil {
+		t.Fatalf("list native threads: %v", err)
+	}
+	got := make(map[string]bool)
+	for _, thread := range threads {
+		got[thread.ThreadID] = true
+	}
+	for _, id := range []string{"legacy-cli", "legacy-vscode", "new-user"} {
+		if !got[id] {
+			t.Fatalf("expected visible codex thread %q, got %#v", id, threads)
 		}
 	}
-	for _, entry := range thread.LogEntries {
-		text := firstNonEmpty(entry.Text, entry.Message)
-		if strings.Contains(text, "Other assistant output should not appear") {
-			t.Fatalf("unexpected other-thread rollout content leaked into target log entries: %#v", thread.LogEntries)
+	for _, id := range []string{"exec-thread", "subagent-thread", "metadata-thread"} {
+		if got[id] {
+			t.Fatalf("did not expect hidden codex thread %q, got %#v", id, threads)
+		}
+	}
+
+	hidden, err := ListNativeHiddenThreadIDs(context.Background(), "/workspace")
+	if err != nil {
+		t.Fatalf("list hidden native threads: %v", err)
+	}
+	for _, id := range []string{"exec-thread", "subagent-thread", "metadata-thread"} {
+		if _, ok := hidden[id]; !ok {
+			t.Fatalf("expected hidden thread id %q, got %#v", id, hidden)
+		}
+	}
+	for _, id := range []string{"legacy-cli", "legacy-vscode", "new-user"} {
+		if _, ok := hidden[id]; ok {
+			t.Fatalf("did not expect visible thread id %q in hidden set %#v", id, hidden)
 		}
 	}
 }
 
-func seedNativeCodexThreadFixture(t *testing.T, homeDir, cwd string) string {
+func TestListNativeThreadsSupportsLegacySchemaWithoutThreadSource(t *testing.T) {
+	codexDir, db := setupCodexThreadsStoreWithoutThreadSource(t)
+	now := time.Date(2026, 5, 24, 1, 0, 0, 0, time.UTC).Unix()
+	rolloutPath := filepath.Join(codexDir, "sessions", "legacy.jsonl")
+	writeRolloutFixture(t, rolloutPath, "legacy reply")
+	if _, err := db.Exec(
+		`insert into threads (id, cwd, title, model, source, model_provider, created_at, updated_at, first_user_message, rollout_path, archived)
+		values ('legacy-thread', '/workspace', 'Legacy', 'gpt-5.5', 'cli', 'openai', ?, ?, 'Legacy', ?, 0)`,
+		now,
+		now,
+		rolloutPath,
+	); err != nil {
+		t.Fatalf("insert legacy thread: %v", err)
+	}
+	if _, err := db.Exec(
+		`insert into threads (id, cwd, title, model, source, model_provider, created_at, updated_at, first_user_message, rollout_path, archived)
+		values ('legacy-exec-thread', '/workspace', 'Legacy exec', 'gpt-5.5', 'exec', 'openai', ?, ?, 'Legacy exec', ?, 0)`,
+		now+1,
+		now+1,
+		rolloutPath,
+	); err != nil {
+		t.Fatalf("insert legacy exec thread: %v", err)
+	}
+
+	threads, err := ListNativeThreads(context.Background(), "/workspace")
+	if err != nil {
+		t.Fatalf("list native threads: %v", err)
+	}
+	if len(threads) != 1 || threads[0].ThreadID != "legacy-thread" {
+		t.Fatalf("expected legacy thread, got %#v", threads)
+	}
+	hidden, err := ListNativeHiddenThreadIDs(context.Background(), "/workspace")
+	if err != nil {
+		t.Fatalf("list hidden legacy threads: %v", err)
+	}
+	if _, ok := hidden["legacy-exec-thread"]; !ok || len(hidden) != 1 {
+		t.Fatalf("expected legacy exec thread hidden, got %#v", hidden)
+	}
+
+	subagents, err := ListNativeSubagentThreadIDs(context.Background(), "/workspace")
+	if err != nil {
+		t.Fatalf("list subagent thread ids: %v", err)
+	}
+	if len(subagents) != 0 {
+		t.Fatalf("legacy schema should not infer subagents, got %#v", subagents)
+	}
+}
+
+func setupCodexThreadsStore(t *testing.T) (string, *sql.DB) {
 	t.Helper()
-
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
 	codexDir := filepath.Join(homeDir, ".codex")
-	if err := os.MkdirAll(codexDir, 0o755); err != nil {
-		t.Fatalf("mkdir codex dir: %v", err)
+	if err := os.MkdirAll(filepath.Join(codexDir, "sessions"), 0o755); err != nil {
+		t.Fatalf("mkdir codex sessions: %v", err)
 	}
-
-	threadID := "019d3c6b-c538-7420-8028-345f7dd70d63"
-	createdAt := time.Date(2026, 3, 29, 10, 0, 0, 0, time.UTC).Unix()
-	updatedAt := time.Date(2026, 3, 30, 11, 30, 0, 0, time.UTC).Unix()
-	rolloutPath := filepath.Join(
-		codexDir,
-		"sessions",
-		"2026",
-		"03",
-		"30",
-		"rollout-2026-03-30T11-30-00-"+threadID+".jsonl",
-	)
-	if err := os.MkdirAll(filepath.Dir(rolloutPath), 0o755); err != nil {
-		t.Fatalf("mkdir rollout dir: %v", err)
-	}
-	dbPath := filepath.Join(codexDir, "state_5.sqlite")
-
-	db, err := sql.Open("sqlite", dbPath)
+	db, err := sql.Open("sqlite", filepath.Join(codexDir, "state_5.sqlite"))
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
-	defer db.Close()
-
-	statements := []string{
-		"create table if not exists threads (id text primary key, cwd text, title text, model text, source text, model_provider text, created_at integer, updated_at integer, first_user_message text, rollout_path text, archived integer default 0);",
-		"delete from threads;",
-		"insert into threads (id, cwd, title, model, source, model_provider, created_at, updated_at, first_user_message, rollout_path, archived) values ('019d3c6b-c538-7420-8028-345f7dd70d63', '" + escapeSQLiteString(cwd) + "', 'Desktop Codex Session', 'gpt-5-codex', 'codex', 'openai', " + strconv.FormatInt(createdAt, 10) + ", " + strconv.FormatInt(updatedAt, 10) + ", 'Fix the README wording', '" + escapeSQLiteString(rolloutPath) + "', 0);",
+	t.Cleanup(func() { _ = db.Close() })
+	if _, err := db.Exec(`create table threads (
+		id text primary key,
+		cwd text,
+		title text,
+		model text,
+		source text,
+		model_provider text,
+		thread_source text,
+		created_at integer,
+		updated_at integer,
+		first_user_message text,
+		rollout_path text,
+		archived integer default 0
+	)`); err != nil {
+		t.Fatalf("create threads table: %v", err)
 	}
-	for _, stmt := range statements {
-		if _, err := db.Exec(stmt); err != nil {
-			t.Fatalf("seed sqlite fixture: %v", err)
-		}
-	}
+	return codexDir, db
+}
 
-	historyPath := filepath.Join(codexDir, "history.jsonl")
-	file, err := os.Create(historyPath)
+func setupCodexThreadsStoreWithoutThreadSource(t *testing.T) (string, *sql.DB) {
+	t.Helper()
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	codexDir := filepath.Join(homeDir, ".codex")
+	if err := os.MkdirAll(filepath.Join(codexDir, "sessions"), 0o755); err != nil {
+		t.Fatalf("mkdir codex sessions: %v", err)
+	}
+	db, err := sql.Open("sqlite", filepath.Join(codexDir, "state_5.sqlite"))
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if _, err := db.Exec(`create table threads (
+		id text primary key,
+		cwd text,
+		title text,
+		model text,
+		source text,
+		model_provider text,
+		created_at integer,
+		updated_at integer,
+		first_user_message text,
+		rollout_path text,
+		archived integer default 0
+	)`); err != nil {
+		t.Fatalf("create legacy threads table: %v", err)
+	}
+	return codexDir, db
+}
+
+func seedTwoCodexThreads(t *testing.T, codexDir string, db *sql.DB) (string, string, string) {
+	t.Helper()
+	targetID := "target-thread"
+	targetRollout := filepath.Join(codexDir, "sessions", "target.jsonl")
+	otherRollout := filepath.Join(codexDir, "sessions", "other.jsonl")
+	writeRolloutFixture(t, targetRollout, "target reply")
+	writeRolloutFixture(t, otherRollout, "other reply")
+	now := time.Date(2026, 5, 24, 1, 0, 0, 0, time.UTC).Unix()
+	insertThread(t, db, targetID, "/workspace", "Target", targetRollout, now)
+	insertThread(t, db, "other-thread", "/workspace", "Other", otherRollout, now+1)
+	return targetID, targetRollout, otherRollout
+}
+
+func insertThread(t *testing.T, db *sql.DB, id, cwd, title, rolloutPath string, updatedAt int64) {
+	t.Helper()
+	insertThreadWithSource(t, db, id, cwd, title, rolloutPath, updatedAt, "")
+}
+
+func insertThreadWithSource(t *testing.T, db *sql.DB, id, cwd, title, rolloutPath string, updatedAt int64, threadSource string) {
+	t.Helper()
+	insertThreadWithSources(t, db, id, cwd, title, rolloutPath, updatedAt, "cli", threadSource)
+}
+
+func insertThreadWithSources(t *testing.T, db *sql.DB, id, cwd, title, rolloutPath string, updatedAt int64, source, threadSource string) {
+	t.Helper()
+	if _, err := db.Exec(
+		`insert into threads (id, cwd, title, model, source, model_provider, thread_source, created_at, updated_at, first_user_message, rollout_path, archived)
+		values (?, ?, ?, 'gpt-5.5', ?, 'openai', ?, ?, ?, ?, ?, 0)`,
+		id,
+		cwd,
+		title,
+		source,
+		threadSource,
+		updatedAt,
+		updatedAt,
+		title,
+		rolloutPath,
+	); err != nil {
+		t.Fatalf("insert thread %s: %v", id, err)
+	}
+}
+
+func writeHistoryFixture(t *testing.T, path, sessionID, text string) {
+	t.Helper()
+	file, err := os.Create(path)
 	if err != nil {
 		t.Fatalf("create history fixture: %v", err)
 	}
 	defer file.Close()
-	encoder := json.NewEncoder(file)
-	for _, line := range []map[string]any{
-		{"session_id": threadID, "ts": createdAt, "text": "Fix the README wording"},
-		{"session_id": threadID, "ts": updatedAt, "text": "Also align the mobile labels"},
-	} {
-		if err := encoder.Encode(line); err != nil {
-			t.Fatalf("write history fixture: %v", err)
-		}
+	line := historyLine{SessionID: sessionID, TS: time.Now().Unix(), Text: text}
+	if err := json.NewEncoder(file).Encode(line); err != nil {
+		t.Fatalf("write history fixture: %v", err)
 	}
+}
 
-	rolloutFile, err := os.Create(rolloutPath)
+func writeRolloutFixture(t *testing.T, path, message string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir rollout dir: %v", err)
+	}
+	file, err := os.Create(path)
 	if err != nil {
 		t.Fatalf("create rollout fixture: %v", err)
 	}
-	defer rolloutFile.Close()
-	rolloutEncoder := json.NewEncoder(rolloutFile)
-	for _, line := range []map[string]any{
-		{
-			"timestamp": time.Unix(createdAt, 0).UTC().Format(time.RFC3339),
-			"type":      "event_msg",
-			"payload": map[string]any{
-				"type":    "task_started",
-				"turn_id": "turn-1",
-			},
-		},
-		{
-			"timestamp": time.Unix(createdAt, 0).UTC().Add(time.Second).Format(time.RFC3339),
-			"type":      "event_msg",
-			"payload": map[string]any{
-				"type":    "user_message",
-				"message": "Fix the README wording",
-			},
-		},
-	} {
-		if err := rolloutEncoder.Encode(line); err != nil {
-			t.Fatalf("write rollout fixture: %v", err)
-		}
-	}
-
-	return threadID
-}
-
-func seedAdditionalNativeCodexThreadFixture(
-	t *testing.T,
-	homeDir string,
-	threadID string,
-	cwd string,
-	title string,
-	historyText string,
-	assistantText string,
-) {
-	t.Helper()
-
-	codexDir := filepath.Join(homeDir, ".codex")
-	if err := os.MkdirAll(codexDir, 0o755); err != nil {
-		t.Fatalf("mkdir codex dir: %v", err)
-	}
-	createdAt := time.Date(2026, 4, 1, 10, 0, 0, 0, time.UTC).Unix()
-	updatedAt := time.Date(2026, 4, 1, 11, 0, 0, 0, time.UTC).Unix()
-	rolloutPath := filepath.Join(
-		codexDir,
-		"sessions",
-		"2026",
-		"04",
-		"01",
-		"rollout-2026-04-01T11-00-00-"+threadID+".jsonl",
-	)
-	if err := os.MkdirAll(filepath.Dir(rolloutPath), 0o755); err != nil {
-		t.Fatalf("mkdir rollout dir: %v", err)
-	}
-	dbPath := filepath.Join(codexDir, "state_5.sqlite")
-
-	db, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		t.Fatalf("open sqlite: %v", err)
-	}
-	defer db.Close()
-	if _, err := db.Exec(
-		"insert into threads (id, cwd, title, model, source, model_provider, created_at, updated_at, first_user_message, rollout_path, archived) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
-		threadID,
-		cwd,
-		title,
-		"gpt-5-codex",
-		"codex",
-		"openai",
-		createdAt,
-		updatedAt,
-		historyText,
-		rolloutPath,
-	); err != nil {
-		t.Fatalf("insert additional sqlite fixture: %v", err)
-	}
-
-	historyPath := filepath.Join(codexDir, "history.jsonl")
-	file, err := os.OpenFile(historyPath, os.O_APPEND|os.O_WRONLY, 0o644)
-	if err != nil {
-		t.Fatalf("open history fixture for append: %v", err)
-	}
 	defer file.Close()
-	encoder := json.NewEncoder(file)
-	if err := encoder.Encode(map[string]any{
-		"session_id": threadID,
-		"ts":         updatedAt,
-		"text":       historyText,
-	}); err != nil {
-		t.Fatalf("append history fixture: %v", err)
-	}
-
-	rolloutFile, err := os.Create(rolloutPath)
-	if err != nil {
-		t.Fatalf("create additional rollout fixture: %v", err)
-	}
-	defer rolloutFile.Close()
-	rolloutEncoder := json.NewEncoder(rolloutFile)
-	for _, line := range []map[string]any{
-		{
-			"timestamp": time.Unix(createdAt, 0).UTC().Format(time.RFC3339),
-			"type":      "event_msg",
-			"payload": map[string]any{
-				"type":    "task_started",
-				"turn_id": "turn-other",
-			},
+	line := map[string]any{
+		"timestamp": time.Now().UTC().Format(time.RFC3339),
+		"type":      "event_msg",
+		"payload": map[string]any{
+			"type":    "agent_message",
+			"message": message,
 		},
-		{
-			"timestamp": time.Unix(updatedAt, 0).UTC().Format(time.RFC3339),
-			"type":      "event_msg",
-			"payload": map[string]any{
-				"type":    "agent_message",
-				"message": assistantText,
-			},
-		},
-	} {
-		if err := rolloutEncoder.Encode(line); err != nil {
-			t.Fatalf("write additional rollout fixture: %v", err)
-		}
 	}
-}
-
-func escapeSQLiteString(value string) string {
-	return strings.ReplaceAll(value, "'", "''")
+	if err := json.NewEncoder(file).Encode(line); err != nil {
+		t.Fatalf("write rollout fixture: %v", err)
+	}
+	if _, err := fmt.Fprintln(file); err != nil {
+		t.Fatalf("terminate rollout fixture: %v", err)
+	}
 }

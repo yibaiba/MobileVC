@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
@@ -7,6 +8,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../core/config/app_config.dart';
 import '../../core/config/app_connection_environment.dart';
+import '../../core/config/relay_config.dart';
+import '../../core/relay_e2ee/relay_security_state.dart';
 import '../../data/models/events.dart';
 import '../../data/models/runtime_meta.dart';
 import '../../data/models/session_models.dart';
@@ -136,6 +139,7 @@ class _PendingOutboundAction {
     required this.label,
     required this.createdAt,
     required this.clientActionId,
+    this.lastSentAt,
     this.displayed = false,
     this.sendAttempts = 0,
   });
@@ -145,11 +149,13 @@ class _PendingOutboundAction {
   final String label;
   final DateTime createdAt;
   final String clientActionId;
+  final DateTime? lastSentAt;
   final bool displayed;
   final int sendAttempts;
 
   _PendingOutboundAction copyWith({
     Map<String, dynamic>? payload,
+    DateTime? lastSentAt,
     bool? displayed,
     int? sendAttempts,
   }) =>
@@ -159,6 +165,7 @@ class _PendingOutboundAction {
         label: label,
         createdAt: createdAt,
         clientActionId: clientActionId,
+        lastSentAt: lastSentAt ?? this.lastSentAt,
         displayed: displayed ?? this.displayed,
         sendAttempts: sendAttempts ?? this.sendAttempts,
       );
@@ -186,8 +193,39 @@ bool shouldPreserveAdbFailureStatus(String status) {
 }
 
 class SessionController extends ChangeNotifier {
-  SessionController({MobileVcWsService? service})
-      : _service = service ?? MobileVcWsService();
+  SessionController({
+    MobileVcWsService? service,
+    @visibleForTesting
+    Duration outboundAckRetryDelay = const Duration(seconds: 6),
+    @visibleForTesting
+    Duration outboundAckStaleTimeout = const Duration(seconds: 12),
+  })  : _service = service ?? MobileVcWsService(),
+        _outboundAckRetryDelay = outboundAckRetryDelay,
+        _outboundAckStaleTimeout = outboundAckStaleTimeout {
+    _terminalExecutionsView = UnmodifiableListView(_terminalExecutions);
+    _runtimeProcessesView = UnmodifiableListView(_runtimeProcesses);
+    _codexModelCatalogView = UnmodifiableListView(_codexModelCatalog);
+    _claudeModelCatalogView = UnmodifiableListView(_claudeModelCatalog);
+    _currentDirectoryItemsView = UnmodifiableListView(_currentDirectoryItems);
+    _recentDiffsView = UnmodifiableListView(_recentDiffs);
+    _sessionsView = UnmodifiableListView(_sessions);
+    _relayDevicesView = UnmodifiableListView(_relayDevices);
+    _skillsView = UnmodifiableListView(_skills);
+    _memoryItemsView = UnmodifiableListView(_memoryItems);
+    _sessionPermissionRulesView = UnmodifiableListView(_sessionPermissionRules);
+    _persistentPermissionRulesView =
+        UnmodifiableListView(_persistentPermissionRules);
+    _debugLogsView = UnmodifiableListView(_debugLogs);
+    _pendingToggleSkillNamesView =
+        UnmodifiableSetView(_pendingToggleSkillNames);
+    _pendingToggleMemoryIdsView = UnmodifiableSetView(_pendingToggleMemoryIds);
+    _adbDevicesView = UnmodifiableListView(_adbDevices);
+    _adbAvailableAvdsView = UnmodifiableListView(_adbAvailableAvds);
+    _pendingPlanQuestionsView = UnmodifiableListView(_pendingPlanQuestions);
+    _pendingPlanAnswersView = UnmodifiableMapView(_pendingPlanAnswers);
+    _timelineView = UnmodifiableListView(_timeline);
+    _reviewGroupsView = UnmodifiableListView(_reviewGroups);
+  }
 
   static const _prefsKey = 'mobilevc.app_config';
   static const _connectionIntentPrefsKey = 'mobilevc.connection_intent';
@@ -195,9 +233,12 @@ class SessionController extends ChangeNotifier {
   static const Duration _connectionHealthInterval = Duration(seconds: 10);
   static const Duration _connectionSilenceTimeout = Duration(seconds: 45);
   static const Duration _observedSessionSyncInterval = Duration(seconds: 3);
-  static const Duration _outboundAckRetryDelay = Duration(seconds: 6);
+  static const Duration _sessionDeltaRequestCoalesceWindow =
+      Duration(seconds: 2);
   final MobileVcWsService _service;
   final AdbWebRtcService _adbWebRtc = AdbWebRtcService();
+  final Duration _outboundAckRetryDelay;
+  final Duration _outboundAckStaleTimeout;
 
   StreamSubscription<AppEvent>? _subscription;
   AppConfig _config = const AppConfig();
@@ -218,8 +259,11 @@ class SessionController extends ChangeNotifier {
   final Map<String, int> _sessionEventCursors = <String, int>{};
   final Map<String, SessionDeltaKnown> _sessionDeltaKnown =
       <String, SessionDeltaKnown>{};
+  final Map<String, DateTime> _sessionDeltaLastRequestedAt =
+      <String, DateTime>{};
   bool _fileListLoading = false;
   bool _fileReading = false;
+  bool _relayDeviceListLoading = false;
   bool _canResumeCurrentSession = false;
   bool _sessionRuntimeAlive = false;
   bool _selectedSessionExternalNative = false;
@@ -229,8 +273,12 @@ class SessionController extends ChangeNotifier {
   bool _isStopping = false;
   bool _isCompacting = false;
   Timer? _sessionLoadingTimeout;
+  Timer? _postHistoryBootstrapTimer;
   static const Duration _sessionLoadingTimeoutDuration = Duration(seconds: 15);
+  static const Duration _postHistoryBootstrapDelay =
+      Duration(milliseconds: 450);
   String _connectionMessage = '未连接';
+  String _relayDeviceStatus = '';
   String _selectedSessionId = '';
   String _selectedSessionTitle = 'MobileVC';
   String _currentDirectoryPath = '';
@@ -242,6 +290,7 @@ class SessionController extends ChangeNotifier {
   // 收到带有新 executionKey 的 AgentStateEvent（或 IDLE/WAIT_INPUT）时解锁。
   bool _isSubmitting = false;
   String _isSubmittingBaselineKey = '';
+  bool _pendingAiLaunchAwaitingInput = false;
   // 用于把 _activityVisible=false 平滑延迟，避免瞬时跳变造成视觉闪烁。
   Timer? _activityHideDebounce;
   AgentStateEvent? _agentState;
@@ -277,6 +326,9 @@ class SessionController extends ChangeNotifier {
   final List<FSItem> _currentDirectoryItems = [];
   final List<HistoryContext> _recentDiffs = [];
   final List<SessionSummary> _sessions = [];
+  final Map<String, SessionSummary> _pendingDeletedSessions =
+      <String, SessionSummary>{};
+  final List<RelayTrustedDevice> _relayDevices = [];
   final List<SkillDefinition> _skills = [];
   final List<MemoryItem> _memoryItems = [];
   final List<PermissionRule> _sessionPermissionRules = [];
@@ -286,6 +338,27 @@ class SessionController extends ChangeNotifier {
   final List<ReviewGroup> _reviewGroups = [];
   final List<TerminalExecution> _terminalExecutions = [];
   final List<RuntimeProcessItem> _runtimeProcesses = [];
+  late final List<TerminalExecution> _terminalExecutionsView;
+  late final List<RuntimeProcessItem> _runtimeProcessesView;
+  late final List<CodexModelCatalogEntry> _codexModelCatalogView;
+  late final List<ClaudeModelCatalogEntry> _claudeModelCatalogView;
+  late final List<FSItem> _currentDirectoryItemsView;
+  late final List<HistoryContext> _recentDiffsView;
+  late final List<SessionSummary> _sessionsView;
+  late final List<RelayTrustedDevice> _relayDevicesView;
+  late final List<SkillDefinition> _skillsView;
+  late final List<MemoryItem> _memoryItemsView;
+  late final List<PermissionRule> _sessionPermissionRulesView;
+  late final List<PermissionRule> _persistentPermissionRulesView;
+  late final List<String> _debugLogsView;
+  late final Set<String> _pendingToggleSkillNamesView;
+  late final Set<String> _pendingToggleMemoryIdsView;
+  late final List<AdbDevice> _adbDevicesView;
+  late final List<String> _adbAvailableAvdsView;
+  late final List<PlanQuestion> _pendingPlanQuestionsView;
+  late final Map<String, String> _pendingPlanAnswersView;
+  late final List<TimelineItem> _timelineView;
+  late final List<ReviewGroup> _reviewGroupsView;
   String _activeReviewGroupId = '';
   String _activeReviewDiffId = '';
   int _activeRuntimeProcessPid = 0;
@@ -352,6 +425,7 @@ class SessionController extends ChangeNotifier {
 
   AppConfig get config => _config;
   SessionConnectionStage get connectionStage => _connectionStage;
+  String get configuredAiEngine => _resolvedConfiguredAiEngine(_config.engine);
   String get currentAiEngine => _resolvedAiEngine(
         command: currentMeta.command,
         engine: currentMeta.engine,
@@ -364,8 +438,8 @@ class SessionController extends ChangeNotifier {
             : _configuredModelForEngine(currentAiEngine),
       );
   String get configuredAiModel => _resolvedAiModel(
-        currentAiEngine,
-        _configuredModelForEngine(currentAiEngine),
+        configuredAiEngine,
+        _configuredModelForEngine(configuredAiEngine),
       );
   String get selectedAiReasoningEffort => _resolvedAiReasoningEffort(
         currentAiEngine,
@@ -374,24 +448,24 @@ class SessionController extends ChangeNotifier {
             : _configuredReasoningEffortForEngine(currentAiEngine),
       );
   String get configuredAiReasoningEffort => _resolvedAiReasoningEffort(
-        currentAiEngine,
-        _configuredReasoningEffortForEngine(currentAiEngine),
+        configuredAiEngine,
+        _configuredReasoningEffortForEngine(configuredAiEngine),
       );
   bool get supportsAiModelSwitch =>
-      currentAiEngine == 'claude' || currentAiEngine == 'codex';
+      configuredAiEngine == 'claude' || configuredAiEngine == 'codex';
   String get currentAiModelSummary => _displayAiModelSummary(
       currentAiEngine, selectedAiModel, selectedAiReasoningEffort);
   String get commandBarEngine =>
       shouldShowClaudeMode ? displayAiEngine : 'shell';
   String get commandBarModelSummary => _displayAiModelSummary(
-        displayAiEngine,
+        configuredAiEngine,
         _resolvedAiModel(
-          displayAiEngine,
-          _configuredModelForEngine(displayAiEngine),
+          configuredAiEngine,
+          _configuredModelForEngine(configuredAiEngine),
         ),
         _resolvedAiReasoningEffort(
-          displayAiEngine,
-          _configuredReasoningEffortForEngine(displayAiEngine),
+          configuredAiEngine,
+          _configuredReasoningEffortForEngine(configuredAiEngine),
         ),
       );
   bool get connecting => _connecting;
@@ -416,13 +490,11 @@ class SessionController extends ChangeNotifier {
   String get effectiveCwd => currentDirectoryPath;
   String get terminalStdout => _terminalStdout;
   String get terminalStderr => _terminalStderr;
-  List<TerminalExecution> get terminalExecutions =>
-      List.unmodifiable(_terminalExecutions);
+  List<TerminalExecution> get terminalExecutions => _terminalExecutionsView;
   String get activeTerminalExecutionId => _activeTerminalExecutionId;
   TerminalExecution? get activeTerminalExecution =>
       _resolvedActiveTerminalExecution();
-  List<RuntimeProcessItem> get runtimeProcesses =>
-      List.unmodifiable(_runtimeProcesses);
+  List<RuntimeProcessItem> get runtimeProcesses => _runtimeProcessesView;
   int get activeRuntimeProcessPid => _activeRuntimeProcessPid;
   RuntimeProcessItem? get activeRuntimeProcess =>
       _resolvedActiveRuntimeProcess();
@@ -459,13 +531,12 @@ class SessionController extends ChangeNotifier {
   AgentStateEvent? get agentState => _agentState;
   SessionStateEvent? get sessionState => _sessionState;
   RuntimeInfoResultEvent? get runtimeInfo => _runtimeInfo;
-  List<CodexModelCatalogEntry> get codexModelCatalog =>
-      List.unmodifiable(_codexModelCatalog);
+  List<CodexModelCatalogEntry> get codexModelCatalog => _codexModelCatalogView;
   bool get codexModelCatalogLoading => _codexModelCatalogLoading;
   String get codexModelCatalogMessage => _codexModelCatalogMessage;
   bool get codexModelCatalogUnavailable => _codexModelCatalogUnavailable;
   List<ClaudeModelCatalogEntry> get claudeModelCatalog =>
-      List.unmodifiable(_claudeModelCatalog);
+      _claudeModelCatalogView;
   bool get claudeModelCatalogLoading => _claudeModelCatalogLoading;
   String get claudeModelCatalogMessage => _claudeModelCatalogMessage;
   bool get claudeModelCatalogUnavailable => _claudeModelCatalogUnavailable;
@@ -492,17 +563,31 @@ class SessionController extends ChangeNotifier {
   HistoryContext? get currentStep => _currentStep;
   HistoryContext? get latestError => _latestError;
   FileReadResult? get openedFile => _openedFile;
-  List<FSItem> get currentDirectoryItems =>
-      List.unmodifiable(_currentDirectoryItems);
-  List<HistoryContext> get recentDiffs => List.unmodifiable(_recentDiffs);
-  List<SessionSummary> get sessions => List.unmodifiable(_sessions);
-  List<SkillDefinition> get skills => List.unmodifiable(_skills);
-  List<MemoryItem> get memoryItems => List.unmodifiable(_memoryItems);
+  List<FSItem> get currentDirectoryItems => _currentDirectoryItemsView;
+  List<HistoryContext> get recentDiffs => _recentDiffsView;
+  List<SessionSummary> get sessions => _sessionsView;
+  List<RelayTrustedDevice> get relayDevices => _relayDevicesView;
+  bool get relayDeviceListLoading => _relayDeviceListLoading;
+  String get relayDeviceStatus => _relayDeviceStatus;
+  bool get canManageRelayDevices =>
+      connected && _config.isRelayMode && _service.hasRelayE2eeDeviceBinding;
+  Future<RelaySecurityState> relaySecurityState() {
+    return RelaySecurityStateEvaluator.evaluate(
+      _service.relaySecurityInput(
+        connectionMode: _config.connectionMode,
+        expectedNodeFingerprintHex: _config.relayNodeFingerprintHex,
+        configuredCapabilities: _config.relayCapabilities,
+      ),
+    );
+  }
+
+  List<SkillDefinition> get skills => _skillsView;
+  List<MemoryItem> get memoryItems => _memoryItemsView;
   List<PermissionRule> get sessionPermissionRules =>
-      List.unmodifiable(_sessionPermissionRules);
+      _sessionPermissionRulesView;
   List<PermissionRule> get persistentPermissionRules =>
-      List.unmodifiable(_persistentPermissionRules);
-  List<String> get debugLogs => List.unmodifiable(_debugLogs);
+      _persistentPermissionRulesView;
+  List<String> get debugLogs => _debugLogsView;
   bool get sessionPermissionRulesEnabled => _sessionPermissionRulesEnabled;
   bool get persistentPermissionRulesEnabled =>
       _persistentPermissionRulesEnabled;
@@ -512,10 +597,8 @@ class SessionController extends ChangeNotifier {
   CatalogMetadata get memoryCatalogMeta => _memoryCatalogMeta;
   String get skillSyncStatus => _skillSyncStatus;
   String get memorySyncStatus => _memorySyncStatus;
-  Set<String> get pendingToggleSkillNames =>
-      Set.unmodifiable(_pendingToggleSkillNames);
-  Set<String> get pendingToggleMemoryIds =>
-      Set.unmodifiable(_pendingToggleMemoryIds);
+  Set<String> get pendingToggleSkillNames => _pendingToggleSkillNamesView;
+  Set<String> get pendingToggleMemoryIds => _pendingToggleMemoryIdsView;
   bool get isSavingSkill => _isSavingSkill;
   bool get isSavingMemory => _isSavingMemory;
   int get permissionRuleCount =>
@@ -539,8 +622,8 @@ class SessionController extends ChangeNotifier {
     return '$total 条 · $scopeText';
   }
 
-  List<AdbDevice> get adbDevices => List.unmodifiable(_adbDevices);
-  List<String> get adbAvailableAvds => List.unmodifiable(_adbAvailableAvds);
+  List<AdbDevice> get adbDevices => _adbDevicesView;
+  List<String> get adbAvailableAvds => _adbAvailableAvdsView;
   Uint8List? get adbFrameBytes => _adbFrameBytes;
   String get adbSelectedSerial => _adbSelectedSerial;
   String get adbPreferredAvd => _adbPreferredAvd;
@@ -608,10 +691,8 @@ class SessionController extends ChangeNotifier {
     return _pendingPlanQuestions[_pendingPlanQuestionIndex];
   }
 
-  List<PlanQuestion> get pendingPlanQuestionList =>
-      List.unmodifiable(_pendingPlanQuestions);
-  Map<String, String> get pendingPlanAnswers =>
-      Map.unmodifiable(_pendingPlanAnswers);
+  List<PlanQuestion> get pendingPlanQuestionList => _pendingPlanQuestionsView;
+  Map<String, String> get pendingPlanAnswers => _pendingPlanAnswersView;
   int get pendingPlanQuestionIndex => _pendingPlanQuestionIndex;
   bool get isPlanSubmissionReady =>
       hasPendingPlanQuestions &&
@@ -666,8 +747,8 @@ class SessionController extends ChangeNotifier {
       _selectedSessionId.trim().isNotEmpty &&
       _continuedSameSessionId == _selectedSessionId.trim();
 
-  List<TimelineItem> get timeline => List.unmodifiable(_timeline);
-  List<ReviewGroup> get reviewGroups => List.unmodifiable(_reviewGroups);
+  List<TimelineItem> get timeline => _timelineView;
+  List<ReviewGroup> get reviewGroups => _reviewGroupsView;
   ReviewGroup? get activeReviewGroup => _resolvedActiveReviewGroup();
   String get activeReviewGroupId => _activeReviewGroupId;
   bool get awaitInput {
@@ -692,8 +773,8 @@ class SessionController extends ChangeNotifier {
   int get pendingDiffCount => _pendingDiffs.length;
   int get pendingReviewGroupCount =>
       _reviewGroups.where((group) => group.pendingCount > 0).length;
-  List<HistoryContext> get diffItems => List.unmodifiable(_recentDiffs);
-  List<HistoryContext> get pendingDiffs => List.unmodifiable(_pendingDiffs);
+  List<HistoryContext> get diffItems => _recentDiffsView;
+  List<HistoryContext> get pendingDiffs => UnmodifiableListView(_pendingDiffs);
   String get activeReviewDiffId => _activeReviewDiffId;
   HistoryContext? get currentDiffContext => _resolvedCurrentDiff();
   HistoryContext? get currentReviewDiff => _currentReviewDiff();
@@ -814,15 +895,6 @@ class SessionController extends ChangeNotifier {
     _syncActiveReviewSelection();
     _syncDerivedState();
     notifyListeners();
-    _sessionLoadingTimeout = Timer(_sessionLoadingTimeoutDuration, () {
-      if (!_isLoadingSession) return;
-      _isLoadingSession = false;
-      _pendingSessionTargetId = '';
-      _agentPhaseLabel = '加载超时';
-      _pushSystem('error', '会话加载超时，请检查网络后重试');
-      _syncDerivedState();
-      notifyListeners();
-    });
   }
 
   void setActiveReviewDiff(String diffId) {
@@ -949,6 +1021,9 @@ class SessionController extends ChangeNotifier {
     if (_isStopping) {
       return false;
     }
+    if (awaitInput || _isClaudePendingReadyForInput) {
+      return false;
+    }
     if (_hasRunningTerminalExecution) {
       return true;
     }
@@ -1051,7 +1126,11 @@ class SessionController extends ChangeNotifier {
     if (_isStopping) {
       return '正在停止';
     }
-    if (_isClaudePendingReadyForInput) {
+    final agentState = (_agentState?.state ?? '').trim().toUpperCase();
+    if (_isClaudePendingReadyForInput ||
+        _pendingAiLaunchAwaitingInput ||
+        agentState == 'WAIT_INPUT' ||
+        awaitInput) {
       return '待输入';
     }
     final stepSummary = _currentStepSummary.trim();
@@ -1072,7 +1151,7 @@ class SessionController extends ChangeNotifier {
     if (_isStopping) {
       return '等待后端确认停止...';
     }
-    if (_isClaudePendingReadyForInput) {
+    if (_isClaudePendingReadyForInput || _pendingAiLaunchAwaitingInput) {
       return 'Claude 已启动，请继续输入';
     }
     final stepSummary = _currentStepSummary.trim();
@@ -1312,6 +1391,7 @@ class SessionController extends ChangeNotifier {
     _connectionHealthTimer?.cancel();
     _pendingOutboundRetryTimer?.cancel();
     _sessionLoadingTimeout?.cancel();
+    _postHistoryBootstrapTimer?.cancel();
     _aiStatusHideDebounce?.cancel();
     _activityHideDebounce?.cancel();
     await _subscription?.cancel();
@@ -1338,6 +1418,67 @@ class SessionController extends ChangeNotifier {
       _pushSystem('error', '保存连接配置失败：$error');
     }
     notifyListeners();
+  }
+
+  Future<bool> importConnectionLink(String raw) async {
+    final AppConfig? imported;
+    try {
+      imported = AppConfig.fromLaunchUri(raw, fallback: _config);
+    } catch (error) {
+      _connectionMessage = _connectionImportErrorMessage(error);
+      _pushSystem('error', _connectionMessage);
+      _syncDerivedState();
+      notifyListeners();
+      return false;
+    }
+    if (imported == null) {
+      _pushSystem('error', '链接无法识别，请使用 MobileVC 连接链接或 Relay 配对二维码');
+      notifyListeners();
+      return false;
+    }
+    if (imported.isRelayMode) {
+      await _prepareForImportedRelayLink();
+    }
+    await saveConfig(imported);
+    _connectionMessage =
+        imported.isRelayMode ? '已导入 Relay 配对，点击连接完成配对' : '已导入连接配置';
+    if (imported.isRelayMode) {
+      _connectionStage = SessionConnectionStage.disconnected;
+      _latestError = null;
+    }
+    _pushSystem(
+      'session',
+      imported.isRelayMode
+          ? '已导入 Relay 配对，点击连接完成配对'
+          : '已导入连接配置：${imported.displayEndpoint}',
+    );
+    notifyListeners();
+    return true;
+  }
+
+  String _connectionImportErrorMessage(Object error) {
+    if (error is FormatException) {
+      final message = error.message.toString().trim();
+      return message.isEmpty ? '导入失败：链接格式错误' : '导入失败：$message';
+    }
+    return '导入失败：$error';
+  }
+
+  Future<void> _prepareForImportedRelayLink() async {
+    _cancelReconnectTimer();
+    _autoReconnectEnabled = false;
+    _reconnectAttempt = 0;
+    unawaited(_saveConnectionIntent(false));
+    if (_connected || _connecting || _service.isConnected) {
+      await _service.disconnect();
+    }
+    _connected = false;
+    _connecting = false;
+    _connectionStage = SessionConnectionStage.disconnected;
+    _latestError = null;
+    _relayDevices.clear();
+    _relayDeviceStatus = '';
+    _relayDeviceListLoading = false;
   }
 
   Future<void> switchWorkingDirectory(String path,
@@ -1413,7 +1554,11 @@ class SessionController extends ChangeNotifier {
     final sent = _service.send(outboundPayload);
     if (sent) {
       _pendingOutboundActions.add(
-        pendingAction.copyWith(displayed: true, sendAttempts: 1),
+        pendingAction.copyWith(
+          displayed: true,
+          lastSentAt: DateTime.now(),
+          sendAttempts: 1,
+        ),
       );
       _appendLocalUserTimeline(userText, clientActionId);
       _schedulePendingOutboundRetry();
@@ -1515,11 +1660,15 @@ class SessionController extends ChangeNotifier {
     if (status.phase.trim().toLowerCase() != 'settled') {
       return false;
     }
-    final replyKey = _lastAssistantReplyExecutionKey;
-    if (replyKey.isEmpty) {
+    if (status.runtimeMeta.claudeLifecycle.trim().toLowerCase() ==
+        'waiting_input') {
       return false;
     }
+    final replyKey = _lastAssistantReplyExecutionKey;
     final statusKey = _runtimeExecutionKey(status.runtimeMeta);
+    if (replyKey.isEmpty) {
+      return statusKey.isNotEmpty && statusKey != _isSubmittingBaselineKey;
+    }
     return statusKey.isEmpty || statusKey == replyKey;
   }
 
@@ -1561,6 +1710,27 @@ class SessionController extends ChangeNotifier {
     _syncDerivedState();
   }
 
+  void _markLocalSubmissionRunning({String command = ''}) {
+    final meta = (_agentState?.runtimeMeta ??
+            _sessionState?.runtimeMeta ??
+            const RuntimeMeta())
+        .merge(RuntimeMeta(command: command));
+    _pendingPrompt = null;
+    _pendingInteraction = null;
+    _clearPlanInteractionState();
+    _agentState = AgentStateEvent(
+      timestamp: DateTime.now(),
+      sessionId: _selectedSessionId,
+      runtimeMeta: meta,
+      raw: const {'type': 'agent_state', 'source': 'local_submission'},
+      state: 'THINKING',
+      message: '思考中',
+      command: command.isNotEmpty ? command : meta.command,
+    );
+    _sessionRuntimeAlive = true;
+    _syncDerivedState();
+  }
+
   String _nextClientActionId() {
     _clientActionSequence += 1;
     return '${DateTime.now().microsecondsSinceEpoch}-$_clientActionSequence';
@@ -1591,6 +1761,7 @@ class SessionController extends ChangeNotifier {
       _pendingOutboundActions.add(
         action.copyWith(
           displayed: true,
+          lastSentAt: DateTime.now(),
           sendAttempts: action.sendAttempts + 1,
         ),
       );
@@ -1634,7 +1805,30 @@ class SessionController extends ChangeNotifier {
       _schedulePendingOutboundRetry();
       return;
     }
+    if (_hasStaleUnacknowledgedOutboundAction()) {
+      unawaited(_service.disconnect());
+      _handleUnexpectedSocketDisconnect('消息投递确认超时，正在重连并补发...');
+      _schedulePendingOutboundRetry();
+      return;
+    }
     _flushPendingOutboundActions();
+  }
+
+  bool _hasStaleUnacknowledgedOutboundAction() {
+    final now = DateTime.now();
+    for (final action in _pendingOutboundActions) {
+      if (action.sendAttempts <= 0) {
+        continue;
+      }
+      if (now.difference(action.createdAt) < _outboundAckStaleTimeout) {
+        continue;
+      }
+      final sentAt = action.lastSentAt ?? action.createdAt;
+      if (now.difference(sentAt) >= _outboundAckStaleTimeout) {
+        return true;
+      }
+    }
+    return false;
   }
 
   Map<String, dynamic> _aiTurnPayload({
@@ -1642,6 +1836,7 @@ class SessionController extends ChangeNotifier {
     required RuntimeMeta meta,
     required String permissionMode,
     String data = '',
+    List<ChatImageAttachment> imageAttachments = const [],
   }) {
     final normalizedEngine = engine.trim().toLowerCase();
     final payload = <String, dynamic>{
@@ -1667,6 +1862,10 @@ class SessionController extends ChangeNotifier {
     }
     if (data.trim().isNotEmpty) {
       payload['data'] = data;
+    }
+    if (imageAttachments.isNotEmpty) {
+      payload['imageAttachments'] =
+          imageAttachments.map((attachment) => attachment.toJson()).toList();
     }
     return payload;
   }
@@ -1770,7 +1969,7 @@ class SessionController extends ChangeNotifier {
       return;
     }
     _cancelReconnectTimer();
-    if (_isInvalidLoopbackHostForMobile()) {
+    if (!_config.isRelayMode && _isInvalidLoopbackHostForMobile()) {
       _connectionStage = SessionConnectionStage.failed;
       _connecting = false;
       _connected = false;
@@ -1792,11 +1991,15 @@ class SessionController extends ChangeNotifier {
     _syncDerivedState();
     notifyListeners();
     try {
-      await _service.connect(
-        _config.wsUrlFor(
-          secureTransport: defaultSecureBackendTransport ? true : null,
-        ),
-      );
+      if (_config.isRelayMode) {
+        await _connectRelay();
+      } else {
+        await _service.connect(
+          _config.wsUrlFor(
+            secureTransport: defaultSecureBackendTransport ? true : null,
+          ),
+        );
+      }
       unawaited(_saveConnectionIntent(true));
       _connected = true;
       _reconnectAttempt = 0;
@@ -1814,6 +2017,9 @@ class SessionController extends ChangeNotifier {
       _claudeModelCatalogMessage = '';
       _claudeModelCatalogUnavailable = false;
       _claudeModelCatalog.clear();
+      _relayDevices.clear();
+      _relayDeviceStatus = '';
+      _relayDeviceListLoading = false;
       await switchWorkingDirectory(_config.cwd);
       requestRuntimeInfo('context');
       requestSkillCatalog();
@@ -1825,6 +2031,9 @@ class SessionController extends ChangeNotifier {
       requestReviewState();
       requestTaskSnapshot();
       requestContextWindowUsage();
+      if (canManageRelayDevices) {
+        requestRelayDeviceList();
+      }
       if (_selectedSessionId.trim().isNotEmpty) {
         _requestSessionResume(reason: silently ? 'reconnect' : 'connect');
       } else {
@@ -1832,10 +2041,11 @@ class SessionController extends ChangeNotifier {
       }
       _sendCachedPushTokenIfPossible();
       _restorePendingNotificationSessionIfNeeded();
-      _flushPendingOutboundActions();
     } catch (error) {
       _connected = false;
-      if (silently && _autoReconnectEnabled) {
+      final relayAgentReconnecting =
+          error is RelayPairingException && error.code == 'agent_disconnected';
+      if ((silently || relayAgentReconnecting) && _autoReconnectEnabled) {
         if (_appInForeground &&
             _reconnectAttempt >= _maxForegroundReconnectAttempts) {
           _autoReconnectEnabled = false;
@@ -1859,6 +2069,7 @@ class SessionController extends ChangeNotifier {
       _connecting = false;
       if (_connected) {
         _restorePendingNotificationSessionIfNeeded();
+        _flushPendingOutboundActions();
       }
       if (shouldRetrySilently) {
         _scheduleReconnect();
@@ -1866,6 +2077,77 @@ class SessionController extends ChangeNotifier {
       _syncDerivedState();
       notifyListeners();
     }
+  }
+
+  Future<void> _connectRelay() async {
+    final relayUrl = _config.relayUrl.trim();
+    final sessionId = _config.relaySessionId.trim();
+    final pairingSecret = _config.relayPairingSecret.trim();
+    final clientId = _config.relayClientId.trim();
+    final clientReconnectSecret = _config.relayClientReconnectSecret.trim();
+    if (relayUrl.isEmpty ||
+        sessionId.isEmpty ||
+        (pairingSecret.isEmpty &&
+            (clientId.isEmpty || clientReconnectSecret.isEmpty))) {
+      throw const FormatException('Relay 配对信息不完整，请重新扫码');
+    }
+    validateRelayUrl(relayUrl);
+    try {
+      await _service.connectRelay(
+        relayUrl: relayUrl,
+        sessionId: sessionId,
+        pairingSecret: pairingSecret,
+        clientId: clientId,
+        clientReconnectSecret: clientReconnectSecret,
+        nodeFingerprintHex: _config.relayNodeFingerprintHex,
+        relayCapabilities: _config.relayCapabilities,
+      );
+    } catch (error) {
+      if (_shouldClearRelayPairingAfterFailure(error, pairingSecret)) {
+        await _clearRelayPairingAfterFailure();
+        throw RelayPairingException(
+          'relay_pairing_consumed',
+          'Relay 配对未完成：当前配对链接已一次性使用，请导入新的中继链接后重试。原始错误：$error',
+        );
+      }
+      rethrow;
+    }
+    final relaySession = _service.takeRelaySession();
+    _config = _config.copyWith(
+      relaySessionId: relaySession?.sessionId ?? sessionId,
+      relayPairingSecret: '',
+      relayPairingExpiresAt: 0,
+      relayClientId: relaySession?.clientId ?? clientId,
+      relayClientReconnectSecret:
+          relaySession?.clientReconnectSecret ?? clientReconnectSecret,
+    );
+    unawaited(_persistCurrentConfig());
+  }
+
+  bool _shouldClearRelayPairingAfterFailure(
+    Object error,
+    String pairingSecret,
+  ) {
+    if (pairingSecret.trim().isEmpty) {
+      return false;
+    }
+    if (error is RelayPairingException) {
+      return error.code != 'agent_disconnected';
+    }
+    if (error is TimeoutException) {
+      final message = (error.message ?? '').trim();
+      return message.contains('E2EE') || message.contains('配对');
+    }
+    final message = error.toString();
+    return message.contains('Relay E2EE') || message.contains('E2EE 握手');
+  }
+
+  Future<void> _clearRelayPairingAfterFailure() async {
+    _config = _config.copyWith(
+      relayPairingSecret: '',
+      relayPairingExpiresAt: 0,
+    );
+    await _persistCurrentConfig();
   }
 
   Future<void> disconnect() async {
@@ -1879,6 +2161,8 @@ class SessionController extends ChangeNotifier {
     _connectionHealthTimer = null;
     _sessionLoadingTimeout?.cancel();
     _sessionLoadingTimeout = null;
+    _postHistoryBootstrapTimer?.cancel();
+    _postHistoryBootstrapTimer = null;
     await _adbWebRtc.stop();
     await _service.disconnect();
     _connected = false;
@@ -1891,6 +2175,9 @@ class SessionController extends ChangeNotifier {
     _sessionListSyncedSinceConnect = false;
     _fileListLoading = false;
     _fileReading = false;
+    _relayDeviceListLoading = false;
+    _relayDeviceStatus = '';
+    _relayDevices.clear();
     _sessionRuntimeAlive = false;
     _selectedSessionExternalNative = false;
     _executionActive = false;
@@ -1957,6 +2244,7 @@ class SessionController extends ChangeNotifier {
     _activityHideDebounce = null;
     _isSubmitting = false;
     _isSubmittingBaselineKey = '';
+    _pendingAiLaunchAwaitingInput = false;
     _aiStatusHideDebounce?.cancel();
     _aiStatusHideDebounce = null;
     _aiStatusIndicatorVisible = false;
@@ -2015,9 +2303,12 @@ class SessionController extends ChangeNotifier {
 
   void resumeConnectionIfNeeded() {
     if (_connected && !_connecting) {
+      if (_isLoadingSession && _pendingSessionTargetId.trim().isNotEmpty) {
+        return;
+      }
       requestTaskSnapshot();
       _requestSessionResume(reason: 'foreground');
-      _requestSessionDelta(reason: 'foreground');
+      _requestSessionDelta(reason: 'foreground', force: true);
       _flushPendingOutboundActions();
       _syncObservedSessionPolling();
       return;
@@ -2028,6 +2319,12 @@ class SessionController extends ChangeNotifier {
   void _requestSessionResume({String reason = ''}) {
     final sessionId = _selectedSessionId.trim();
     if (!_connected || _connecting || sessionId.isEmpty) {
+      return;
+    }
+    final pendingTargetId = _pendingSessionTargetId.trim();
+    if (_isLoadingSession &&
+        pendingTargetId.isNotEmpty &&
+        pendingTargetId != sessionId) {
       return;
     }
     final lastSeenCursor = _sessionEventCursors[sessionId] ?? 0;
@@ -2046,11 +2343,25 @@ class SessionController extends ChangeNotifier {
     notifyListeners();
   }
 
-  void _requestSessionDelta({String reason = ''}) {
+  void _requestSessionDelta({String reason = '', bool force = false}) {
     final sessionId = _selectedSessionId.trim();
     if (!_connected || _connecting || sessionId.isEmpty) {
       return;
     }
+    final pendingTargetId = _pendingSessionTargetId.trim();
+    if (_isLoadingSession &&
+        pendingTargetId.isNotEmpty &&
+        pendingTargetId != sessionId) {
+      return;
+    }
+    final now = DateTime.now();
+    final lastRequestedAt = _sessionDeltaLastRequestedAt[sessionId];
+    if (!force &&
+        lastRequestedAt != null &&
+        now.difference(lastRequestedAt) < _sessionDeltaRequestCoalesceWindow) {
+      return;
+    }
+    _sessionDeltaLastRequestedAt[sessionId] = now;
     _service.send({
       'action': 'session_delta_get',
       'sessionId': sessionId,
@@ -2156,7 +2467,7 @@ class SessionController extends ChangeNotifier {
   }
 
   void requestSessionList() {
-    _service.send({'action': 'session_list', 'cwd': effectiveCwd});
+    _service.send({'action': 'session_list'});
   }
 
   void _handleAutoSessionBinding(List<SessionSummary> items) {
@@ -2223,6 +2534,18 @@ class SessionController extends ChangeNotifier {
     if (targetId.isEmpty) {
       return;
     }
+    final selectedId = _selectedSessionId.trim();
+    final pendingTargetId = _pendingSessionTargetId.trim();
+    if (_isLoadingSession && pendingTargetId == targetId) {
+      return;
+    }
+    if (!_isLoadingSession && selectedId == targetId) {
+      return;
+    }
+    _postHistoryBootstrapTimer?.cancel();
+    _postHistoryBootstrapTimer = null;
+    _stopObservedSessionSync();
+    _sessionDeltaLastRequestedAt.clear();
     _connectionStage =
         _connected ? SessionConnectionStage.catchingUp : _connectionStage;
     _beginSessionLoading(targetId: targetId);
@@ -2233,19 +2556,51 @@ class SessionController extends ChangeNotifier {
     });
   }
 
+  Future<void> loadSessionFromSummary(SessionSummary summary) async {
+    final targetId = summary.id.trim();
+    if (targetId.isEmpty) {
+      return;
+    }
+    final targetCwd = summary.runtime.cwd.trim();
+    if (targetCwd.isNotEmpty &&
+        _normalizePath(targetCwd) != _normalizePath(effectiveCwd)) {
+      await switchWorkingDirectory(targetCwd);
+    }
+    loadSession(targetId);
+  }
+
   void deleteSession(String sessionId) {
     final targetId = sessionId.trim();
     if (targetId.isEmpty) {
       return;
     }
+    final target = _removeSessionLocally(targetId);
     if (targetId == _selectedSessionId) {
       _beginSessionLoading();
+    }
+    if (target != null) {
+      _pendingDeletedSessions[targetId] = target;
+      _pushSystem('system', '正在删除会话：${sessionDisplayTitle(target)}');
+      notifyListeners();
     }
     _service.send({'action': 'session_delete', 'sessionId': targetId});
   }
 
   void _beginSessionLoading({String targetId = ''}) {
     _sessionLoadingTimeout?.cancel();
+    _postHistoryBootstrapTimer?.cancel();
+    _postHistoryBootstrapTimer = null;
+    _sessionLoadingTimeout = Timer(_sessionLoadingTimeoutDuration, () {
+      if (!_isLoadingSession) {
+        return;
+      }
+      _isLoadingSession = false;
+      _pendingSessionTargetId = '';
+      _agentPhaseLabel = '加载超时';
+      _pushSystem('error', '会话加载超时，请检查网络后重试');
+      _syncDerivedState();
+      notifyListeners();
+    });
     _isLoadingSession = true;
     _pendingSessionTargetId = targetId.trim();
     _pendingPrompt = null;
@@ -2267,6 +2622,7 @@ class SessionController extends ChangeNotifier {
     _activityHideDebounce = null;
     _isSubmitting = false;
     _isSubmittingBaselineKey = '';
+    _pendingAiLaunchAwaitingInput = false;
     _aiStatusHideDebounce?.cancel();
     _aiStatusHideDebounce = null;
     _aiStatusIndicatorVisible = false;
@@ -2304,6 +2660,7 @@ class SessionController extends ChangeNotifier {
     _activityHideDebounce = null;
     _isSubmitting = false;
     _isSubmittingBaselineKey = '';
+    _pendingAiLaunchAwaitingInput = false;
     _aiStatusHideDebounce?.cancel();
     _aiStatusHideDebounce = null;
     _aiStatusIndicatorVisible = false;
@@ -2384,6 +2741,27 @@ class SessionController extends ChangeNotifier {
     _pendingSessionTargetId = '';
   }
 
+  void _schedulePostHistoryBootstrap({
+    required String sessionId,
+  }) {
+    _postHistoryBootstrapTimer?.cancel();
+    final normalizedSessionId = sessionId.trim();
+    _postHistoryBootstrapTimer = Timer(_postHistoryBootstrapDelay, () {
+      _postHistoryBootstrapTimer = null;
+      if (!_connected ||
+          _connecting ||
+          normalizedSessionId.isEmpty ||
+          _selectedSessionId.trim() != normalizedSessionId ||
+          _isLoadingSession) {
+        return;
+      }
+      requestRuntimeProcessList();
+      requestPermissionRuleList();
+      requestTaskSnapshot();
+      requestContextWindowUsage();
+    });
+  }
+
   void updatePermissionMode(String permissionMode) {
     final normalizedMode = _normalizeDisplayPermissionMode(permissionMode);
     _config = _config.copyWith(permissionMode: normalizedMode);
@@ -2429,31 +2807,38 @@ class SessionController extends ChangeNotifier {
   Future<void> updateAiModelSelection({
     required String model,
     String reasoningEffort = '',
+    String engine = '',
   }) async {
-    final engine = currentAiEngine;
-    if (!(engine == 'claude' || engine == 'codex')) {
+    final targetEngine = engine.trim().isNotEmpty
+        ? _resolvedConfiguredAiEngine(engine)
+        : configuredAiEngine;
+    if (!(targetEngine == 'claude' || targetEngine == 'codex')) {
       _pushSystem('session', '当前模式暂不支持快捷切换模型');
       return;
     }
     final normalizedModel =
-        engine == 'codex' && model.trim().toLowerCase() == 'default'
+        targetEngine == 'codex' && model.trim().toLowerCase() == 'default'
             ? ''
-            : _resolvedAiModel(engine, model);
+            : _resolvedAiModel(targetEngine, model);
     final normalizedEffort =
-        _resolvedAiReasoningEffort(engine, reasoningEffort);
-    _pendingAiPreferences[engine] = _PendingAiPreference(
+        _resolvedAiReasoningEffort(targetEngine, reasoningEffort);
+    _pendingAiPreferences[targetEngine] = _PendingAiPreference(
       model: normalizedModel,
       reasoningEffort: normalizedEffort,
     );
     await saveConfig(_config.copyWith(
-      claudeModel: engine == 'claude' ? normalizedModel : _config.claudeModel,
-      codexModel: engine == 'codex' ? normalizedModel : _config.codexModel,
-      codexReasoningEffort:
-          engine == 'codex' ? normalizedEffort : _config.codexReasoningEffort,
+      engine: targetEngine,
+      claudeModel:
+          targetEngine == 'claude' ? normalizedModel : _config.claudeModel,
+      codexModel:
+          targetEngine == 'codex' ? normalizedModel : _config.codexModel,
+      codexReasoningEffort: targetEngine == 'codex'
+          ? normalizedEffort
+          : _config.codexReasoningEffort,
     ));
     _pushSystem(
       'session',
-      engine == 'codex'
+      targetEngine == 'codex'
           ? 'Codex 模型已切换为 ${normalizedModel.isEmpty ? 'Default' : _codexModelDisplayLabel(normalizedModel)} · ${normalizedEffort.toUpperCase()}，将对下一次 Codex 启动生效'
           : 'Claude 模型已切换为 ${_claudeModelLabel(normalizedModel)}，将对下一次 Claude 启动生效',
     );
@@ -2487,6 +2872,90 @@ class SessionController extends ChangeNotifier {
     }
     _fileReading = true;
     _service.send({'action': 'fs_read', 'path': target});
+    notifyListeners();
+  }
+
+  Future<RelayFileDownloadResult> downloadRelayFile(
+    String path, {
+    void Function(int receivedBytes, int? totalBytes)? onProgress,
+    FutureOr<void> Function(Uint8List chunk)? onChunk,
+    RelayFileDownloadCancelToken? cancelToken,
+  }) {
+    return _service.downloadRelayFile(
+      path,
+      onProgress: onProgress,
+      onChunk: onChunk,
+      cancelToken: cancelToken,
+    );
+  }
+
+  void requestRelayDeviceList() {
+    if (!canManageRelayDevices) {
+      _relayDeviceStatus =
+          _config.isRelayMode ? 'Relay E2EE 未就绪，暂不能读取设备列表' : '当前不是 Relay 模式';
+      notifyListeners();
+      return;
+    }
+    _relayDeviceListLoading = true;
+    _relayDeviceStatus = '正在读取 Relay 设备列表...';
+    _service.send({'action': 'relay_device_list'});
+    notifyListeners();
+  }
+
+  void revokeRelayDevice(String deviceId) {
+    final target = deviceId.trim();
+    if (target.isEmpty) {
+      return;
+    }
+    if (!canManageRelayDevices) {
+      _relayDeviceStatus = 'Relay E2EE 未就绪，不能撤销设备';
+      notifyListeners();
+      return;
+    }
+    final targetDevice = _relayDevices.cast<RelayTrustedDevice?>().firstWhere(
+          (device) => device?.deviceId == target,
+          orElse: () => null,
+        );
+    if (targetDevice?.currentDevice == true) {
+      _relayDeviceStatus = '不能从当前手机撤销当前设备，请在本机管理端执行全局轮换';
+      notifyListeners();
+      return;
+    }
+    _relayDeviceStatus = '正在撤销设备...';
+    _service.send({'action': 'relay_device_revoke', 'deviceId': target});
+    notifyListeners();
+  }
+
+  void rotateRelayDevices() {
+    if (!canManageRelayDevices) {
+      _relayDeviceStatus = 'Relay E2EE 未就绪，不能执行全局轮换';
+      notifyListeners();
+      return;
+    }
+    _relayDeviceStatus = '正在全局轮换 Relay 身份...';
+    _service.send({'action': 'relay_device_rotate'});
+    notifyListeners();
+  }
+
+  Future<void> _handleRelayDeviceRotateResult(
+    RelayDeviceRotateResultEvent result,
+  ) async {
+    await _service.resetRelayDeviceBinding();
+    _relayDevices.clear();
+    _relayDeviceListLoading = false;
+    _relayDeviceStatus = 'Relay 身份已轮换，请导入新的中继链接后重新配对';
+    _config = _config.copyWith(
+      relaySessionId: '',
+      relayPairingSecret: '',
+      relayPairingExpiresAt: 0,
+      relayClientId: '',
+      relayClientReconnectSecret: '',
+      relayNodeFingerprintHex: result.nodeFingerprintHex,
+    );
+    await _persistCurrentConfig();
+    await disconnect();
+    _relayDeviceStatus = 'Relay 身份已轮换，请导入新的中继链接后重新配对';
+    _connectionMessage = 'Relay 身份已轮换，需要重新配对';
     notifyListeners();
   }
 
@@ -3097,6 +3566,7 @@ class SessionController extends ChangeNotifier {
     RuntimeMeta? meta,
     String label = '命令',
     String? targetEngine,
+    List<ChatImageAttachment> imageAttachments = const [],
   }) {
     final value = prompt.trim();
     final resolvedEngine = (targetEngine ??
@@ -3113,6 +3583,7 @@ class SessionController extends ChangeNotifier {
       meta: meta ?? currentMeta,
       permissionMode: _config.permissionMode,
       data: value.isNotEmpty ? '$value\n' : '',
+      imageAttachments: imageAttachments,
     );
     final launchSent = _sendUserVisibleAction(
       launchPayload,
@@ -3123,15 +3594,21 @@ class SessionController extends ChangeNotifier {
     if (!launchSent) {
       return;
     }
+    if (value.isEmpty && imageAttachments.isEmpty) {
+      _pendingAiLaunchAwaitingInput = true;
+      _syncDerivedState();
+      notifyListeners();
+    }
   }
 
   void _submitClaudeContinuation(
     String prompt, {
     RuntimeMeta? meta,
     String label = '回复',
+    List<ChatImageAttachment> imageAttachments = const [],
   }) {
     final value = prompt.trim();
-    if (value.isEmpty) {
+    if (value.isEmpty && imageAttachments.isEmpty) {
       return;
     }
     final continuationEngine = _resolvedAiEngine(
@@ -3144,6 +3621,7 @@ class SessionController extends ChangeNotifier {
       meta: meta ?? currentMeta,
       permissionMode: _config.permissionMode,
       data: '$value\n',
+      imageAttachments: imageAttachments,
     );
     final sent = _sendUserVisibleAction(
       payload,
@@ -3153,6 +3631,7 @@ class SessionController extends ChangeNotifier {
     if (!sent) {
       return;
     }
+    _markLocalSubmissionRunning(command: continuationEngine);
   }
 
   void continueWithCurrentFile([String text = '基于当前文件继续处理']) {
@@ -3236,8 +3715,15 @@ class SessionController extends ChangeNotifier {
   }
 
   void sendInputText(String text) {
+    sendInputTextWithImages(text, const []);
+  }
+
+  void sendInputTextWithImages(
+    String text,
+    List<ChatImageAttachment> imageAttachments,
+  ) {
     final value = text.trim();
-    if (value.isEmpty) {
+    if (value.isEmpty && imageAttachments.isEmpty) {
       return;
     }
     if (_isLoadingSession) {
@@ -3264,15 +3750,19 @@ class SessionController extends ChangeNotifier {
     }
     if (canSendToContinuedSameSession) {
       _resetActionNeededTracking();
-      _submitClaudeContinuation(value, label: '回复');
+      _submitClaudeContinuation(
+        value,
+        label: '回复',
+        imageAttachments: imageAttachments,
+      );
       return;
     }
     if (awaitInput) {
       _markActionNeededHandled();
-      _submitAwaitingPrompt(value);
+      _submitAwaitingPrompt(value, imageAttachments: imageAttachments);
       return;
     }
-    if (value.startsWith('/')) {
+    if (value.startsWith('/') && imageAttachments.isEmpty) {
       _handleSlashCommand(value);
       return;
     }
@@ -3298,6 +3788,7 @@ class SessionController extends ChangeNotifier {
         meta: currentMeta,
         label: '命令',
         targetEngine: aiHead,
+        imageAttachments: imageAttachments,
       );
       return;
     }
@@ -3310,7 +3801,33 @@ class SessionController extends ChangeNotifier {
         return;
       }
       _resetActionNeededTracking();
-      _submitClaudeContinuation(value, label: '回复');
+      _submitClaudeContinuation(
+        value,
+        label: '回复',
+        imageAttachments: imageAttachments,
+      );
+      return;
+    }
+    if (!_looksLikeShellCommand(value)) {
+      if (isSessionBusy) {
+        if (hasPendingReview) {
+          _pushSystem('session', '当前会话仍在运行，请先完成待审核 diff，再继续处理。');
+        } else {
+          _pushSystem('session', '当前会话仍在运行，暂时不能发起新的请求。');
+        }
+        return;
+      }
+      _resetActionNeededTracking();
+      _startClaudeTurn(
+        value,
+        meta: currentMeta,
+        label: '命令',
+        imageAttachments: imageAttachments,
+      );
+      return;
+    }
+    if (imageAttachments.isNotEmpty) {
+      _pushSystem('session', '图片只能发送给 AI 助手，请输入 codex、claude 或自然语言请求。');
       return;
     }
     _beginUserSubmission();
@@ -3434,6 +3951,7 @@ class SessionController extends ChangeNotifier {
     String value, {
     String promptLabel = '回复',
     bool fallbackToInput = false,
+    List<ChatImageAttachment> imageAttachments = const [],
   }) {
     if (_isLoadingSession) {
       _pushSystem('session', '会话切换中，请等待加载完成');
@@ -3441,8 +3959,12 @@ class SessionController extends ChangeNotifier {
     }
     final interaction = pendingInteraction;
     if (interaction != null) {
-      _submitInteractionActionValue(interaction, value,
-          promptLabel: promptLabel);
+      _submitInteractionActionValue(
+        interaction,
+        value,
+        promptLabel: promptLabel,
+        imageAttachments: imageAttachments,
+      );
       return;
     }
     final prompt = _pendingPrompt;
@@ -3456,13 +3978,18 @@ class SessionController extends ChangeNotifier {
     if (!fallbackToInput && !awaitInput) {
       return;
     }
-    _submitAwaitingInput(value, promptLabel: promptLabel);
+    _submitAwaitingInput(
+      value,
+      promptLabel: promptLabel,
+      imageAttachments: imageAttachments,
+    );
   }
 
   void _submitInteractionActionValue(
     InteractionRequestEvent interaction,
     String value, {
     String promptLabel = '回复',
+    List<ChatImageAttachment> imageAttachments = const [],
   }) {
     final normalized = value.trim();
     if (normalized.isEmpty) {
@@ -3481,7 +4008,11 @@ class SessionController extends ChangeNotifier {
       _sendPlanDecision(interaction, normalized, promptLabel: promptLabel);
       return;
     }
-    _submitAwaitingInput(normalized, promptLabel: promptLabel);
+    _submitAwaitingInput(
+      normalized,
+      promptLabel: promptLabel,
+      imageAttachments: imageAttachments,
+    );
   }
 
   void _sendPlanDecision(
@@ -3537,6 +4068,11 @@ class SessionController extends ChangeNotifier {
       'targetPath': interaction.targetPath,
       'targetText': currentMeta.targetText,
     });
+    _pendingInteraction = null;
+    _pendingPrompt = null;
+    _clearPlanInteractionState();
+    _runtimePhase = null;
+    _syncDerivedState();
     notifyListeners();
   }
 
@@ -3664,13 +4200,22 @@ class SessionController extends ChangeNotifier {
     _submitAwaitingInput(decision, promptLabel: promptLabel);
   }
 
-  void _submitAwaitingInput(String value, {String promptLabel = '回复'}) {
+  void _submitAwaitingInput(
+    String value, {
+    String promptLabel = '回复',
+    List<ChatImageAttachment> imageAttachments = const [],
+  }) {
     _beginUserSubmission();
-    final payload = {
+    _markLocalSubmissionRunning();
+    final payload = <String, dynamic>{
       'action': 'input',
       'data': '$value\n',
       'permissionMode': _config.permissionMode,
     };
+    if (imageAttachments.isNotEmpty) {
+      payload['imageAttachments'] =
+          imageAttachments.map((attachment) => attachment.toJson()).toList();
+    }
     if (!_sendUserVisibleAction(payload, userText: value, label: promptLabel)) {
       return;
     }
@@ -3866,7 +4411,7 @@ class SessionController extends ChangeNotifier {
   }
 
   void stopCurrentRun() {
-    if (!canStopCurrentRun) {
+    if (!connected || _isStopping) {
       return;
     }
     _canResumeCurrentSession = false;
@@ -4059,7 +4604,14 @@ class SessionController extends ChangeNotifier {
         _flushDeferredFirstInputIfNeeded();
         break;
       case SessionListResultEvent list:
+        final confirmedIds = _pendingDeletedSessions.keys
+            .where((id) => !list.items.any((item) => item.id == id))
+            .toList();
+        for (final id in confirmedIds) {
+          _pendingDeletedSessions.remove(id);
+        }
         final mergedItems = list.items
+            .where((item) => !_pendingDeletedSessions.containsKey(item.id))
             .map((item) => _mergedSessionSummary(
                   _sessions.cast<SessionSummary?>().firstWhere(
                         (existing) => existing?.id == item.id,
@@ -4159,9 +4711,6 @@ class SessionController extends ChangeNotifier {
         );
         _syncActiveTerminalExecution();
         _resetRuntimeProcessState();
-        requestRuntimeProcessList();
-        requestPermissionRuleList();
-        requestContextWindowUsage();
         if (history.currentDiff != null) {
           final current = _normalizeHistoryDiff(history.currentDiff!);
           _mergeRecentDiff(current);
@@ -4219,13 +4768,21 @@ class SessionController extends ChangeNotifier {
             resolvedHistorySummary.id) {
           _pendingNotificationSessionTargetId = '';
         }
-        final restoredCwd = history.resumeRuntimeMeta.cwd.trim();
-        final targetCwd = restoredCwd.isNotEmpty ? restoredCwd : _config.cwd;
-        await switchWorkingDirectory(targetCwd);
-        _requestSessionDelta(reason: 'history_loaded');
         if (!_timeline.any(_hasVisibleTimelineContent)) {
           _pushSystem('session', '会话已就绪，可以继续输入');
         }
+        _syncDerivedState();
+        notifyListeners();
+        needsDerivedSync = false;
+        final restoredCwd = history.resumeRuntimeMeta.cwd.trim();
+        final targetCwd = restoredCwd.isNotEmpty ? restoredCwd : _config.cwd;
+        unawaited(_refreshContextAfterHistoryLoaded(
+          sessionId: resolvedHistorySummary.id,
+          cwd: targetCwd,
+        ));
+        _schedulePostHistoryBootstrap(
+          sessionId: resolvedHistorySummary.id,
+        );
         break;
       case SessionDeltaEvent delta:
         _handleSessionDelta(delta);
@@ -4265,12 +4822,17 @@ class SessionController extends ChangeNotifier {
             _continueSameSessionEnabled = false;
             _continuedSameSessionId = '';
           }
+        } else if (_isDefinitiveAgentState(
+          '',
+          state.state.trim().toUpperCase(),
+        )) {
+          _sessionRuntimeAlive = true;
+          _pendingAiLaunchAwaitingInput = false;
         }
         _maybeAutoSyncAiModel(state.runtimeMeta);
         _syncRuntimePermissionMode();
 
-        // 收到 stopped 事件后，清除停止中标记
-        if (state.state.trim().toLowerCase() == 'stopped') {
+        if (_isIdleLikeState(state.state)) {
           _isStopping = false;
         }
 
@@ -4326,6 +4888,7 @@ class SessionController extends ChangeNotifier {
         if (!_eventTargetsCurrentSession(agent.sessionId)) {
           break;
         }
+        _pendingAiLaunchAwaitingInput = false;
         _agentState = agent;
         final agentStateName = agent.state.trim().toUpperCase();
         // Only lift to true; never force to false — delta/history events
@@ -4420,14 +4983,26 @@ class SessionController extends ChangeNotifier {
       case ErrorEvent error:
         _fileListLoading = false;
         _fileReading = false;
+        final mutationFailureHandled = _handleMutationFailure(error);
+        if (error.code.startsWith('device_') ||
+            error.code.startsWith('e2ee_')) {
+          _relayDeviceListLoading = false;
+          _relayDeviceStatus = error.message.trim().isEmpty
+              ? 'Relay 设备管理失败：${error.code}'
+              : error.message.trim();
+        }
         final errorMessage = error.message.trim();
         if (error.code == 'ws_closed' ||
             error.code == 'ws_stream_error' ||
-            error.code == 'ws_send_error') {
+            error.code == 'ws_send_error' ||
+            error.code == 'agent_disconnected') {
           _handleUnexpectedSocketDisconnect(errorMessage);
           break;
         }
         if (_shouldSuppressIntentionalHandoffNoise(errorMessage)) {
+          break;
+        }
+        if (mutationFailureHandled && error.code == 'session_delete_failed') {
           break;
         }
         if (errorMessage.contains('ADB') ||
@@ -4463,9 +5038,33 @@ class SessionController extends ChangeNotifier {
             context: _latestError,
           ),
         );
-        _handleMutationFailure(error.message);
+        break;
+      case RelayDeviceListResultEvent result:
+        _relayDeviceListLoading = false;
+        _relayDevices
+          ..clear()
+          ..addAll(result.devices);
+        _relayDeviceStatus = result.devices.isEmpty
+            ? '当前没有已绑定设备'
+            : '已同步 ${result.devices.length} 台 Relay 设备';
+        break;
+      case RelayDeviceRegisterResultEvent result:
+        _service.markRelayDeviceRegistered(result);
+        _relayDeviceStatus = 'Relay 设备已绑定';
+        if (canManageRelayDevices) {
+          requestRelayDeviceList();
+        }
+        break;
+      case RelayDeviceRevokeResultEvent result:
+        _relayDeviceStatus =
+            result.status.trim().isNotEmpty ? '设备已撤销' : '设备撤销完成';
+        requestRelayDeviceList();
+        break;
+      case RelayDeviceRotateResultEvent result:
+        await _handleRelayDeviceRotateResult(result);
         break;
       case PromptRequestEvent prompt:
+        _pendingAiLaunchAwaitingInput = false;
         if (prompt.isReview && _reviewShouldAutoAccept(prompt.runtimeMeta)) {
           if (_pendingInteraction?.isReview == true) {
             _pendingInteraction = null;
@@ -4497,6 +5096,7 @@ class SessionController extends ChangeNotifier {
         notifyListeners();
         break;
       case InteractionRequestEvent interaction:
+        _pendingAiLaunchAwaitingInput = false;
         if (interaction.isReview &&
             _reviewShouldAutoAccept(interaction.runtimeMeta)) {
           if (_pendingInteraction?.isReview == true) {
@@ -4949,11 +5549,30 @@ class SessionController extends ChangeNotifier {
     return changed;
   }
 
-  void _handleMutationFailure(String message) {
+  bool _handleMutationFailure(ErrorEvent error) {
+    final message = error.message;
+    var handled = false;
+    if (error.code == 'session_delete_failed' &&
+        _pendingDeletedSessions.isNotEmpty) {
+      handled = true;
+      final restored = _pendingDeletedSessions.values.toList();
+      _pendingDeletedSessions.clear();
+      for (final summary in restored.reversed) {
+        _upsertSession(summary);
+      }
+      if (message.trim().isNotEmpty) {
+        _pushSystem('error', '删除会话失败：$message');
+      }
+      if (_isLoadingSession) {
+        _finishSessionLoading();
+      }
+    }
     if (_autoSessionCreating) {
+      handled = true;
       _clearDeferredFirstInput();
     }
     if (_pendingSessionContextTarget != null) {
+      handled = true;
       _pendingSessionContextTarget = null;
       _pendingToggleSkillNames.clear();
       _pendingToggleMemoryIds.clear();
@@ -4962,17 +5581,20 @@ class SessionController extends ChangeNotifier {
       }
     }
     if (_isSavingSkill) {
+      handled = true;
       _isSavingSkill = false;
       if (message.trim().isNotEmpty) {
         _skillSyncStatus = '保存 skill 失败：$message';
       }
     }
     if (_isSavingMemory) {
+      handled = true;
       _isSavingMemory = false;
       if (message.trim().isNotEmpty) {
         _memorySyncStatus = '保存 memory 失败：$message';
       }
     }
+    return handled;
   }
 
   bool _isIdleLikeState(String state) {
@@ -4981,6 +5603,10 @@ class SessionController extends ChangeNotifier {
         normalized == 'IDLE' ||
         normalized == 'DONE' ||
         normalized == 'COMPLETED' ||
+        normalized == 'FAILED' ||
+        normalized == 'ERROR' ||
+        normalized == 'SYSTEMERROR' ||
+        normalized == 'STOPPED' ||
         normalized == 'DISCONNECTED' ||
         normalized == 'CLOSED';
   }
@@ -5260,6 +5886,19 @@ class SessionController extends ChangeNotifier {
     notifyListeners();
   }
 
+  Future<void> _refreshContextAfterHistoryLoaded({
+    required String sessionId,
+    required String cwd,
+  }) async {
+    if (_selectedSessionId.trim() != sessionId.trim()) {
+      return;
+    }
+    await switchWorkingDirectory(cwd);
+    if (_selectedSessionId.trim() == sessionId.trim()) {
+      _requestSessionDelta(reason: 'history_loaded', force: true);
+    }
+  }
+
   void _restoreTimelineFromHistory(
     List<HistoryLogEntry> entries,
     RuntimeMeta resumeMeta,
@@ -5415,6 +6054,14 @@ class SessionController extends ChangeNotifier {
     } else {
       _sessions[index] = next;
     }
+  }
+
+  SessionSummary? _removeSessionLocally(String sessionId) {
+    final index = _sessions.indexWhere((item) => item.id == sessionId);
+    if (index == -1) {
+      return null;
+    }
+    return _sessions.removeAt(index);
   }
 
   bool _isExternalNativeSession(SessionSummary summary) {
@@ -7036,9 +7683,10 @@ class SessionController extends ChangeNotifier {
     if (currentInteraction?.isPermission == true ||
         currentPrompt?.isPermission == true) {
       if (!incoming.isPermission) {
-        // AI 结束（end_turn）发送的 ready prompt 应替换陈旧权限提示，
-        // 避免_clearPermissionBlockingState 未生效时用户看到已批准的授权卡片。
-        if (incoming.isReady) {
+        // Ready prompt can replace a permission prompt because it is backend
+        // acknowledgement that the prompt is stale. Keep interaction requests
+        // until a permission decision/auto-apply event explicitly clears them.
+        if (incoming.isReady && currentInteraction?.isPermission != true) {
           return false;
         }
         return true;
@@ -7118,7 +7766,8 @@ class SessionController extends ChangeNotifier {
     final hasBlockingPrompt = awaitInput ||
         hasPendingPermission ||
         shouldShowReviewChoices ||
-        hasPendingPlanQuestions;
+        hasPendingPlanQuestions ||
+        _pendingAiLaunchAwaitingInput;
     final hasRealRunningSignal = _executionActive ||
         _sessionRuntimeAlive ||
         agentState == 'THINKING' ||
@@ -7141,6 +7790,7 @@ class SessionController extends ChangeNotifier {
     final hideImmediately = hasPendingPermission ||
         hasBlockingPrompt ||
         _isClaudePendingReadyForInput ||
+        _pendingAiLaunchAwaitingInput ||
         !_connected;
     if (active) {
       // 一旦本轮重新激活，立即取消任何延迟消隐计时器，保证状态球瞬间点亮。
@@ -7766,7 +8416,7 @@ class SessionController extends ChangeNotifier {
     if (!_connected) {
       return _connecting ? '连接中' : '未连接';
     }
-    if (_isClaudePendingReadyForInput) {
+    if (_isClaudePendingReadyForInput || _pendingAiLaunchAwaitingInput) {
       return '待输入';
     }
     final state = _agentState?.state ?? '';
@@ -8132,12 +8782,12 @@ class SessionController extends ChangeNotifier {
         nextModel = parsed.$1.isNotEmpty ? parsed.$1 : nextModel;
         nextEffort = parsed.$2.isNotEmpty ? parsed.$2 : nextEffort;
       }
-    }
-
-    if (rawText.trim().isNotEmpty) {
+    } else if (rawText.trim().isNotEmpty) {
       final parsed = _parseAiModelFromText(engine, rawText);
       nextModel = parsed.$1.isNotEmpty ? parsed.$1 : nextModel;
       nextEffort = parsed.$2.isNotEmpty ? parsed.$2 : nextEffort;
+    } else {
+      return;
     }
 
     if (nextModel.isEmpty) {
@@ -8166,6 +8816,7 @@ class SessionController extends ChangeNotifier {
       return;
     }
     unawaited(saveConfig(_config.copyWith(
+      engine: engine,
       claudeModel: engine == 'claude' ? normalizedModel : _config.claudeModel,
       codexModel: engine == 'codex' ? normalizedModel : _config.codexModel,
       codexReasoningEffort:
@@ -8269,7 +8920,6 @@ class SessionController extends ChangeNotifier {
   if (normalized.isEmpty) {
     return ('', '');
   }
-  final lower = normalized.toLowerCase();
   if (engine == 'claude') {
     final parsed = parseClaudeModelFromText(normalized);
     if (parsed != null && parsed.isNotEmpty) {
@@ -8283,8 +8933,6 @@ class SessionController extends ChangeNotifier {
       .firstMatch(normalized);
   if (modelMatch != null) {
     model = modelMatch.group(1)!.toLowerCase().replaceAll(' ', '-');
-  } else if (lower.contains('codex')) {
-    model = 'gpt-5-codex';
   }
   String effort = '';
   final effortMatch = RegExp(
@@ -8295,6 +8943,74 @@ class SessionController extends ChangeNotifier {
     effort = (effortMatch.group(1) ?? '').toLowerCase();
   }
   return (model, effort);
+}
+
+bool _looksLikeShellCommand(String value) {
+  final trimmed = value.trim();
+  if (trimmed.isEmpty) {
+    return false;
+  }
+  if (RegExp(r'[^\x00-\x7F]').hasMatch(trimmed)) {
+    return false;
+  }
+  if (trimmed.startsWith('./') ||
+      trimmed.startsWith('../') ||
+      trimmed.startsWith('~/')) {
+    return true;
+  }
+  if (RegExp(r'^[A-Za-z_][A-Za-z0-9_]*=').hasMatch(trimmed)) {
+    return true;
+  }
+  if (RegExp(r'[|&;<>(){}*$`\\]').hasMatch(trimmed)) {
+    return true;
+  }
+  final head = trimmed.split(RegExp(r'\s+')).first.toLowerCase();
+  const shellHeads = <String>{
+    'adb',
+    'bash',
+    'cat',
+    'cd',
+    'chmod',
+    'chown',
+    'cp',
+    'curl',
+    'dart',
+    'docker',
+    'echo',
+    'find',
+    'flutter',
+    'git',
+    'go',
+    'grep',
+    'head',
+    'kill',
+    'less',
+    'ls',
+    'make',
+    'mkdir',
+    'mv',
+    'node',
+    'npm',
+    'npx',
+    'pnpm',
+    'ps',
+    'pwd',
+    'python',
+    'python3',
+    'rm',
+    'rg',
+    'sed',
+    'sh',
+    'tail',
+    'tar',
+    'touch',
+    'tree',
+    'uname',
+    'which',
+    'yarn',
+    'zsh',
+  };
+  return shellHeads.contains(head);
 }
 
 String _resolvedAiEngine({
@@ -8314,6 +9030,14 @@ String _resolvedAiEngine({
     return 'gemini';
   }
   return 'claude';
+}
+
+String _resolvedConfiguredAiEngine(String engine) {
+  final normalized = engine.trim().toLowerCase();
+  return switch (normalized) {
+    'codex' || 'gemini' => normalized,
+    _ => 'claude',
+  };
 }
 
 String _resolvedAiModel(String engine, String configured) {

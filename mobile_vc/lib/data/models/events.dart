@@ -248,6 +248,154 @@ class ErrorEvent extends AppEvent {
       );
 }
 
+class RelayDeviceRegisterResultEvent extends AppEvent {
+  const RelayDeviceRegisterResultEvent({
+    required super.timestamp,
+    required super.sessionId,
+    required super.runtimeMeta,
+    required super.raw,
+    this.deviceId = '',
+    this.fingerprintHex = '',
+    this.status = '',
+  }) : super(type: 'relay_device_register_result');
+
+  final String deviceId;
+  final String fingerprintHex;
+  final String status;
+
+  factory RelayDeviceRegisterResultEvent.fromJson(Map<String, dynamic> json) {
+    return RelayDeviceRegisterResultEvent(
+      timestamp: _readTimestamp(json),
+      sessionId: (json['sessionId'] ?? '').toString(),
+      runtimeMeta: RuntimeMeta.fromJson(json),
+      raw: json,
+      deviceId: (json['deviceId'] ?? '').toString(),
+      fingerprintHex: (json['fingerprintHex'] ?? '').toString(),
+      status: (json['status'] ?? '').toString(),
+    );
+  }
+}
+
+class RelayTrustedDevice {
+  const RelayTrustedDevice({
+    required this.deviceId,
+    this.displayName = '',
+    this.fingerprintHex = '',
+    this.createdAt,
+    this.lastSeenAt,
+    this.revokedAt,
+    this.activeSessionId = '',
+    this.connected = false,
+    this.currentDevice = false,
+    this.revoked = false,
+  });
+
+  final String deviceId;
+  final String displayName;
+  final String fingerprintHex;
+  final DateTime? createdAt;
+  final DateTime? lastSeenAt;
+  final DateTime? revokedAt;
+  final String activeSessionId;
+  final bool connected;
+  final bool currentDevice;
+  final bool revoked;
+
+  String get displayTitle =>
+      displayName.trim().isNotEmpty ? displayName.trim() : '未命名设备';
+
+  factory RelayTrustedDevice.fromJson(Map<String, dynamic> json) {
+    return RelayTrustedDevice(
+      deviceId: (json['deviceId'] ?? '').toString(),
+      displayName: (json['displayName'] ?? '').toString(),
+      fingerprintHex: (json['fingerprintHex'] ?? '').toString(),
+      createdAt: _tryReadTimestamp(json['createdAt']),
+      lastSeenAt: _tryReadTimestamp(json['lastSeenAt']),
+      revokedAt: _tryReadTimestamp(json['revokedAt']),
+      activeSessionId: (json['activeSessionId'] ?? '').toString(),
+      connected: json['connected'] == true,
+      currentDevice: json['currentDevice'] == true,
+      revoked: json['revoked'] == true,
+    );
+  }
+}
+
+class RelayDeviceListResultEvent extends AppEvent {
+  const RelayDeviceListResultEvent({
+    required super.timestamp,
+    required super.sessionId,
+    required super.runtimeMeta,
+    required super.raw,
+    this.devices = const [],
+  }) : super(type: 'relay_device_list_result');
+
+  final List<RelayTrustedDevice> devices;
+
+  factory RelayDeviceListResultEvent.fromJson(Map<String, dynamic> json) {
+    return RelayDeviceListResultEvent(
+      timestamp: _readTimestamp(json),
+      sessionId: (json['sessionId'] ?? '').toString(),
+      runtimeMeta: RuntimeMeta.fromJson(json),
+      raw: json,
+      devices: (json['devices'] as List? ?? const [])
+          .whereType<Map>()
+          .map((item) =>
+              RelayTrustedDevice.fromJson(item.cast<String, dynamic>()))
+          .toList(),
+    );
+  }
+}
+
+class RelayDeviceRevokeResultEvent extends AppEvent {
+  const RelayDeviceRevokeResultEvent({
+    required super.timestamp,
+    required super.sessionId,
+    required super.runtimeMeta,
+    required super.raw,
+    this.deviceId = '',
+    this.status = '',
+  }) : super(type: 'relay_device_revoke_result');
+
+  final String deviceId;
+  final String status;
+
+  factory RelayDeviceRevokeResultEvent.fromJson(Map<String, dynamic> json) {
+    return RelayDeviceRevokeResultEvent(
+      timestamp: _readTimestamp(json),
+      sessionId: (json['sessionId'] ?? '').toString(),
+      runtimeMeta: RuntimeMeta.fromJson(json),
+      raw: json,
+      deviceId: (json['deviceId'] ?? '').toString(),
+      status: (json['status'] ?? '').toString(),
+    );
+  }
+}
+
+class RelayDeviceRotateResultEvent extends AppEvent {
+  const RelayDeviceRotateResultEvent({
+    required super.timestamp,
+    required super.sessionId,
+    required super.runtimeMeta,
+    required super.raw,
+    this.nodeFingerprintHex = '',
+    this.status = '',
+  }) : super(type: 'relay_device_rotate_result');
+
+  final String nodeFingerprintHex;
+  final String status;
+
+  factory RelayDeviceRotateResultEvent.fromJson(Map<String, dynamic> json) {
+    return RelayDeviceRotateResultEvent(
+      timestamp: _readTimestamp(json),
+      sessionId: (json['sessionId'] ?? '').toString(),
+      runtimeMeta: RuntimeMeta.fromJson(json),
+      raw: json,
+      nodeFingerprintHex: (json['nodeFingerprintHex'] ?? '').toString(),
+      status: (json['status'] ?? '').toString(),
+    );
+  }
+}
+
 class PromptOption {
   const PromptOption({
     required this.value,

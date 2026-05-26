@@ -45,16 +45,13 @@ cp -r mobile_vc/build/web cmd/server/web
 go build -o server ./cmd/server
 ```
 
-### 4. 提交到 Git
-```bash
-git add cmd/server/web/
-git commit -m "feat: update embedded Flutter Web build"
-git push origin main
-```
+### 4. Git 跟踪规则
+
+`cmd/server/web/` 是本地嵌入产物目录，不再提交 Flutter Web 构建产物到 Git。仓库只保留 `cmd/server/web/.gitkeep`，用于保证 `//go:embed web/*` 在干净 clone 后有匹配文件。
 
 ## 自动化脚本
 
-使用 `scripts/update-web-and-push.sh` 一键完成所有步骤：
+使用 `scripts/update-web-and-push.sh` 一键完成本地构建、同步和 Go 编译：
 
 ```bash
 ./scripts/update-web-and-push.sh
@@ -66,13 +63,19 @@ git push origin main
 # 1. 拉取最新代码
 git pull origin main
 
-# 2. 重新编译（包含新的嵌入资源）
+# 2. 本地生成 Flutter Web 嵌入资源
+cd mobile_vc
+flutter build web --release
+cd ..
+node scripts/sync-embedded-web.js
+
+# 3. 重新编译（包含本地嵌入资源）
 go build -o server ./cmd/server
 
-# 3. 启动服务
+# 4. 启动服务
 AUTH_TOKEN=test ./server
 
-# 4. 访问 http://localhost:8001
+# 5. 访问 http://localhost:8001
 # 现在应该看到 Flutter Web 版本了
 ```
 
@@ -106,17 +109,15 @@ ls -lh server
 ## 为什么有两个 web 目录？
 
 1. **根目录 `web/`**：方便开发和查看，但不会被 Go 嵌入
-2. **`cmd/server/web/`**：Go 实际嵌入的目录，必须保持最新
+2. **`cmd/server/web/`**：Go 实际嵌入的本地产物目录，必须在 `go build` 前重新生成
 
 建议：
 - 开发时在 `mobile_vc/` 中修改
 - 构建后复制到 `cmd/server/web/`
-- 提交 `cmd/server/web/` 到 Git
+- 不提交 `cmd/server/web/` 的构建产物到 Git
 
 ## 已修复
 
-✅ 已将 Flutter Web 构建产物复制到 `cmd/server/web/`
-✅ 已提交到 Git
-✅ 已推送到 GitHub
-
-用户现在拉取代码后，重新编译即可看到 Flutter Web 版本。
+✅ `cmd/server/web/` 是 Go 嵌入目录
+✅ Flutter Web 构建产物需要本地生成
+✅ 构建产物不再提交到 Git

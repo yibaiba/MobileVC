@@ -28,7 +28,7 @@ Main files:
    - `RUNTIME_WORKSPACE_ROOT=process.cwd()`
 4. It prints local/LAN URLs and a terminal QR code.
 5. The URL includes `token` and `cwd`; scanning it in Flutter fills host, port, token, and CWD.
-6. Flutter persists the resulting `AppConfig` and connects to `ws://host:port/ws?token=...`.
+6. Flutter persists the resulting `AppConfig` and derives the backend URLs from the runtime page scheme: HTTP/native uses `ws://host:port/ws?token=...`; HTTPS Flutter Web uses `wss://host:port/ws?token=...` and `https://.../download`.
 
 Important current behavior: if a backend is already running, QR generation still uses the current `mobilevc` invocation directory for `cwd`, so users can re-scan from the intended project directory.
 
