@@ -135,7 +135,6 @@ void main() {
         cwd: '/workspace',
         engine: 'codex',
         permissionMode: 'default',
-        codexReasoningEffort: 'medium',
       ),
     );
 
@@ -146,7 +145,7 @@ void main() {
     );
     await _pumpFrames(tester);
 
-    await _tapCommandBarModel(tester, '模型 · Default · MEDIUM');
+    await _tapCommandBarModel(tester, '模型 · Default · HIGH');
     await _pumpFrames(tester);
 
     expect(controller.catalogRequestCount, 1);
@@ -157,15 +156,15 @@ void main() {
     await _pumpFrames(tester);
 
     expect(controller.configuredAiModel, isEmpty);
-    expect(find.text('应用 gpt-5.5 · MEDIUM'), findsOneWidget);
+    expect(find.text('应用 gpt-5.5 · HIGH'), findsOneWidget);
 
-    await tester.tap(find.text('应用 gpt-5.5 · MEDIUM'));
+    await tester.tap(find.text('应用 gpt-5.5 · HIGH'));
     await _pumpFrames(tester);
 
     expect(controller.configuredAiEngine, 'codex');
     expect(controller.configuredAiModel, 'gpt-5.5');
-    expect(controller.configuredAiReasoningEffort, 'medium');
-    expect(controller.commandBarModelSummary, 'gpt-5.5 · MEDIUM');
+    expect(controller.configuredAiReasoningEffort, 'high');
+    expect(controller.commandBarModelSummary, 'gpt-5.5 · HIGH');
     expect(controller.catalogRequestCount, 1);
 
     await tester.pumpWidget(const SizedBox.shrink());
@@ -210,9 +209,38 @@ void main() {
     await _pumpFrames(tester);
 
     expect(find.text('连接'), findsOneWidget);
-    expect(find.textContaining('当前配对链接已一次性使用'), findsAtLeastNWidgets(1));
+    expect(find.textContaining('Relay E2EE 握手失败'), findsAtLeastNWidgets(1));
 
     await controller.disposeController();
+  });
+
+  testWidgets('顶部连接路径使用紧凑标识避免挤压标题', (tester) async {
+    final service = _FakeMobileVcWsService();
+    final controller = SessionController(service: service);
+    addTearDown(controller.disposeController);
+
+    await controller.saveConfig(const AppConfig(
+      connectionMode: 'relay',
+      relayUrl: 'wss://relay.example.test',
+      relaySessionId: 'rs_test',
+      relayPairingSecret: 'pair_secret',
+      relayPairingExpiresAt: 1760000000,
+    ));
+    await controller.connect();
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SessionHomePage(controller: controller),
+      ),
+    );
+    await _pumpFrames(tester);
+
+    expect(
+      find.byKey(const ValueKey('connection-transport-label')),
+      findsOneWidget,
+    );
+    expect(find.text('R'), findsOneWidget);
+    expect(find.text('Relay'), findsNothing);
   });
 }
 
@@ -336,6 +364,7 @@ class _ModelCatalogSessionController extends SessionController {
             CodexReasoningEffortOption(reasoningEffort: 'medium'),
             CodexReasoningEffortOption(reasoningEffort: 'high'),
           ],
+          isDefault: true,
         ),
       ];
 

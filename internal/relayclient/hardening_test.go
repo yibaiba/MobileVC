@@ -1120,6 +1120,10 @@ func TestPairingEventIncludesCapabilities(t *testing.T) {
 		ExpiresAt:          time.Now().Add(time.Minute).Unix(),
 		Capabilities:       e2ee.PlaintextTestCapabilities(),
 		NodeFingerprintHex: testNodeFingerprintHex,
+		LANHost:            "192.168.1.2",
+		LANPort:            "8001",
+		LANToken:           "direct-token",
+		LANCWD:             "/workspace",
 	}
 
 	raw, err := json.Marshal(event)
@@ -1135,6 +1139,12 @@ func TestPairingEventIncludesCapabilities(t *testing.T) {
 	}
 	if decoded.NodeFingerprintHex != testNodeFingerprintHex {
 		t.Fatalf("node fingerprint: got %q", decoded.NodeFingerprintHex)
+	}
+	if decoded.LANHost != "192.168.1.2" ||
+		decoded.LANPort != "8001" ||
+		decoded.LANToken != "direct-token" ||
+		decoded.LANCWD != "/workspace" {
+		t.Fatalf("decoded LAN endpoint: %#v", decoded)
 	}
 }
 

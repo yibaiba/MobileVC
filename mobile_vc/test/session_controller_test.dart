@@ -2,11 +2,12 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
-import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:mobile_vc/core/config/app_config.dart';
+import 'package:mobile_vc/core/config/relay_config.dart';
 import 'package:mobile_vc/core/relay_e2ee/relay_e2ee_capability.dart';
 import 'package:mobile_vc/core/relay_e2ee/relay_device_identity.dart';
 import 'package:mobile_vc/core/relay_e2ee/relay_e2ee_crypto.dart';
@@ -1211,6 +1212,35 @@ void main() {
       expect(persisted.containsKey('relayPairingSecret'), isFalse);
     });
 
+    test('external relay deep link with LAN endpoint imports auto mode',
+        () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      final imported = await controller.importConnectionLink(
+        'mobilevc://relay/v1?relay=wss%3A%2F%2Frelay.example.test'
+        '&session=rs_import&secret=pair_secret&exp=1760000000'
+        '&nodeFingerprint=1111111111111111111111111111111111111111111111111111111111111111'
+        '&lanHost=192.168.1.2&lanPort=8001&lanToken=direct-token'
+        '&lanCwd=%2Fworkspace'
+        '&relayProtocolVersion=1&e2eeProtocolVersion=1'
+        '&cryptoSuite=p256-ecdsa%2Bp256-ecdh%2Bhkdf-sha256%2Baes-256-gcm'
+        '&tunnelProtocolVersion=1&supportsMultiplexStreams=true'
+        '&supportsFileDownloadStream=true&supportsDeviceManagement=true'
+        '&requiresE2EE=true&plaintextTestMode=false',
+      );
+
+      expect(imported, isTrue);
+      expect(controller.config.connectionMode, ConnectionMode.auto.name);
+      expect(controller.config.host, '192.168.1.2');
+      expect(controller.config.port, '8001');
+      expect(controller.config.token, 'direct-token');
+      expect(controller.config.cwd, '/workspace');
+      expect(controller.config.relayUrl, 'wss://relay.example.test');
+    });
+
     test('relay connect validates url and persists reconnect fields', () async {
       SharedPreferences.setMockInitialValues({
         'mobilevc.app_config': jsonEncode(const AppConfig(
@@ -1252,7 +1282,7 @@ void main() {
       expect(persisted['relayClientReconnectSecret'], 'reconnect_secret');
     });
 
-    test('relay pairing failure clears one-time secret and asks reimport',
+    test('relay pairing failure keeps one-time secret for explicit retry',
         () async {
       final service = _FakeMobileVcWsService()
         ..connectRelayError = const RelayPairingException(
@@ -1275,15 +1305,204 @@ void main() {
 
       expect(controller.connected, isFalse);
       expect(controller.connectionStage, SessionConnectionStage.failed);
-      expect(controller.connectionMessage, contains('请导入新的中继链接'));
-      expect(controller.config.relayPairingSecret, isEmpty);
-      expect(controller.config.relayPairingExpiresAt, 0);
+      expect(controller.connectionMessage, contains('Relay E2EE 握手失败'));
+      expect(controller.config.relayPairingSecret, 'pair_secret');
+      expect(controller.config.relayPairingExpiresAt, 1760000000);
 
       final prefs = await SharedPreferences.getInstance();
       final persisted = jsonDecode(prefs.getString('mobilevc.app_config')!)
           as Map<String, dynamic>;
       expect(persisted.containsKey('relayPairingSecret'), isFalse);
       expect(persisted.containsKey('relayPairingExpiresAt'), isFalse);
+    });
+
+    test('auto mode tries LAN first and falls back to relay', () async {
+      final service = _FakeMobileVcWsService()
+        ..connectErrors.add(StateError('LAN unavailable'));
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.saveConfig(const AppConfig(
+        connectionMode: 'auto',
+        host: '192.168.1.2',
+        port: '8001',
+        token: 'direct-token',
+        relayUrl: 'wss://relay.example.test',
+        relaySessionId: 'rs_test',
+        relayClientId: 'rc_test',
+        relayClientReconnectSecret: 'reconnect_secret',
+      ));
+
+      await controller.connect();
+
+      expect(controller.connected, isTrue);
+      expect(controller.activeTransportPath, ActiveTransportPath.relay);
+      expect(service.connectedUrls.single,
+          'ws://192.168.1.2:8001/ws?token=direct-token');
+      expect(
+          service.connectedRelays.single.relayUrl, 'wss://relay.example.test');
+    });
+
+    test('auto mode skips iOS loopback LAN and falls back to relay', () async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
+      addTearDown(() {
+        debugDefaultTargetPlatformOverride = null;
+      });
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.saveConfig(const AppConfig(
+        connectionMode: 'auto',
+        host: 'localhost',
+        port: '8001',
+        token: 'direct-token',
+        relayUrl: 'wss://relay.example.test',
+        relaySessionId: 'rs_test',
+        relayClientId: 'rc_test',
+        relayClientReconnectSecret: 'reconnect_secret',
+      ));
+
+      await controller.connect();
+
+      expect(controller.connected, isTrue);
+      expect(controller.activeTransportPath, ActiveTransportPath.relay);
+      expect(service.connectedUrls, isEmpty);
+      expect(
+          service.connectedRelays.single.relayUrl, 'wss://relay.example.test');
+    });
+
+    test('auto mode does not probe iOS loopback after relay fallback',
+        () async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
+      addTearDown(() {
+        debugDefaultTargetPlatformOverride = null;
+      });
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(
+        service: service,
+        lanReturnProbeInterval: const Duration(milliseconds: 10),
+      );
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.saveConfig(const AppConfig(
+        connectionMode: 'auto',
+        host: 'localhost',
+        port: '8001',
+        token: 'direct-token',
+        relayUrl: 'wss://relay.example.test',
+        relaySessionId: 'rs_test',
+        relayClientId: 'rc_test',
+        relayClientReconnectSecret: 'reconnect_secret',
+      ));
+
+      await controller.connect();
+      await Future<void>.delayed(const Duration(milliseconds: 35));
+
+      expect(controller.activeTransportPath, ActiveTransportPath.relay);
+      expect(service.connectedUrls, isEmpty);
+      expect(service.readyDirectUrls, isEmpty);
+      expect(service.connectedRelays, hasLength(1));
+    });
+
+    test('auto relay to LAN return keeps relay when LAN preconnect fails',
+        () async {
+      final service = _FakeMobileVcWsService()
+        ..connectErrors.add(StateError('LAN unavailable'))
+        ..readyDirectErrors.add(StateError('LAN still unavailable'));
+      final controller = SessionController(
+        service: service,
+        lanReturnProbeInterval: const Duration(milliseconds: 10),
+      );
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.saveConfig(const AppConfig(
+        connectionMode: 'auto',
+        host: '192.168.1.2',
+        port: '8001',
+        token: 'direct-token',
+        relayUrl: 'wss://relay.example.test',
+        relaySessionId: 'rs_test',
+        relayClientId: 'rc_test',
+        relayClientReconnectSecret: 'reconnect_secret',
+      ));
+
+      await controller.connect();
+      await Future<void>.delayed(const Duration(milliseconds: 35));
+
+      expect(controller.activeTransportPath, ActiveTransportPath.relay);
+      expect(service.readyDirectUrls, [
+        'ws://192.168.1.2:8001/ws?token=direct-token',
+      ]);
+      expect(service.connectedRelays, hasLength(1));
+    });
+
+    test('auto relay to LAN return switches only after ready direct connect',
+        () async {
+      final service = _FakeMobileVcWsService()
+        ..connectErrors.add(StateError('LAN unavailable'));
+      final controller = SessionController(
+        service: service,
+        lanReturnProbeInterval: const Duration(milliseconds: 10),
+      );
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.saveConfig(const AppConfig(
+        connectionMode: 'auto',
+        host: '192.168.1.2',
+        port: '8001',
+        token: 'direct-token',
+        relayUrl: 'wss://relay.example.test',
+        relaySessionId: 'rs_test',
+        relayClientId: 'rc_test',
+        relayClientReconnectSecret: 'reconnect_secret',
+      ));
+
+      await controller.connect();
+      await Future<void>.delayed(const Duration(milliseconds: 35));
+
+      expect(controller.activeTransportPath, ActiveTransportPath.lan);
+      expect(service.readyDirectUrls, [
+        'ws://192.168.1.2:8001/ws?token=direct-token',
+      ]);
+      expect(service.connectedRelays, hasLength(1));
+    });
+
+    test('auto relay security state follows actual relay path', () async {
+      final service = _FakeMobileVcWsService()
+        ..connectErrors.add(StateError('LAN unavailable'))
+        ..relayE2eeHandshake = true
+        ..relayE2eeDeviceBinding = true;
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+      final expectedFingerprint =
+          await _testFingerprintHex(service.relayNodeFingerprint);
+
+      await controller.saveConfig(AppConfig(
+        connectionMode: 'auto',
+        host: '192.168.1.2',
+        port: '8001',
+        token: 'direct-token',
+        relayUrl: 'wss://relay.example.test',
+        relaySessionId: 'rs_test',
+        relayClientId: 'rc_test',
+        relayClientReconnectSecret: 'reconnect_secret',
+        relayNodeFingerprintHex: expectedFingerprint,
+        relayCapabilities: RelayE2eeCapabilitySet.production(),
+      ));
+
+      await controller.connect();
+      final state = await controller.relaySecurityState();
+
+      expect(controller.activeTransportPath, ActiveTransportPath.relay);
+      expect(state.title, 'E2EE 已验证');
+      expect(state.canShowVerified, isTrue);
     });
 
     test('relay agent reconnecting does not clear one-time pairing secret',
@@ -1394,6 +1613,175 @@ void main() {
             payload['action'] == 'ai_turn' &&
             payload['clientActionId'] == clientActionId),
         isEmpty,
+      );
+    });
+
+    test('relay reconnect resumes selected session and keeps visible state',
+        () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.saveConfig(const AppConfig(
+        connectionMode: 'relay',
+        relayUrl: 'wss://relay.example.test',
+        relaySessionId: 'rs_test',
+        relayClientId: 'rc_test',
+        relayClientReconnectSecret: 'reconnect_secret',
+      ));
+      await controller.connect();
+      service.emit(
+        SessionHistoryEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-relay',
+          runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+          raw: const {'type': 'session_history'},
+          summary: const SessionSummary(
+            id: 'session-relay',
+            title: 'Relay Session',
+          ),
+          logEntries: const [
+            HistoryLogEntry(
+              kind: 'assistant',
+              message: 'relay history',
+              label: 'Assistant',
+            ),
+          ],
+          resumeRuntimeMeta: const RuntimeMeta(
+            command: 'codex',
+            engine: 'codex',
+          ),
+        ),
+      );
+      await _flushEvents();
+      expect(controller.selectedSessionId, 'session-relay');
+      expect(controller.timeline.single.body, 'relay history');
+      expect(controller.shouldShowSessionSurface, isTrue);
+
+      service.sentPayloads.clear();
+      service.emit(
+        ErrorEvent(
+          timestamp: _timestamp.add(const Duration(seconds: 1)),
+          sessionId: 'session-relay',
+          runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+          raw: const {'type': 'error'},
+          code: 'agent_disconnected',
+          message: '本机 Relay 正在重连，请稍后自动恢复',
+        ),
+      );
+      await _flushEvents();
+      await _flushEvents();
+
+      expect(service.connectCalls, 2);
+      expect(controller.connected, isTrue);
+      expect(controller.activeTransportPath, ActiveTransportPath.relay);
+      expect(controller.selectedSessionId, 'session-relay');
+      expect(controller.timeline.single.body, 'relay history');
+      expect(controller.shouldShowSessionSurface, isTrue);
+      expect(
+        service.sentPayloads.where((payload) =>
+            payload['action'] == 'session_resume' &&
+            payload['sessionId'] == 'session-relay' &&
+            payload['reason'] == 'reconnect'),
+        hasLength(1),
+      );
+    });
+
+    test('relay reconnect keeps awaiting input context while chatting',
+        () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.saveConfig(const AppConfig(
+        connectionMode: 'relay',
+        relayUrl: 'wss://relay.example.test',
+        relaySessionId: 'rs_test',
+        relayClientId: 'rc_test',
+        relayClientReconnectSecret: 'reconnect_secret',
+      ));
+      await controller.connect();
+      service.emit(
+        SessionHistoryEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-relay-chat',
+          runtimeMeta: const RuntimeMeta(command: 'claude', engine: 'claude'),
+          raw: const {'type': 'session_history'},
+          summary: const SessionSummary(
+            id: 'session-relay-chat',
+            title: 'Relay Chat',
+          ),
+          logEntries: const [
+            HistoryLogEntry(
+              kind: 'assistant',
+              message: '等待你继续',
+              label: 'Assistant',
+            ),
+          ],
+          resumeRuntimeMeta: const RuntimeMeta(
+            command: 'claude',
+            engine: 'claude',
+            claudeLifecycle: 'waiting_input',
+          ),
+        ),
+      );
+      service.emit(
+        AgentStateEvent(
+          timestamp: _timestamp.add(const Duration(milliseconds: 100)),
+          sessionId: 'session-relay-chat',
+          runtimeMeta: const RuntimeMeta(
+            command: 'claude',
+            engine: 'claude',
+            claudeLifecycle: 'waiting_input',
+          ),
+          raw: const {'type': 'agent_state'},
+          state: 'WAIT_INPUT',
+          message: '等待输入',
+          command: 'claude',
+          awaitInput: true,
+        ),
+      );
+      await _flushEvents();
+      expect(controller.awaitInput, isTrue);
+      expect(controller.shouldShowClaudeMode, isTrue);
+
+      service.sentPayloads.clear();
+      service.emit(
+        ErrorEvent(
+          timestamp: _timestamp.add(const Duration(seconds: 1)),
+          sessionId: 'session-relay-chat',
+          runtimeMeta: const RuntimeMeta(command: 'claude', engine: 'claude'),
+          raw: const {'type': 'error'},
+          code: 'agent_disconnected',
+          message: '本机 Relay 正在重连，请稍后自动恢复',
+        ),
+      );
+      await _flushEvents();
+      await _flushEvents();
+
+      expect(service.connectCalls, 2);
+      expect(controller.connected, isTrue);
+      expect(controller.awaitInput, isTrue);
+      expect(controller.shouldShowClaudeMode, isTrue);
+
+      controller.sendInputText('继续这个对话');
+      await _flushEvents();
+
+      final inputPayload = service.sentPayloads.singleWhere(
+        (payload) => payload['action'] == 'input',
+      );
+      expect(inputPayload['sessionId'], 'session-relay-chat');
+      expect(inputPayload['data'], '继续这个对话\n');
+      expect(
+        service.sentPayloads.where((payload) =>
+            payload['action'] == 'ai_turn' || payload['action'] == 'exec'),
+        isEmpty,
+      );
+      expect(
+        controller.timeline.where((item) => item.body == '继续这个对话'),
+        hasLength(1),
       );
     });
 
@@ -2517,7 +2905,10 @@ void main() {
       );
       await _flushEvents();
 
-      expect(service.sentPayloads.map((item) => item['action']), [
+      final actions =
+          service.sentPayloads.map((item) => item['action']).toList();
+      actions.remove('context_window_usage_get');
+      expect(actions, [
         'session_create',
         'session_context_get',
         'permission_rule_list',
@@ -2564,14 +2955,20 @@ void main() {
       );
       await _flushEvents();
 
-      expect(service.sentPayloads.map((item) => item['action']), [
+      final actions =
+          service.sentPayloads.map((item) => item['action']).toList();
+      actions.remove('context_window_usage_get');
+      expect(actions, [
         'session_create',
         'session_context_get',
         'permission_rule_list',
         'ai_turn',
       ]);
-      expect(service.sentPayloads[3]['engine'], 'claude');
-      expect(service.sentPayloads[3]['data'], '请帮我总结当前问题\n');
+      final aiTurn = service.sentPayloads.singleWhere(
+        (payload) => payload['action'] == 'ai_turn',
+      );
+      expect(aiTurn['engine'], 'claude');
+      expect(aiTurn['data'], '请帮我总结当前问题\n');
       expect(controller.selectedSessionId, 'session-new');
     });
 
@@ -3191,6 +3588,19 @@ void main() {
         ),
         'xhigh',
       );
+      expect(
+        controller.preferredCodexReasoningEffortForModel(
+          '',
+          fallback: '',
+        ),
+        'high',
+      );
+      await controller.saveConfig(
+        controller.config.copyWith(engine: 'codex'),
+      );
+      expect(controller.configuredAiModel, isEmpty);
+      expect(controller.configuredAiReasoningEffort, 'high');
+      expect(controller.commandBarModelSummary, 'Default · HIGH');
     });
 
     test('手动应用 Codex 配置后不会被旧运行时模型回填覆盖', () async {
@@ -5248,6 +5658,7 @@ void main() {
       await _flushEvents();
 
       service.sentPayloads.clear();
+      controller.loadSession('session-b');
       service.emit(
         SessionHistoryEvent(
           timestamp: _timestamp.add(const Duration(seconds: 1)),
@@ -9817,6 +10228,95 @@ void main() {
       expect(controller.isLoadingSession, isTrue);
     });
 
+    test('SessionDeltaEvent for other session does not overwrite active chat',
+        () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'claude', engine: 'claude'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-current', title: 'Current'),
+        logEntries: const [
+          HistoryLogEntry(
+            kind: 'assistant',
+            message: '当前会话回复',
+            label: 'Assistant',
+          ),
+        ],
+        resumeRuntimeMeta: const RuntimeMeta(
+          command: 'claude',
+          engine: 'claude',
+          claudeLifecycle: 'waiting_input',
+        ),
+        runtimeAlive: true,
+      ));
+      service.emit(AgentStateEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 100)),
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(
+          command: 'claude',
+          engine: 'claude',
+          claudeLifecycle: 'waiting_input',
+        ),
+        raw: const {'type': 'agent_state'},
+        state: 'WAIT_INPUT',
+        message: '等待输入',
+        command: 'claude',
+        awaitInput: true,
+      ));
+      await _flushEvents();
+      expect(controller.selectedSessionId, 'session-current');
+      expect(controller.awaitInput, isTrue);
+
+      service.emit(SessionDeltaEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 200)),
+        sessionId: 'session-other',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'session_delta'},
+        summary: const SessionSummary(id: 'session-other', title: 'Other'),
+        appendLogEntries: const [
+          HistoryLogEntry(
+            kind: 'assistant',
+            message: '其他会话回复',
+            label: 'Assistant',
+          ),
+        ],
+        base: const SessionDeltaKnown(),
+        latest: const SessionDeltaKnown(eventCursor: 9, logEntryCount: 1),
+        resumeRuntimeMeta: const RuntimeMeta(
+          command: 'codex',
+          engine: 'codex',
+          claudeLifecycle: 'active',
+        ),
+        runtimeAlive: true,
+      ));
+      await _flushEvents();
+
+      expect(controller.selectedSessionId, 'session-current');
+      expect(controller.awaitInput, isTrue);
+      expect(controller.shouldShowClaudeMode, isTrue);
+      expect(
+        controller.timeline.any((item) => item.body == '其他会话回复'),
+        isFalse,
+      );
+
+      service.sentPayloads.clear();
+      controller.sendInputText('继续当前会话');
+      await _flushEvents();
+
+      final inputPayload = service.sentPayloads.singleWhere(
+        (payload) => payload['action'] == 'input',
+      );
+      expect(inputPayload['sessionId'], 'session-current');
+      expect(inputPayload['data'], '继续当前会话\n');
+    });
+
     test(
         'SessionHistoryEvent does not overwrite selectedSessionId while loading',
         () async {
@@ -9871,6 +10371,272 @@ void main() {
       expect(controller.isLoadingSession, isTrue);
     });
 
+    test('SessionHistoryEvent for other session does not overwrite active chat',
+        () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'claude', engine: 'claude'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-current', title: 'Current'),
+        logEntries: const [
+          HistoryLogEntry(
+            kind: 'assistant',
+            message: '当前会话回复',
+            label: 'Assistant',
+          ),
+        ],
+        resumeRuntimeMeta: const RuntimeMeta(
+          command: 'claude',
+          engine: 'claude',
+          claudeLifecycle: 'waiting_input',
+        ),
+        runtimeAlive: true,
+      ));
+      service.emit(AgentStateEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 100)),
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(
+          command: 'claude',
+          engine: 'claude',
+          claudeLifecycle: 'waiting_input',
+        ),
+        raw: const {'type': 'agent_state'},
+        state: 'WAIT_INPUT',
+        message: '等待输入',
+        command: 'claude',
+        awaitInput: true,
+      ));
+      await _flushEvents();
+      expect(controller.selectedSessionId, 'session-current');
+      expect(controller.awaitInput, isTrue);
+
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 200)),
+        sessionId: 'session-other',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-other', title: 'Other'),
+        logEntries: const [
+          HistoryLogEntry(
+            kind: 'assistant',
+            message: '其他会话全量历史',
+            label: 'Assistant',
+          ),
+        ],
+        resumeRuntimeMeta: const RuntimeMeta(
+          command: 'codex',
+          engine: 'codex',
+          claudeLifecycle: 'active',
+        ),
+        runtimeAlive: true,
+      ));
+      await _flushEvents();
+
+      expect(controller.selectedSessionId, 'session-current');
+      expect(controller.awaitInput, isTrue);
+      expect(controller.shouldShowClaudeMode, isTrue);
+      expect(
+        controller.timeline.any((item) => item.body == '其他会话全量历史'),
+        isFalse,
+      );
+
+      service.sentPayloads.clear();
+      controller.sendInputText('继续当前会话');
+      await _flushEvents();
+
+      final inputPayload = service.sentPayloads.singleWhere(
+        (payload) => payload['action'] == 'input',
+      );
+      expect(inputPayload['sessionId'], 'session-current');
+      expect(inputPayload['data'], '继续当前会话\n');
+    });
+
+    test('other session runtime events do not overwrite active chat context',
+        () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'claude', engine: 'claude'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-current', title: 'Current'),
+        logEntries: const [
+          HistoryLogEntry(
+            kind: 'assistant',
+            message: '当前会话回复',
+            label: 'Assistant',
+          ),
+        ],
+        resumeRuntimeMeta: const RuntimeMeta(
+          command: 'claude',
+          engine: 'claude',
+          claudeLifecycle: 'waiting_input',
+        ),
+        runtimeAlive: true,
+      ));
+      service.emit(AgentStateEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 100)),
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(
+          command: 'claude',
+          engine: 'claude',
+          claudeLifecycle: 'waiting_input',
+        ),
+        raw: const {'type': 'agent_state'},
+        state: 'WAIT_INPUT',
+        message: '等待输入',
+        command: 'claude',
+        awaitInput: true,
+      ));
+      await _flushEvents();
+      expect(controller.selectedSessionId, 'session-current');
+      expect(controller.awaitInput, isTrue);
+
+      service.emit(RuntimePhaseEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 200)),
+        sessionId: 'session-other',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'runtime_phase'},
+        phase: 'permission_blocked',
+        kind: 'permission',
+        message: '其他会话需要授权',
+      ));
+      service.emit(LogEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 300)),
+        sessionId: 'session-other',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'log'},
+        message: '其他会话输出',
+        stream: 'stdout',
+      ));
+      service.emit(ProgressEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 400)),
+        sessionId: 'session-other',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'progress'},
+        message: '其他会话进度',
+        percent: 50,
+      ));
+      service.emit(PromptRequestEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 500)),
+        sessionId: 'session-other',
+        runtimeMeta: const RuntimeMeta(
+          command: 'claude',
+          blockingKind: 'permission',
+          targetPath: '/workspace/other.dart',
+        ),
+        raw: const {'type': 'prompt_request'},
+        message: 'Allow edit other.dart?',
+        options: const [PromptOption(value: 'y'), PromptOption(value: 'n')],
+      ));
+      service.emit(InteractionRequestEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 600)),
+        sessionId: 'session-other',
+        runtimeMeta: const RuntimeMeta(
+          command: 'claude',
+          contextId: 'other-permission',
+          targetPath: '/workspace/other.dart',
+        ),
+        raw: const {'type': 'interaction_request'},
+        kind: 'permission',
+        title: 'Permission required',
+        message: '其他会话需要授权',
+        options: const [PromptOption(value: 'y'), PromptOption(value: 'n')],
+      ));
+      service.emit(StepUpdateEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 700)),
+        sessionId: 'session-other',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'step_update'},
+        message: '其他会话步骤',
+        status: 'running',
+        target: 'command',
+        command: 'codex',
+      ));
+      service.emit(ReviewStateEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 800)),
+        sessionId: 'session-other',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'review_state'},
+        groups: const [
+          ReviewGroup(
+            id: 'other-review',
+            title: 'Other review',
+            pendingReview: true,
+            pendingCount: 1,
+          ),
+        ],
+      ));
+      service.emit(FileDiffEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 900)),
+        sessionId: 'session-other',
+        runtimeMeta: const RuntimeMeta(
+          command: 'codex',
+          engine: 'codex',
+          contextId: 'other-diff',
+          targetPath: '/workspace/other.dart',
+        ),
+        raw: const {'type': 'file_diff'},
+        path: '/workspace/other.dart',
+        title: 'Other diff',
+        diff: '@@ -1 +1 @@\n-old\n+new',
+        lang: 'dart',
+      ));
+      service.emit(SessionContextResultEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 1000)),
+        sessionId: 'session-other',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'session_context_result'},
+        sessionContext: const SessionContext(
+          enabledSkillNames: ['other-skill'],
+          enabledMemoryIds: ['other-memory'],
+        ),
+      ));
+      await _flushEvents();
+
+      expect(controller.selectedSessionId, 'session-current');
+      expect(controller.awaitInput, isTrue);
+      expect(controller.shouldShowClaudeMode, isTrue);
+      expect(controller.shouldShowPermissionChoices, isFalse);
+      expect(controller.shouldShowReviewChoices, isFalse);
+      expect(controller.terminalStdout, isEmpty);
+      expect(controller.currentStepSummary, isNot('其他会话进度'));
+      expect(controller.currentStepSummary, isNot('其他会话步骤'));
+      expect(controller.reviewGroups, isEmpty);
+      expect(controller.enabledSkillSummary, isEmpty);
+      expect(controller.enabledMemorySummary, isEmpty);
+      expect(
+        controller.timeline.any((item) => item.body == '其他会话输出'),
+        isFalse,
+      );
+      expect(
+        controller.timeline.any((item) => item.body == '/workspace/other.dart'),
+        isFalse,
+      );
+
+      service.sentPayloads.clear();
+      controller.sendInputText('继续当前会话');
+      await _flushEvents();
+
+      final inputPayload = service.sentPayloads.singleWhere(
+        (payload) => payload['action'] == 'input',
+      );
+      expect(inputPayload['sessionId'], 'session-current');
+      expect(inputPayload['data'], '继续当前会话\n');
+    });
+
     test('loadSession 后匹配的 SessionHistoryEvent 必须还原 timeline', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);
@@ -9912,6 +10678,44 @@ void main() {
           reason: '主界面不能在 loadSession 之后仍停留在 logo');
       expect(controller.timeline.any((item) => item.body.contains('历史里的助手回复')),
           isTrue);
+    });
+
+    test('session_history 使用时间升序恢复 timeline，避免旧记录叠到最新消息后面', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        logEntries: const [
+          HistoryLogEntry(
+            kind: 'markdown',
+            message: 'Android release APK 已重新打包成功',
+            timestamp: '2026-05-27T05:53:00Z',
+          ),
+          HistoryLogEntry(
+            kind: 'user',
+            message: 'LAN-first 和 Relay fallback 方案',
+            timestamp: '2026-05-27T05:20:00Z',
+          ),
+        ],
+        resumeRuntimeMeta: RuntimeMeta(command: 'claude'),
+      ));
+      await _flushEvents();
+
+      expect(
+        controller.timeline.map((item) => item.body).toList(),
+        containsAllInOrder([
+          'LAN-first 和 Relay fallback 方案',
+          'Android release APK 已重新打包成功',
+        ]),
+      );
     });
 
     test('loadSession 匹配 history 后先显示 timeline 再异步刷新目录和 delta', () async {
@@ -10156,6 +10960,99 @@ void main() {
       );
     });
 
+    test('stale session_delta 不会把旧历史追加到当前最新消息后面', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        logEntries: const [
+          HistoryLogEntry(
+            kind: 'markdown',
+            message: 'Android release APK 已重新打包成功',
+            timestamp: '2026-05-27T05:53:00Z',
+          ),
+        ],
+        resumeRuntimeMeta: RuntimeMeta(command: 'claude'),
+      ));
+      await _flushEvents();
+
+      service.emit(SessionDeltaEvent(
+        timestamp: _timestamp.add(const Duration(seconds: 1)),
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_delta'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        base: const SessionDeltaKnown(eventCursor: 1, logEntryCount: 0),
+        latest: const SessionDeltaKnown(eventCursor: 3, logEntryCount: 2),
+        appendLogEntries: const [
+          HistoryLogEntry(
+            kind: 'user',
+            message: 'LAN-first 和 Relay fallback 方案',
+            timestamp: '2026-05-27T05:20:00Z',
+          ),
+        ],
+        resumeRuntimeMeta: RuntimeMeta(command: 'claude'),
+      ));
+      await _flushEvents();
+
+      expect(
+        controller.timeline.map((item) => item.body).toList(),
+        ['Android release APK 已重新打包成功'],
+      );
+    });
+
+    test('session_delta 重放已恢复的历史 entry 时不会重复显示', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      const replayedEntry = HistoryLogEntry(
+        kind: 'markdown',
+        message: '同一条原生历史回复',
+        timestamp: '2026-05-27T05:53:00Z',
+        executionId: 'exec-native-1',
+      );
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'codex'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        logEntries: const [replayedEntry],
+        resumeRuntimeMeta: const RuntimeMeta(command: 'codex'),
+      ));
+      await _flushEvents();
+
+      service.emit(SessionDeltaEvent(
+        timestamp: _timestamp.add(const Duration(seconds: 1)),
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'codex'),
+        raw: const {'type': 'session_delta'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        base: const SessionDeltaKnown(eventCursor: 1, logEntryCount: 1),
+        latest: const SessionDeltaKnown(eventCursor: 2, logEntryCount: 2),
+        appendLogEntries: const [replayedEntry],
+        resumeRuntimeMeta: const RuntimeMeta(command: 'codex'),
+      ));
+      await _flushEvents();
+
+      expect(
+        controller.timeline.where((item) => item.body == '同一条原生历史回复').length,
+        1,
+      );
+    });
+
     test('loadSession 期间不属于目标的 stale history 仍会被丢弃', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);
@@ -10224,7 +11121,10 @@ class _FakeMobileVcWsService extends MobileVcWsService {
       StreamController<AppEvent>.broadcast();
   final List<Map<String, dynamic>> sentPayloads = [];
   final List<String> connectedUrls = [];
+  final List<String> readyDirectUrls = [];
   final List<_RelayConnectCall> connectedRelays = [];
+  final List<Object> connectErrors = [];
+  final List<Object> readyDirectErrors = [];
   int connectCalls = 0;
   int disconnectCalls = 0;
   int resetRelayBindingCalls = 0;
@@ -10291,6 +11191,18 @@ class _FakeMobileVcWsService extends MobileVcWsService {
   Future<void> connect(String url) async {
     connectCalls++;
     connectedUrls.add(url);
+    if (connectErrors.isNotEmpty) {
+      throw connectErrors.removeAt(0);
+    }
+  }
+
+  @override
+  Future<void> connectDirectAfterReady(String url) async {
+    connectCalls++;
+    readyDirectUrls.add(url);
+    if (readyDirectErrors.isNotEmpty) {
+      throw readyDirectErrors.removeAt(0);
+    }
   }
 
   @override

@@ -63,6 +63,20 @@ class AppConfig {
 
   bool get isRelayMode => connectionMode == ConnectionMode.relay.name;
 
+  bool get isAutoMode => connectionMode == ConnectionMode.auto.name;
+
+  bool get canUseRelay =>
+      relayUrl.trim().isNotEmpty &&
+      relaySessionId.trim().isNotEmpty &&
+      (relayPairingSecret.trim().isNotEmpty ||
+          (relayClientId.trim().isNotEmpty &&
+              relayClientReconnectSecret.trim().isNotEmpty));
+
+  bool get hasDirectEndpoint =>
+      host.trim().isNotEmpty &&
+      port.trim().isNotEmpty &&
+      token.trim().isNotEmpty;
+
   String get baseHttpUrl => baseHttpUrlFor();
 
   String get wsUrl => wsUrlFor();
@@ -120,7 +134,7 @@ class AppConfig {
     String? permissionMode,
     bool? fastMode,
     String? adbIceServersJson,
-    bool? secureTransport,
+    Object? secureTransport = _unchanged,
     String? connectionMode,
     String? relayUrl,
     String? relaySessionId,
@@ -163,8 +177,9 @@ class AppConfig {
       ),
       fastMode: fastMode ?? this.fastMode,
       adbIceServersJson: adbIceServersJson ?? this.adbIceServersJson,
-      secureTransport:
-          secureTransport ?? endpoint.secureTransport ?? this.secureTransport,
+      secureTransport: identical(secureTransport, _unchanged)
+          ? endpoint.secureTransport ?? this.secureTransport
+          : secureTransport as bool?,
       connectionMode:
           normalizeConnectionMode(connectionMode ?? this.connectionMode),
       relayUrl: relayUrl ?? this.relayUrl,
@@ -319,14 +334,29 @@ class AppConfig {
     }
     final relayPairing = parseRelayPairingUri(trimmed);
     if (relayPairing != null) {
-      final sameRelaySession = fallback.isRelayMode &&
-          fallback.relayUrl.trim() == relayPairing.relayUrl.trim() &&
-          fallback.relaySessionId.trim() == relayPairing.sessionId.trim();
+      final sameRelaySession =
+          fallback.connectionMode != ConnectionMode.direct.name &&
+              fallback.relayUrl.trim() == relayPairing.relayUrl.trim() &&
+              fallback.relaySessionId.trim() == relayPairing.sessionId.trim();
       final hasReconnectCredentials =
           fallback.relayClientId.trim().isNotEmpty &&
               fallback.relayClientReconnectSecret.trim().isNotEmpty;
       return fallback.copyWith(
-        connectionMode: ConnectionMode.relay.name,
+        connectionMode: relayPairing.hasLanEndpoint
+            ? ConnectionMode.auto.name
+            : ConnectionMode.relay.name,
+        host:
+            relayPairing.hasLanEndpoint ? relayPairing.lanHost : fallback.host,
+        port:
+            relayPairing.hasLanEndpoint ? relayPairing.lanPort : fallback.port,
+        token: relayPairing.hasLanEndpoint
+            ? relayPairing.lanToken
+            : fallback.token,
+        cwd: relayPairing.lanCwd.trim().isNotEmpty
+            ? relayPairing.lanCwd
+            : fallback.cwd,
+        secureTransport: relayPairing.lanSecureTransport ??
+            (relayPairing.hasLanEndpoint ? fallback.secureTransport : null),
         relayUrl: relayPairing.relayUrl,
         relaySessionId: relayPairing.sessionId,
         relayPairingSecret: sameRelaySession && hasReconnectCredentials

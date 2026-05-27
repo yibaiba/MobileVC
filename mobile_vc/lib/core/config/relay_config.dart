@@ -2,7 +2,7 @@ import 'dart:convert';
 
 import '../relay_e2ee/relay_e2ee_capability.dart';
 
-enum ConnectionMode { direct, relay }
+enum ConnectionMode { direct, relay, auto }
 
 class RelayPairing {
   const RelayPairing({
@@ -12,6 +12,11 @@ class RelayPairing {
     required this.expiresAt,
     required this.nodeFingerprintHex,
     this.capabilities,
+    this.lanHost = '',
+    this.lanPort = '',
+    this.lanToken = '',
+    this.lanCwd = '',
+    this.lanSecureTransport,
   });
 
   final String relayUrl;
@@ -20,6 +25,14 @@ class RelayPairing {
   final int expiresAt;
   final String nodeFingerprintHex;
   final RelayE2eeCapabilitySet? capabilities;
+  final String lanHost;
+  final String lanPort;
+  final String lanToken;
+  final String lanCwd;
+  final bool? lanSecureTransport;
+
+  bool get hasLanEndpoint =>
+      lanHost.trim().isNotEmpty && lanToken.trim().isNotEmpty;
 }
 
 String relayPairingUriFromEventJson(Map<String, Object?> json) {
@@ -44,6 +57,7 @@ String relayPairingUriFromEventJson(Map<String, Object?> json) {
     'nodeFingerprint': nodeFingerprintHex,
     ..._relayCapabilityQuery(capabilities),
   };
+  _appendLanPairingQuery(query, json);
   return Uri(
     scheme: 'mobilevc',
     host: 'relay',
@@ -53,9 +67,14 @@ String relayPairingUriFromEventJson(Map<String, Object?> json) {
 }
 
 String normalizeConnectionMode(Object? value) {
-  return value?.toString().trim() == ConnectionMode.relay.name
-      ? ConnectionMode.relay.name
-      : ConnectionMode.direct.name;
+  switch (value?.toString().trim()) {
+    case 'relay':
+      return ConnectionMode.relay.name;
+    case 'auto':
+      return ConnectionMode.auto.name;
+    default:
+      return ConnectionMode.direct.name;
+  }
 }
 
 void validateRelayUrl(String raw) {
@@ -106,6 +125,16 @@ RelayPairing? parseRelayPairingUri(String raw) {
         'relay pairing uri is missing node fingerprint');
   }
   final capabilities = _parseRelayCapabilities(uri);
+  final lanHost = (uri.queryParameters['lanHost'] ?? '').trim();
+  final lanPort = (uri.queryParameters['lanPort'] ?? '').trim();
+  final lanToken = (uri.queryParameters['lanToken'] ?? '').trim();
+  final lanCwd = (uri.queryParameters['lanCwd'] ?? '').trim();
+  final lanSecureTransport = _optionalBool(uri, 'lanSecureTransport');
+  if ((lanHost.isEmpty) != (lanToken.isEmpty)) {
+    throw const FormatException(
+      'relay pairing uri LAN endpoint must include lanHost and lanToken',
+    );
+  }
   validateRelayUrl(relayUrl);
   return RelayPairing(
     relayUrl: relayUrl,
@@ -114,7 +143,37 @@ RelayPairing? parseRelayPairingUri(String raw) {
     expiresAt: expiresAt ?? 0,
     nodeFingerprintHex: nodeFingerprintHex,
     capabilities: capabilities,
+    lanHost: lanHost,
+    lanPort: lanPort,
+    lanToken: lanToken,
+    lanCwd: lanCwd,
+    lanSecureTransport: lanSecureTransport,
   );
+}
+
+void _appendLanPairingQuery(
+  Map<String, String> query,
+  Map<String, Object?> json,
+) {
+  final host = (json['lanHost'] ?? json['host'] ?? '').toString().trim();
+  final token = (json['lanToken'] ?? json['token'] ?? '').toString().trim();
+  if (host.isEmpty || token.isEmpty) {
+    return;
+  }
+  query['lanHost'] = host;
+  final port = (json['lanPort'] ?? json['port'] ?? '').toString().trim();
+  if (port.isNotEmpty) {
+    query['lanPort'] = port;
+  }
+  query['lanToken'] = token;
+  final cwd = (json['lanCwd'] ?? json['cwd'] ?? '').toString().trim();
+  if (cwd.isNotEmpty) {
+    query['lanCwd'] = cwd;
+  }
+  final secureTransport = json['lanSecureTransport'] ?? json['secureTransport'];
+  if (secureTransport is bool) {
+    query['lanSecureTransport'] = secureTransport.toString();
+  }
 }
 
 String _normalizeRelayPairingInput(String raw) {
@@ -241,6 +300,18 @@ bool _requiredBool(Uri uri, String key) {
     _ => throw FormatException(
         'relay pairing uri has invalid capability field $key',
       ),
+  };
+}
+
+bool? _optionalBool(Uri uri, String key) {
+  if (!uri.queryParameters.containsKey(key)) {
+    return null;
+  }
+  final value = (uri.queryParameters[key] ?? '').trim().toLowerCase();
+  return switch (value) {
+    'true' => true,
+    'false' => false,
+    _ => throw FormatException('relay pairing uri has invalid field $key'),
   };
 }
 

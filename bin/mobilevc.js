@@ -342,12 +342,16 @@ async function runStart(options = {}) {
   try {
     fs.chmodSync(logPath, 0o600);
   } catch (_) {}
+  const lanHost = relayAccess.enabled && relayAccess.networkExposureMode === 'lan'
+    ? await detectLanHost()
+    : '';
 
   const env = {
     ...process.env,
     PORT: String(config.port),
     AUTH_TOKEN: String(config.authToken),
     RUNTIME_WORKSPACE_ROOT: process.cwd(),
+    MOBILEVC_LAN_HOST: lanHost,
     ...relayAccess.env,
   };
   if (relayAccess.enabled) {
@@ -410,7 +414,7 @@ async function runStart(options = {}) {
   }
   if (relayAccess.enabled) {
     if (relayAccess.networkExposureMode === 'lan') {
-      await printLanQr(language, state.port, state.authToken, state.cwd || process.cwd());
+      printLanQrWithHost(language, lanHost, state.port, state.authToken, state.cwd || process.cwd());
       console.log('');
       console.log(message(language, 'relayLanAccess'));
     }
@@ -1123,6 +1127,10 @@ function message(language, key, ...args) {
 
 async function printLanQr(language, port, authToken = '', cwd = process.cwd()) {
   const host = await detectLanHost();
+  printLanQrWithHost(language, host, port, authToken, cwd);
+}
+
+function printLanQrWithHost(language, host, port, authToken = '', cwd = process.cwd()) {
   const localUrl = buildLaunchUrl('127.0.0.1', port, authToken, cwd);
   console.log('');
   console.log(`${message(language, 'localAccess')}: ${localUrl}`);
