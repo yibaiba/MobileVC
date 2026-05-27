@@ -1616,6 +1616,175 @@ void main() {
       );
     });
 
+    test('relay reconnect resumes selected session and keeps visible state',
+        () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.saveConfig(const AppConfig(
+        connectionMode: 'relay',
+        relayUrl: 'wss://relay.example.test',
+        relaySessionId: 'rs_test',
+        relayClientId: 'rc_test',
+        relayClientReconnectSecret: 'reconnect_secret',
+      ));
+      await controller.connect();
+      service.emit(
+        SessionHistoryEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-relay',
+          runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+          raw: const {'type': 'session_history'},
+          summary: const SessionSummary(
+            id: 'session-relay',
+            title: 'Relay Session',
+          ),
+          logEntries: const [
+            HistoryLogEntry(
+              kind: 'assistant',
+              message: 'relay history',
+              label: 'Assistant',
+            ),
+          ],
+          resumeRuntimeMeta: const RuntimeMeta(
+            command: 'codex',
+            engine: 'codex',
+          ),
+        ),
+      );
+      await _flushEvents();
+      expect(controller.selectedSessionId, 'session-relay');
+      expect(controller.timeline.single.body, 'relay history');
+      expect(controller.shouldShowSessionSurface, isTrue);
+
+      service.sentPayloads.clear();
+      service.emit(
+        ErrorEvent(
+          timestamp: _timestamp.add(const Duration(seconds: 1)),
+          sessionId: 'session-relay',
+          runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+          raw: const {'type': 'error'},
+          code: 'agent_disconnected',
+          message: '本机 Relay 正在重连，请稍后自动恢复',
+        ),
+      );
+      await _flushEvents();
+      await _flushEvents();
+
+      expect(service.connectCalls, 2);
+      expect(controller.connected, isTrue);
+      expect(controller.activeTransportPath, ActiveTransportPath.relay);
+      expect(controller.selectedSessionId, 'session-relay');
+      expect(controller.timeline.single.body, 'relay history');
+      expect(controller.shouldShowSessionSurface, isTrue);
+      expect(
+        service.sentPayloads.where((payload) =>
+            payload['action'] == 'session_resume' &&
+            payload['sessionId'] == 'session-relay' &&
+            payload['reason'] == 'reconnect'),
+        hasLength(1),
+      );
+    });
+
+    test('relay reconnect keeps awaiting input context while chatting',
+        () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.saveConfig(const AppConfig(
+        connectionMode: 'relay',
+        relayUrl: 'wss://relay.example.test',
+        relaySessionId: 'rs_test',
+        relayClientId: 'rc_test',
+        relayClientReconnectSecret: 'reconnect_secret',
+      ));
+      await controller.connect();
+      service.emit(
+        SessionHistoryEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-relay-chat',
+          runtimeMeta: const RuntimeMeta(command: 'claude', engine: 'claude'),
+          raw: const {'type': 'session_history'},
+          summary: const SessionSummary(
+            id: 'session-relay-chat',
+            title: 'Relay Chat',
+          ),
+          logEntries: const [
+            HistoryLogEntry(
+              kind: 'assistant',
+              message: '等待你继续',
+              label: 'Assistant',
+            ),
+          ],
+          resumeRuntimeMeta: const RuntimeMeta(
+            command: 'claude',
+            engine: 'claude',
+            claudeLifecycle: 'waiting_input',
+          ),
+        ),
+      );
+      service.emit(
+        AgentStateEvent(
+          timestamp: _timestamp.add(const Duration(milliseconds: 100)),
+          sessionId: 'session-relay-chat',
+          runtimeMeta: const RuntimeMeta(
+            command: 'claude',
+            engine: 'claude',
+            claudeLifecycle: 'waiting_input',
+          ),
+          raw: const {'type': 'agent_state'},
+          state: 'WAIT_INPUT',
+          message: '等待输入',
+          command: 'claude',
+          awaitInput: true,
+        ),
+      );
+      await _flushEvents();
+      expect(controller.awaitInput, isTrue);
+      expect(controller.shouldShowClaudeMode, isTrue);
+
+      service.sentPayloads.clear();
+      service.emit(
+        ErrorEvent(
+          timestamp: _timestamp.add(const Duration(seconds: 1)),
+          sessionId: 'session-relay-chat',
+          runtimeMeta: const RuntimeMeta(command: 'claude', engine: 'claude'),
+          raw: const {'type': 'error'},
+          code: 'agent_disconnected',
+          message: '本机 Relay 正在重连，请稍后自动恢复',
+        ),
+      );
+      await _flushEvents();
+      await _flushEvents();
+
+      expect(service.connectCalls, 2);
+      expect(controller.connected, isTrue);
+      expect(controller.awaitInput, isTrue);
+      expect(controller.shouldShowClaudeMode, isTrue);
+
+      controller.sendInputText('继续这个对话');
+      await _flushEvents();
+
+      final inputPayload = service.sentPayloads.singleWhere(
+        (payload) => payload['action'] == 'input',
+      );
+      expect(inputPayload['sessionId'], 'session-relay-chat');
+      expect(inputPayload['data'], '继续这个对话\n');
+      expect(
+        service.sentPayloads.where((payload) =>
+            payload['action'] == 'ai_turn' || payload['action'] == 'exec'),
+        isEmpty,
+      );
+      expect(
+        controller.timeline.where((item) => item.body == '继续这个对话'),
+        hasLength(1),
+      );
+    });
+
     test('unacknowledged relay send reconnects and resends queued action',
         () async {
       final service = _FakeMobileVcWsService();
@@ -5476,6 +5645,7 @@ void main() {
       await _flushEvents();
 
       service.sentPayloads.clear();
+      controller.loadSession('session-b');
       service.emit(
         SessionHistoryEvent(
           timestamp: _timestamp.add(const Duration(seconds: 1)),
@@ -10045,6 +10215,95 @@ void main() {
       expect(controller.isLoadingSession, isTrue);
     });
 
+    test('SessionDeltaEvent for other session does not overwrite active chat',
+        () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'claude', engine: 'claude'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-current', title: 'Current'),
+        logEntries: const [
+          HistoryLogEntry(
+            kind: 'assistant',
+            message: '当前会话回复',
+            label: 'Assistant',
+          ),
+        ],
+        resumeRuntimeMeta: const RuntimeMeta(
+          command: 'claude',
+          engine: 'claude',
+          claudeLifecycle: 'waiting_input',
+        ),
+        runtimeAlive: true,
+      ));
+      service.emit(AgentStateEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 100)),
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(
+          command: 'claude',
+          engine: 'claude',
+          claudeLifecycle: 'waiting_input',
+        ),
+        raw: const {'type': 'agent_state'},
+        state: 'WAIT_INPUT',
+        message: '等待输入',
+        command: 'claude',
+        awaitInput: true,
+      ));
+      await _flushEvents();
+      expect(controller.selectedSessionId, 'session-current');
+      expect(controller.awaitInput, isTrue);
+
+      service.emit(SessionDeltaEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 200)),
+        sessionId: 'session-other',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'session_delta'},
+        summary: const SessionSummary(id: 'session-other', title: 'Other'),
+        appendLogEntries: const [
+          HistoryLogEntry(
+            kind: 'assistant',
+            message: '其他会话回复',
+            label: 'Assistant',
+          ),
+        ],
+        base: const SessionDeltaKnown(),
+        latest: const SessionDeltaKnown(eventCursor: 9, logEntryCount: 1),
+        resumeRuntimeMeta: const RuntimeMeta(
+          command: 'codex',
+          engine: 'codex',
+          claudeLifecycle: 'active',
+        ),
+        runtimeAlive: true,
+      ));
+      await _flushEvents();
+
+      expect(controller.selectedSessionId, 'session-current');
+      expect(controller.awaitInput, isTrue);
+      expect(controller.shouldShowClaudeMode, isTrue);
+      expect(
+        controller.timeline.any((item) => item.body == '其他会话回复'),
+        isFalse,
+      );
+
+      service.sentPayloads.clear();
+      controller.sendInputText('继续当前会话');
+      await _flushEvents();
+
+      final inputPayload = service.sentPayloads.singleWhere(
+        (payload) => payload['action'] == 'input',
+      );
+      expect(inputPayload['sessionId'], 'session-current');
+      expect(inputPayload['data'], '继续当前会话\n');
+    });
+
     test(
         'SessionHistoryEvent does not overwrite selectedSessionId while loading',
         () async {
@@ -10097,6 +10356,273 @@ void main() {
       // selectedSessionId should NOT be overwritten
       expect(controller.selectedSessionId, isNot('stale-history-session'));
       expect(controller.isLoadingSession, isTrue);
+    });
+
+    test('SessionHistoryEvent for other session does not overwrite active chat',
+        () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'claude', engine: 'claude'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-current', title: 'Current'),
+        logEntries: const [
+          HistoryLogEntry(
+            kind: 'assistant',
+            message: '当前会话回复',
+            label: 'Assistant',
+          ),
+        ],
+        resumeRuntimeMeta: const RuntimeMeta(
+          command: 'claude',
+          engine: 'claude',
+          claudeLifecycle: 'waiting_input',
+        ),
+        runtimeAlive: true,
+      ));
+      service.emit(AgentStateEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 100)),
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(
+          command: 'claude',
+          engine: 'claude',
+          claudeLifecycle: 'waiting_input',
+        ),
+        raw: const {'type': 'agent_state'},
+        state: 'WAIT_INPUT',
+        message: '等待输入',
+        command: 'claude',
+        awaitInput: true,
+      ));
+      await _flushEvents();
+      expect(controller.selectedSessionId, 'session-current');
+      expect(controller.awaitInput, isTrue);
+
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 200)),
+        sessionId: 'session-other',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-other', title: 'Other'),
+        logEntries: const [
+          HistoryLogEntry(
+            kind: 'assistant',
+            message: '其他会话全量历史',
+            label: 'Assistant',
+          ),
+        ],
+        resumeRuntimeMeta: const RuntimeMeta(
+          command: 'codex',
+          engine: 'codex',
+          claudeLifecycle: 'active',
+        ),
+        runtimeAlive: true,
+      ));
+      await _flushEvents();
+
+      expect(controller.selectedSessionId, 'session-current');
+      expect(controller.awaitInput, isTrue);
+      expect(controller.shouldShowClaudeMode, isTrue);
+      expect(
+        controller.timeline.any((item) => item.body == '其他会话全量历史'),
+        isFalse,
+      );
+
+      service.sentPayloads.clear();
+      controller.sendInputText('继续当前会话');
+      await _flushEvents();
+
+      final inputPayload = service.sentPayloads.singleWhere(
+        (payload) => payload['action'] == 'input',
+      );
+      expect(inputPayload['sessionId'], 'session-current');
+      expect(inputPayload['data'], '继续当前会话\n');
+    });
+
+    test(
+        'other session runtime events do not overwrite active chat context',
+        () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'claude', engine: 'claude'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-current', title: 'Current'),
+        logEntries: const [
+          HistoryLogEntry(
+            kind: 'assistant',
+            message: '当前会话回复',
+            label: 'Assistant',
+          ),
+        ],
+        resumeRuntimeMeta: const RuntimeMeta(
+          command: 'claude',
+          engine: 'claude',
+          claudeLifecycle: 'waiting_input',
+        ),
+        runtimeAlive: true,
+      ));
+      service.emit(AgentStateEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 100)),
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(
+          command: 'claude',
+          engine: 'claude',
+          claudeLifecycle: 'waiting_input',
+        ),
+        raw: const {'type': 'agent_state'},
+        state: 'WAIT_INPUT',
+        message: '等待输入',
+        command: 'claude',
+        awaitInput: true,
+      ));
+      await _flushEvents();
+      expect(controller.selectedSessionId, 'session-current');
+      expect(controller.awaitInput, isTrue);
+
+      service.emit(RuntimePhaseEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 200)),
+        sessionId: 'session-other',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'runtime_phase'},
+        phase: 'permission_blocked',
+        kind: 'permission',
+        message: '其他会话需要授权',
+      ));
+      service.emit(LogEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 300)),
+        sessionId: 'session-other',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'log'},
+        message: '其他会话输出',
+        stream: 'stdout',
+      ));
+      service.emit(ProgressEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 400)),
+        sessionId: 'session-other',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'progress'},
+        message: '其他会话进度',
+        percent: 50,
+      ));
+      service.emit(PromptRequestEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 500)),
+        sessionId: 'session-other',
+        runtimeMeta: const RuntimeMeta(
+          command: 'claude',
+          blockingKind: 'permission',
+          targetPath: '/workspace/other.dart',
+        ),
+        raw: const {'type': 'prompt_request'},
+        message: 'Allow edit other.dart?',
+        options: const [PromptOption(value: 'y'), PromptOption(value: 'n')],
+      ));
+      service.emit(InteractionRequestEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 600)),
+        sessionId: 'session-other',
+        runtimeMeta: const RuntimeMeta(
+          command: 'claude',
+          contextId: 'other-permission',
+          targetPath: '/workspace/other.dart',
+        ),
+        raw: const {'type': 'interaction_request'},
+        kind: 'permission',
+        title: 'Permission required',
+        message: '其他会话需要授权',
+        options: const [PromptOption(value: 'y'), PromptOption(value: 'n')],
+      ));
+      service.emit(StepUpdateEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 700)),
+        sessionId: 'session-other',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'step_update'},
+        message: '其他会话步骤',
+        status: 'running',
+        target: 'command',
+        command: 'codex',
+      ));
+      service.emit(ReviewStateEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 800)),
+        sessionId: 'session-other',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'review_state'},
+        groups: const [
+          ReviewGroup(
+            id: 'other-review',
+            title: 'Other review',
+            pendingReview: true,
+            pendingCount: 1,
+          ),
+        ],
+      ));
+      service.emit(FileDiffEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 900)),
+        sessionId: 'session-other',
+        runtimeMeta: const RuntimeMeta(
+          command: 'codex',
+          engine: 'codex',
+          contextId: 'other-diff',
+          targetPath: '/workspace/other.dart',
+        ),
+        raw: const {'type': 'file_diff'},
+        path: '/workspace/other.dart',
+        title: 'Other diff',
+        diff: '@@ -1 +1 @@\n-old\n+new',
+        lang: 'dart',
+      ));
+      service.emit(SessionContextResultEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 1000)),
+        sessionId: 'session-other',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'session_context_result'},
+        sessionContext: const SessionContext(
+          enabledSkillNames: ['other-skill'],
+          enabledMemoryIds: ['other-memory'],
+        ),
+      ));
+      await _flushEvents();
+
+      expect(controller.selectedSessionId, 'session-current');
+      expect(controller.awaitInput, isTrue);
+      expect(controller.shouldShowClaudeMode, isTrue);
+      expect(controller.shouldShowPermissionChoices, isFalse);
+      expect(controller.shouldShowReviewChoices, isFalse);
+      expect(controller.terminalStdout, isEmpty);
+      expect(controller.currentStepSummary, isNot('其他会话进度'));
+      expect(controller.currentStepSummary, isNot('其他会话步骤'));
+      expect(controller.reviewGroups, isEmpty);
+      expect(controller.enabledSkillSummary, isEmpty);
+      expect(controller.enabledMemorySummary, isEmpty);
+      expect(
+        controller.timeline.any((item) => item.body == '其他会话输出'),
+        isFalse,
+      );
+      expect(
+        controller.timeline.any((item) => item.body == '/workspace/other.dart'),
+        isFalse,
+      );
+
+      service.sentPayloads.clear();
+      controller.sendInputText('继续当前会话');
+      await _flushEvents();
+
+      final inputPayload = service.sentPayloads.singleWhere(
+        (payload) => payload['action'] == 'input',
+      );
+      expect(inputPayload['sessionId'], 'session-current');
+      expect(inputPayload['data'], '继续当前会话\n');
     });
 
     test('loadSession 后匹配的 SessionHistoryEvent 必须还原 timeline', () async {

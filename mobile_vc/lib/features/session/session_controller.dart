@@ -2060,7 +2060,11 @@ class SessionController extends ChangeNotifier {
         requestRelayDeviceList();
       }
       if (_selectedSessionId.trim().isNotEmpty) {
-        _requestSessionResume(reason: silently ? 'reconnect' : 'connect');
+        final isRelayPath = _activeTransportPath == ActiveTransportPath.relay;
+        _requestSessionResume(
+          reason: silently ? 'reconnect' : 'connect',
+          allowWhileConnecting: isRelayPath,
+        );
       } else {
         _requestSessionDelta(reason: silently ? 'reconnect' : 'connect');
       }
@@ -2393,11 +2397,11 @@ class SessionController extends ChangeNotifier {
   void _handleUnexpectedSocketDisconnect(String message) {
     final normalized = message.trim().isEmpty ? '连接已断开' : message.trim();
     final wasRecovering = reconnecting;
+    final preserveRuntimeForRelayRecovery =
+        _shouldPreserveRuntimeForRelayRecovery();
     _connected = false;
     _connecting = false;
     _activeTransportPath = ActiveTransportPath.none;
-    _selectedSessionExternalNative = false;
-    _executionActive = false;
     _isLoadingSession = false;
     _sessionListSyncedSinceConnect = false;
     _pendingSessionTargetId = '';
@@ -2405,12 +2409,9 @@ class SessionController extends ChangeNotifier {
     _clearDeferredFirstInput();
     _sessionEventCursors.clear();
     _sessionDeltaKnown.clear();
-    _sessionRuntimeAlive = false;
-    _continueSameSessionEnabled = false;
-    _continuedSameSessionId = '';
-    _agentState = null;
-    _sessionState = null;
-    _runtimePhase = null;
+    if (!preserveRuntimeForRelayRecovery) {
+      _clearRuntimeContextAfterDisconnect();
+    }
     _stopObservedSessionSync();
     _stopAdbRefreshPolling();
     if (_autoReconnectEnabled) {
@@ -2436,6 +2437,23 @@ class SessionController extends ChangeNotifier {
     notifyListeners();
   }
 
+  bool _shouldPreserveRuntimeForRelayRecovery() {
+    return _autoReconnectEnabled &&
+        _activeTransportPath == ActiveTransportPath.relay &&
+        _selectedSessionId.trim().isNotEmpty;
+  }
+
+  void _clearRuntimeContextAfterDisconnect() {
+    _selectedSessionExternalNative = false;
+    _executionActive = false;
+    _sessionRuntimeAlive = false;
+    _continueSameSessionEnabled = false;
+    _continuedSameSessionId = '';
+    _agentState = null;
+    _sessionState = null;
+    _runtimePhase = null;
+  }
+
   void resumeConnectionIfNeeded() {
     if (_connected && !_connecting) {
       if (_isLoadingSession && _pendingSessionTargetId.trim().isNotEmpty) {
@@ -2451,9 +2469,14 @@ class SessionController extends ChangeNotifier {
     _scheduleReconnect(immediate: true);
   }
 
-  void _requestSessionResume({String reason = ''}) {
+  void _requestSessionResume({
+    String reason = '',
+    bool allowWhileConnecting = false,
+  }) {
     final sessionId = _selectedSessionId.trim();
-    if (!_connected || _connecting || sessionId.isEmpty) {
+    if (!_connected ||
+        (_connecting && !allowWhileConnecting) ||
+        sessionId.isEmpty) {
       return;
     }
     final pendingTargetId = _pendingSessionTargetId.trim();
@@ -4780,11 +4803,9 @@ class SessionController extends ChangeNotifier {
         _handleAutoSessionBinding(mergedItems);
         break;
       case SessionHistoryEvent history:
-        // 加载/auto-create 期间不能让无关会话的 history 覆盖 _selectedSessionId，
-        // 但用户主动 loadSession 请求回的合法 history 必须放行，否则 timeline
-        // 永远不会从 logo 切换到历史内容。
-        if (_isLoadingSession &&
-            !_isHistoryEventForActiveTarget(history.sessionId)) {
+        // 只处理当前会话或用户主动 loadSession 目标的 history；否则后台/迟到的
+        // 其他会话全量历史会覆盖 selected session 与运行时上下文。
+        if (!_isSessionRecoveryEventForActiveSession(history.sessionId)) {
           break;
         }
         _connectionStage = SessionConnectionStage.ready;
@@ -4949,6 +4970,9 @@ class SessionController extends ChangeNotifier {
         _syncObservedSessionPolling();
         break;
       case SessionResumeNoticeEvent notice:
+        if (!_eventTargetsCurrentSession(notice.sessionId)) {
+          break;
+        }
         _emitResumeNotification(notice);
         break;
       case SessionStateEvent state:
@@ -5094,10 +5118,16 @@ class SessionController extends ChangeNotifier {
         );
         break;
       case RuntimePhaseEvent runtimePhase:
+        if (!_eventTargetsCurrentSession(runtimePhase.sessionId)) {
+          break;
+        }
         _runtimePhase = runtimePhase;
         _syncRuntimePermissionMode();
         break;
       case LogEvent log:
+        if (!_eventTargetsCurrentSession(log.sessionId)) {
+          break;
+        }
         _appendTerminalLog(
           log.stream,
           log.message,
@@ -5112,6 +5142,9 @@ class SessionController extends ChangeNotifier {
         _handleLogTimeline(log);
         break;
       case ProgressEvent progress:
+        if (!_eventTargetsCurrentSession(progress.sessionId)) {
+          break;
+        }
         _maybeAutoSyncAiModel(
           progress.runtimeMeta,
           rawText: progress.message,
@@ -5205,6 +5238,9 @@ class SessionController extends ChangeNotifier {
         await _handleRelayDeviceRotateResult(result);
         break;
       case PromptRequestEvent prompt:
+        if (!_eventTargetsCurrentSession(prompt.sessionId)) {
+          break;
+        }
         _pendingAiLaunchAwaitingInput = false;
         if (prompt.isReview && _reviewShouldAutoAccept(prompt.runtimeMeta)) {
           if (_pendingInteraction?.isReview == true) {
@@ -5237,6 +5273,9 @@ class SessionController extends ChangeNotifier {
         notifyListeners();
         break;
       case InteractionRequestEvent interaction:
+        if (!_eventTargetsCurrentSession(interaction.sessionId)) {
+          break;
+        }
         _pendingAiLaunchAwaitingInput = false;
         if (interaction.isReview &&
             _reviewShouldAutoAccept(interaction.runtimeMeta)) {
@@ -5309,6 +5348,9 @@ class SessionController extends ChangeNotifier {
         );
         break;
       case StepUpdateEvent step:
+        if (!_eventTargetsCurrentSession(step.sessionId)) {
+          break;
+        }
         if (!_isTerminalStepStatus(step.status) &&
             !_isTerminalStepMessage(step.message)) {
           _currentStep = HistoryContext(
@@ -5339,6 +5381,9 @@ class SessionController extends ChangeNotifier {
         _syncDerivedState();
         break;
       case ReviewStateEvent reviewState:
+        if (!_eventTargetsCurrentSession(reviewState.sessionId)) {
+          break;
+        }
         _reviewGroups
           ..clear()
           ..addAll(reviewState.groups.map(_normalizeReviewGroup));
@@ -5348,6 +5393,9 @@ class SessionController extends ChangeNotifier {
         _syncActiveReviewSelection();
         break;
       case FileDiffEvent diff:
+        if (!_eventTargetsCurrentSession(diff.sessionId)) {
+          break;
+        }
         _currentDiff = diff;
         final autoAccepted = _reviewShouldAutoAccept(diff.runtimeMeta);
         final waitingForPermission = hasPendingPermissionPrompt;
@@ -5499,6 +5547,9 @@ class SessionController extends ChangeNotifier {
         }
         break;
       case SessionContextResultEvent result:
+        if (!_eventTargetsCurrentSession(result.sessionId)) {
+          break;
+        }
         _sessionContext = result.sessionContext;
         _pendingSessionContextTarget = null;
         _pendingToggleSkillNames.clear();
@@ -5515,6 +5566,9 @@ class SessionController extends ChangeNotifier {
           ..addAll(result.persistentRules);
         break;
       case PermissionAutoAppliedEvent result:
+        if (!_eventTargetsCurrentSession(result.sessionId)) {
+          break;
+        }
         // 后端已自动应用权限规则，清空 pending 状态
         _pendingPrompt = null;
         _pendingInteraction = null;
@@ -5935,9 +5989,9 @@ class SessionController extends ChangeNotifier {
       _requestSessionResume(reason: 'delta_base_mismatch');
       return;
     }
-    // 加载/auto-create 期间只丢弃不属于当前目标的 delta；用户主动 loadSession
-    // 之后回流的匹配 delta 必须放行，否则增量内容永远不会落到 timeline。
-    if (_isLoadingSession && !_isHistoryEventForActiveTarget(delta.sessionId)) {
+    // 只处理当前会话或用户主动 loadSession 目标的 delta；否则后台/迟到的
+    // 其他会话增量会覆盖 selected session 与运行时上下文。
+    if (!_isSessionRecoveryEventForActiveSession(delta.sessionId)) {
       return;
     }
     _connectionStage = SessionConnectionStage.ready;
@@ -6025,6 +6079,13 @@ class SessionController extends ChangeNotifier {
     }
     _syncDerivedState();
     notifyListeners();
+  }
+
+  bool _isSessionRecoveryEventForActiveSession(String sessionId) {
+    if (_isLoadingSession) {
+      return _isHistoryEventForActiveTarget(sessionId);
+    }
+    return _eventTargetsCurrentSession(sessionId);
   }
 
   Future<void> _refreshContextAfterHistoryLoaded({
