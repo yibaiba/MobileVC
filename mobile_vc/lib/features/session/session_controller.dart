@@ -348,6 +348,8 @@ class SessionController extends ChangeNotifier {
   final List<PermissionRule> _persistentPermissionRules = [];
   final List<String> _debugLogs = [];
   final List<TimelineItem> _timeline = [];
+  final Map<String, Set<String>> _visibleHistoryLogEntryKeys =
+      <String, Set<String>>{};
   final List<ReviewGroup> _reviewGroups = [];
   final List<TerminalExecution> _terminalExecutions = [];
   final List<RuntimeProcessItem> _runtimeProcesses = [];
@@ -454,14 +456,16 @@ class SessionController extends ChangeNotifier {
         configuredAiEngine,
         _configuredModelForEngine(configuredAiEngine),
       );
-  String get selectedAiReasoningEffort => _resolvedAiReasoningEffort(
+  String get selectedAiReasoningEffort => _resolvedDisplayAiReasoningEffort(
         currentAiEngine,
+        selectedAiModel,
         currentMeta.reasoningEffort.isNotEmpty
             ? currentMeta.reasoningEffort
             : _configuredReasoningEffortForEngine(currentAiEngine),
       );
-  String get configuredAiReasoningEffort => _resolvedAiReasoningEffort(
+  String get configuredAiReasoningEffort => _resolvedDisplayAiReasoningEffort(
         configuredAiEngine,
+        configuredAiModel,
         _configuredReasoningEffortForEngine(configuredAiEngine),
       );
   bool get supportsAiModelSwitch =>
@@ -476,10 +480,7 @@ class SessionController extends ChangeNotifier {
           configuredAiEngine,
           _configuredModelForEngine(configuredAiEngine),
         ),
-        _resolvedAiReasoningEffort(
-          configuredAiEngine,
-          _configuredReasoningEffortForEngine(configuredAiEngine),
-        ),
+        configuredAiReasoningEffort,
       );
   bool get connecting => _connecting;
   bool get connected => _connected;
@@ -1919,7 +1920,11 @@ class SessionController extends ChangeNotifier {
     if (configured.isEmpty || configured.toLowerCase() == 'default') {
       return '';
     }
-    return _resolvedAiReasoningEffort('codex', configured);
+    return _resolvedAiReasoningEffort(
+      'codex',
+      configured,
+      model: _resolvedAiModel('codex', _configuredModelForEngine('codex')),
+    );
   }
 
   void setDevicePushToken(String token) {
@@ -2332,6 +2337,7 @@ class SessionController extends ChangeNotifier {
     _resetRuntimeProcessState();
     _sessionEventCursors.clear();
     _sessionDeltaKnown.clear();
+    _visibleHistoryLogEntryKeys.clear();
     _lastServerEventAt = null;
     _canResumeCurrentSession = false;
     _resumeRuntimeMeta = const RuntimeMeta();
@@ -2830,6 +2836,7 @@ class SessionController extends ChangeNotifier {
     _activeReviewGroupId = '';
     _activeReviewDiffId = '';
     _timeline.clear();
+    _visibleHistoryLogEntryKeys.clear();
     _terminalStdout = '';
     _terminalStderr = '';
     _activeTerminalExecutionId = '';
@@ -2978,8 +2985,11 @@ class SessionController extends ChangeNotifier {
         targetEngine == 'codex' && model.trim().toLowerCase() == 'default'
             ? ''
             : _resolvedAiModel(targetEngine, model);
-    final normalizedEffort =
-        _resolvedAiReasoningEffort(targetEngine, reasoningEffort);
+    final normalizedEffort = _resolvedAiReasoningEffort(
+      targetEngine,
+      reasoningEffort,
+      model: normalizedModel,
+    );
     _pendingAiPreferences[targetEngine] = _PendingAiPreference(
       model: normalizedModel,
       reasoningEffort: normalizedEffort,
@@ -4659,6 +4669,10 @@ class SessionController extends ChangeNotifier {
 
   void clearTimeline() {
     _timeline.clear();
+    final sessionId = _selectedSessionId.trim();
+    if (sessionId.isNotEmpty) {
+      _visibleHistoryLogEntryKeys.remove(sessionId);
+    }
     notifyListeners();
   }
 
@@ -4838,6 +4852,7 @@ class SessionController extends ChangeNotifier {
         _reconcileAiStatusFromRestoredRuntime(history.resumeRuntimeMeta);
         _upsertSession(resolvedHistorySummary);
         _restoreTimelineFromHistory(
+          resolvedHistorySummary.id,
           history.logEntries,
           history.resumeRuntimeMeta,
         );
@@ -6038,7 +6053,11 @@ class SessionController extends ChangeNotifier {
     for (final entry in shouldApplyAppendLogEntries
         ? appendLogEntries
         : const <HistoryLogEntry>[]) {
-      _appendHistoryTimelineEntry(entry, delta.resumeRuntimeMeta);
+      _appendHistoryTimelineEntry(
+        delta.sessionId,
+        entry,
+        delta.resumeRuntimeMeta,
+      );
     }
     for (final diff in delta.upsertDiffs) {
       _mergeRecentDiff(diff);
@@ -6107,14 +6126,19 @@ class SessionController extends ChangeNotifier {
   }
 
   void _restoreTimelineFromHistory(
+    String sessionId,
     List<HistoryLogEntry> entries,
     RuntimeMeta resumeMeta,
   ) {
     _timeline.clear();
     _isCompacting = false;
+    final normalizedSessionId = sessionId.trim();
+    if (normalizedSessionId.isNotEmpty) {
+      _visibleHistoryLogEntryKeys[normalizedSessionId] = <String>{};
+    }
     final sortedEntries = _sortedHistoryLogEntries(entries);
     for (final entry in sortedEntries) {
-      _appendHistoryTimelineEntry(entry, resumeMeta);
+      _appendHistoryTimelineEntry(normalizedSessionId, entry, resumeMeta);
     }
   }
 
@@ -6169,9 +6193,13 @@ class SessionController extends ChangeNotifier {
   }
 
   void _appendHistoryTimelineEntry(
+    String sessionId,
     HistoryLogEntry entry,
     RuntimeMeta resumeMeta,
   ) {
+    if (_isVisibleHistoryLogEntry(sessionId, entry)) {
+      return;
+    }
     final item = _timelineFromHistory(entry, resumeMeta);
     if (item.kind == 'compaction') {
       _upsertCompactionTimelineItem(
@@ -6184,9 +6212,65 @@ class SessionController extends ChangeNotifier {
       );
       final normalizedStatus = item.status.trim().toLowerCase();
       _isCompacting = normalizedStatus == 'loading';
+      _rememberVisibleHistoryLogEntry(sessionId, entry);
       return;
     }
+    final beforeCount = _timeline.length;
     _appendTimelineItem(item, emitNotifications: false);
+    if (_timeline.length > beforeCount) {
+      _rememberVisibleHistoryLogEntry(sessionId, entry);
+    }
+  }
+
+  bool _isVisibleHistoryLogEntry(String sessionId, HistoryLogEntry entry) {
+    final key = _historyLogEntryKey(entry);
+    if (key.isEmpty) {
+      return false;
+    }
+    return _visibleHistoryLogEntryKeys[sessionId.trim()]?.contains(key) ??
+        false;
+  }
+
+  void _rememberVisibleHistoryLogEntry(
+      String sessionId, HistoryLogEntry entry) {
+    final normalizedSessionId = sessionId.trim();
+    if (normalizedSessionId.isEmpty) {
+      return;
+    }
+    final key = _historyLogEntryKey(entry);
+    if (key.isEmpty) {
+      return;
+    }
+    _visibleHistoryLogEntryKeys
+        .putIfAbsent(normalizedSessionId, () => <String>{})
+        .add(key);
+  }
+
+  String _historyLogEntryKey(HistoryLogEntry entry) {
+    return jsonEncode(<Object?>[
+      entry.kind,
+      entry.timestamp,
+      entry.stream,
+      entry.executionId,
+      entry.phase,
+      entry.exitCode,
+      entry.label,
+      entry.message,
+      entry.text,
+      entry.context?.id ?? '',
+      entry.context?.type ?? '',
+      entry.context?.source ?? '',
+      entry.context?.status ?? '',
+      entry.context?.title ?? '',
+      entry.context?.message ?? '',
+      entry.context?.path ?? '',
+      entry.context?.targetPath ?? '',
+      entry.context?.diff ?? '',
+      entry.context?.command ?? '',
+      entry.context?.trigger ?? '',
+      entry.context?.executionId ?? '',
+      entry.context?.groupId ?? '',
+    ]);
   }
 
   TimelineItem _timelineFromHistory(
@@ -9100,7 +9184,7 @@ class SessionController extends ChangeNotifier {
     if (normalized.isEmpty) {
       return null;
     }
-    for (final entry in _codexModelCatalog) {
+    for (final entry in codexModelCatalog) {
       if (_normalizeCodexModel(entry.model) == normalized) {
         return entry;
       }
@@ -9126,7 +9210,7 @@ class SessionController extends ChangeNotifier {
       case 'codex':
         final label =
             model.trim().isEmpty ? 'Default' : _codexModelDisplayLabel(model);
-        return '$label · ${_resolvedAiReasoningEffort('codex', reasoningEffort).toUpperCase()}';
+        return '$label · ${_resolvedDisplayAiReasoningEffort('codex', model, reasoningEffort).toUpperCase()}';
       case 'claude':
         return _claudeModelLabel(model);
       case 'gemini':
@@ -9136,14 +9220,41 @@ class SessionController extends ChangeNotifier {
     }
   }
 
+  String _resolvedDisplayAiReasoningEffort(
+    String engine,
+    String model,
+    String configured,
+  ) {
+    if (engine != 'codex') {
+      return '';
+    }
+    final explicit = _normalizeCodexReasoningEffort(configured);
+    if (explicit.isNotEmpty) {
+      return explicit;
+    }
+    final normalizedModel = model.trim().toLowerCase();
+    if (normalizedModel.isEmpty || normalizedModel == 'default') {
+      return _preferredCodexReasoningEffortForModel('', fallback: '');
+    }
+    return _resolvedAiReasoningEffort(
+      engine,
+      configured,
+      model: model,
+    );
+  }
+
   String _preferredCodexReasoningEffortForModel(
     String model, {
     String fallback = '',
   }) {
-    final normalizedFallback = _resolvedAiReasoningEffort('codex', fallback);
-    final entry = _findCodexModelCatalogEntry(model);
+    final normalizedFallback =
+        _normalizeCodexReasoningEffort(fallback.trim().toLowerCase());
+    final entry = _findCodexModelCatalogEntry(model) ??
+        (model.trim().isEmpty || model.trim().toLowerCase() == 'default'
+            ? _defaultCodexModelCatalogEntry()
+            : null);
     if (entry == null) {
-      return normalizedFallback;
+      return normalizedFallback.isNotEmpty ? normalizedFallback : 'medium';
     }
     final supported = entry.reasoningEffortOptions
         .map((option) => option.reasoningEffort.trim().toLowerCase())
@@ -9159,7 +9270,16 @@ class SessionController extends ChangeNotifier {
     if (supported.isNotEmpty) {
       return supported.first;
     }
-    return normalizedFallback;
+    return normalizedFallback.isNotEmpty ? normalizedFallback : 'medium';
+  }
+
+  CodexModelCatalogEntry? _defaultCodexModelCatalogEntry() {
+    for (final entry in codexModelCatalog) {
+      if (entry.isDefault) {
+        return entry;
+      }
+    }
+    return codexModelCatalog.isNotEmpty ? codexModelCatalog.first : null;
   }
 
   String _parentDirectory(String path) {
@@ -9319,15 +9439,32 @@ String _resolvedAiModel(String engine, String configured) {
   }
 }
 
-String _resolvedAiReasoningEffort(String engine, String configured) {
+String _resolvedAiReasoningEffort(
+  String engine,
+  String configured, {
+  String model = '',
+}) {
   if (engine != 'codex') {
     return '';
   }
   final normalized = configured.trim().toLowerCase();
+  final configuredEffort = _normalizeCodexReasoningEffort(normalized);
+  if (configuredEffort.isNotEmpty) {
+    return configuredEffort;
+  }
+  final normalizedModel = model.trim().toLowerCase();
+  if (normalizedModel.isEmpty || normalizedModel == 'default') {
+    return '';
+  }
+  return 'medium';
+}
+
+String _normalizeCodexReasoningEffort(String value) {
+  final normalized = value.trim().toLowerCase();
   if (_codexReasoningEffortOptions.contains(normalized)) {
     return normalized;
   }
-  return 'medium';
+  return '';
 }
 
 String _claudeModelLabel(String value) {

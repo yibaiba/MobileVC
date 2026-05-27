@@ -135,7 +135,6 @@ void main() {
         cwd: '/workspace',
         engine: 'codex',
         permissionMode: 'default',
-        codexReasoningEffort: 'medium',
       ),
     );
 
@@ -146,7 +145,7 @@ void main() {
     );
     await _pumpFrames(tester);
 
-    await _tapCommandBarModel(tester, '模型 · Default · MEDIUM');
+    await _tapCommandBarModel(tester, '模型 · Default · HIGH');
     await _pumpFrames(tester);
 
     expect(controller.catalogRequestCount, 1);
@@ -157,15 +156,15 @@ void main() {
     await _pumpFrames(tester);
 
     expect(controller.configuredAiModel, isEmpty);
-    expect(find.text('应用 gpt-5.5 · MEDIUM'), findsOneWidget);
+    expect(find.text('应用 gpt-5.5 · HIGH'), findsOneWidget);
 
-    await tester.tap(find.text('应用 gpt-5.5 · MEDIUM'));
+    await tester.tap(find.text('应用 gpt-5.5 · HIGH'));
     await _pumpFrames(tester);
 
     expect(controller.configuredAiEngine, 'codex');
     expect(controller.configuredAiModel, 'gpt-5.5');
-    expect(controller.configuredAiReasoningEffort, 'medium');
-    expect(controller.commandBarModelSummary, 'gpt-5.5 · MEDIUM');
+    expect(controller.configuredAiReasoningEffort, 'high');
+    expect(controller.commandBarModelSummary, 'gpt-5.5 · HIGH');
     expect(controller.catalogRequestCount, 1);
 
     await tester.pumpWidget(const SizedBox.shrink());
@@ -365,6 +364,7 @@ class _ModelCatalogSessionController extends SessionController {
             CodexReasoningEffortOption(reasoningEffort: 'medium'),
             CodexReasoningEffortOption(reasoningEffort: 'high'),
           ],
+          isDefault: true,
         ),
       ];
 

@@ -3588,6 +3588,19 @@ void main() {
         ),
         'xhigh',
       );
+      expect(
+        controller.preferredCodexReasoningEffortForModel(
+          '',
+          fallback: '',
+        ),
+        'high',
+      );
+      await controller.saveConfig(
+        controller.config.copyWith(engine: 'codex'),
+      );
+      expect(controller.configuredAiModel, isEmpty);
+      expect(controller.configuredAiReasoningEffort, 'high');
+      expect(controller.commandBarModelSummary, 'Default · HIGH');
     });
 
     test('手动应用 Codex 配置后不会被旧运行时模型回填覆盖', () async {
@@ -10993,6 +11006,50 @@ void main() {
       expect(
         controller.timeline.map((item) => item.body).toList(),
         ['Android release APK 已重新打包成功'],
+      );
+    });
+
+    test('session_delta 重放已恢复的历史 entry 时不会重复显示', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      const replayedEntry = HistoryLogEntry(
+        kind: 'markdown',
+        message: '同一条原生历史回复',
+        timestamp: '2026-05-27T05:53:00Z',
+        executionId: 'exec-native-1',
+      );
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'codex'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        logEntries: const [replayedEntry],
+        resumeRuntimeMeta: const RuntimeMeta(command: 'codex'),
+      ));
+      await _flushEvents();
+
+      service.emit(SessionDeltaEvent(
+        timestamp: _timestamp.add(const Duration(seconds: 1)),
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'codex'),
+        raw: const {'type': 'session_delta'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        base: const SessionDeltaKnown(eventCursor: 1, logEntryCount: 1),
+        latest: const SessionDeltaKnown(eventCursor: 2, logEntryCount: 2),
+        appendLogEntries: const [replayedEntry],
+        resumeRuntimeMeta: const RuntimeMeta(command: 'codex'),
+      ));
+      await _flushEvents();
+
+      expect(
+        controller.timeline.where((item) => item.body == '同一条原生历史回复').length,
+        1,
       );
     });
 
