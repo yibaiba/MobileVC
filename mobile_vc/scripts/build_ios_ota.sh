@@ -3,7 +3,7 @@
 set -euo pipefail
 
 TEAM_ID_DEFAULT="947RV2M27F"
-SERVER_DEFAULT="root@8.162.1.176"
+SERVER_DEFAULT="root@8.162.0.88"
 SERVER_DIR_DEFAULT="/var/www/mobilevc-7899/install"
 SITE_URL_DEFAULT="https://mobilevc.top/install"
 KEYCHAIN_PATH_DEFAULT="$HOME/Library/Keychains/login.keychain-db"
@@ -41,7 +41,7 @@ Options:
   --team-id ID          Apple team ID. Default: 947RV2M27F.
   --output-root DIR     Keep all build artifacts under DIR.
   --deploy              Upload IPA + manifest + install page to the server.
-  --server USER@HOST    SSH target for deploy. Default: root@8.162.1.176.
+  --server USER@HOST    SSH target for deploy. Default: root@8.162.0.88.
   --server-dir DIR      Remote install directory. Default: /var/www/mobilevc-7899/install.
   --site-url URL        Public install base URL. Default: https://mobilevc.top/install.
   --testflight-url URL  Optional TestFlight invite link to show on the install page.

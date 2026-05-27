@@ -76,32 +76,29 @@ mobilevc config          # 重新配置
 mobilevc stop            # 停止服务
 ```
 
-### 公网 Relay 连接
+### 公网连接（Relay 模式）
 
-公网 Relay 分成两端：
-
-- 云服务器/VPS 只运行 relay Docker 服务，负责公网中继。
-- 你的本地电脑运行 `mobilevc public --relay ...`，把本机 MobileVC 后端注册到公网 relay，并打印手机配对二维码。
-
-VPS relay 部署完成后，在本地电脑执行：
+不在同一 WiFi 下也能用手机连电脑。MobileVC 提供**官方公网中继服务器**，端到端加密，免费使用。
 
 ```bash
-mobilevc public --relay wss://relay.example.com:9443
-```
-
-如果只想通过 relay 连接，不开放局域网监听：
-
-```bash
-mobilevc public --relay wss://relay.example.com:9443 --network-exposure-mode relay-only
-```
-
-`mobilevc` 命令由 npm 包提供：
-
-```bash
+# 安装
 npm install -g @justprove/mobilevc
+
+# 启动（LAN + Relay 双模）
+mobilevc public --relay wss://relay.mobilevc.top:9443
 ```
 
-完整部署步骤见 [docs/guides/relay-deployment.md](docs/guides/relay-deployment.md)。
+终端会打印配对二维码，手机扫码即可通过 E2EE 加密隧道连接你的电脑。无论你在哪里、手机用什么网络，都能连上。
+
+如果只想走 Relay、不开放局域网：
+
+```bash
+mobilevc public --relay wss://relay.mobilevc.top:9443 --network-exposure-mode relay-only
+```
+
+> **安全说明**：Relay 只转发加密数据包，无法解密你的会话内容。密钥通过扫码（带外）传递，服务器端看不到明文。详见[架构安全分析](docs/guides/relay-deployment.md)。
+
+**自建 Relay（可选）**：如果你需要独立部署中继节点，完整步骤见 [docs/guides/relay-deployment.md](docs/guides/relay-deployment.md)。
 
 ## Documentation
 
