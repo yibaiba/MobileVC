@@ -231,7 +231,32 @@ func relayConfig(cfg config.Config, trustStore *e2ee.DeviceTrustStore, nodeIdent
 		NodeFingerprintHex: fmt.Sprintf("%x", identity.Fingerprint),
 		NodeIdentityStore:  nodeIdentityStore,
 		DeviceTrust:        trustStore,
+		LANHost:            relayPairingLANHost(cfg),
+		LANPort:            relayPairingLANPort(cfg),
+		LANToken:           relayPairingLANToken(cfg),
+		LANCWD:             strings.TrimSpace(cfg.Runtime.WorkspaceRoot),
 	}, nil
+}
+
+func relayPairingLANHost(cfg config.Config) string {
+	if cfg.Network.ExposureMode == config.ExposureModeRelayOnly {
+		return ""
+	}
+	return strings.TrimSpace(os.Getenv("MOBILEVC_LAN_HOST"))
+}
+
+func relayPairingLANPort(cfg config.Config) string {
+	if relayPairingLANHost(cfg) == "" {
+		return ""
+	}
+	return strings.TrimSpace(cfg.Port)
+}
+
+func relayPairingLANToken(cfg config.Config) string {
+	if relayPairingLANHost(cfg) == "" {
+		return ""
+	}
+	return strings.TrimSpace(cfg.AuthToken)
 }
 
 func localSelectedRoutePolicy(cfg config.Config) (relay.SelectedRoutePolicy, error) {

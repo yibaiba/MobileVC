@@ -2,11 +2,12 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
-import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:mobile_vc/core/config/app_config.dart';
+import 'package:mobile_vc/core/config/relay_config.dart';
 import 'package:mobile_vc/core/relay_e2ee/relay_e2ee_capability.dart';
 import 'package:mobile_vc/core/relay_e2ee/relay_device_identity.dart';
 import 'package:mobile_vc/core/relay_e2ee/relay_e2ee_crypto.dart';
@@ -1211,6 +1212,35 @@ void main() {
       expect(persisted.containsKey('relayPairingSecret'), isFalse);
     });
 
+    test('external relay deep link with LAN endpoint imports auto mode',
+        () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      final imported = await controller.importConnectionLink(
+        'mobilevc://relay/v1?relay=wss%3A%2F%2Frelay.example.test'
+        '&session=rs_import&secret=pair_secret&exp=1760000000'
+        '&nodeFingerprint=1111111111111111111111111111111111111111111111111111111111111111'
+        '&lanHost=192.168.1.2&lanPort=8001&lanToken=direct-token'
+        '&lanCwd=%2Fworkspace'
+        '&relayProtocolVersion=1&e2eeProtocolVersion=1'
+        '&cryptoSuite=p256-ecdsa%2Bp256-ecdh%2Bhkdf-sha256%2Baes-256-gcm'
+        '&tunnelProtocolVersion=1&supportsMultiplexStreams=true'
+        '&supportsFileDownloadStream=true&supportsDeviceManagement=true'
+        '&requiresE2EE=true&plaintextTestMode=false',
+      );
+
+      expect(imported, isTrue);
+      expect(controller.config.connectionMode, ConnectionMode.auto.name);
+      expect(controller.config.host, '192.168.1.2');
+      expect(controller.config.port, '8001');
+      expect(controller.config.token, 'direct-token');
+      expect(controller.config.cwd, '/workspace');
+      expect(controller.config.relayUrl, 'wss://relay.example.test');
+    });
+
     test('relay connect validates url and persists reconnect fields', () async {
       SharedPreferences.setMockInitialValues({
         'mobilevc.app_config': jsonEncode(const AppConfig(
@@ -1252,7 +1282,7 @@ void main() {
       expect(persisted['relayClientReconnectSecret'], 'reconnect_secret');
     });
 
-    test('relay pairing failure clears one-time secret and asks reimport',
+    test('relay pairing failure keeps one-time secret for explicit retry',
         () async {
       final service = _FakeMobileVcWsService()
         ..connectRelayError = const RelayPairingException(
@@ -1275,15 +1305,204 @@ void main() {
 
       expect(controller.connected, isFalse);
       expect(controller.connectionStage, SessionConnectionStage.failed);
-      expect(controller.connectionMessage, contains('请导入新的中继链接'));
-      expect(controller.config.relayPairingSecret, isEmpty);
-      expect(controller.config.relayPairingExpiresAt, 0);
+      expect(controller.connectionMessage, contains('Relay E2EE 握手失败'));
+      expect(controller.config.relayPairingSecret, 'pair_secret');
+      expect(controller.config.relayPairingExpiresAt, 1760000000);
 
       final prefs = await SharedPreferences.getInstance();
       final persisted = jsonDecode(prefs.getString('mobilevc.app_config')!)
           as Map<String, dynamic>;
       expect(persisted.containsKey('relayPairingSecret'), isFalse);
       expect(persisted.containsKey('relayPairingExpiresAt'), isFalse);
+    });
+
+    test('auto mode tries LAN first and falls back to relay', () async {
+      final service = _FakeMobileVcWsService()
+        ..connectErrors.add(StateError('LAN unavailable'));
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.saveConfig(const AppConfig(
+        connectionMode: 'auto',
+        host: '192.168.1.2',
+        port: '8001',
+        token: 'direct-token',
+        relayUrl: 'wss://relay.example.test',
+        relaySessionId: 'rs_test',
+        relayClientId: 'rc_test',
+        relayClientReconnectSecret: 'reconnect_secret',
+      ));
+
+      await controller.connect();
+
+      expect(controller.connected, isTrue);
+      expect(controller.activeTransportPath, ActiveTransportPath.relay);
+      expect(service.connectedUrls.single,
+          'ws://192.168.1.2:8001/ws?token=direct-token');
+      expect(
+          service.connectedRelays.single.relayUrl, 'wss://relay.example.test');
+    });
+
+    test('auto mode skips iOS loopback LAN and falls back to relay', () async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
+      addTearDown(() {
+        debugDefaultTargetPlatformOverride = null;
+      });
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.saveConfig(const AppConfig(
+        connectionMode: 'auto',
+        host: 'localhost',
+        port: '8001',
+        token: 'direct-token',
+        relayUrl: 'wss://relay.example.test',
+        relaySessionId: 'rs_test',
+        relayClientId: 'rc_test',
+        relayClientReconnectSecret: 'reconnect_secret',
+      ));
+
+      await controller.connect();
+
+      expect(controller.connected, isTrue);
+      expect(controller.activeTransportPath, ActiveTransportPath.relay);
+      expect(service.connectedUrls, isEmpty);
+      expect(
+          service.connectedRelays.single.relayUrl, 'wss://relay.example.test');
+    });
+
+    test('auto mode does not probe iOS loopback after relay fallback',
+        () async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
+      addTearDown(() {
+        debugDefaultTargetPlatformOverride = null;
+      });
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(
+        service: service,
+        lanReturnProbeInterval: const Duration(milliseconds: 10),
+      );
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.saveConfig(const AppConfig(
+        connectionMode: 'auto',
+        host: 'localhost',
+        port: '8001',
+        token: 'direct-token',
+        relayUrl: 'wss://relay.example.test',
+        relaySessionId: 'rs_test',
+        relayClientId: 'rc_test',
+        relayClientReconnectSecret: 'reconnect_secret',
+      ));
+
+      await controller.connect();
+      await Future<void>.delayed(const Duration(milliseconds: 35));
+
+      expect(controller.activeTransportPath, ActiveTransportPath.relay);
+      expect(service.connectedUrls, isEmpty);
+      expect(service.readyDirectUrls, isEmpty);
+      expect(service.connectedRelays, hasLength(1));
+    });
+
+    test('auto relay to LAN return keeps relay when LAN preconnect fails',
+        () async {
+      final service = _FakeMobileVcWsService()
+        ..connectErrors.add(StateError('LAN unavailable'))
+        ..readyDirectErrors.add(StateError('LAN still unavailable'));
+      final controller = SessionController(
+        service: service,
+        lanReturnProbeInterval: const Duration(milliseconds: 10),
+      );
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.saveConfig(const AppConfig(
+        connectionMode: 'auto',
+        host: '192.168.1.2',
+        port: '8001',
+        token: 'direct-token',
+        relayUrl: 'wss://relay.example.test',
+        relaySessionId: 'rs_test',
+        relayClientId: 'rc_test',
+        relayClientReconnectSecret: 'reconnect_secret',
+      ));
+
+      await controller.connect();
+      await Future<void>.delayed(const Duration(milliseconds: 35));
+
+      expect(controller.activeTransportPath, ActiveTransportPath.relay);
+      expect(service.readyDirectUrls, [
+        'ws://192.168.1.2:8001/ws?token=direct-token',
+      ]);
+      expect(service.connectedRelays, hasLength(1));
+    });
+
+    test('auto relay to LAN return switches only after ready direct connect',
+        () async {
+      final service = _FakeMobileVcWsService()
+        ..connectErrors.add(StateError('LAN unavailable'));
+      final controller = SessionController(
+        service: service,
+        lanReturnProbeInterval: const Duration(milliseconds: 10),
+      );
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.saveConfig(const AppConfig(
+        connectionMode: 'auto',
+        host: '192.168.1.2',
+        port: '8001',
+        token: 'direct-token',
+        relayUrl: 'wss://relay.example.test',
+        relaySessionId: 'rs_test',
+        relayClientId: 'rc_test',
+        relayClientReconnectSecret: 'reconnect_secret',
+      ));
+
+      await controller.connect();
+      await Future<void>.delayed(const Duration(milliseconds: 35));
+
+      expect(controller.activeTransportPath, ActiveTransportPath.lan);
+      expect(service.readyDirectUrls, [
+        'ws://192.168.1.2:8001/ws?token=direct-token',
+      ]);
+      expect(service.connectedRelays, hasLength(1));
+    });
+
+    test('auto relay security state follows actual relay path', () async {
+      final service = _FakeMobileVcWsService()
+        ..connectErrors.add(StateError('LAN unavailable'))
+        ..relayE2eeHandshake = true
+        ..relayE2eeDeviceBinding = true;
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+      final expectedFingerprint =
+          await _testFingerprintHex(service.relayNodeFingerprint);
+
+      await controller.saveConfig(AppConfig(
+        connectionMode: 'auto',
+        host: '192.168.1.2',
+        port: '8001',
+        token: 'direct-token',
+        relayUrl: 'wss://relay.example.test',
+        relaySessionId: 'rs_test',
+        relayClientId: 'rc_test',
+        relayClientReconnectSecret: 'reconnect_secret',
+        relayNodeFingerprintHex: expectedFingerprint,
+        relayCapabilities: RelayE2eeCapabilitySet.production(),
+      ));
+
+      await controller.connect();
+      final state = await controller.relaySecurityState();
+
+      expect(controller.activeTransportPath, ActiveTransportPath.relay);
+      expect(state.title, 'E2EE 已验证');
+      expect(state.canShowVerified, isTrue);
     });
 
     test('relay agent reconnecting does not clear one-time pairing secret',
@@ -2517,7 +2736,10 @@ void main() {
       );
       await _flushEvents();
 
-      expect(service.sentPayloads.map((item) => item['action']), [
+      final actions =
+          service.sentPayloads.map((item) => item['action']).toList();
+      actions.remove('context_window_usage_get');
+      expect(actions, [
         'session_create',
         'session_context_get',
         'permission_rule_list',
@@ -2564,14 +2786,20 @@ void main() {
       );
       await _flushEvents();
 
-      expect(service.sentPayloads.map((item) => item['action']), [
+      final actions =
+          service.sentPayloads.map((item) => item['action']).toList();
+      actions.remove('context_window_usage_get');
+      expect(actions, [
         'session_create',
         'session_context_get',
         'permission_rule_list',
         'ai_turn',
       ]);
-      expect(service.sentPayloads[3]['engine'], 'claude');
-      expect(service.sentPayloads[3]['data'], '请帮我总结当前问题\n');
+      final aiTurn = service.sentPayloads.singleWhere(
+        (payload) => payload['action'] == 'ai_turn',
+      );
+      expect(aiTurn['engine'], 'claude');
+      expect(aiTurn['data'], '请帮我总结当前问题\n');
       expect(controller.selectedSessionId, 'session-new');
     });
 
@@ -10224,7 +10452,10 @@ class _FakeMobileVcWsService extends MobileVcWsService {
       StreamController<AppEvent>.broadcast();
   final List<Map<String, dynamic>> sentPayloads = [];
   final List<String> connectedUrls = [];
+  final List<String> readyDirectUrls = [];
   final List<_RelayConnectCall> connectedRelays = [];
+  final List<Object> connectErrors = [];
+  final List<Object> readyDirectErrors = [];
   int connectCalls = 0;
   int disconnectCalls = 0;
   int resetRelayBindingCalls = 0;
@@ -10291,6 +10522,18 @@ class _FakeMobileVcWsService extends MobileVcWsService {
   Future<void> connect(String url) async {
     connectCalls++;
     connectedUrls.add(url);
+    if (connectErrors.isNotEmpty) {
+      throw connectErrors.removeAt(0);
+    }
+  }
+
+  @override
+  Future<void> connectDirectAfterReady(String url) async {
+    connectCalls++;
+    readyDirectUrls.add(url);
+    if (readyDirectErrors.isNotEmpty) {
+      throw readyDirectErrors.removeAt(0);
+    }
   }
 
   @override

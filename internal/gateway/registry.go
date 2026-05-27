@@ -285,10 +285,13 @@ func (s *runtimeSession) LatestPendingPrompt() *protocol.PromptRequestEvent {
 	return s.latestPendingPrompt()
 }
 
-func (s *runtimeSession) markClientAction(clientActionID string) bool {
+func (s *runtimeSession) markClientAction(clientActionID string, seenAt time.Time) bool {
 	clientActionID = strings.TrimSpace(clientActionID)
 	if clientActionID == "" {
 		return true
+	}
+	if seenAt.IsZero() {
+		seenAt = time.Now()
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -298,10 +301,9 @@ func (s *runtimeSession) markClientAction(clientActionID string) bool {
 	if _, exists := s.clientActions[clientActionID]; exists {
 		return false
 	}
-	now := time.Now()
-	s.clientActions[clientActionID] = now
+	s.clientActions[clientActionID] = seenAt
 	if len(s.clientActions) > defaultRuntimeSessionPendingLimit*4 {
-		cutoff := now.Add(-2 * time.Hour)
+		cutoff := seenAt.Add(-2 * time.Hour)
 		for id, seenAt := range s.clientActions {
 			if seenAt.Before(cutoff) {
 				delete(s.clientActions, id)

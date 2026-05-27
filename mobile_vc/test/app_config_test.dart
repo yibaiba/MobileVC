@@ -187,6 +187,94 @@ void main() {
       expect(config.relayNodeFingerprintHex, testNodeFingerprint);
     });
 
+    test('relay pairing uri with LAN endpoint selects auto mode', () {
+      final config = AppConfig.fromLaunchUri(
+        'mobilevc://relay/v1?relay=wss%3A%2F%2Frelay.example.test'
+        '&session=rs_test&secret=pair_secret&exp=1760000000'
+        '&nodeFingerprint=$testNodeFingerprint'
+        '&lanHost=192.168.1.9&lanPort=19080&lanToken=direct_secret'
+        '&lanCwd=%2Fworkspace&lanSecureTransport=false',
+        fallback: const AppConfig(
+          host: 'old-host',
+          port: '8001',
+          token: 'old-token',
+          secureTransport: true,
+        ),
+      );
+
+      expect(config, isNotNull);
+      expect(config!.connectionMode, ConnectionMode.auto.name);
+      expect(config.isAutoMode, isTrue);
+      expect(config.host, '192.168.1.9');
+      expect(config.port, '19080');
+      expect(config.token, 'direct_secret');
+      expect(config.cwd, '/workspace');
+      expect(config.secureTransport, isFalse);
+      expect(config.relayUrl, 'wss://relay.example.test');
+      expect(config.relaySessionId, 'rs_test');
+      expect(config.relayPairingSecret, 'pair_secret');
+    });
+
+    test('relay pairing event json includes LAN endpoint in generated URI', () {
+      final uri = relayPairingUriFromEventJson({
+        'type': 'mobilevc.relay.pairing_ready',
+        'relayUrl': 'wss://relay.example.test',
+        'sessionId': 'rs_json',
+        'pairingSecret': 'pair_secret',
+        'expiresAt': 1760000000,
+        'nodeFingerprintHex': testNodeFingerprint,
+        'lanHost': '192.168.1.9',
+        'lanPort': '19080',
+        'lanToken': 'direct_secret',
+        'lanCwd': '/workspace',
+        'lanSecureTransport': false,
+        'capabilities': {
+          'relayProtocolVersion': 1,
+          'e2eeProtocolVersion': 1,
+          'cryptoSuite': 'p256-ecdsa+p256-ecdh+hkdf-sha256+aes-256-gcm',
+          'tunnelProtocolVersion': 1,
+          'supportsMultiplexStreams': true,
+          'supportsFileDownloadStream': true,
+          'supportsDeviceManagement': true,
+          'requiresE2EE': true,
+          'plaintextTestMode': false,
+        },
+      });
+      final pairing = parseRelayPairingUri(uri);
+
+      expect(pairing, isNotNull);
+      expect(pairing!.hasLanEndpoint, isTrue);
+      expect(pairing.lanHost, '192.168.1.9');
+      expect(pairing.lanPort, '19080');
+      expect(pairing.lanToken, 'direct_secret');
+      expect(pairing.lanCwd, '/workspace');
+      expect(pairing.lanSecureTransport, isFalse);
+    });
+
+    test('relay pairing uri rejects partial LAN endpoint', () {
+      expect(
+        () => parseRelayPairingUri(
+          'mobilevc://relay/v1?relay=wss%3A%2F%2Frelay.example.test'
+          '&session=rs_test&secret=pair_secret'
+          '&nodeFingerprint=$testNodeFingerprint&lanHost=192.168.1.9',
+        ),
+        throwsA(
+          isA<FormatException>().having(
+            (error) => error.message,
+            'message',
+            contains('lanHost and lanToken'),
+          ),
+        ),
+      );
+    });
+
+    test('normalizes persisted auto connection mode', () {
+      final config = AppConfig.fromJson(const {'connectionMode': 'auto'});
+
+      expect(config.connectionMode, ConnectionMode.auto.name);
+      expect(config.isAutoMode, isTrue);
+    });
+
     test('relay config persists reconnect fields but not pairing secret', () {
       const config = AppConfig(
         connectionMode: 'relay',

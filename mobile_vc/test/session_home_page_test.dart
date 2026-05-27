@@ -210,7 +210,7 @@ void main() {
     await _pumpFrames(tester);
 
     expect(find.text('连接'), findsOneWidget);
-    expect(find.textContaining('当前配对链接已一次性使用'), findsAtLeastNWidgets(1));
+    expect(find.textContaining('Relay E2EE 握手失败'), findsAtLeastNWidgets(1));
 
     await controller.disposeController();
   });

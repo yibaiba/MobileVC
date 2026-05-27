@@ -305,6 +305,10 @@ func (s *countingStore) DeleteSession(ctx context.Context, sessionID string) err
 	return s.inner.DeleteSession(ctx, sessionID)
 }
 
+func (s *countingStore) MarkClientAction(ctx context.Context, sessionID string, record data.ClientActionRecord, ttl time.Duration, limit int) (bool, error) {
+	return s.inner.MarkClientAction(ctx, sessionID, record, ttl, limit)
+}
+
 func (s *countingStore) SavePushToken(ctx context.Context, sessionID, token, platform string) error {
 	return s.inner.SavePushToken(ctx, sessionID, token, platform)
 }

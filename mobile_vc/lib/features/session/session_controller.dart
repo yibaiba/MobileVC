@@ -132,6 +132,8 @@ class _DeferredFirstInput {
   final String text;
 }
 
+enum ActiveTransportPath { none, lan, relay }
+
 class _PendingOutboundAction {
   const _PendingOutboundAction({
     required this.payload,
@@ -199,9 +201,12 @@ class SessionController extends ChangeNotifier {
     Duration outboundAckRetryDelay = const Duration(seconds: 6),
     @visibleForTesting
     Duration outboundAckStaleTimeout = const Duration(seconds: 12),
+    @visibleForTesting Duration? lanReturnProbeInterval,
   })  : _service = service ?? MobileVcWsService(),
         _outboundAckRetryDelay = outboundAckRetryDelay,
-        _outboundAckStaleTimeout = outboundAckStaleTimeout {
+        _outboundAckStaleTimeout = outboundAckStaleTimeout,
+        _lanReturnProbeInterval =
+            lanReturnProbeInterval ?? _defaultLanReturnProbeInterval {
     _terminalExecutionsView = UnmodifiableListView(_terminalExecutions);
     _runtimeProcessesView = UnmodifiableListView(_runtimeProcesses);
     _codexModelCatalogView = UnmodifiableListView(_codexModelCatalog);
@@ -235,10 +240,13 @@ class SessionController extends ChangeNotifier {
   static const Duration _observedSessionSyncInterval = Duration(seconds: 3);
   static const Duration _sessionDeltaRequestCoalesceWindow =
       Duration(seconds: 2);
+  static const Duration _defaultLanReturnProbeInterval = Duration(seconds: 20);
+  static const Duration _lanReturnCooldown = Duration(seconds: 30);
   final MobileVcWsService _service;
   final AdbWebRtcService _adbWebRtc = AdbWebRtcService();
   final Duration _outboundAckRetryDelay;
   final Duration _outboundAckStaleTimeout;
+  final Duration _lanReturnProbeInterval;
 
   StreamSubscription<AppEvent>? _subscription;
   AppConfig _config = const AppConfig();
@@ -250,12 +258,17 @@ class SessionController extends ChangeNotifier {
   int _reconnectAttempt = 0;
   Timer? _reconnectTimer;
   Timer? _connectionHealthTimer;
+  Timer? _lanReturnProbeTimer;
   Timer? _observedSessionSyncTimer;
   Timer? _pendingOutboundRetryTimer;
   DateTime? _lastServerEventAt;
   final List<_PendingOutboundAction> _pendingOutboundActions =
       <_PendingOutboundAction>[];
   int _clientActionSequence = 0;
+  ActiveTransportPath _activeTransportPath = ActiveTransportPath.none;
+  DateTime? _lastLanReturnAttemptAt;
+  int _lanReturnFailureCount = 0;
+  int _activeFileTransfers = 0;
   final Map<String, int> _sessionEventCursors = <String, int>{};
   final Map<String, SessionDeltaKnown> _sessionDeltaKnown =
       <String, SessionDeltaKnown>{};
@@ -470,6 +483,12 @@ class SessionController extends ChangeNotifier {
       );
   bool get connecting => _connecting;
   bool get connected => _connected;
+  ActiveTransportPath get activeTransportPath => _activeTransportPath;
+  String get activeTransportLabel => switch (_activeTransportPath) {
+        ActiveTransportPath.lan => 'LAN',
+        ActiveTransportPath.relay => 'Relay',
+        ActiveTransportPath.none => '',
+      };
   bool get autoReconnectEnabled => _autoReconnectEnabled;
   bool get reconnecting =>
       _connectionStage == SessionConnectionStage.reconnecting ||
@@ -570,11 +589,17 @@ class SessionController extends ChangeNotifier {
   bool get relayDeviceListLoading => _relayDeviceListLoading;
   String get relayDeviceStatus => _relayDeviceStatus;
   bool get canManageRelayDevices =>
-      connected && _config.isRelayMode && _service.hasRelayE2eeDeviceBinding;
+      connected &&
+      _activeTransportPath == ActiveTransportPath.relay &&
+      _service.hasRelayE2eeDeviceBinding;
   Future<RelaySecurityState> relaySecurityState() {
+    final actualConnectionMode =
+        _activeTransportPath == ActiveTransportPath.relay
+            ? ConnectionMode.relay.name
+            : ConnectionMode.direct.name;
     return RelaySecurityStateEvaluator.evaluate(
       _service.relaySecurityInput(
-        connectionMode: _config.connectionMode,
+        connectionMode: actualConnectionMode,
         expectedNodeFingerprintHex: _config.relayNodeFingerprintHex,
         configuredCapabilities: _config.relayCapabilities,
       ),
@@ -1389,6 +1414,7 @@ class SessionController extends ChangeNotifier {
     _adbWebRtcStartTimeout?.cancel();
     _reconnectTimer?.cancel();
     _connectionHealthTimer?.cancel();
+    _lanReturnProbeTimer?.cancel();
     _pendingOutboundRetryTimer?.cancel();
     _sessionLoadingTimeout?.cancel();
     _postHistoryBootstrapTimer?.cancel();
@@ -1436,19 +1462,20 @@ class SessionController extends ChangeNotifier {
       notifyListeners();
       return false;
     }
-    if (imported.isRelayMode) {
+    if (imported.connectionMode != ConnectionMode.direct.name) {
       await _prepareForImportedRelayLink();
     }
     await saveConfig(imported);
-    _connectionMessage =
-        imported.isRelayMode ? '已导入 Relay 配对，点击连接完成配对' : '已导入连接配置';
-    if (imported.isRelayMode) {
+    _connectionMessage = imported.connectionMode == ConnectionMode.direct.name
+        ? '已导入连接配置'
+        : '已导入 Relay 配对，点击连接完成配对';
+    if (imported.connectionMode != ConnectionMode.direct.name) {
       _connectionStage = SessionConnectionStage.disconnected;
       _latestError = null;
     }
     _pushSystem(
       'session',
-      imported.isRelayMode
+      imported.connectionMode != ConnectionMode.direct.name
           ? '已导入 Relay 配对，点击连接完成配对'
           : '已导入连接配置：${imported.displayEndpoint}',
     );
@@ -1474,6 +1501,7 @@ class SessionController extends ChangeNotifier {
     }
     _connected = false;
     _connecting = false;
+    _activeTransportPath = ActiveTransportPath.none;
     _connectionStage = SessionConnectionStage.disconnected;
     _latestError = null;
     _relayDevices.clear();
@@ -1969,7 +1997,7 @@ class SessionController extends ChangeNotifier {
       return;
     }
     _cancelReconnectTimer();
-    if (!_config.isRelayMode && _isInvalidLoopbackHostForMobile()) {
+    if (_shouldRejectLoopbackDirectEndpoint()) {
       _connectionStage = SessionConnectionStage.failed;
       _connecting = false;
       _connected = false;
@@ -1991,14 +2019,11 @@ class SessionController extends ChangeNotifier {
     _syncDerivedState();
     notifyListeners();
     try {
-      if (_config.isRelayMode) {
-        await _connectRelay();
-      } else {
-        await _service.connect(
-          _config.wsUrlFor(
-            secureTransport: defaultSecureBackendTransport ? true : null,
-          ),
-        );
+      final path = await _connectForCurrentMode();
+      _activeTransportPath = path;
+      if (path != ActiveTransportPath.relay) {
+        _lanReturnProbeTimer?.cancel();
+        _lanReturnProbeTimer = null;
       }
       unawaited(_saveConnectionIntent(true));
       _connected = true;
@@ -2043,6 +2068,7 @@ class SessionController extends ChangeNotifier {
       _restorePendingNotificationSessionIfNeeded();
     } catch (error) {
       _connected = false;
+      _activeTransportPath = ActiveTransportPath.none;
       final relayAgentReconnecting =
           error is RelayPairingException && error.code == 'agent_disconnected';
       if ((silently || relayAgentReconnecting) && _autoReconnectEnabled) {
@@ -2070,6 +2096,9 @@ class SessionController extends ChangeNotifier {
       if (_connected) {
         _restorePendingNotificationSessionIfNeeded();
         _flushPendingOutboundActions();
+        if (_activeTransportPath == ActiveTransportPath.relay) {
+          _startLanReturnProbe();
+        }
       }
       if (shouldRetrySilently) {
         _scheduleReconnect();
@@ -2077,6 +2106,56 @@ class SessionController extends ChangeNotifier {
       _syncDerivedState();
       notifyListeners();
     }
+  }
+
+  bool _shouldRejectLoopbackDirectEndpoint() {
+    if (!_config.hasDirectEndpoint || !_isInvalidLoopbackHostForMobile()) {
+      return false;
+    }
+    final mode = _config.connectionMode;
+    return mode == ConnectionMode.direct.name ||
+        (mode == ConnectionMode.auto.name && !_config.canUseRelay);
+  }
+
+  Future<ActiveTransportPath> _connectForCurrentMode() async {
+    final mode = _config.connectionMode;
+    if (mode == ConnectionMode.relay.name) {
+      await _connectRelay();
+      return ActiveTransportPath.relay;
+    }
+    if (mode == ConnectionMode.direct.name) {
+      await _connectDirect();
+      return ActiveTransportPath.lan;
+    }
+    if (_config.hasDirectEndpoint && !_isInvalidLoopbackHostForMobile()) {
+      try {
+        await _connectDirect();
+        _lanReturnFailureCount = 0;
+        return ActiveTransportPath.lan;
+      } catch (directError) {
+        if (!_config.canUseRelay) {
+          rethrow;
+        }
+        _connectionMessage = 'LAN 不可用，正在切换 Relay...';
+      }
+    } else if (_config.hasDirectEndpoint && _isInvalidLoopbackHostForMobile()) {
+      _connectionMessage = 'iPhone 不能使用 localhost/127.0.0.1，正在切换 Relay...';
+    }
+    if (_config.canUseRelay) {
+      await _connectRelay();
+      _activeTransportPath = ActiveTransportPath.relay;
+      _startLanReturnProbe();
+      return ActiveTransportPath.relay;
+    }
+    throw const FormatException('auto 模式缺少可用的 LAN 或 Relay 配置');
+  }
+
+  Future<void> _connectDirect() {
+    return _service.connect(
+      _config.wsUrlFor(
+        secureTransport: defaultSecureBackendTransport ? true : null,
+      ),
+    );
   }
 
   Future<void> _connectRelay() async {
@@ -2092,26 +2171,15 @@ class SessionController extends ChangeNotifier {
       throw const FormatException('Relay 配对信息不完整，请重新扫码');
     }
     validateRelayUrl(relayUrl);
-    try {
-      await _service.connectRelay(
-        relayUrl: relayUrl,
-        sessionId: sessionId,
-        pairingSecret: pairingSecret,
-        clientId: clientId,
-        clientReconnectSecret: clientReconnectSecret,
-        nodeFingerprintHex: _config.relayNodeFingerprintHex,
-        relayCapabilities: _config.relayCapabilities,
-      );
-    } catch (error) {
-      if (_shouldClearRelayPairingAfterFailure(error, pairingSecret)) {
-        await _clearRelayPairingAfterFailure();
-        throw RelayPairingException(
-          'relay_pairing_consumed',
-          'Relay 配对未完成：当前配对链接已一次性使用，请导入新的中继链接后重试。原始错误：$error',
-        );
-      }
-      rethrow;
-    }
+    await _service.connectRelay(
+      relayUrl: relayUrl,
+      sessionId: sessionId,
+      pairingSecret: pairingSecret,
+      clientId: clientId,
+      clientReconnectSecret: clientReconnectSecret,
+      nodeFingerprintHex: _config.relayNodeFingerprintHex,
+      relayCapabilities: _config.relayCapabilities,
+    );
     final relaySession = _service.takeRelaySession();
     _config = _config.copyWith(
       relaySessionId: relaySession?.sessionId ?? sessionId,
@@ -2124,30 +2192,93 @@ class SessionController extends ChangeNotifier {
     unawaited(_persistCurrentConfig());
   }
 
-  bool _shouldClearRelayPairingAfterFailure(
-    Object error,
-    String pairingSecret,
-  ) {
-    if (pairingSecret.trim().isEmpty) {
-      return false;
+  void _startLanReturnProbe() {
+    _lanReturnProbeTimer?.cancel();
+    if (_config.connectionMode != ConnectionMode.auto.name ||
+        !_config.hasDirectEndpoint ||
+        _isInvalidLoopbackHostForMobile() ||
+        _activeTransportPath == ActiveTransportPath.lan) {
+      return;
     }
-    if (error is RelayPairingException) {
-      return error.code != 'agent_disconnected';
-    }
-    if (error is TimeoutException) {
-      final message = (error.message ?? '').trim();
-      return message.contains('E2EE') || message.contains('配对');
-    }
-    final message = error.toString();
-    return message.contains('Relay E2EE') || message.contains('E2EE 握手');
+    _lanReturnProbeTimer = Timer.periodic(_lanReturnProbeInterval, (_) {
+      if (_canAttemptLanReturn()) {
+        unawaited(_attemptLanReturn());
+      }
+    });
   }
 
-  Future<void> _clearRelayPairingAfterFailure() async {
-    _config = _config.copyWith(
-      relayPairingSecret: '',
-      relayPairingExpiresAt: 0,
-    );
-    await _persistCurrentConfig();
+  bool _canAttemptLanReturn() {
+    if (!_connected ||
+        _connecting ||
+        _activeTransportPath != ActiveTransportPath.relay ||
+        _pendingOutboundActions.isNotEmpty ||
+        _activeFileTransfers > 0) {
+      return false;
+    }
+    final lastAttempt = _lastLanReturnAttemptAt;
+    if (lastAttempt == null) {
+      return true;
+    }
+    final backoffSeconds = _lanReturnFailureCount <= 0
+        ? _lanReturnCooldown.inSeconds
+        : _lanReturnCooldown.inSeconds *
+            (1 << _lanReturnFailureCount.clamp(0, 3));
+    return DateTime.now().difference(lastAttempt) >=
+        Duration(seconds: backoffSeconds);
+  }
+
+  Future<void> _attemptLanReturn() async {
+    if (_connecting) {
+      return;
+    }
+    _lastLanReturnAttemptAt = DateTime.now();
+    _connecting = true;
+    try {
+      await _service.connectDirectAfterReady(
+        _config.wsUrlFor(
+          secureTransport: defaultSecureBackendTransport ? true : null,
+        ),
+      );
+      _activeTransportPath = ActiveTransportPath.lan;
+      _connecting = false;
+      _lanReturnFailureCount = 0;
+      _lanReturnProbeTimer?.cancel();
+      _lanReturnProbeTimer = null;
+      _requestSessionResume(reason: 'lan_return');
+      _requestSessionDelta(reason: 'lan_return', force: true);
+      _flushPendingOutboundActions();
+      _syncDerivedState();
+      notifyListeners();
+    } catch (error) {
+      _lanReturnFailureCount += 1;
+      _connecting = false;
+      if (_activeTransportPath == ActiveTransportPath.relay) {
+        _connectionMessage = 'LAN 切回失败，继续使用 Relay';
+        _syncDerivedState();
+        notifyListeners();
+        return;
+      }
+      if (!_config.canUseRelay) {
+        _handleUnexpectedSocketDisconnect('LAN 切回失败：$error');
+        return;
+      }
+      try {
+        await _connectRelay();
+        _activeTransportPath = ActiveTransportPath.relay;
+        _connected = true;
+        _connecting = false;
+        _connectionStage = SessionConnectionStage.catchingUp;
+        _connectionMessage = '已切回 Relay';
+        _requestSessionResume(reason: 'lan_return_failed');
+        _requestSessionDelta(reason: 'lan_return_failed', force: true);
+        _flushPendingOutboundActions();
+        _syncDerivedState();
+        notifyListeners();
+      } catch (relayError) {
+        _connecting = false;
+        _handleUnexpectedSocketDisconnect('Relay 重连失败：$relayError');
+      }
+    }
   }
 
   Future<void> disconnect() async {
@@ -2159,6 +2290,8 @@ class SessionController extends ChangeNotifier {
     _stopAdbRefreshPolling();
     _connectionHealthTimer?.cancel();
     _connectionHealthTimer = null;
+    _lanReturnProbeTimer?.cancel();
+    _lanReturnProbeTimer = null;
     _sessionLoadingTimeout?.cancel();
     _sessionLoadingTimeout = null;
     _postHistoryBootstrapTimer?.cancel();
@@ -2166,6 +2299,7 @@ class SessionController extends ChangeNotifier {
     await _adbWebRtc.stop();
     await _service.disconnect();
     _connected = false;
+    _activeTransportPath = ActiveTransportPath.none;
     _connectionStage = SessionConnectionStage.disconnected;
     _selectedSessionId = '';
     _selectedSessionTitle = 'MobileVC';
@@ -2261,6 +2395,7 @@ class SessionController extends ChangeNotifier {
     final wasRecovering = reconnecting;
     _connected = false;
     _connecting = false;
+    _activeTransportPath = ActiveTransportPath.none;
     _selectedSessionExternalNative = false;
     _executionActive = false;
     _isLoadingSession = false;
@@ -2880,19 +3015,25 @@ class SessionController extends ChangeNotifier {
     void Function(int receivedBytes, int? totalBytes)? onProgress,
     FutureOr<void> Function(Uint8List chunk)? onChunk,
     RelayFileDownloadCancelToken? cancelToken,
-  }) {
-    return _service.downloadRelayFile(
-      path,
-      onProgress: onProgress,
-      onChunk: onChunk,
-      cancelToken: cancelToken,
-    );
+  }) async {
+    _activeFileTransfers++;
+    try {
+      return await _service.downloadRelayFile(
+        path,
+        onProgress: onProgress,
+        onChunk: onChunk,
+        cancelToken: cancelToken,
+      );
+    } finally {
+      _activeFileTransfers = (_activeFileTransfers - 1).clamp(0, 1 << 30);
+    }
   }
 
   void requestRelayDeviceList() {
     if (!canManageRelayDevices) {
-      _relayDeviceStatus =
-          _config.isRelayMode ? 'Relay E2EE 未就绪，暂不能读取设备列表' : '当前不是 Relay 模式';
+      _relayDeviceStatus = _activeTransportPath == ActiveTransportPath.relay
+          ? 'Relay E2EE 未就绪，暂不能读取设备列表'
+          : '当前未使用 Relay';
       notifyListeners();
       return;
     }
@@ -8122,6 +8263,11 @@ class SessionController extends ChangeNotifier {
         _handleUnexpectedSocketDisconnect(
             'Connection timed out, reconnecting...');
         return;
+      }
+      if (_config.connectionMode == ConnectionMode.auto.name &&
+          _activeTransportPath == ActiveTransportPath.relay &&
+          _canAttemptLanReturn()) {
+        unawaited(_attemptLanReturn());
       }
       _service.send({
         'action': 'ping',

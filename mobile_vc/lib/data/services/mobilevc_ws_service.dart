@@ -91,6 +91,11 @@ class MobileVcWsService {
     await _connectChannel(Uri.parse(url));
   }
 
+  Future<void> connectDirectAfterReady(String url) async {
+    final channel = await _openReadyChannel(Uri.parse(url));
+    await _replaceWithReadyDirectChannel(channel);
+  }
+
   Future<void> connectRelay({
     required String relayUrl,
     required String sessionId,
@@ -141,13 +146,7 @@ class MobileVcWsService {
     _connectionEpoch++;
     await previousSubscription?.cancel();
     await previousChannel?.sink.close();
-    final channel = kIsWeb
-        ? WebSocketChannel.connect(uri)
-        : IOWebSocketChannel.connect(
-            uri,
-            pingInterval: const Duration(seconds: 15),
-            connectTimeout: const Duration(seconds: 15),
-          );
+    final channel = _createChannel(uri);
     _channel = channel;
     final epoch = _connectionEpoch;
     var activeRelayClientId = initialRelayClientId;
@@ -351,6 +350,113 @@ class MobileVcWsService {
         clientReconnectSecret: activeRelayReconnectSecret,
       );
     }
+  }
+
+  WebSocketChannel _createChannel(Uri uri) {
+    return kIsWeb
+        ? WebSocketChannel.connect(uri)
+        : IOWebSocketChannel.connect(
+            uri,
+            pingInterval: const Duration(seconds: 15),
+            connectTimeout: const Duration(seconds: 15),
+          );
+  }
+
+  Future<WebSocketChannel> _openReadyChannel(Uri uri) async {
+    final channel = _createChannel(uri);
+    try {
+      await channel.ready.timeout(const Duration(seconds: 15));
+      return channel;
+    } catch (_) {
+      await channel.sink.close();
+      rethrow;
+    }
+  }
+
+  Future<void> _replaceWithReadyDirectChannel(WebSocketChannel channel) async {
+    final previousSubscription = _subscription;
+    final previousChannel = _channel;
+    _subscription = null;
+    _channel = null;
+    _relayContext = const _RelayContext();
+    _relayE2eeState = null;
+    _relaySendQueue = Future<void>.value();
+    _relayReceiveQueue = Future<void>.value();
+    _failRelayDownloads(StateError('Relay connection replaced'));
+    _connectionEpoch++;
+    await previousSubscription?.cancel();
+    await previousChannel?.sink.close();
+    _channel = channel;
+    final epoch = _connectionEpoch;
+    var disconnectEmitted = false;
+    void emitDisconnect({
+      required String code,
+      required String message,
+      Map<String, dynamic> raw = const <String, dynamic>{},
+    }) {
+      if (disconnectEmitted ||
+          epoch != _connectionEpoch ||
+          _channel != channel) {
+        return;
+      }
+      disconnectEmitted = true;
+      _channel = null;
+      _subscription = null;
+      _events.add(
+        ErrorEvent(
+          timestamp: DateTime.now(),
+          sessionId: '',
+          runtimeMeta: const RuntimeMeta(),
+          raw: <String, dynamic>{
+            'type': 'error',
+            'code': code,
+            'msg': message,
+            ...raw,
+          },
+          code: code,
+          message: message,
+        ),
+      );
+    }
+
+    _subscription = channel.stream.listen(
+      (dynamic data) {
+        if (epoch != _connectionEpoch || _channel != channel) {
+          return;
+        }
+        final decoded = jsonDecode(data as String);
+        if (decoded is Map<String, dynamic>) {
+          _events.add(_mapper.mapEvent(decoded));
+        }
+      },
+      onError: (Object error, StackTrace stackTrace) {
+        emitDisconnect(
+          code: 'ws_stream_error',
+          message: 'WebSocket 连接异常：$error',
+          raw: <String, dynamic>{
+            'stack': stackTrace.toString(),
+          },
+        );
+      },
+      onDone: () {
+        final closeCode = channel.closeCode;
+        final closeReason = channel.closeReason;
+        final message = closeCode == null
+            ? 'WebSocket 连接已断开'
+            : closeReason == null || closeReason.isEmpty
+                ? 'WebSocket 连接已断开（$closeCode）'
+                : 'WebSocket 连接已断开（$closeCode: $closeReason）';
+        emitDisconnect(
+          code: 'ws_closed',
+          message: message,
+          raw: <String, dynamic>{
+            'closeCode': closeCode,
+            'closeReason': closeReason,
+          },
+        );
+      },
+      cancelOnError: false,
+    );
   }
 
   Future<void> disconnect() async {

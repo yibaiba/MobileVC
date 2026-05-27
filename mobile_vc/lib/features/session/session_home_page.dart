@@ -286,7 +286,10 @@ class _SessionHomePageState extends State<SessionHomePage> {
               ),
             ),
             const SizedBox(width: 8),
-            _ConnectionDot(connected: controller.connected),
+            _ConnectionDot(
+              connected: controller.connected,
+              label: controller.activeTransportLabel,
+            ),
           ],
         ),
         actions: [
@@ -591,7 +594,8 @@ class _SessionHomePageState extends State<SessionHomePage> {
                       ? controller.config.host
                       : hostController.text.trim()),
             );
-            final relayModeSelected = pendingConfig.isRelayMode;
+            final relayModeSelected =
+                pendingConfig.connectionMode != ConnectionMode.direct.name;
             final connectionBusy = connectingFromSheet || controller.connecting;
             final canConnectRelay = !relayModeSelected ||
                 pendingConfig.relayPairingSecret.trim().isNotEmpty ||
@@ -610,7 +614,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
               selectedEngine = scanned.engine.trim().isEmpty
                   ? selectedEngine
                   : scanned.engine.trim();
-              scanHint = scanned.isRelayMode
+              scanHint = scanned.connectionMode != ConnectionMode.direct.name
                   ? '已导入 Relay 配对，点击连接完成配对'
                   : '已回填 ${scanned.displayHost}:${scanned.port}${scanned.token.isNotEmpty ? ' 与 token' : ''}';
             }
@@ -647,7 +651,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
               AppConfig scanned,
               String raw,
             ) async {
-              if (!scanned.isRelayMode) {
+              if (scanned.connectionMode == ConnectionMode.direct.name) {
                 return false;
               }
               final imported = await controller.importConnectionLink(raw);
@@ -727,11 +731,13 @@ class _SessionHomePageState extends State<SessionHomePage> {
             Future<bool> persistConfig({bool connect = false}) async {
               final hostText = hostController.text.trim();
               final nextConfig = pendingConfig.copyWith(
-                host: relayModeSelected ? pendingConfig.host : hostText,
-                port: relayModeSelected
+                host: pendingConfig.connectionMode == ConnectionMode.relay.name
+                    ? pendingConfig.host
+                    : hostText,
+                port: pendingConfig.connectionMode == ConnectionMode.relay.name
                     ? pendingConfig.port
                     : _portForHostInput(hostText, portController.text),
-                token: relayModeSelected
+                token: pendingConfig.connectionMode == ConnectionMode.relay.name
                     ? pendingConfig.token
                     : tokenController.text.trim(),
                 cwd: cwdController.text.trim(),
@@ -839,15 +845,21 @@ class _SessionHomePageState extends State<SessionHomePage> {
                           label: Text('直连'),
                         ),
                         ButtonSegment(
+                          value: ConnectionMode.auto,
+                          icon: Icon(Icons.swap_horiz_outlined),
+                          label: Text('自动'),
+                        ),
+                        ButtonSegment(
                           value: ConnectionMode.relay,
                           icon: Icon(Icons.hub_outlined),
                           label: Text('中继'),
                         ),
                       ],
                       selected: {
-                        relayModeSelected
-                            ? ConnectionMode.relay
-                            : ConnectionMode.direct,
+                        ConnectionMode.values.firstWhere(
+                          (mode) => mode.name == pendingConfig.connectionMode,
+                          orElse: () => ConnectionMode.direct,
+                        ),
                       },
                       onSelectionChanged: connectionBusy
                           ? null
@@ -869,9 +881,11 @@ class _SessionHomePageState extends State<SessionHomePage> {
                                   return;
                                 }
                                 pendingConfig = pendingConfig.copyWith(
-                                  connectionMode: ConnectionMode.relay.name,
+                                  connectionMode: mode.name,
                                 );
-                                scanHint = '已切换为 Relay 中继模式';
+                                scanHint = mode == ConnectionMode.auto
+                                    ? '已切换为自动模式：优先 LAN，Relay 兜底'
+                                    : '已切换为 Relay 中继模式';
                               });
                             },
                     ),
@@ -1066,7 +1080,8 @@ class _SessionHomePageState extends State<SessionHomePage> {
                           child: const Text('断开连接'),
                         ),
                       ),
-                    if (controller.config.isRelayMode) ...[
+                    if (controller.config.connectionMode !=
+                        ConnectionMode.direct.name) ...[
                       const SizedBox(height: 10),
                       SizedBox(
                         width: double.infinity,
@@ -1503,13 +1518,14 @@ class _SessionHomePageState extends State<SessionHomePage> {
     messenger
       ..hideCurrentSnackBar()
       ..showSnackBar(SnackBar(
-        content: Text(controller.config.isRelayMode
-            ? '开始 Relay 加密下载：$path'
-            : '开始下载：$path'),
+        content: Text(
+            controller.activeTransportPath == ActiveTransportPath.relay
+                ? '开始 Relay 加密下载：$path'
+                : '开始下载：$path'),
       ));
 
     try {
-      if (controller.config.isRelayMode) {
+      if (controller.activeTransportPath == ActiveTransportPath.relay) {
         final savedFile = await _downloadRelayFileToDisk(
           path: path,
           fileName: fileName,
@@ -3019,28 +3035,44 @@ class _RelayDeviceTile extends StatelessWidget {
 }
 
 class _ConnectionDot extends StatelessWidget {
-  const _ConnectionDot({required this.connected});
+  const _ConnectionDot({required this.connected, required this.label});
 
   final bool connected;
+  final String label;
 
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     final color = connected ? const Color(0xFF22C55E) : scheme.outline;
-    return Container(
-      width: 10,
-      height: 10,
-      decoration: BoxDecoration(
-        color: color,
-        shape: BoxShape.circle,
-        boxShadow: [
-          BoxShadow(
-            color: color.withValues(alpha: 0.35),
-            blurRadius: 8,
-            spreadRadius: 1,
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Container(
+          width: 10,
+          height: 10,
+          decoration: BoxDecoration(
+            color: color,
+            shape: BoxShape.circle,
+            boxShadow: [
+              BoxShadow(
+                color: color.withValues(alpha: 0.35),
+                blurRadius: 8,
+                spreadRadius: 1,
+              ),
+            ],
+          ),
+        ),
+        if (connected && label.trim().isNotEmpty) ...[
+          const SizedBox(width: 6),
+          Text(
+            label,
+            style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                  color: scheme.onSurfaceVariant,
+                  fontWeight: FontWeight.w700,
+                ),
           ),
         ],
-      ),
+      ],
     );
   }
 }

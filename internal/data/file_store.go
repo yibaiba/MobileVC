@@ -506,6 +506,52 @@ func (s *FileStore) BaseDir() string {
 	return s.baseDir
 }
 
+func (s *FileStore) MarkClientAction(ctx context.Context, sessionID string, record ClientActionRecord, ttl time.Duration, limit int) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	select {
+	case <-ctx.Done():
+		return false, ctx.Err()
+	default:
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	record.ClientActionID = strings.TrimSpace(record.ClientActionID)
+	record.Action = strings.TrimSpace(record.Action)
+	record.Status = strings.TrimSpace(record.Status)
+	if sessionID == "" {
+		return false, fmt.Errorf("session id is required")
+	}
+	if record.ClientActionID == "" {
+		return false, fmt.Errorf("client action id is required")
+	}
+	if record.Status == "" {
+		record.Status = "accepted"
+	}
+	now := time.Now().UTC()
+	if record.AckedAt.IsZero() {
+		record.AckedAt = now
+	}
+	if limit <= 0 {
+		limit = 500
+	}
+	sessionRecord, err := s.readSessionLocked(sessionID)
+	if err != nil {
+		return false, err
+	}
+	sessionRecord.ClientActions = normalizeClientActionRecords(sessionRecord.ClientActions, now, ttl, limit)
+	for _, item := range sessionRecord.ClientActions {
+		if item.ClientActionID == record.ClientActionID {
+			return true, nil
+		}
+	}
+	sessionRecord.ClientActions = append(sessionRecord.ClientActions, record)
+	sessionRecord.ClientActions = normalizeClientActionRecords(sessionRecord.ClientActions, now, ttl, limit)
+	if err := s.writeSessionLocked(sessionRecord); err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
 func filterOut(items []SessionSummary, id string) []SessionSummary {
 	out := make([]SessionSummary, 0, len(items))
 	for _, item := range items {
@@ -548,6 +594,7 @@ func normalizeProjection(projection ProjectionSnapshot) ProjectionSnapshot {
 
 func normalizeSessionRecord(record SessionRecord) SessionRecord {
 	record.Projection = normalizeProjection(record.Projection)
+	record.ClientActions = normalizeClientActionRecords(record.ClientActions, time.Time{}, 0, 0)
 	runtimeSource := strings.ToLower(strings.TrimSpace(firstNonEmptyString(
 		record.Projection.Runtime.Source,
 		record.Summary.Runtime.Source,
@@ -586,6 +633,45 @@ func normalizeSessionRecord(record SessionRecord) SessionRecord {
 	}
 	record.Summary = deriveProjectionSummary(record.Summary, record.Projection)
 	return record
+}
+
+func normalizeClientActionRecords(items []ClientActionRecord, now time.Time, ttl time.Duration, limit int) []ClientActionRecord {
+	if len(items) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(items))
+	cutoff := time.Time{}
+	if ttl > 0 && !now.IsZero() {
+		cutoff = now.Add(-ttl)
+	}
+	normalized := make([]ClientActionRecord, 0, len(items))
+	for i := len(items) - 1; i >= 0; i-- {
+		item := items[i]
+		item.ClientActionID = strings.TrimSpace(item.ClientActionID)
+		item.Action = strings.TrimSpace(item.Action)
+		item.Status = strings.TrimSpace(item.Status)
+		if item.ClientActionID == "" {
+			continue
+		}
+		if !cutoff.IsZero() && !item.AckedAt.IsZero() && item.AckedAt.Before(cutoff) {
+			continue
+		}
+		if _, exists := seen[item.ClientActionID]; exists {
+			continue
+		}
+		seen[item.ClientActionID] = struct{}{}
+		normalized = append(normalized, item)
+	}
+	for i, j := 0, len(normalized)-1; i < j; i, j = i+1, j-1 {
+		normalized[i], normalized[j] = normalized[j], normalized[i]
+	}
+	if limit > 0 && len(normalized) > limit {
+		normalized = append([]ClientActionRecord(nil), normalized[len(normalized)-limit:]...)
+	}
+	if len(normalized) == 0 {
+		return nil
+	}
+	return normalized
 }
 
 func mergeSessionRuntime(base SessionRuntime, overlay SessionRuntime) SessionRuntime {

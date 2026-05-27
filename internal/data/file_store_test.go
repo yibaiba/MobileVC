@@ -130,6 +130,103 @@ func TestFileStorePersistsSessionContext(t *testing.T) {
 	}
 }
 
+func TestFileStoreMarkClientActionPersistsDuplicateMetadata(t *testing.T) {
+	fs, err := NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new file store: %v", err)
+	}
+	created, err := fs.CreateSession(context.Background(), "dedupe")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	duplicate, err := fs.MarkClientAction(context.Background(), created.ID, ClientActionRecord{
+		ClientActionID: " action-1 ",
+		Action:         " input ",
+	}, time.Hour, 10)
+	if err != nil {
+		t.Fatalf("mark client action: %v", err)
+	}
+	if duplicate {
+		t.Fatal("first client action should not be duplicate")
+	}
+
+	duplicate, err = fs.MarkClientAction(context.Background(), created.ID, ClientActionRecord{
+		ClientActionID: "action-1",
+		Action:         "input",
+	}, time.Hour, 10)
+	if err != nil {
+		t.Fatalf("mark duplicate client action: %v", err)
+	}
+	if !duplicate {
+		t.Fatal("second client action should be duplicate")
+	}
+
+	record, err := fs.GetSession(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	if len(record.ClientActions) != 1 {
+		t.Fatalf("expected one client action record, got %#v", record.ClientActions)
+	}
+	got := record.ClientActions[0]
+	if got.ClientActionID != "action-1" || got.Action != "input" || got.Status != "accepted" {
+		t.Fatalf("unexpected client action record: %#v", got)
+	}
+	if got.AckedAt.IsZero() {
+		t.Fatal("expected ack timestamp to be stored")
+	}
+}
+
+func TestFileStoreMarkClientActionAppliesTTLAndLimit(t *testing.T) {
+	fs, err := NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new file store: %v", err)
+	}
+	created, err := fs.CreateSession(context.Background(), "dedupe")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	stale := time.Now().UTC().Add(-2 * time.Hour)
+	record, err := fs.GetSession(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	record.ClientActions = []ClientActionRecord{
+		{ClientActionID: "old", Action: "input", Status: "accepted", AckedAt: stale},
+	}
+	if _, err := fs.UpsertSession(context.Background(), record); err != nil {
+		t.Fatalf("upsert session: %v", err)
+	}
+
+	for _, id := range []string{"new-1", "new-2", "new-3"} {
+		if _, err := fs.MarkClientAction(context.Background(), created.ID, ClientActionRecord{
+			ClientActionID: id,
+			Action:         "input",
+		}, time.Hour, 2); err != nil {
+			t.Fatalf("mark client action %s: %v", id, err)
+		}
+	}
+
+	record, err = fs.GetSession(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("get updated session: %v", err)
+	}
+	ids := make([]string, 0, len(record.ClientActions))
+	for _, item := range record.ClientActions {
+		ids = append(ids, item.ClientActionID)
+	}
+	want := []string{"new-2", "new-3"}
+	if len(ids) != len(want) {
+		t.Fatalf("expected ids %v, got %v", want, ids)
+	}
+	for i := range want {
+		if ids[i] != want[i] {
+			t.Fatalf("expected ids %v, got %v", want, ids)
+		}
+	}
+}
+
 func TestFileStoreSaveProjectionPersistsExternalCodexSessionState(t *testing.T) {
 	fs, err := NewFileStore(t.TempDir())
 	if err != nil {

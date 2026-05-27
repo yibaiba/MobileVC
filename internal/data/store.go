@@ -297,8 +297,16 @@ type ProjectionSnapshot struct {
 }
 
 type SessionRecord struct {
-	Summary    SessionSummary     `json:"summary"`
-	Projection ProjectionSnapshot `json:"projection"`
+	Summary       SessionSummary       `json:"summary"`
+	Projection    ProjectionSnapshot   `json:"projection"`
+	ClientActions []ClientActionRecord `json:"clientActions,omitempty"`
+}
+
+type ClientActionRecord struct {
+	ClientActionID string    `json:"clientActionId"`
+	Action         string    `json:"action"`
+	Status         string    `json:"status"`
+	AckedAt        time.Time `json:"ackedAt"`
 }
 
 type Store interface {
@@ -308,6 +316,7 @@ type Store interface {
 	GetSession(ctx context.Context, sessionID string) (SessionRecord, error)
 	ListSessions(ctx context.Context) ([]SessionSummary, error)
 	DeleteSession(ctx context.Context, sessionID string) error
+	MarkClientAction(ctx context.Context, sessionID string, record ClientActionRecord, ttl time.Duration, limit int) (duplicate bool, err error)
 	SavePushToken(ctx context.Context, sessionID, token, platform string) error
 	GetPushToken(ctx context.Context, sessionID string) (token string, platform string, err error)
 	ListSkillCatalog(ctx context.Context) ([]SkillDefinition, error)

@@ -32,6 +32,8 @@ import (
 
 const wsDebugPreviewLimit = 240
 const sessionListCacheTTL = 1500 * time.Millisecond
+const clientActionDedupeTTL = 24 * time.Hour
+const clientActionDedupeLimit = 500
 
 type sessionLoadTraceStage struct {
 	name     string
@@ -586,10 +588,25 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 		if targetSessionID == "" {
 			targetSessionID = strings.TrimSpace(selectedSessionID)
 		}
-		sessionRuntime := h.runtimeSessions.Ensure(targetSessionID)
+		now := time.Now().UTC()
 		accepted := true
+		if h.SessionStore != nil && targetSessionID != "" {
+			duplicate, err := h.SessionStore.MarkClientAction(ctx, targetSessionID, data.ClientActionRecord{
+				ClientActionID: clientActionID,
+				Action:         strings.TrimSpace(action),
+				Status:         "accepted",
+				AckedAt:        now,
+			}, clientActionDedupeTTL, clientActionDedupeLimit)
+			if err != nil {
+				logx.Warn("ws", "persist client action marker failed: connectionID=%s sessionID=%s remoteAddr=%s action=%s clientActionID=%s err=%v", connectionID, targetSessionID, remoteAddr, action, clientActionID, err)
+				emit(protocol.NewErrorEvent(targetSessionID, fmt.Sprintf("记录操作确认失败：%v", err), ""))
+				return false
+			}
+			accepted = !duplicate
+		}
+		sessionRuntime := h.runtimeSessions.Ensure(targetSessionID)
 		if sessionRuntime != nil {
-			accepted = sessionRuntime.markClientAction(clientActionID)
+			accepted = sessionRuntime.markClientAction(clientActionID, now) && accepted
 		}
 		emit(protocol.NewClientActionAckEvent(targetSessionID, action, clientActionID, "accepted", !accepted))
 		return accepted
@@ -2127,6 +2144,10 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			if strings.TrimSpace(selectedSessionID) == "" || selectedSessionID == connectionID {
 				continue
 			}
+			if !ackClientAction(selectedSessionID, "stop", clientEvent) {
+				logx.Info("ws", "duplicate client action ignored: connectionID=%s sessionID=%s remoteAddr=%s action=stop clientActionID=%s", connectionID, selectedSessionID, remoteAddr, clientEvent.ClientActionID)
+				continue
+			}
 			_, service := runtimeForSession(selectedSessionID)
 			if err := service.StopActive(selectedSessionID, emitAndPersistFor(selectedSessionID)); err != nil && !errors.Is(err, session.ErrNoActiveRunner) {
 				logx.Warn("ws", "stop active runner failed: connectionID=%s sessionID=%s remoteAddr=%s action=stop err=%v", connectionID, selectedSessionID, remoteAddr, err)
@@ -2147,6 +2168,10 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				continue
 			}
 			sessionID, service := resolvePermissionDecisionRuntime(permissionEvent)
+			if !ackClientAction(sessionID, "permission_decision", permissionEvent.ClientEvent) {
+				logx.Info("ws", "duplicate client action ignored: connectionID=%s sessionID=%s remoteAddr=%s action=permission_decision clientActionID=%s", connectionID, sessionID, remoteAddr, permissionEvent.ClientActionID)
+				continue
+			}
 			sessionRuntime, _ := runtimeForSession(sessionID)
 			emitAndPersist := emitAndPersistFor(sessionID)
 			projection := buildProjectionSnapshotFor(sessionID)
@@ -2236,6 +2261,10 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				continue
 			}
 			sessionID := selectedSessionID
+			if !ackClientAction(sessionID, "review_decision", reviewEvent.ClientEvent) {
+				logx.Info("ws", "duplicate client action ignored: connectionID=%s sessionID=%s remoteAddr=%s action=review_decision clientActionID=%s", connectionID, sessionID, remoteAddr, reviewEvent.ClientActionID)
+				continue
+			}
 			_, service := runtimeForSession(sessionID)
 			emitAndPersist := emitAndPersistFor(sessionID)
 			projection := buildProjectionSnapshotFor(sessionID)
@@ -2305,6 +2334,10 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				continue
 			}
 			logx.Info("ws", "incoming action: connectionID=%s sessionID=%s remoteAddr=%s action=plan_decision decision=%q executionID=%q groupID=%q contextID=%q promptPreview=%q", connectionID, selectedSessionID, remoteAddr, planEvent.Decision, planEvent.ExecutionID, planEvent.GroupID, planEvent.ContextID, wsDebugPreview(planEvent.PromptMessage))
+			if !ackClientAction(selectedSessionID, "plan_decision", planEvent.ClientEvent) {
+				logx.Info("ws", "duplicate client action ignored: connectionID=%s sessionID=%s remoteAddr=%s action=plan_decision clientActionID=%s", connectionID, selectedSessionID, remoteAddr, planEvent.ClientActionID)
+				continue
+			}
 			_, service := runtimeForSession(selectedSessionID)
 			emitAndPersist := emitAndPersistFor(selectedSessionID)
 			req := session.PlanDecisionRequest{

@@ -33,6 +33,11 @@ type Config struct {
 	NodeIdentityStore  *e2ee.NodeIdentityStore
 	DeviceTrust        *e2ee.DeviceTrustStore
 	SelectedRoutes     relay.SelectedRoutePolicy
+	LANHost            string
+	LANPort            string
+	LANToken           string
+	LANCWD             string
+	LANSecureTransport *bool
 }
 
 type ReconnectBackoff struct {
@@ -48,6 +53,11 @@ type PairingReadyEvent struct {
 	ExpiresAt          int64              `json:"expiresAt"`
 	Capabilities       e2ee.CapabilitySet `json:"capabilities"`
 	NodeFingerprintHex string             `json:"nodeFingerprintHex"`
+	LANHost            string             `json:"lanHost,omitempty"`
+	LANPort            string             `json:"lanPort,omitempty"`
+	LANToken           string             `json:"lanToken,omitempty"`
+	LANCWD             string             `json:"lanCwd,omitempty"`
+	LANSecureTransport *bool              `json:"lanSecureTransport,omitempty"`
 }
 
 type LocalPairingEmitter func(string, PairingReadyEvent) error
@@ -155,6 +165,11 @@ func runRegisteredSession(ctx context.Context, cfg Config, handler Handler, emit
 		ExpiresAt:          expiresAt.Unix(),
 		Capabilities:       req.Capabilities,
 		NodeFingerprintHex: nodeFingerprintHex,
+		LANHost:            cfg.LANHost,
+		LANPort:            cfg.LANPort,
+		LANToken:           cfg.LANToken,
+		LANCWD:             cfg.LANCWD,
+		LANSecureTransport: cfg.LANSecureTransport,
 	}); err != nil {
 		_ = conn.Close()
 		_ = store.delete()
