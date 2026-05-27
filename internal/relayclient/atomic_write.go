@@ -40,7 +40,11 @@ func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 	if err := os.Chmod(path, mode); err != nil {
 		return err
 	}
-	return syncDirectory(dir)
+	// Best-effort: dir.Sync() requires SYNCHRONIZE permission on Windows
+	// which is not always available for user directories. The file data
+	// is already safe via tmp.Sync() above.
+	_ = syncDirectory(dir)
+	return nil
 }
 
 func syncDirectory(path string) error {
