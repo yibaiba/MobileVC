@@ -6530,7 +6530,7 @@ func TestLoadSessionRecordReturnsCodexMirrorAfterUpsertWithoutSecondRead(t *test
 	}
 }
 
-func TestLoadSessionRecordSortsMergedCodexMirrorLogEntries(t *testing.T) {
+func TestLoadSessionRecordUsesNativeCodexHistoryOverStaleMirrorCache(t *testing.T) {
 	homeDir := t.TempDir()
 	projectDir := filepath.Join(homeDir, "workspace", "MobileVC")
 	if err := os.MkdirAll(projectDir, 0o755); err != nil {
@@ -6552,20 +6552,15 @@ func TestLoadSessionRecordSortsMergedCodexMirrorLogEntries(t *testing.T) {
 		t.Fatalf("find native thread: %v", err)
 	}
 	record := codexsync.MirrorRecord(thread)
-	record.Projection.LogEntries = append(record.Projection.LogEntries, data.SnapshotLogEntry{
-		Kind:      "markdown",
-		Message:   "Android release APK 已重新打包成功",
-		Timestamp: "2026-05-27T05:54:13Z",
-	})
 	if _, err := fileStore.UpsertSession(context.Background(), record); err != nil {
 		t.Fatalf("upsert mirror session: %v", err)
 	}
 	if _, err := fileStore.SaveProjection(context.Background(), mirrorID, data.ProjectionSnapshot{
-		LogEntries: append(record.Projection.LogEntries, data.SnapshotLogEntry{
+		LogEntries: []data.SnapshotLogEntry{{
 			Kind:      "markdown",
-			Message:   "LAN-first 和 Relay fallback 方案",
-			Timestamp: "2026-05-27T00:13:17Z",
-		}),
+			Message:   "stale cached MobileVC-only message",
+			Timestamp: "2026-05-27T05:54:13Z",
+		}},
 		Runtime: data.SessionRuntime{
 			ResumeSessionID: threadID,
 			Command:         "codex resume " + threadID,
@@ -6581,20 +6576,88 @@ func TestLoadSessionRecordSortsMergedCodexMirrorLogEntries(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load codex mirror session: %v", err)
 	}
-	var oldIndex, latestIndex = -1, -1
-	for i, entry := range loaded.Projection.LogEntries {
-		switch entry.Message {
-		case "LAN-first 和 Relay fallback 方案":
-			oldIndex = i
-		case "Android release APK 已重新打包成功":
-			latestIndex = i
+	foundNative := false
+	for _, entry := range loaded.Projection.LogEntries {
+		if entry.Message == "stale cached MobileVC-only message" {
+			t.Fatalf("expected stale cached mirror log entry to be dropped, got %#v", loaded.Projection.LogEntries)
+		}
+		if strings.Contains(entry.Message, "Mobile labels aligned") {
+			foundNative = true
 		}
 	}
-	if oldIndex == -1 || latestIndex == -1 {
-		t.Fatalf("expected both cached and fresh entries, got %#v", loaded.Projection.LogEntries)
+	if !foundNative {
+		t.Fatalf("expected native codex history to remain authoritative, got %#v", loaded.Projection.LogEntries)
 	}
-	if oldIndex > latestIndex {
-		t.Fatalf("expected older cached entry before latest entry, old=%d latest=%d entries=%#v", oldIndex, latestIndex, loaded.Projection.LogEntries)
+}
+
+func TestLoadSessionRecordUsesNativeClaudeHistoryOverStaleMirrorCache(t *testing.T) {
+	homeDir := t.TempDir()
+	projectDir := filepath.Join(homeDir, "workspace", "ClaudeProject")
+	if err := os.MkdirAll(projectDir, 0o755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
+	}
+	t.Setenv("HOME", homeDir)
+	uuid := "claude-main"
+	if err := claudesync.WriteSessionToJSONL(projectDir, uuid, []claudesync.JSONLEvent{
+		{Type: "user", Text: "native claude prompt", Timestamp: "2026-05-27T01:00:00Z"},
+		{Type: "assistant", Text: "native claude answer", Timestamp: "2026-05-27T01:01:00Z"},
+	}); err != nil {
+		t.Fatalf("write claude fixture: %v", err)
+	}
+
+	fileStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	mirrorID := claudesync.MirrorSessionID(uuid)
+	native, err := claudesync.FindNativeSession(context.Background(), mirrorID)
+	if err != nil {
+		t.Fatalf("find native claude session: %v", err)
+	}
+	record := claudesync.MirrorRecord(native)
+	if _, err := fileStore.UpsertSession(context.Background(), record); err != nil {
+		t.Fatalf("upsert claude mirror session: %v", err)
+	}
+	if _, err := fileStore.SaveProjection(context.Background(), mirrorID, data.ProjectionSnapshot{
+		LogEntries: []data.SnapshotLogEntry{{
+			Kind:      "markdown",
+			Message:   "stale cached claude mirror message",
+			Timestamp: "2026-05-27T02:00:00Z",
+		}},
+		Runtime: data.SessionRuntime{
+			ResumeSessionID: uuid,
+			Command:         "claude --resume " + uuid,
+			Engine:          "claude",
+			CWD:             projectDir,
+			Source:          "claude-native",
+		},
+		SessionContext: data.SessionContext{
+			EnabledSkillNames: []string{"review"},
+			Configured:        true,
+		},
+		SessionContextSet: true,
+	}); err != nil {
+		t.Fatalf("save cached claude projection: %v", err)
+	}
+
+	loaded, err := loadSessionRecord(context.Background(), fileStore, mirrorID)
+	if err != nil {
+		t.Fatalf("load claude mirror session: %v", err)
+	}
+	foundNative := false
+	for _, entry := range loaded.Projection.LogEntries {
+		if entry.Message == "stale cached claude mirror message" {
+			t.Fatalf("expected stale cached claude mirror log entry to be dropped, got %#v", loaded.Projection.LogEntries)
+		}
+		if entry.Message == "native claude answer" {
+			foundNative = true
+		}
+	}
+	if !foundNative {
+		t.Fatalf("expected native claude history to remain authoritative, got %#v", loaded.Projection.LogEntries)
+	}
+	if got := loaded.Projection.SessionContext.EnabledSkillNames; len(got) != 1 || got[0] != "review" {
+		t.Fatalf("expected MobileVC overlay session context to be preserved, got %#v", loaded.Projection.SessionContext)
 	}
 }
 
@@ -6619,7 +6682,7 @@ func TestMergeSnapshotLogEntriesPreservesAppendOrder(t *testing.T) {
 	}
 }
 
-func TestHandlerSessionLoadPreservesCachedCodexMirrorRuntimeState(t *testing.T) {
+func TestHandlerSessionLoadPreservesCodexMirrorOverlayButDropsStaleCachedLogs(t *testing.T) {
 	homeDir := t.TempDir()
 	projectDir := filepath.Join(homeDir, "workspace", "MobileVC")
 	if err := os.MkdirAll(projectDir, 0o755); err != nil {
@@ -6705,16 +6768,11 @@ func TestHandlerSessionLoadPreservesCachedCodexMirrorRuntimeState(t *testing.T) 
 	if !ok {
 		t.Fatalf("expected history log entries, got %#v", history)
 	}
-	foundCachedLog := false
 	for _, raw := range logEntries {
 		entry, _ := raw.(map[string]any)
 		if entry["message"] == "Cached MobileVC follow-up" {
-			foundCachedLog = true
-			break
+			t.Fatalf("expected cached mirror-only log entry to be dropped, got %#v", logEntries)
 		}
-	}
-	if !foundCachedLog {
-		t.Fatalf("expected cached MobileVC log entry to survive native mirror reload, got %#v", logEntries)
 	}
 	resumeMeta, _ := history["resumeRuntimeMeta"].(map[string]any)
 	if resumeMeta["claudeLifecycle"] != "waiting_input" {

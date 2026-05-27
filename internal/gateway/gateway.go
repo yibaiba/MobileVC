@@ -1123,7 +1123,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			// Switch runtime first so merge sees the correct ActiveSession.
 			switchRuntimeSession(record.Summary.ID)
 			trace.Step("switch_runtime")
-			if !activeRuntimeLoad && !codexsync.IsMirrorSessionID(record.Summary.ID) {
+			if !activeRuntimeLoad && !isNativeMirrorSessionID(record.Summary.ID) {
 				record = mergeClaudeJSONLToRecord(ctx, h.SessionStore, record, runtimeSvc)
 				invalidateSessionListCache()
 			}
@@ -1131,7 +1131,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			augmentedProjection := session.NormalizeProjectionSnapshot(record.Projection)
 			runtimeProjection := buildProjectionSnapshotForService(record.Summary.ID, runtimeSvc)
 			trace.Step("build_projection")
-			if codexsync.IsMirrorSessionID(record.Summary.ID) {
+			if isNativeMirrorSessionID(record.Summary.ID) {
 				record.Projection = mergeProjectionWithOptionalRuntime(augmentedProjection, runtimeProjection, runtimeSvc, record.Summary.ID)
 			} else {
 				record.Projection = runtimeProjection
@@ -1233,7 +1233,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			sessionRuntime, sessionRuntimeSvc := runtimeForSession(record.Summary.ID)
 			freshProjection := session.NormalizeProjectionSnapshot(record.Projection)
 			runtimeProjection := finalizeProjectionSnapshotForService(record.Summary.ID, sessionRuntimeSvc, freshProjection)
-			if codexsync.IsMirrorSessionID(record.Summary.ID) {
+			if isNativeMirrorSessionID(record.Summary.ID) {
 				record.Projection = mergeProjectionWithOptionalRuntime(freshProjection, runtimeProjection, sessionRuntimeSvc, record.Summary.ID)
 			} else {
 				record.Projection = runtimeProjection
@@ -1278,13 +1278,13 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			// Re-bind PTY runner output sink to new connection after reconnect.
 			resumeEmitAndPersist := emitAndPersistFor(selectedSessionID)
 			runtimeSvc.SetSink(sessionRuntime.EnsureBufferedSinkWithProcessor(resumeEmitAndPersist))
-			if !codexsync.IsMirrorSessionID(record.Summary.ID) {
+			if !isNativeMirrorSessionID(record.Summary.ID) {
 				record = mergeClaudeJSONLToRecord(ctx, h.SessionStore, record, runtimeSvc)
 			}
 			augmentedProjection := session.NormalizeProjectionSnapshot(record.Projection)
 			runtimeProjection := buildProjectionSnapshotForService(record.Summary.ID, runtimeSvc)
 			projection := runtimeProjection
-			if codexsync.IsMirrorSessionID(record.Summary.ID) {
+			if isNativeMirrorSessionID(record.Summary.ID) {
 				projection = mergeProjectionWithOptionalRuntime(augmentedProjection, runtimeProjection, runtimeSvc, record.Summary.ID)
 			} else if preferAugmentedLogEntries(augmentedProjection.LogEntries, projection.LogEntries) {
 				projection.LogEntries = augmentedProjection.LogEntries
@@ -2902,9 +2902,24 @@ func mergeProjectionWithOptionalRuntime(base data.ProjectionSnapshot, runtimePro
 	if !runtimeActiveForSession {
 		return base
 	}
-	merged := mergeCodexMirrorProjection(base, runtimeProjection)
+	merged := mergeNativeMirrorProjection(base, runtimeProjection, nativeMirrorSourceForSessionID(sessionID))
 	merged.LogEntries = mergeCodexMirrorLogEntries(base.LogEntries, runtimeProjection.LogEntries)
 	return session.NormalizeProjectionSnapshot(merged)
+}
+
+func nativeMirrorSourceForSessionID(sessionID string) string {
+	switch {
+	case claudesync.IsMirrorSessionID(sessionID):
+		return "claude-native"
+	case codexsync.IsMirrorSessionID(sessionID):
+		return "codex-native"
+	default:
+		return "mobilevc"
+	}
+}
+
+func isNativeMirrorSessionID(sessionID string) bool {
+	return claudesync.IsMirrorSessionID(sessionID) || codexsync.IsMirrorSessionID(sessionID)
 }
 
 func sessionRecordRuntimeAlive(record data.SessionRecord, svc *session.Service) bool {
@@ -4454,8 +4469,8 @@ func loadSessionRecord(ctx context.Context, sessionStore data.Store, sessionID s
 		native, nativeErr := claudesync.FindNativeSession(ctx, sessionID)
 		if nativeErr == nil {
 			record := claudesync.MirrorRecord(native)
-			if existingErr == nil && len(existing.Projection.LogEntries) > len(record.Projection.LogEntries) {
-				record.Projection.LogEntries = existing.Projection.LogEntries
+			if existingErr == nil {
+				record = mergeNativeMirrorRecord(record, existing, "claude-native")
 			}
 			summary, upsertErr := sessionStore.UpsertSession(ctx, record)
 			if upsertErr != nil {
@@ -4483,7 +4498,7 @@ func loadSessionRecord(ctx context.Context, sessionStore data.Store, sessionID s
 	if nativeErr == nil {
 		record := codexsync.MirrorRecord(thread)
 		if existingErr == nil {
-			record = mergeCodexMirrorRecord(record, existing)
+			record = mergeNativeMirrorRecord(record, existing, "codex-native")
 		}
 		summary, upsertErr := sessionStore.UpsertSession(ctx, record)
 		if upsertErr != nil {
@@ -4564,49 +4579,26 @@ func augmentLocalClaudeRecordFromNative(ctx context.Context, record data.Session
 	return augmented
 }
 
-func mergeCodexMirrorRecord(fresh data.SessionRecord, existing data.SessionRecord) data.SessionRecord {
-	fresh.Projection = mergeCodexMirrorProjection(fresh.Projection, existing.Projection)
+func mergeNativeMirrorRecord(fresh data.SessionRecord, existing data.SessionRecord, source string) data.SessionRecord {
+	fresh.Projection = mergeNativeMirrorProjection(fresh.Projection, existing.Projection, source)
 	fresh.Summary.CreatedAt = laterNonZeroTime(fresh.Summary.CreatedAt, existing.Summary.CreatedAt)
 	fresh.Summary.UpdatedAt = laterNonZeroTime(fresh.Summary.UpdatedAt, existing.Summary.UpdatedAt)
 	fresh.Summary.Runtime = session.MergeStoreSessionRuntime(data.SessionRuntime{}, fresh.Projection.Runtime)
 	if fresh.Summary.Runtime.Source == "" {
-		fresh.Summary.Runtime.Source = "codex-native"
+		fresh.Summary.Runtime.Source = source
 	}
-	fresh.Summary.Source = firstNonEmptyString(fresh.Summary.Source, existing.Summary.Source, "codex-native")
+	fresh.Summary.Source = firstNonEmptyString(fresh.Summary.Source, existing.Summary.Source, source)
 	fresh.Summary.External = true
+	if fresh.Summary.Ownership == "" {
+		fresh.Summary.Ownership = source
+	}
+	fresh.ClientActions = existing.ClientActions
 	return fresh
 }
 
-func preserveCodexMirrorLocalSettings(fresh data.ProjectionSnapshot, existing data.ProjectionSnapshot) data.ProjectionSnapshot {
+func preserveNativeMirrorLocalSettings(fresh data.ProjectionSnapshot, existing data.ProjectionSnapshot) data.ProjectionSnapshot {
 	fresh = session.NormalizeProjectionSnapshot(fresh)
 	existing = session.NormalizeProjectionSnapshot(existing)
-	fresh.SessionContext = existing.SessionContext
-	fresh.SessionContextSet = existing.SessionContext.Configured
-	fresh.PermissionRulesEnabled = existing.PermissionRulesEnabled
-	if len(existing.PermissionRules) > 0 {
-		fresh.PermissionRules = existing.PermissionRules
-	}
-	fresh.SkillCatalogMeta = existing.SkillCatalogMeta
-	fresh.MemoryCatalogMeta = existing.MemoryCatalogMeta
-	return session.NormalizeProjectionSnapshot(fresh)
-}
-
-func mergeCodexMirrorProjection(fresh data.ProjectionSnapshot, existing data.ProjectionSnapshot) data.ProjectionSnapshot {
-	fresh = session.NormalizeProjectionSnapshot(fresh)
-	existing = session.NormalizeProjectionSnapshot(existing)
-
-	fresh.LogEntries = mergeCodexMirrorLogEntries(fresh.LogEntries, existing.LogEntries)
-	fresh.RawTerminalByStream = mergeRawTerminalByStream(fresh.RawTerminalByStream, existing.RawTerminalByStream)
-	fresh.TerminalExecutions = mergeTerminalExecutions(fresh.TerminalExecutions, existing.TerminalExecutions)
-	fresh.Controller = mergeCodexMirrorController(fresh.Controller, existing.Controller)
-	fresh.Runtime = mergeCodexMirrorRuntime(fresh.Runtime, existing.Runtime)
-	if fresh.ContextWindowUsage.TokenLimit <= 0 {
-		fresh.ContextWindowUsage = existing.ContextWindowUsage
-	}
-	if fresh.Runtime.Source == "" {
-		fresh.Runtime.Source = "codex-native"
-	}
-
 	if len(existing.Diffs) > 0 {
 		fresh.Diffs = existing.Diffs
 	}
@@ -4637,22 +4629,41 @@ func mergeCodexMirrorProjection(fresh data.ProjectionSnapshot, existing data.Pro
 	return session.NormalizeProjectionSnapshot(fresh)
 }
 
-func mergeCodexMirrorRuntime(fresh data.SessionRuntime, existing data.SessionRuntime) data.SessionRuntime {
-	merged := session.MergeStoreSessionRuntime(fresh, existing)
-	if !strings.EqualFold(strings.TrimSpace(merged.Engine), "codex") {
-		merged.Engine = firstNonEmptyString(fresh.Engine, "codex")
+func mergeNativeMirrorProjection(fresh data.ProjectionSnapshot, existing data.ProjectionSnapshot, source string) data.ProjectionSnapshot {
+	fresh = preserveNativeMirrorLocalSettings(fresh, existing)
+	fresh.RawTerminalByStream = mergeRawTerminalByStream(fresh.RawTerminalByStream, existing.RawTerminalByStream)
+	fresh.TerminalExecutions = mergeTerminalExecutions(fresh.TerminalExecutions, existing.TerminalExecutions)
+	fresh.Controller = mergeNativeMirrorController(fresh.Controller, existing.Controller, source)
+	fresh.Runtime = mergeNativeMirrorRuntime(fresh.Runtime, existing.Runtime, source)
+	if fresh.ContextWindowUsage.TokenLimit <= 0 {
+		fresh.ContextWindowUsage = existing.ContextWindowUsage
 	}
-	if !isCodexMirrorRuntimeCommand(merged.Command) {
+	if fresh.Runtime.Source == "" {
+		fresh.Runtime.Source = source
+	}
+	return session.NormalizeProjectionSnapshot(fresh)
+}
+
+func mergeNativeMirrorRuntime(fresh data.SessionRuntime, existing data.SessionRuntime, source string) data.SessionRuntime {
+	merged := session.MergeStoreSessionRuntime(fresh, existing)
+	expectedEngine := strings.TrimSuffix(source, "-native")
+	if !strings.EqualFold(strings.TrimSpace(merged.Engine), expectedEngine) {
+		merged.Engine = firstNonEmptyString(fresh.Engine, expectedEngine)
+	}
+	if source == "codex-native" && !isCodexMirrorRuntimeCommand(merged.Command) {
 		merged.Command = firstNonEmptyString(fresh.Command, "codex")
+	}
+	if source == "claude-native" && !isClaudeMirrorRuntimeCommand(merged.Command) {
+		merged.Command = firstNonEmptyString(fresh.Command, "claude")
 	}
 	if strings.TrimSpace(merged.ResumeSessionID) != strings.TrimSpace(fresh.ResumeSessionID) {
 		merged.ResumeSessionID = fresh.ResumeSessionID
 	}
-	merged.Source = firstNonEmptyString(fresh.Source, merged.Source, "codex-native")
+	merged.Source = firstNonEmptyString(fresh.Source, merged.Source, source)
 	return merged
 }
 
-func mergeCodexMirrorController(fresh session.ControllerSnapshot, existing session.ControllerSnapshot) session.ControllerSnapshot {
+func mergeNativeMirrorController(fresh session.ControllerSnapshot, existing session.ControllerSnapshot, source string) session.ControllerSnapshot {
 	merged := session.MergeControllerSnapshot(fresh, existing)
 	merged.ResumeSession = firstNonEmptyString(fresh.ResumeSession, merged.ResumeSession)
 	merged.CurrentCommand = firstNonEmptyString(fresh.CurrentCommand, merged.CurrentCommand)
@@ -4661,13 +4672,17 @@ func mergeCodexMirrorController(fresh session.ControllerSnapshot, existing sessi
 		Command:         fresh.ActiveMeta.Command,
 		Engine:          fresh.ActiveMeta.Engine,
 		CWD:             fresh.ActiveMeta.CWD,
-		Source:          firstNonEmptyString(fresh.ActiveMeta.Source, "codex-native"),
+		Source:          firstNonEmptyString(fresh.ActiveMeta.Source, source),
 	})
-	if !strings.EqualFold(strings.TrimSpace(merged.ActiveMeta.Engine), "codex") {
-		merged.ActiveMeta.Engine = firstNonEmptyString(fresh.ActiveMeta.Engine, "codex")
+	expectedEngine := strings.TrimSuffix(source, "-native")
+	if !strings.EqualFold(strings.TrimSpace(merged.ActiveMeta.Engine), expectedEngine) {
+		merged.ActiveMeta.Engine = firstNonEmptyString(fresh.ActiveMeta.Engine, expectedEngine)
 	}
-	if !isCodexMirrorRuntimeCommand(merged.ActiveMeta.Command) {
+	if source == "codex-native" && !isCodexMirrorRuntimeCommand(merged.ActiveMeta.Command) {
 		merged.ActiveMeta.Command = firstNonEmptyString(fresh.ActiveMeta.Command, "codex")
+	}
+	if source == "claude-native" && !isClaudeMirrorRuntimeCommand(merged.ActiveMeta.Command) {
+		merged.ActiveMeta.Command = firstNonEmptyString(fresh.ActiveMeta.Command, "claude")
 	}
 	if strings.TrimSpace(merged.ActiveMeta.ResumeSessionID) != strings.TrimSpace(fresh.ActiveMeta.ResumeSessionID) {
 		merged.ActiveMeta.ResumeSessionID = fresh.ActiveMeta.ResumeSessionID
@@ -4678,6 +4693,11 @@ func mergeCodexMirrorController(fresh session.ControllerSnapshot, existing sessi
 func isCodexMirrorRuntimeCommand(command string) bool {
 	trimmed := strings.ToLower(strings.TrimSpace(command))
 	return trimmed == "codex" || strings.HasPrefix(trimmed, "codex ")
+}
+
+func isClaudeMirrorRuntimeCommand(command string) bool {
+	trimmed := strings.ToLower(strings.TrimSpace(command))
+	return trimmed == "claude" || strings.HasPrefix(trimmed, "claude ")
 }
 
 func mergeSnapshotLogEntries(base []data.SnapshotLogEntry, overlay []data.SnapshotLogEntry) []data.SnapshotLogEntry {
