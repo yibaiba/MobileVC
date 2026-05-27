@@ -2833,6 +2833,51 @@ func TestSessionHistoryNormalizesStaleStartingToResumable(t *testing.T) {
 	}
 }
 
+func TestHandlerSessionLoadCollapsesAdjacentDuplicateLogEntries(t *testing.T) {
+	h := newTestHandler()
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	h.SessionStore = tempStore
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+	sessionID := createHistorySessionForHandlerTest(t, h, conn, "duplicate-history")
+	if _, err := tempStore.SaveProjection(context.Background(), sessionID, data.ProjectionSnapshot{
+		RawTerminalByStream: map[string]string{"stdout": "", "stderr": ""},
+		LogEntries: []data.SnapshotLogEntry{
+			{Kind: "user", Message: "重复输入", Timestamp: "2026-05-27T08:01:59Z"},
+			{Kind: "user", Message: "重复输入", Timestamp: "2026-05-27T08:01:59Z"},
+			{Kind: "markdown", Message: "重复回复", Timestamp: "2026-05-27T08:02:16Z"},
+			{Kind: "markdown", Message: "重复回复", Timestamp: "2026-05-27T08:02:16Z"},
+		},
+		Runtime: data.SessionRuntime{Source: "mobilevc"},
+	}); err != nil {
+		t.Fatalf("save duplicate projection: %v", err)
+	}
+
+	if err := conn.WriteJSON(protocol.SessionLoadRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_load"},
+		SessionID:   sessionID,
+	}); err != nil {
+		t.Fatalf("write session_load request: %v", err)
+	}
+	history := readUntilSessionHistory(t, conn)
+	entries, ok := history["logEntries"].([]any)
+	if !ok {
+		t.Fatalf("expected logEntries payload, got %#v", history)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected duplicate history entries to collapse, got %#v", entries)
+	}
+	first, _ := entries[0].(map[string]any)
+	second, _ := entries[1].(map[string]any)
+	if first["message"] != "重复输入" || second["message"] != "重复回复" {
+		t.Fatalf("unexpected deduped history entries: %#v", entries)
+	}
+	closeConnAndCleanupRuntime(t, conn, h)
+}
+
 func TestProjectionHistoryIncludesTerminalExecutions(t *testing.T) {
 	executionID := "exec-test-1"
 	snapshot := data.ProjectionSnapshot{RawTerminalByStream: map[string]string{"stdout": "", "stderr": ""}}
@@ -6482,6 +6527,95 @@ func TestLoadSessionRecordReturnsCodexMirrorAfterUpsertWithoutSecondRead(t *test
 	}
 	if got := store.getCallCount(); got != 1 {
 		t.Fatalf("expected only the initial cache lookup GetSession call, got %d", got)
+	}
+}
+
+func TestLoadSessionRecordSortsMergedCodexMirrorLogEntries(t *testing.T) {
+	homeDir := t.TempDir()
+	projectDir := filepath.Join(homeDir, "workspace", "MobileVC")
+	if err := os.MkdirAll(projectDir, 0o755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
+	}
+	t.Setenv("HOME", homeDir)
+	t.Setenv("USERPROFILE", homeDir)
+	t.Setenv("HOMEDRIVE", "")
+	t.Setenv("HOMEPATH", "")
+	threadID := seedNativeCodexSessionFixture(t, homeDir, projectDir)
+
+	fileStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	mirrorID := "codex-thread:" + threadID
+	thread, err := codexsync.FindNativeThread(context.Background(), threadID)
+	if err != nil {
+		t.Fatalf("find native thread: %v", err)
+	}
+	record := codexsync.MirrorRecord(thread)
+	record.Projection.LogEntries = append(record.Projection.LogEntries, data.SnapshotLogEntry{
+		Kind:      "markdown",
+		Message:   "Android release APK 已重新打包成功",
+		Timestamp: "2026-05-27T05:54:13Z",
+	})
+	if _, err := fileStore.UpsertSession(context.Background(), record); err != nil {
+		t.Fatalf("upsert mirror session: %v", err)
+	}
+	if _, err := fileStore.SaveProjection(context.Background(), mirrorID, data.ProjectionSnapshot{
+		LogEntries: append(record.Projection.LogEntries, data.SnapshotLogEntry{
+			Kind:      "markdown",
+			Message:   "LAN-first 和 Relay fallback 方案",
+			Timestamp: "2026-05-27T00:13:17Z",
+		}),
+		Runtime: data.SessionRuntime{
+			ResumeSessionID: threadID,
+			Command:         "codex resume " + threadID,
+			Engine:          "codex",
+			CWD:             projectDir,
+			Source:          "codex-native",
+		},
+	}); err != nil {
+		t.Fatalf("save cached projection: %v", err)
+	}
+
+	loaded, err := loadSessionRecord(context.Background(), fileStore, mirrorID)
+	if err != nil {
+		t.Fatalf("load codex mirror session: %v", err)
+	}
+	var oldIndex, latestIndex = -1, -1
+	for i, entry := range loaded.Projection.LogEntries {
+		switch entry.Message {
+		case "LAN-first 和 Relay fallback 方案":
+			oldIndex = i
+		case "Android release APK 已重新打包成功":
+			latestIndex = i
+		}
+	}
+	if oldIndex == -1 || latestIndex == -1 {
+		t.Fatalf("expected both cached and fresh entries, got %#v", loaded.Projection.LogEntries)
+	}
+	if oldIndex > latestIndex {
+		t.Fatalf("expected older cached entry before latest entry, old=%d latest=%d entries=%#v", oldIndex, latestIndex, loaded.Projection.LogEntries)
+	}
+}
+
+func TestMergeSnapshotLogEntriesPreservesAppendOrder(t *testing.T) {
+	merged := mergeSnapshotLogEntries(
+		[]data.SnapshotLogEntry{{
+			Kind:      "markdown",
+			Message:   "new runtime state",
+			Timestamp: "2026-05-27T05:54:13Z",
+		}},
+		[]data.SnapshotLogEntry{{
+			Kind:      "markdown",
+			Message:   "older cached state",
+			Timestamp: "2026-05-27T00:13:17Z",
+		}},
+	)
+	if len(merged) != 2 {
+		t.Fatalf("expected two merged entries, got %#v", merged)
+	}
+	if merged[0].Message != "new runtime state" || merged[1].Message != "older cached state" {
+		t.Fatalf("expected append order to be preserved for generic merge, got %#v", merged)
 	}
 }
 

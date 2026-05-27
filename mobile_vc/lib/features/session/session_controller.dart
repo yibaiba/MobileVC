@@ -6029,10 +6029,15 @@ class SessionController extends ChangeNotifier {
         _sessionEventCursors[sessionId] = delta.latest.eventCursor;
       }
     }
+    final appendLogEntries = _sortedHistoryLogEntries(delta.appendLogEntries);
+    final shouldApplyAppendLogEntries =
+        !_isStaleDeltaAppendForCurrentKnown(delta);
     if (delta.sessionId.trim().isNotEmpty) {
       _sessionDeltaKnown[delta.sessionId.trim()] = delta.latest;
     }
-    for (final entry in delta.appendLogEntries) {
+    for (final entry in shouldApplyAppendLogEntries
+        ? appendLogEntries
+        : const <HistoryLogEntry>[]) {
       _appendHistoryTimelineEntry(entry, delta.resumeRuntimeMeta);
     }
     for (final diff in delta.upsertDiffs) {
@@ -6107,9 +6112,60 @@ class SessionController extends ChangeNotifier {
   ) {
     _timeline.clear();
     _isCompacting = false;
-    for (final entry in entries) {
+    final sortedEntries = _sortedHistoryLogEntries(entries);
+    for (final entry in sortedEntries) {
       _appendHistoryTimelineEntry(entry, resumeMeta);
     }
+  }
+
+  List<HistoryLogEntry> _sortedHistoryLogEntries(
+    List<HistoryLogEntry> entries,
+  ) {
+    final indexed = entries.indexed.toList(growable: false);
+    indexed.sort((left, right) {
+      final leftTimestamp = _historyLogEntryTimestamp(left.$2);
+      final rightTimestamp = _historyLogEntryTimestamp(right.$2);
+      if (leftTimestamp == null || rightTimestamp == null) {
+        return left.$1.compareTo(right.$1);
+      }
+      final timestampOrder = leftTimestamp.compareTo(rightTimestamp);
+      if (timestampOrder != 0) {
+        return timestampOrder;
+      }
+      return left.$1.compareTo(right.$1);
+    });
+    return indexed.map((entry) => entry.$2).toList(growable: false);
+  }
+
+  DateTime? _historyLogEntryTimestamp(HistoryLogEntry entry) {
+    final direct = DateTime.tryParse(entry.timestamp.trim());
+    if (direct != null) {
+      return direct;
+    }
+    return DateTime.tryParse(entry.context?.timestamp.trim() ?? '');
+  }
+
+  bool _isStaleDeltaAppendForCurrentKnown(SessionDeltaEvent delta) {
+    if (delta.appendLogEntries.isEmpty) {
+      return false;
+    }
+    final sessionId = delta.sessionId.trim();
+    if (sessionId.isEmpty) {
+      return false;
+    }
+    final known = _sessionDeltaKnown[sessionId];
+    if (known == null) {
+      return false;
+    }
+    if (delta.base.eventCursor > 0 &&
+        known.eventCursor > 0 &&
+        delta.base.eventCursor < known.eventCursor) {
+      return true;
+    }
+    if (delta.base.logEntryCount < known.logEntryCount) {
+      return true;
+    }
+    return false;
   }
 
   void _appendHistoryTimelineEntry(

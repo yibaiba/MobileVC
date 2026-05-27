@@ -2903,7 +2903,7 @@ func mergeProjectionWithOptionalRuntime(base data.ProjectionSnapshot, runtimePro
 		return base
 	}
 	merged := mergeCodexMirrorProjection(base, runtimeProjection)
-	merged.LogEntries = mergeSnapshotLogEntries(base.LogEntries, runtimeProjection.LogEntries)
+	merged.LogEntries = mergeCodexMirrorLogEntries(base.LogEntries, runtimeProjection.LogEntries)
 	return session.NormalizeProjectionSnapshot(merged)
 }
 
@@ -4595,7 +4595,7 @@ func mergeCodexMirrorProjection(fresh data.ProjectionSnapshot, existing data.Pro
 	fresh = session.NormalizeProjectionSnapshot(fresh)
 	existing = session.NormalizeProjectionSnapshot(existing)
 
-	fresh.LogEntries = mergeSnapshotLogEntries(fresh.LogEntries, existing.LogEntries)
+	fresh.LogEntries = mergeCodexMirrorLogEntries(fresh.LogEntries, existing.LogEntries)
 	fresh.RawTerminalByStream = mergeRawTerminalByStream(fresh.RawTerminalByStream, existing.RawTerminalByStream)
 	fresh.TerminalExecutions = mergeTerminalExecutions(fresh.TerminalExecutions, existing.TerminalExecutions)
 	fresh.Controller = mergeCodexMirrorController(fresh.Controller, existing.Controller)
@@ -4698,6 +4698,70 @@ func mergeSnapshotLogEntries(base []data.SnapshotLogEntry, overlay []data.Snapsh
 		seen[key] = struct{}{}
 	}
 	return merged
+}
+
+func mergeCodexMirrorLogEntries(base []data.SnapshotLogEntry, overlay []data.SnapshotLogEntry) []data.SnapshotLogEntry {
+	return sortSnapshotLogEntriesByTime(mergeSnapshotLogEntries(base, overlay))
+}
+
+func sortSnapshotLogEntriesByTime(entries []data.SnapshotLogEntry) []data.SnapshotLogEntry {
+	indexed := make([]struct {
+		index int
+		entry data.SnapshotLogEntry
+		time  time.Time
+	}, 0, len(entries))
+	for i, entry := range entries {
+		indexed = append(indexed, struct {
+			index int
+			entry data.SnapshotLogEntry
+			time  time.Time
+		}{
+			index: i,
+			entry: entry,
+			time:  snapshotLogEntryTime(entry),
+		})
+	}
+	sort.SliceStable(indexed, func(i, j int) bool {
+		left := indexed[i]
+		right := indexed[j]
+		if left.time.IsZero() || right.time.IsZero() {
+			return left.index < right.index
+		}
+		if left.time.Equal(right.time) {
+			return left.index < right.index
+		}
+		return left.time.Before(right.time)
+	})
+	sorted := make([]data.SnapshotLogEntry, 0, len(indexed))
+	for _, item := range indexed {
+		sorted = append(sorted, item.entry)
+	}
+	return sorted
+}
+
+func snapshotLogEntryTime(entry data.SnapshotLogEntry) time.Time {
+	for _, raw := range []string{
+		strings.TrimSpace(entry.Timestamp),
+		snapshotContextTimestamp(entry.Context),
+	} {
+		if raw == "" {
+			continue
+		}
+		if parsed, err := time.Parse(time.RFC3339Nano, raw); err == nil {
+			return parsed
+		}
+		if parsed, err := time.Parse(time.RFC3339, raw); err == nil {
+			return parsed
+		}
+	}
+	return time.Time{}
+}
+
+func snapshotContextTimestamp(context *data.SnapshotContext) string {
+	if context == nil {
+		return ""
+	}
+	return strings.TrimSpace(context.Timestamp)
 }
 
 func snapshotLogEntryKey(entry data.SnapshotLogEntry) string {

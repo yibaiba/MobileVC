@@ -575,6 +575,7 @@ func normalizeProjection(projection ProjectionSnapshot) ProjectionSnapshot {
 	if projection.LogEntries == nil {
 		projection.LogEntries = []SnapshotLogEntry{}
 	}
+	projection.LogEntries = dedupeAdjacentLogEntries(projection.LogEntries)
 	if projection.TerminalExecutions == nil {
 		projection.TerminalExecutions = []TerminalExecution{}
 	}
@@ -590,6 +591,95 @@ func normalizeProjection(projection ProjectionSnapshot) ProjectionSnapshot {
 	projection.SkillCatalogMeta = normalizeCatalogMetadata(projection.SkillCatalogMeta, CatalogDomainSkill)
 	projection.MemoryCatalogMeta = normalizeCatalogMetadata(projection.MemoryCatalogMeta, CatalogDomainMemory)
 	return projection
+}
+
+func dedupeAdjacentLogEntries(entries []SnapshotLogEntry) []SnapshotLogEntry {
+	if len(entries) < 2 {
+		return entries
+	}
+	out := make([]SnapshotLogEntry, 0, len(entries))
+	for _, entry := range entries {
+		if len(out) > 0 && equivalentAdjacentLogEntry(out[len(out)-1], entry) {
+			continue
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
+func equivalentAdjacentLogEntry(left SnapshotLogEntry, right SnapshotLogEntry) bool {
+	if left.Kind != right.Kind {
+		return false
+	}
+	switch left.Kind {
+	case "markdown", "system", "user":
+		return displayLogEntryDedupeKey(left) == displayLogEntryDedupeKey(right)
+	default:
+		return snapshotLogEntryDedupeKey(left) == snapshotLogEntryDedupeKey(right)
+	}
+}
+
+func displayLogEntryDedupeKey(entry SnapshotLogEntry) string {
+	return strings.Join([]string{
+		entry.Kind,
+		logEntryDisplayTimestamp(entry),
+		normalizeLogEntryText(logEntryDisplayText(entry)),
+	}, "\x1f")
+}
+
+func snapshotLogEntryDedupeKey(entry SnapshotLogEntry) string {
+	exitCode := ""
+	if entry.ExitCode != nil {
+		exitCode = fmt.Sprintf("%d", *entry.ExitCode)
+	}
+	contextFields := []string{"", "", "", "", "", "", "", "", "", "", ""}
+	if entry.Context != nil {
+		contextFields = []string{
+			entry.Context.ID,
+			entry.Context.Type,
+			entry.Context.Path,
+			entry.Context.Title,
+			entry.Context.Message,
+			entry.Context.Target,
+			entry.Context.TargetPath,
+			entry.Context.Tool,
+			entry.Context.Command,
+			entry.Context.Source,
+			entry.Context.ExecutionID,
+		}
+	}
+	fields := []string{
+		entry.Kind,
+		logEntryDisplayTimestamp(entry),
+		normalizeLogEntryText(logEntryDisplayText(entry)),
+		entry.Label,
+		entry.Stream,
+		entry.ExecutionID,
+		entry.Phase,
+		exitCode,
+	}
+	fields = append(fields, contextFields...)
+	return strings.Join(fields, "\x1f")
+}
+
+func logEntryDisplayTimestamp(entry SnapshotLogEntry) string {
+	contextTimestamp := ""
+	if entry.Context != nil {
+		contextTimestamp = strings.TrimSpace(entry.Context.Timestamp)
+	}
+	return firstNonEmptyString(strings.TrimSpace(entry.Timestamp), contextTimestamp)
+}
+
+func logEntryDisplayText(entry SnapshotLogEntry) string {
+	text := firstNonEmptyString(entry.Message, entry.Text)
+	if text == "" && entry.Context != nil {
+		text = entry.Context.Message
+	}
+	return text
+}
+
+func normalizeLogEntryText(text string) string {
+	return strings.Join(strings.Fields(strings.TrimSpace(text)), " ")
 }
 
 func normalizeSessionRecord(record SessionRecord) SessionRecord {

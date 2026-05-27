@@ -3044,7 +3044,9 @@ class _ConnectionDot extends StatelessWidget {
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     final color = connected ? const Color(0xFF22C55E) : scheme.outline;
-    return Row(
+    final normalizedLabel = label.trim();
+    final compactLabel = _compactTransportLabel(normalizedLabel);
+    final indicator = Row(
       mainAxisSize: MainAxisSize.min,
       children: [
         Container(
@@ -3062,10 +3064,11 @@ class _ConnectionDot extends StatelessWidget {
             ],
           ),
         ),
-        if (connected && label.trim().isNotEmpty) ...[
-          const SizedBox(width: 6),
+        if (connected && compactLabel.isNotEmpty) ...[
+          const SizedBox(width: 4),
           Text(
-            label,
+            compactLabel,
+            key: const ValueKey('connection-transport-label'),
             style: Theme.of(context).textTheme.labelSmall?.copyWith(
                   color: scheme.onSurfaceVariant,
                   fontWeight: FontWeight.w700,
@@ -3074,7 +3077,22 @@ class _ConnectionDot extends StatelessWidget {
         ],
       ],
     );
+    if (!connected || normalizedLabel.isEmpty) {
+      return indicator;
+    }
+    return Tooltip(
+      message: normalizedLabel,
+      child: indicator,
+    );
   }
+}
+
+String _compactTransportLabel(String label) {
+  return switch (label.toLowerCase()) {
+    'lan' => 'L',
+    'relay' => 'R',
+    _ => label,
+  };
 }
 
 String _iceHostLiteral(String rawHost) {

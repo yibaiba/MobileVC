@@ -214,6 +214,35 @@ void main() {
 
     await controller.disposeController();
   });
+
+  testWidgets('顶部连接路径使用紧凑标识避免挤压标题', (tester) async {
+    final service = _FakeMobileVcWsService();
+    final controller = SessionController(service: service);
+    addTearDown(controller.disposeController);
+
+    await controller.saveConfig(const AppConfig(
+      connectionMode: 'relay',
+      relayUrl: 'wss://relay.example.test',
+      relaySessionId: 'rs_test',
+      relayPairingSecret: 'pair_secret',
+      relayPairingExpiresAt: 1760000000,
+    ));
+    await controller.connect();
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SessionHomePage(controller: controller),
+      ),
+    );
+    await _pumpFrames(tester);
+
+    expect(
+      find.byKey(const ValueKey('connection-transport-label')),
+      findsOneWidget,
+    );
+    expect(find.text('R'), findsOneWidget);
+    expect(find.text('Relay'), findsNothing);
+  });
 }
 
 final _timestamp = DateTime(2026, 1, 1);

@@ -10445,8 +10445,7 @@ void main() {
       expect(inputPayload['data'], '继续当前会话\n');
     });
 
-    test(
-        'other session runtime events do not overwrite active chat context',
+    test('other session runtime events do not overwrite active chat context',
         () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);
@@ -10666,6 +10665,44 @@ void main() {
           reason: '主界面不能在 loadSession 之后仍停留在 logo');
       expect(controller.timeline.any((item) => item.body.contains('历史里的助手回复')),
           isTrue);
+    });
+
+    test('session_history 使用时间升序恢复 timeline，避免旧记录叠到最新消息后面', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        logEntries: const [
+          HistoryLogEntry(
+            kind: 'markdown',
+            message: 'Android release APK 已重新打包成功',
+            timestamp: '2026-05-27T05:53:00Z',
+          ),
+          HistoryLogEntry(
+            kind: 'user',
+            message: 'LAN-first 和 Relay fallback 方案',
+            timestamp: '2026-05-27T05:20:00Z',
+          ),
+        ],
+        resumeRuntimeMeta: RuntimeMeta(command: 'claude'),
+      ));
+      await _flushEvents();
+
+      expect(
+        controller.timeline.map((item) => item.body).toList(),
+        containsAllInOrder([
+          'LAN-first 和 Relay fallback 方案',
+          'Android release APK 已重新打包成功',
+        ]),
+      );
     });
 
     test('loadSession 匹配 history 后先显示 timeline 再异步刷新目录和 delta', () async {
@@ -10907,6 +10944,55 @@ void main() {
         isTrue,
         reason: 'history_loaded is the first post-history sync and must bypass '
             'the short duplicate-request coalesce window',
+      );
+    });
+
+    test('stale session_delta 不会把旧历史追加到当前最新消息后面', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        logEntries: const [
+          HistoryLogEntry(
+            kind: 'markdown',
+            message: 'Android release APK 已重新打包成功',
+            timestamp: '2026-05-27T05:53:00Z',
+          ),
+        ],
+        resumeRuntimeMeta: RuntimeMeta(command: 'claude'),
+      ));
+      await _flushEvents();
+
+      service.emit(SessionDeltaEvent(
+        timestamp: _timestamp.add(const Duration(seconds: 1)),
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_delta'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        base: const SessionDeltaKnown(eventCursor: 1, logEntryCount: 0),
+        latest: const SessionDeltaKnown(eventCursor: 3, logEntryCount: 2),
+        appendLogEntries: const [
+          HistoryLogEntry(
+            kind: 'user',
+            message: 'LAN-first 和 Relay fallback 方案',
+            timestamp: '2026-05-27T05:20:00Z',
+          ),
+        ],
+        resumeRuntimeMeta: RuntimeMeta(command: 'claude'),
+      ));
+      await _flushEvents();
+
+      expect(
+        controller.timeline.map((item) => item.body).toList(),
+        ['Android release APK 已重新打包成功'],
       );
     });
 

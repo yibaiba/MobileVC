@@ -361,6 +361,129 @@ func TestFileStoreSaveProjectionDerivesTitleAndPreviewFromMeaningfulUserInput(t 
 	}
 }
 
+func TestFileStoreSaveProjectionCollapsesExactAdjacentDuplicateLogEntries(t *testing.T) {
+	fs, err := NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new file store: %v", err)
+	}
+	created, err := fs.CreateSession(context.Background(), "dedupe logs")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	summary, err := fs.SaveProjection(context.Background(), created.ID, ProjectionSnapshot{
+		RawTerminalByStream: map[string]string{"stdout": "", "stderr": ""},
+		LogEntries: []SnapshotLogEntry{
+			{Kind: "user", Message: "a", Timestamp: "2026-05-27T08:01:59Z"},
+			{Kind: "user", Message: "a", Label: "回复", Timestamp: "2026-05-27T08:01:59Z"},
+			{Kind: "markdown", Message: "同一回复", Timestamp: "2026-05-27T08:02:16Z"},
+			{
+				Kind:        "markdown",
+				Message:     "同一回复",
+				Timestamp:   "2026-05-27T08:02:16Z",
+				Stream:      "stdout",
+				ExecutionID: "exec-1",
+				Phase:       "stdout",
+				Context: &SnapshotContext{
+					ID:          "hook-1",
+					Title:       "同一回复",
+					Timestamp:   "2026-05-27T08:02:16Z",
+					ExecutionID: "exec-1",
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("save projection: %v", err)
+	}
+	if summary.EntryCount != 2 {
+		t.Fatalf("expected deduped entry count, got %#v", summary)
+	}
+	record, err := fs.GetSession(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	if got := len(record.Projection.LogEntries); got != 2 {
+		t.Fatalf("expected two deduped entries, got %d: %#v", got, record.Projection.LogEntries)
+	}
+	if record.Projection.LogEntries[0].Kind != "user" || record.Projection.LogEntries[1].Kind != "markdown" {
+		t.Fatalf("unexpected deduped entries: %#v", record.Projection.LogEntries)
+	}
+}
+
+func TestFileStoreSaveProjectionKeepsLegitimateRepeatedLogEntries(t *testing.T) {
+	fs, err := NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new file store: %v", err)
+	}
+	created, err := fs.CreateSession(context.Background(), "keep repeats")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	if _, err := fs.SaveProjection(context.Background(), created.ID, ProjectionSnapshot{
+		RawTerminalByStream: map[string]string{"stdout": "", "stderr": ""},
+		LogEntries: []SnapshotLogEntry{
+			{Kind: "user", Message: "a", Timestamp: "2026-05-27T08:01:59Z"},
+			{Kind: "user", Message: "a", Timestamp: "2026-05-27T08:02:00Z"},
+			{Kind: "markdown", Message: "分隔回复", Timestamp: "2026-05-27T08:02:01Z"},
+			{Kind: "user", Message: "a", Timestamp: "2026-05-27T08:01:59Z"},
+		},
+	}); err != nil {
+		t.Fatalf("save projection: %v", err)
+	}
+	record, err := fs.GetSession(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	if got := len(record.Projection.LogEntries); got != 4 {
+		t.Fatalf("expected repeated but distinct entries to remain, got %d: %#v", got, record.Projection.LogEntries)
+	}
+}
+
+func TestFileStoreGetSessionNormalizesLegacyAdjacentDuplicateLogEntries(t *testing.T) {
+	fs, err := NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new file store: %v", err)
+	}
+	created, err := fs.CreateSession(context.Background(), "legacy dupes")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	legacy := SessionRecord{
+		Summary: SessionSummary{
+			ID:        created.ID,
+			Title:     "legacy dupes",
+			CreatedAt: created.CreatedAt,
+			UpdatedAt: created.UpdatedAt,
+			Runtime:   SessionRuntime{Source: "mobilevc"},
+		},
+		Projection: ProjectionSnapshot{
+			RawTerminalByStream: map[string]string{"stdout": "", "stderr": ""},
+			LogEntries: []SnapshotLogEntry{
+				{Kind: "markdown", Message: "重复回复", Timestamp: "2026-05-27T08:02:16Z"},
+				{Kind: "markdown", Message: "重复回复", Timestamp: "2026-05-27T08:02:16Z"},
+			},
+			Runtime: SessionRuntime{Source: "mobilevc"},
+		},
+	}
+	data, err := json.MarshalIndent(legacy, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal legacy record: %v", err)
+	}
+	if err := os.WriteFile(fs.sessionPath(created.ID), data, 0o644); err != nil {
+		t.Fatalf("write legacy record: %v", err)
+	}
+
+	record, err := fs.GetSession(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	if got := len(record.Projection.LogEntries); got != 1 {
+		t.Fatalf("expected legacy adjacent duplicate to collapse, got %d: %#v", got, record.Projection.LogEntries)
+	}
+}
+
 func TestFileStoreListSessionsRepairsLegacySummaryFromProjection(t *testing.T) {
 	fs, err := NewFileStore(t.TempDir())
 	if err != nil {
