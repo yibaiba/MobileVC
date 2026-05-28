@@ -45,34 +45,40 @@ func timelineAttachmentPaths(text string) []string {
 	matches := markdownImagePathPattern.FindAllStringSubmatch(text, -1)
 	paths := make([]string, 0, len(matches))
 	for _, match := range matches {
-		if len(match) > 1 && isSupportedLocalAttachmentPath(match[1]) {
-			paths = append(paths, match[1])
+		if len(match) <= 1 {
+			continue
+		}
+		if path, ok := normalizeLocalAttachmentPath(match[1]); ok {
+			paths = append(paths, path)
 		}
 	}
 	for _, match := range localPathPattern.FindAllStringSubmatch(text, -1) {
-		if len(match) > 1 && isSupportedLocalAttachmentPath(match[1]) {
-			paths = append(paths, match[1])
+		if len(match) <= 1 {
+			continue
+		}
+		if path, ok := normalizeLocalAttachmentPath(match[1]); ok {
+			paths = append(paths, path)
 		}
 	}
 	return paths
 }
 
-func isSupportedLocalAttachmentPath(path string) bool {
+func normalizeLocalAttachmentPath(path string) (string, bool) {
 	trimmed := strings.Trim(strings.TrimSpace(path), ".,;:!?")
 	if !strings.HasPrefix(trimmed, "/") {
-		return false
+		return "", false
 	}
 	ext := strings.ToLower(filepath.Ext(trimmed))
 	if ext == "" {
-		return false
+		return "", false
 	}
 	switch ext {
 	case ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".heic", ".heif",
 		".pdf", ".txt", ".md", ".json", ".yaml", ".yml", ".csv", ".tsv",
 		".zip", ".log", ".dart", ".go", ".js", ".ts", ".tsx", ".jsx":
-		return true
+		return trimmed, true
 	default:
-		return false
+		return "", false
 	}
 }
 
