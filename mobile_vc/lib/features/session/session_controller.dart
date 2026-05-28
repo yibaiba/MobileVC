@@ -348,6 +348,9 @@ class SessionController extends ChangeNotifier {
   final List<PermissionRule> _persistentPermissionRules = [];
   final List<String> _debugLogs = [];
   final List<TimelineItem> _timeline = [];
+  final Map<String, MediaPreviewState> _mediaPreviewStates =
+      <String, MediaPreviewState>{};
+  final Set<String> _requestedMediaPreviewKeys = <String>{};
   final Map<String, Set<String>> _visibleHistoryLogEntryKeys =
       <String, Set<String>>{};
   final List<ReviewGroup> _reviewGroups = [];
@@ -774,6 +777,8 @@ class SessionController extends ChangeNotifier {
       _continuedSameSessionId == _selectedSessionId.trim();
 
   List<TimelineItem> get timeline => _timelineView;
+  Map<String, MediaPreviewState> get mediaPreviewStates =>
+      UnmodifiableMapView(_mediaPreviewStates);
   List<ReviewGroup> get reviewGroups => _reviewGroupsView;
   ReviewGroup? get activeReviewGroup => _resolvedActiveReviewGroup();
   String get activeReviewGroupId => _activeReviewGroupId;
@@ -1559,6 +1564,93 @@ class SessionController extends ChangeNotifier {
     });
   }
 
+  void requestMediaPreview(TimelineAttachment attachment) {
+    final key = _mediaPreviewKey(attachment);
+    if (key.isEmpty || !attachment.isImage) {
+      return;
+    }
+    final existing = _mediaPreviewStates[key];
+    if (existing?.ok == true || existing?.loading == true) {
+      return;
+    }
+    if (_requestedMediaPreviewKeys.contains(key)) {
+      return;
+    }
+    final path = attachment.path.trim();
+    if (path.isEmpty) {
+      _mediaPreviewStates[key] = MediaPreviewState(
+        key: key,
+        status: 'error',
+        message: '缺少可读取的文件路径',
+      );
+      notifyListeners();
+      return;
+    }
+    _requestedMediaPreviewKeys.add(key);
+    _mediaPreviewStates[key] = MediaPreviewState(key: key, status: 'loading');
+    final sent = _service.send({
+      'action': 'media_preview',
+      'attachmentId': key,
+      'path': path,
+      if (_selectedSessionId.trim().isNotEmpty)
+        'sessionId': _selectedSessionId.trim(),
+    });
+    if (!sent) {
+      _requestedMediaPreviewKeys.remove(key);
+      _mediaPreviewStates[key] = MediaPreviewState(
+        key: key,
+        status: 'error',
+        message: '预览请求发送失败：WebSocket 未连接或写入失败',
+      );
+    }
+    notifyListeners();
+  }
+
+  String mediaPreviewKey(TimelineAttachment attachment) =>
+      _mediaPreviewKey(attachment);
+
+  String _mediaPreviewKey(TimelineAttachment attachment) {
+    final id = attachment.id.trim();
+    if (id.isNotEmpty) {
+      return id;
+    }
+    return attachment.path.trim();
+  }
+
+  void _handleMediaPreviewResult(MediaPreviewResultEvent preview) {
+    final key = preview.attachmentId.trim().isNotEmpty
+        ? preview.attachmentId.trim()
+        : preview.path.trim();
+    if (key.isEmpty) {
+      return;
+    }
+    _requestedMediaPreviewKeys.remove(key);
+    if (preview.ok) {
+      final bytes = _decodeBase64Bytes(preview.content);
+      if (bytes == null) {
+        _mediaPreviewStates[key] = MediaPreviewState(
+          key: key,
+          status: 'error',
+          message: '图片预览解码失败',
+        );
+      } else {
+        _mediaPreviewStates[key] = MediaPreviewState(
+          key: key,
+          status: 'ok',
+          bytes: bytes,
+        );
+      }
+    } else {
+      _mediaPreviewStates[key] = MediaPreviewState(
+        key: key,
+        status: preview.status.trim().isEmpty ? 'error' : preview.status.trim(),
+        message:
+            preview.message.trim().isEmpty ? '图片预览失败' : preview.message.trim(),
+      );
+    }
+    notifyListeners();
+  }
+
   bool _sendUserVisibleAction(
     Map<String, dynamic> payload, {
     required String userText,
@@ -1589,13 +1681,21 @@ class SessionController extends ChangeNotifier {
           sendAttempts: 1,
         ),
       );
-      _appendLocalUserTimeline(userText, clientActionId);
+      _appendLocalUserTimeline(
+        userText,
+        clientActionId,
+        _timelineAttachmentsFromPayload(outboundPayload),
+      );
       _schedulePendingOutboundRetry();
       return true;
     }
     if (queueOnFailure) {
       _pendingOutboundActions.add(pendingAction);
-      _appendLocalUserTimeline(userText, clientActionId);
+      _appendLocalUserTimeline(
+        userText,
+        clientActionId,
+        _timelineAttachmentsFromPayload(outboundPayload),
+      );
       _pushSystem('session', '网络暂不可用，消息已排队，恢复连接后自动发送');
       _scheduleReconnect(immediate: true);
       _schedulePendingOutboundRetry();
@@ -1605,9 +1705,13 @@ class SessionController extends ChangeNotifier {
     return false;
   }
 
-  void _appendLocalUserTimeline(String userText, String clientActionId) {
+  void _appendLocalUserTimeline(
+    String userText,
+    String clientActionId,
+    List<TimelineAttachment> attachments,
+  ) {
     final body = userText.trim();
-    if (body.isEmpty) {
+    if (body.isEmpty && attachments.isEmpty) {
       return;
     }
     _appendTimelineItem(
@@ -1616,10 +1720,72 @@ class SessionController extends ChangeNotifier {
         kind: 'user',
         timestamp: DateTime.now(),
         body: body,
+        attachments: attachments,
       ),
       emitNotifications: false,
     );
     notifyListeners();
+  }
+
+  List<TimelineAttachment> _timelineAttachmentsFromPayload(
+    Map<String, dynamic> payload,
+  ) {
+    final rawAttachments = payload['imageAttachments'];
+    if (rawAttachments is! List || rawAttachments.isEmpty) {
+      return const [];
+    }
+    return rawAttachments.whereType<Map<String, dynamic>>().map((json) {
+      final id = _localAttachmentId(json);
+      final data = (json['data'] ?? '').toString();
+      final bytes = _decodeBase64Bytes(data);
+      if (bytes != null) {
+        _mediaPreviewStates[id] = MediaPreviewState(
+          key: id,
+          status: 'ok',
+          bytes: bytes,
+        );
+      }
+      return TimelineAttachment(
+        id: id,
+        kind: 'image',
+        name: (json['name'] ?? '').toString(),
+        mimeType: (json['mimeType'] ?? '').toString(),
+        size: _base64PayloadSize(data),
+        previewStatus: 'local',
+        source: 'user_upload',
+      );
+    }).toList();
+  }
+
+  String _localAttachmentId(Map<String, dynamic> json) {
+    final name = (json['name'] ?? '').toString().trim();
+    final data = (json['data'] ?? '').toString();
+    return 'local-${name.hashCode}-${data.length}';
+  }
+
+  int _base64PayloadSize(String value) {
+    final trimmed = value.trim();
+    if (trimmed.isEmpty) {
+      return 0;
+    }
+    final padding = trimmed.endsWith('==')
+        ? 2
+        : trimmed.endsWith('=')
+            ? 1
+            : 0;
+    return ((trimmed.length * 3) ~/ 4) - padding;
+  }
+
+  Uint8List? _decodeBase64Bytes(String value) {
+    final trimmed = value.trim();
+    if (trimmed.isEmpty) {
+      return null;
+    }
+    try {
+      return base64Decode(trimmed);
+    } on FormatException {
+      return null;
+    }
   }
 
   void _setAiStatusVisible(
@@ -5139,6 +5305,12 @@ class SessionController extends ChangeNotifier {
         _runtimePhase = runtimePhase;
         _syncRuntimePermissionMode();
         break;
+      case MediaPreviewResultEvent preview:
+        if (!_eventTargetsCurrentSession(preview.sessionId)) {
+          break;
+        }
+        _handleMediaPreviewResult(preview);
+        break;
       case LogEvent log:
         if (!_eventTargetsCurrentSession(log.sessionId)) {
           break;
@@ -5352,6 +5524,7 @@ class SessionController extends ChangeNotifier {
             title: fsRead.result.title,
             body: fsRead.result.path,
             meta: fsRead.runtimeMeta,
+            attachments: [_attachmentFromFileRead(fsRead.result)],
             context: HistoryContext(
               id: fsRead.runtimeMeta.contextId,
               type: 'file',
@@ -6050,15 +6223,13 @@ class SessionController extends ChangeNotifier {
     if (delta.sessionId.trim().isNotEmpty) {
       _sessionDeltaKnown[delta.sessionId.trim()] = delta.latest;
     }
-    for (final entry in shouldApplyAppendLogEntries
-        ? appendLogEntries
-        : const <HistoryLogEntry>[]) {
-      _appendHistoryTimelineEntry(
-        delta.sessionId,
-        entry,
-        delta.resumeRuntimeMeta,
-      );
-    }
+    _appendHistoryTimelineEntries(
+      delta.sessionId,
+      shouldApplyAppendLogEntries
+          ? appendLogEntries
+          : const <HistoryLogEntry>[],
+      delta.resumeRuntimeMeta,
+    );
     for (final diff in delta.upsertDiffs) {
       _mergeRecentDiff(diff);
     }
@@ -6137,9 +6308,11 @@ class SessionController extends ChangeNotifier {
       _visibleHistoryLogEntryKeys[normalizedSessionId] = <String>{};
     }
     final sortedEntries = _sortedHistoryLogEntries(entries);
-    for (final entry in sortedEntries) {
-      _appendHistoryTimelineEntry(normalizedSessionId, entry, resumeMeta);
-    }
+    _appendHistoryTimelineEntries(
+      normalizedSessionId,
+      sortedEntries,
+      resumeMeta,
+    );
   }
 
   List<HistoryLogEntry> _sortedHistoryLogEntries(
@@ -6222,6 +6395,204 @@ class SessionController extends ChangeNotifier {
     }
   }
 
+  void _appendHistoryTimelineEntries(
+    String sessionId,
+    List<HistoryLogEntry> entries,
+    RuntimeMeta resumeMeta,
+  ) {
+    final pendingCodexOps = <HistoryLogEntry>[];
+    for (final entry in entries) {
+      if (_isCodexNativeOperationalHistoryEntry(entry)) {
+        if (!_isVisibleHistoryLogEntry(sessionId, entry)) {
+          pendingCodexOps.add(entry);
+        }
+        continue;
+      }
+      _flushCodexNativeOperationalGroup(
+        sessionId,
+        pendingCodexOps,
+        resumeMeta,
+      );
+      _appendHistoryTimelineEntry(sessionId, entry, resumeMeta);
+    }
+    _flushCodexNativeOperationalGroup(
+      sessionId,
+      pendingCodexOps,
+      resumeMeta,
+    );
+  }
+
+  void _flushCodexNativeOperationalGroup(
+    String sessionId,
+    List<HistoryLogEntry> entries,
+    RuntimeMeta resumeMeta,
+  ) {
+    if (entries.isEmpty) {
+      return;
+    }
+    final item = _codexNativeOperationalTimelineItem(entries, resumeMeta);
+    final beforeCount = _timeline.length;
+    _appendTimelineItem(item, emitNotifications: false);
+    if (_timeline.length > beforeCount) {
+      for (final entry in entries) {
+        _rememberVisibleHistoryLogEntry(sessionId, entry);
+      }
+    }
+    entries.clear();
+  }
+
+  TimelineItem _codexNativeOperationalTimelineItem(
+    List<HistoryLogEntry> entries,
+    RuntimeMeta resumeMeta,
+  ) {
+    final first = entries.first;
+    final last = entries.last;
+    final startedAt = _historyLogEntryTimestamp(first) ?? DateTime.now();
+    final endedAt = _historyLogEntryTimestamp(last) ?? startedAt;
+    final summary = _codexNativeOperationalSummary(entries);
+    final detail = _codexNativeOperationalDetail(entries);
+    return TimelineItem(
+      id: 'history-codex-tools-${startedAt.microsecondsSinceEpoch}-${endedAt.microsecondsSinceEpoch}-${entries.length}-${detail.hashCode}',
+      kind: 'codex_tool_group',
+      timestamp: endedAt,
+      title: 'Codex 原生操作',
+      body: detail,
+      status: summary,
+      meta: _historyRuntimeMetaForEntry(first, resumeMeta),
+      context: first.context,
+      animateBody: false,
+    );
+  }
+
+  String _codexNativeOperationalSummary(List<HistoryLogEntry> entries) {
+    var toolCalls = 0;
+    var toolOutputs = 0;
+    var patches = 0;
+    var tasks = 0;
+    var failures = 0;
+    for (final entry in entries) {
+      final type = entry.context?.type.trim() ?? '';
+      final status = entry.context?.status.trim().toLowerCase() ?? '';
+      if (status == 'failed' || status == 'aborted') {
+        failures++;
+      }
+      switch (type) {
+        case 'codex_tool_call':
+          toolCalls++;
+          break;
+        case 'codex_tool_output':
+          toolOutputs++;
+          break;
+        case 'codex_patch':
+          patches++;
+          break;
+        case 'codex_task':
+          tasks++;
+          break;
+      }
+    }
+    final parts = <String>[
+      if (toolCalls > 0) '工具调用 $toolCalls',
+      if (toolOutputs > 0) '输出 $toolOutputs',
+      if (patches > 0) 'Patch $patches',
+      if (tasks > 0) '任务状态 $tasks',
+      if (failures > 0) '失败 $failures',
+    ];
+    return parts.isEmpty ? '已折叠 ${entries.length} 条原生事件' : parts.join(' · ');
+  }
+
+  String _codexNativeOperationalDetail(List<HistoryLogEntry> entries) {
+    final lines = <String>[];
+    final sections = <String, List<HistoryLogEntry>>{
+      '任务状态': <HistoryLogEntry>[],
+      '工具调用': <HistoryLogEntry>[],
+      '工具输出': <HistoryLogEntry>[],
+      'Patch': <HistoryLogEntry>[],
+    };
+    for (final entry in entries) {
+      final section = switch (entry.context?.type.trim()) {
+        'codex_task' => '任务状态',
+        'codex_tool_call' => '工具调用',
+        'codex_tool_output' => '工具输出',
+        'codex_patch' => 'Patch',
+        _ => '',
+      };
+      if (section.isNotEmpty) {
+        sections[section]!.add(entry);
+      }
+    }
+    for (final section in sections.entries) {
+      if (section.value.isEmpty) {
+        continue;
+      }
+      lines.add('## ${section.key} (${section.value.length})');
+      for (final entry in section.value) {
+        final title = _codexNativeOperationalEntryTitle(entry);
+        if (title.isNotEmpty) {
+          lines.add('- **$title**');
+        }
+        final body = _restoredHistoryBody(entry).trim();
+        if (body.isNotEmpty) {
+          lines.add(_indentMarkdownBlock(body));
+        }
+      }
+      lines.add('');
+    }
+    return lines.join('\n').trim();
+  }
+
+  String _codexNativeOperationalEntryTitle(HistoryLogEntry entry) {
+    final context = entry.context;
+    return switch (context?.type.trim()) {
+      'codex_tool_call' => _codexToolLabel(context),
+      'codex_tool_output' => _codexToolLabel(context),
+      'codex_patch' => context?.status.trim() ?? '',
+      'codex_task' => context?.status.trim() ?? '',
+      _ => '',
+    };
+  }
+
+  String _indentMarkdownBlock(String value) {
+    return value.split('\n').map((line) {
+      if (line.trim().isEmpty) {
+        return '  ';
+      }
+      return '  $line';
+    }).join('\n');
+  }
+
+  String _codexToolLabel(HistoryContext? context) {
+    final tool = context?.tool.trim() ?? '';
+    if (tool.isNotEmpty) {
+      return tool;
+    }
+    final command = context?.command.trim() ?? '';
+    if (command.isNotEmpty) {
+      final line = command.split('\n').first.trim();
+      return line.length > 80 ? '${line.substring(0, 80)}...' : line;
+    }
+    return '';
+  }
+
+  bool _isCodexNativeOperationalHistoryEntry(HistoryLogEntry entry) {
+    if (entry.kind.trim().toLowerCase() != 'system') {
+      return false;
+    }
+    final context = entry.context;
+    if (context == null || context.source.trim() != 'codex-native') {
+      return false;
+    }
+    switch (context.type.trim()) {
+      case 'codex_task':
+      case 'codex_tool_call':
+      case 'codex_tool_output':
+      case 'codex_patch':
+        return true;
+      default:
+        return false;
+    }
+  }
+
   bool _isVisibleHistoryLogEntry(String sessionId, HistoryLogEntry entry) {
     final key = _historyLogEntryKey(entry);
     if (key.isEmpty) {
@@ -6291,6 +6662,7 @@ class SessionController extends ChangeNotifier {
       trigger: entry.context?.trigger ?? '',
       meta: _historyRuntimeMetaForEntry(entry, resumeMeta),
       context: entry.context,
+      attachments: entry.attachments,
       animateBody: false,
     );
   }
@@ -6594,6 +6966,10 @@ class SessionController extends ChangeNotifier {
         trigger: item.trigger.isNotEmpty ? item.trigger : previous.trigger,
         meta: item.meta,
         context: item.context ?? previous.context,
+        attachments: _mergeTimelineAttachments(
+          previous.attachments,
+          item.attachments,
+        ),
         animateBody: previous.animateBody || item.animateBody,
       );
       _timeline.add(mergedItem);
@@ -6616,6 +6992,9 @@ class SessionController extends ChangeNotifier {
       return false;
     }
     final body = item.body.trim();
+    if (item.attachments.isNotEmpty) {
+      return false;
+    }
     if (body.isEmpty) {
       return false;
     }
@@ -6638,6 +7017,9 @@ class SessionController extends ChangeNotifier {
       return false;
     }
     final body = item.body.trim();
+    if (item.attachments.isNotEmpty) {
+      return false;
+    }
     if (body.isEmpty) {
       return false;
     }
@@ -6679,6 +7061,13 @@ class SessionController extends ChangeNotifier {
   }
 
   bool _shouldMergeTimelineBodies(TimelineItem previous, TimelineItem item) {
+    if (previous.kind == 'codex_tool_group' ||
+        item.kind == 'codex_tool_group') {
+      return false;
+    }
+    if (previous.attachments.isNotEmpty || item.attachments.isNotEmpty) {
+      return false;
+    }
     if (previous.kind == 'compaction' || item.kind == 'compaction') {
       return false;
     }
@@ -6750,6 +7139,27 @@ class SessionController extends ChangeNotifier {
     return '$previous$next';
   }
 
+  List<TimelineAttachment> _mergeTimelineAttachments(
+    List<TimelineAttachment> previous,
+    List<TimelineAttachment> next,
+  ) {
+    if (previous.isEmpty) {
+      return next;
+    }
+    if (next.isEmpty) {
+      return previous;
+    }
+    final merged = <TimelineAttachment>[];
+    final seen = <String>{};
+    for (final attachment in [...previous, ...next]) {
+      final key = _mediaPreviewKey(attachment);
+      if (key.isEmpty || seen.add(key)) {
+        merged.add(attachment);
+      }
+    }
+    return merged;
+  }
+
   bool _continuesMarkdownLink(String previous, String next) {
     final previousTrimmed = previous.trimRight();
     final nextTrimmed = next.trimLeft();
@@ -6788,7 +7198,9 @@ class SessionController extends ChangeNotifier {
       final status = item.status.trim().toLowerCase();
       return status == 'loading' || status == 'completed' || status == 'failed';
     }
-    if (item.body.trim().isEmpty && item.title.trim().isEmpty) {
+    if (item.body.trim().isEmpty &&
+        item.title.trim().isEmpty &&
+        item.attachments.isEmpty) {
       return false;
     }
     if (_shouldHideTimelineLogMessage(item.body, item.stream)) {
@@ -6897,8 +7309,141 @@ class SessionController extends ChangeNotifier {
         body: message,
         stream: log.stream,
         meta: mergedMeta,
+        attachments: _timelineAttachmentsFromText(message),
       ),
     );
+  }
+
+  TimelineAttachment _attachmentFromFileRead(FileReadResult result) {
+    return TimelineAttachment(
+      id: 'fs-${result.path.hashCode}',
+      kind: result.isImage ? 'image' : 'file',
+      name: result.title,
+      mimeType: _mimeTypeForPath(result.path),
+      size: result.size,
+      path: result.path,
+      previewStatus: result.isImage ? 'available' : 'unsupported',
+      source: 'fs_read',
+    );
+  }
+
+  String _mimeTypeForPath(String path) {
+    final lower = path.toLowerCase();
+    if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) {
+      return 'image/jpeg';
+    }
+    if (lower.endsWith('.png')) {
+      return 'image/png';
+    }
+    if (lower.endsWith('.webp')) {
+      return 'image/webp';
+    }
+    if (lower.endsWith('.gif')) {
+      return 'image/gif';
+    }
+    if (lower.endsWith('.pdf')) {
+      return 'application/pdf';
+    }
+    if (lower.endsWith('.json')) {
+      return 'application/json';
+    }
+    if (lower.endsWith('.txt') ||
+        lower.endsWith('.md') ||
+        lower.endsWith('.log')) {
+      return 'text/plain';
+    }
+    return '';
+  }
+
+  List<TimelineAttachment> _timelineAttachmentsFromText(String text) {
+    final paths = _localAttachmentPaths(text);
+    if (paths.isEmpty) {
+      return const [];
+    }
+    final attachments = <TimelineAttachment>[];
+    final seen = <String>{};
+    for (final path in paths) {
+      final normalized = path.trim();
+      if (normalized.isEmpty || !seen.add(normalized)) {
+        continue;
+      }
+      final mimeType = _mimeTypeForPath(normalized);
+      attachments.add(TimelineAttachment(
+        id: 'path-${normalized.hashCode}',
+        kind: mimeType.startsWith('image/') ? 'image' : 'file',
+        name: _fileNameOfPath(normalized),
+        mimeType: mimeType,
+        path: normalized,
+        previewStatus: 'pending',
+        source: 'assistant_path',
+      ));
+    }
+    return attachments;
+  }
+
+  List<String> _localAttachmentPaths(String text) {
+    final matches = <String>[];
+    final markdownImagePattern = RegExp(r'!\[[^\]]*\]\(([^)]+)\)');
+    for (final match in markdownImagePattern.allMatches(text)) {
+      final value = match.group(1) ?? '';
+      if (_isSupportedLocalAttachmentPath(value)) {
+        matches.add(_trimAttachmentPath(value));
+      }
+    }
+    final localPathPattern =
+        RegExp(r'''(?:^|[\s('"[])(/[^\s)'"<>]+)''', multiLine: true);
+    for (final match in localPathPattern.allMatches(text)) {
+      final value = match.group(1) ?? '';
+      if (_isSupportedLocalAttachmentPath(value)) {
+        matches.add(_trimAttachmentPath(value));
+      }
+    }
+    return matches;
+  }
+
+  bool _isSupportedLocalAttachmentPath(String value) {
+    final path = _trimAttachmentPath(value);
+    if (!path.startsWith('/')) {
+      return false;
+    }
+    final lower = path.toLowerCase();
+    const extensions = [
+      '.png',
+      '.jpg',
+      '.jpeg',
+      '.webp',
+      '.gif',
+      '.bmp',
+      '.heic',
+      '.heif',
+      '.pdf',
+      '.txt',
+      '.md',
+      '.json',
+      '.yaml',
+      '.yml',
+      '.csv',
+      '.tsv',
+      '.zip',
+      '.log',
+      '.dart',
+      '.go',
+      '.js',
+      '.ts',
+      '.tsx',
+      '.jsx',
+    ];
+    return extensions.any(lower.endsWith);
+  }
+
+  String _trimAttachmentPath(String value) =>
+      value.trim().replaceAll(RegExp(r'[.,;:!?]+$'), '');
+
+  String _fileNameOfPath(String path) {
+    final normalized = path.replaceAll('\\', '/');
+    final index = normalized.lastIndexOf('/');
+    final name = index == -1 ? normalized : normalized.substring(index + 1);
+    return name.trim().isEmpty ? '文件' : name;
   }
 
   String _sanitizeAiBootstrapLogMessage(String message, RuntimeMeta meta) {

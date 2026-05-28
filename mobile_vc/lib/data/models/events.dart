@@ -1002,6 +1002,47 @@ class FSReadResultEvent extends AppEvent {
       );
 }
 
+class MediaPreviewResultEvent extends AppEvent {
+  const MediaPreviewResultEvent({
+    required super.timestamp,
+    required super.sessionId,
+    required super.runtimeMeta,
+    required super.raw,
+    this.attachmentId = '',
+    this.path = '',
+    this.content = '',
+    this.size = 0,
+    this.mimeType = '',
+    this.status = '',
+    this.message = '',
+  }) : super(type: 'media_preview_result');
+
+  final String attachmentId;
+  final String path;
+  final String content;
+  final int size;
+  final String mimeType;
+  final String status;
+  final String message;
+
+  bool get ok => status.trim().toLowerCase() == 'ok';
+
+  factory MediaPreviewResultEvent.fromJson(Map<String, dynamic> json) =>
+      MediaPreviewResultEvent(
+        timestamp: _readTimestamp(json),
+        sessionId: (json['sessionId'] ?? '').toString(),
+        runtimeMeta: RuntimeMeta.fromJson(json),
+        raw: json,
+        attachmentId: (json['attachmentId'] ?? '').toString(),
+        path: (json['path'] ?? '').toString(),
+        content: (json['content'] ?? '').toString(),
+        size: (json['size'] as num?)?.toInt() ?? 0,
+        mimeType: (json['mimeType'] ?? '').toString(),
+        status: (json['status'] ?? '').toString(),
+        message: (json['message'] ?? '').toString(),
+      );
+}
+
 class StepUpdateEvent extends AppEvent {
   const StepUpdateEvent({
     required super.timestamp,
@@ -2050,6 +2091,7 @@ class TimelineItem {
     this.trigger = '',
     this.meta = const RuntimeMeta(),
     this.context,
+    this.attachments = const [],
     this.animateBody = true,
   });
 
@@ -2063,6 +2105,7 @@ class TimelineItem {
   final String trigger;
   final RuntimeMeta meta;
   final HistoryContext? context;
+  final List<TimelineAttachment> attachments;
   final bool animateBody;
 
   TimelineItem copyWith({
@@ -2076,6 +2119,7 @@ class TimelineItem {
     String? trigger,
     RuntimeMeta? meta,
     HistoryContext? context,
+    List<TimelineAttachment>? attachments,
     bool? animateBody,
   }) {
     return TimelineItem(
@@ -2089,6 +2133,7 @@ class TimelineItem {
       trigger: trigger ?? this.trigger,
       meta: meta ?? this.meta,
       context: context ?? this.context,
+      attachments: attachments ?? this.attachments,
       animateBody: animateBody ?? this.animateBody,
     );
   }

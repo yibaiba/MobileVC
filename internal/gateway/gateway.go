@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -1231,6 +1232,9 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				continue
 			}
 			sessionRuntime, sessionRuntimeSvc := runtimeForSession(record.Summary.ID)
+			if !isNativeMirrorSessionID(record.Summary.ID) {
+				record = mergeClaudeJSONLToRecord(ctx, h.SessionStore, record, sessionRuntimeSvc)
+			}
 			freshProjection := session.NormalizeProjectionSnapshot(record.Projection)
 			runtimeProjection := finalizeProjectionSnapshotForService(record.Summary.ID, sessionRuntimeSvc, freshProjection)
 			if isNativeMirrorSessionID(record.Summary.ID) {
@@ -1761,14 +1765,15 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				controller.ActiveMeta.PermissionMode,
 				projection.Runtime.PermissionMode,
 			))
+			visibleUserText := strings.TrimRight(aiReq.Data, "\n")
 			inputData := aiReq.Data
-			attachmentPaths, err := persistImageAttachments(ctx, sessionID, aiReq.ImageAttachments)
+			attachments, err := persistImageAttachments(ctx, sessionID, aiReq.ImageAttachments)
 			if err != nil {
 				logx.Warn("ws", "persist ai_turn image attachments failed: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, sessionID, remoteAddr, err)
 				emit(protocol.NewErrorEvent(sessionID, err.Error(), ""))
 				continue
 			}
-			inputData = appendAttachmentPathPrompt(inputData, attachmentPaths)
+			inputData = appendAttachmentPathPrompt(inputData, attachmentPaths(attachments))
 			if strings.TrimSpace(inputData) != "" {
 				service.RecordUserInput(inputData)
 				skillPrefix, err := skills.BuildEnabledSkillsPrefix(h.SessionStore, projection.SessionContext)
@@ -1796,9 +1801,9 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				PermissionMode: permissionMode,
 				RuntimeMeta:    reqMeta,
 			}
-			rawUserText := strings.TrimRight(inputData, "\n")
-			if rawUserText == "" {
-				appendUserProjectionEntry(h.SessionStore, ctx, sessionID, command, "命令", connectionID, remoteAddr)
+			runnerInputText := strings.TrimRight(inputData, "\n")
+			if runnerInputText == "" {
+				appendUserProjectionEntry(h.SessionStore, ctx, sessionID, command, "命令", connectionID, remoteAddr, attachments)
 				logx.Info("ws", "dispatch ai_turn execute: connectionID=%s sessionID=%s remoteAddr=%s command=%q cwd=%q permissionMode=%q", connectionID, sessionID, remoteAddr, command, cwd, permissionMode)
 				if err := service.Execute(ctx, sessionID, execReq, emitAndPersist); err != nil {
 					logx.Error("ws", "ai_turn execute failed: connectionID=%s sessionID=%s remoteAddr=%s command=%q err=%v", connectionID, sessionID, remoteAddr, command, err)
@@ -1863,7 +1868,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				emit(protocol.NewErrorEvent(sessionID, message, ""))
 				continue
 			}
-			appendUserProjectionEntry(h.SessionStore, ctx, sessionID, rawUserText, "回复", connectionID, remoteAddr)
+			appendUserProjectionEntry(h.SessionStore, ctx, sessionID, visibleUserText, "回复", connectionID, remoteAddr, attachments)
 		case "exec":
 			var reqEvent protocol.ExecRequestEvent
 			if err := json.Unmarshal(payloadBytes, &reqEvent); err != nil {
@@ -1891,7 +1896,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			}
 			sessionRuntime, service := runtimeForSession(sessionID)
 			emitAndPersist := emitAndPersistFor(sessionID)
-			appendUserProjectionEntry(h.SessionStore, ctx, sessionID, reqEvent.Command, "命令", connectionID, remoteAddr)
+			appendUserProjectionEntry(h.SessionStore, ctx, sessionID, reqEvent.Command, "命令", connectionID, remoteAddr, nil)
 			mode, err := session.ParseMode(reqEvent.Mode)
 			if err != nil {
 				logx.Warn("ws", "parse exec mode failed: connectionID=%s sessionID=%s remoteAddr=%s mode=%q err=%v", connectionID, sessionID, remoteAddr, reqEvent.Mode, err)
@@ -1981,7 +1986,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				command := strings.TrimSpace(inputEvent.Data)
 				permissionMode := normalizePermissionModeForClaude(inputEvent.PermissionMode)
 				logx.Info("ws", "promote input to exec: connectionID=%s sessionID=%s remoteAddr=%s action=input command=%q", connectionID, sessionID, remoteAddr, command)
-				appendUserProjectionEntry(h.SessionStore, ctx, sessionID, command, "命令", connectionID, remoteAddr)
+				appendUserProjectionEntry(h.SessionStore, ctx, sessionID, command, "命令", connectionID, remoteAddr, nil)
 				if sessionRuntime != nil {
 					service.SetSink(sessionRuntime.EnsureBufferedSinkWithProcessor(emitAndPersist))
 				}
@@ -2007,13 +2012,13 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			projection := buildProjectionSnapshotFor(sessionID)
 			snapshot := service.RuntimeSnapshot()
 			inputData := inputEvent.Data
-			attachmentPaths, err := persistImageAttachments(ctx, sessionID, inputEvent.ImageAttachments)
+			attachments, err := persistImageAttachments(ctx, sessionID, inputEvent.ImageAttachments)
 			if err != nil {
 				logx.Warn("ws", "persist input image attachments failed: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, sessionID, remoteAddr, err)
 				emit(protocol.NewErrorEvent(sessionID, err.Error(), ""))
 				continue
 			}
-			inputData = appendAttachmentPathPrompt(inputData, attachmentPaths)
+			inputData = appendAttachmentPathPrompt(inputData, attachmentPaths(attachments))
 			service.RecordUserInput(inputData)
 			if shouldInjectEnabledSkillsForInput(
 				firstNonEmptyString(snapshot.ActiveMeta.Command, controller.CurrentCommand, projection.Runtime.Command),
@@ -2138,7 +2143,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				logx.Warn("ws", "service send input failed: connectionID=%s sessionID=%s remoteAddr=%s action=input err=%v", connectionID, sessionID, remoteAddr, err)
 				emit(protocol.NewErrorEvent(sessionID, message, ""))
 			} else {
-				appendUserProjectionEntry(h.SessionStore, ctx, sessionID, strings.TrimRight(inputEvent.Data, "\n"), "回复", connectionID, remoteAddr)
+				appendUserProjectionEntry(h.SessionStore, ctx, sessionID, strings.TrimRight(inputEvent.Data, "\n"), "回复", connectionID, remoteAddr, attachments)
 			}
 		case "stop":
 			if strings.TrimSpace(selectedSessionID) == "" || selectedSessionID == connectionID {
@@ -2193,7 +2198,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 					}
 				}
 			}
-			appendUserProjectionEntry(h.SessionStore, ctx, sessionID, strings.TrimSpace(permissionEvent.PromptMessage), "权限决策", connectionID, remoteAddr)
+			appendUserProjectionEntry(h.SessionStore, ctx, sessionID, strings.TrimSpace(permissionEvent.PromptMessage), "权限决策", connectionID, remoteAddr, nil)
 			scope := strings.TrimSpace(permissionEvent.Scope)
 			if decision == "approve" && (scope == string(data.PermissionScopeSession) || scope == string(data.PermissionScopePersistent)) {
 				rule := buildPermissionRule(permissionEvent, scope, projection, controller)
@@ -2786,6 +2791,18 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				continue
 			}
 			emit(result)
+		case "media_preview":
+			var previewReq protocol.MediaPreviewRequestEvent
+			if err := json.Unmarshal(payloadBytes, &previewReq); err != nil {
+				logx.Warn("ws", "invalid media_preview request: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
+				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid media_preview request: %v", err), ""))
+				continue
+			}
+			result := readMediaPreview(selectedSessionID, previewReq.AttachmentID, previewReq.Path)
+			if result.Status != "ok" {
+				logx.Warn("ws", "media preview failed: connectionID=%s sessionID=%s remoteAddr=%s attachmentID=%q path=%q status=%q message=%q", connectionID, selectedSessionID, remoteAddr, previewReq.AttachmentID, previewReq.Path, result.Status, result.Message)
+			}
+			emit(result)
 		default:
 			logx.Warn("ws", "unknown action: connectionID=%s sessionID=%s remoteAddr=%s action=%s", connectionID, selectedSessionID, remoteAddr, clientEvent.Action)
 			emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("unknown action: %s", clientEvent.Action), ""))
@@ -2794,8 +2811,8 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 
 }
 
-func appendUserProjectionEntry(sessionStore data.Store, ctx context.Context, sessionID, text, label, connectionID, remoteAddr string) {
-	if sessionStore == nil || strings.TrimSpace(sessionID) == "" || strings.TrimSpace(text) == "" {
+func appendUserProjectionEntry(sessionStore data.Store, ctx context.Context, sessionID, text, label, connectionID, remoteAddr string, attachments []protocol.TimelineAttachment) {
+	if sessionStore == nil || strings.TrimSpace(sessionID) == "" || (strings.TrimSpace(text) == "" && len(attachments) == 0) {
 		if sessionStore == nil {
 			logx.Warn("ws", "skip append user projection entry because session store unavailable: connectionID=%s sessionID=%s remoteAddr=%s", connectionID, sessionID, remoteAddr)
 		}
@@ -2808,10 +2825,11 @@ func appendUserProjectionEntry(sessionStore data.Store, ctx context.Context, ses
 	}
 	projection := session.NormalizeProjectionSnapshot(record.Projection)
 	projection.LogEntries = append(projection.LogEntries, data.SnapshotLogEntry{
-		Kind:      "user",
-		Message:   text,
-		Label:     label,
-		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Kind:        "user",
+		Message:     text,
+		Label:       label,
+		Timestamp:   time.Now().UTC().Format(time.RFC3339),
+		Attachments: append([]protocol.TimelineAttachment(nil), attachments...),
 	})
 	if _, err := sessionStore.SaveProjection(ctx, sessionID, projection); err != nil {
 		logx.Error("ws", "save projection after append user entry failed: connectionID=%s sessionID=%s remoteAddr=%s label=%s err=%v", connectionID, sessionID, remoteAddr, label, err)
@@ -4071,12 +4089,62 @@ func readFile(sessionID, rawPath string) (protocol.FSReadResultEvent, error) {
 		return protocol.FSReadResultEvent{}, err
 	}
 
-	isText := !hasBinaryContent(content)
+	isImage := isPreviewableImagePath(absPath)
+	isText := !hasBinaryContent(content) && !isImage
 	textContent := string(content)
-	if !isText {
+	if isImage {
+		if info.Size() > maxImageAttachmentBytes {
+			return protocol.FSReadResultEvent{}, fmt.Errorf("image exceeds %d bytes", maxImageAttachmentBytes)
+		}
+		textContent = base64.StdEncoding.EncodeToString(content)
+	} else if !isText {
 		textContent = ""
 	}
 	return protocol.NewFSReadResultEvent(sessionID, absPath, textContent, info.Size(), detectLangFromPath(absPath), "utf-8", isText), nil
+}
+
+func readMediaPreview(sessionID, attachmentID, rawPath string) protocol.MediaPreviewResultEvent {
+	target := strings.TrimSpace(rawPath)
+	if target == "" {
+		return protocol.NewMediaPreviewResultEvent(sessionID, attachmentID, "", "", 0, "", "error", "path is required")
+	}
+	absPath, err := filepath.Abs(filepath.Clean(target))
+	if err != nil {
+		return protocol.NewMediaPreviewResultEvent(sessionID, attachmentID, target, "", 0, "", "error", err.Error())
+	}
+	info, err := os.Stat(absPath)
+	if err != nil {
+		return protocol.NewMediaPreviewResultEvent(sessionID, attachmentID, absPath, "", 0, "", "error", err.Error())
+	}
+	if info.IsDir() {
+		return protocol.NewMediaPreviewResultEvent(sessionID, attachmentID, absPath, "", 0, "", "unsupported", "path is a directory")
+	}
+	mimeType := mime.TypeByExtension(strings.ToLower(filepath.Ext(absPath)))
+	if !strings.HasPrefix(strings.ToLower(mimeType), "image/") {
+		return protocol.NewMediaPreviewResultEvent(sessionID, attachmentID, absPath, "", info.Size(), mimeType, "unsupported", "file is not an image")
+	}
+	if info.Size() > maxImageAttachmentBytes {
+		return protocol.NewMediaPreviewResultEvent(sessionID, attachmentID, absPath, "", info.Size(), mimeType, "unsupported", fmt.Sprintf("image exceeds %d bytes", maxImageAttachmentBytes))
+	}
+	content, err := os.ReadFile(absPath)
+	if err != nil {
+		return protocol.NewMediaPreviewResultEvent(sessionID, attachmentID, absPath, "", info.Size(), mimeType, "error", err.Error())
+	}
+	return protocol.NewMediaPreviewResultEvent(
+		sessionID,
+		attachmentID,
+		absPath,
+		base64.StdEncoding.EncodeToString(content),
+		info.Size(),
+		mimeType,
+		"ok",
+		"",
+	)
+}
+
+func isPreviewableImagePath(path string) bool {
+	mimeType := mime.TypeByExtension(strings.ToLower(filepath.Ext(path)))
+	return strings.HasPrefix(strings.ToLower(mimeType), "image/")
 }
 
 func detectLangFromPath(path string) string {

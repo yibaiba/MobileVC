@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -511,6 +512,85 @@ func TestHandlerFileAccessReadsAbsolutePath(t *testing.T) {
 	readEvent := readUntilType(t, conn, protocol.EventTypeFSReadResult)
 	if readEvent["content"] != "ok" {
 		t.Fatalf("content: got %#v", readEvent["content"])
+	}
+}
+
+func TestHandlerFileAccessReadsImageAsBase64(t *testing.T) {
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "screen.png")
+	raw := []byte{0x89, 0x50, 0x4E, 0x47}
+	if err := os.WriteFile(filePath, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h := newTestHandler()
+	conn := newTestConn(t, h)
+
+	if err := conn.WriteJSON(protocol.FSReadRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "fs_read"},
+		Path:        filePath,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	readEvent := readUntilType(t, conn, protocol.EventTypeFSReadResult)
+	if readEvent["content"] != base64.StdEncoding.EncodeToString(raw) {
+		t.Fatalf("content: got %#v", readEvent["content"])
+	}
+	if readEvent["isText"] != false {
+		t.Fatalf("isText: got %#v", readEvent["isText"])
+	}
+}
+
+func TestHandlerMediaPreviewReadsImageAsBase64(t *testing.T) {
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "preview.png")
+	raw := []byte{0x89, 0x50, 0x4E, 0x47}
+	if err := os.WriteFile(filePath, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h := newTestHandler()
+	conn := newTestConn(t, h)
+
+	if err := conn.WriteJSON(protocol.MediaPreviewRequestEvent{
+		ClientEvent:  protocol.ClientEvent{Action: "media_preview"},
+		AttachmentID: "att-1",
+		Path:         filePath,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	result := readUntilType(t, conn, protocol.EventTypeMediaPreviewResult)
+	if result["attachmentId"] != "att-1" {
+		t.Fatalf("attachmentId: got %#v", result["attachmentId"])
+	}
+	if result["status"] != "ok" {
+		t.Fatalf("status: got %#v", result["status"])
+	}
+	if result["content"] != base64.StdEncoding.EncodeToString(raw) {
+		t.Fatalf("content: got %#v", result["content"])
+	}
+}
+
+func TestHandlerMediaPreviewRejectsNonImage(t *testing.T) {
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "notes.txt")
+	if err := os.WriteFile(filePath, []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h := newTestHandler()
+	conn := newTestConn(t, h)
+
+	if err := conn.WriteJSON(protocol.MediaPreviewRequestEvent{
+		ClientEvent:  protocol.ClientEvent{Action: "media_preview"},
+		AttachmentID: "att-text",
+		Path:         filePath,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	result := readUntilType(t, conn, protocol.EventTypeMediaPreviewResult)
+	if result["status"] != "unsupported" {
+		t.Fatalf("status: got %#v", result["status"])
+	}
+	if result["message"] != "file is not an image" {
+		t.Fatalf("message: got %#v", result["message"])
 	}
 }
 
@@ -7291,6 +7371,105 @@ func TestHandlerSessionDeltaRefreshesNativeCodexMirror(t *testing.T) {
 	}
 	if !foundFresh {
 		t.Fatalf("expected fresh native mirror log entry in delta, got %#v", entries)
+	}
+}
+
+func TestHandlerSessionDeltaMergesClaudeJSONLForMobileVCSession(t *testing.T) {
+	homeDir := t.TempDir()
+	projectDir := filepath.Join(homeDir, "workspace", "ClaudeProject")
+	if err := os.MkdirAll(projectDir, 0o755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
+	}
+	t.Setenv("HOME", homeDir)
+	t.Setenv("USERPROFILE", homeDir)
+	t.Setenv("HOMEDRIVE", "")
+	t.Setenv("HOMEPATH", "")
+
+	h := newTestHandler()
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	h.SessionStore = tempStore
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+
+	sessionID := createHistorySessionForHandlerTest(t, h, conn, "mobilevc-claude")
+	record, err := h.SessionStore.GetSession(context.Background(), sessionID)
+	if err != nil {
+		t.Fatalf("get created session: %v", err)
+	}
+	record.Summary.Runtime.CWD = projectDir
+	record.Projection.Runtime = data.SessionRuntime{
+		ResumeSessionID: record.Summary.ClaudeSessionUUID,
+		Command:         "claude --resume " + record.Summary.ClaudeSessionUUID,
+		Engine:          "claude",
+		CWD:             projectDir,
+		Source:          "mobilevc",
+	}
+	record.Projection.Controller.SessionID = sessionID
+	record.Projection.LogEntries = []data.SnapshotLogEntry{{
+		Kind:      "user",
+		Label:     "历史输入",
+		Message:   "mobile existing prompt",
+		Timestamp: "2026-05-28T01:00:00Z",
+	}}
+	summary, err := h.SessionStore.UpsertSession(context.Background(), record)
+	if err != nil {
+		t.Fatalf("upsert mobilevc claude session: %v", err)
+	}
+	record.Summary = summary
+
+	if err := conn.WriteJSON(protocol.SessionLoadRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_load"},
+		SessionID:   sessionID,
+		CWD:         projectDir,
+	}); err != nil {
+		t.Fatalf("write session_load request: %v", err)
+	}
+	_ = readUntilSessionHistory(t, conn)
+
+	if err := claudesync.WriteSessionToJSONL(projectDir, record.Summary.ClaudeSessionUUID, []claudesync.JSONLEvent{
+		{Type: "assistant", Text: "Fresh desktop Claude answer", Timestamp: "2026-05-28T01:01:00Z"},
+	}); err != nil {
+		t.Fatalf("append claude jsonl: %v", err)
+	}
+
+	if err := conn.WriteJSON(protocol.SessionDeltaRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_delta_get"},
+		SessionID:   sessionID,
+		Known: protocol.SessionDeltaKnown{
+			LogEntryCount: len(record.Projection.LogEntries),
+		},
+	}); err != nil {
+		t.Fatalf("write session_delta_get request: %v", err)
+	}
+	delta := readUntilType(t, conn, protocol.EventTypeSessionDelta)
+	if delta["requiresFullSync"] == true {
+		t.Fatalf("expected incremental delta, got full sync request: %#v", delta)
+	}
+	entries, ok := delta["appendLogEntries"].([]any)
+	if !ok || len(entries) == 0 {
+		t.Fatalf("expected claude jsonl entry in delta, got %#v", delta)
+	}
+	foundFresh := false
+	for _, raw := range entries {
+		entry, _ := raw.(map[string]any)
+		if entry["message"] == "Fresh desktop Claude answer" {
+			foundFresh = true
+			break
+		}
+	}
+	if !foundFresh {
+		t.Fatalf("expected fresh desktop Claude entry in delta, got %#v", entries)
+	}
+
+	updated, err := h.SessionStore.GetSession(context.Background(), sessionID)
+	if err != nil {
+		t.Fatalf("get updated session: %v", err)
+	}
+	if updated.Summary.Ownership != "mobilevc" || updated.Summary.External {
+		t.Fatalf("mobilevc-owned session should not become external: %#v", updated.Summary)
 	}
 }
 

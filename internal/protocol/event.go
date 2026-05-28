@@ -27,6 +27,7 @@ const (
 	EventTypeTaskSnapshot              = "task_snapshot"
 	EventTypeFSListResult              = "fs_list_result"
 	EventTypeFSReadResult              = "fs_read_result"
+	EventTypeMediaPreviewResult        = "media_preview_result"
 	EventTypeStepUpdate                = "step_update"
 	EventTypeFileDiff                  = "file_diff"
 	EventTypeRuntimeInfoResult         = "runtime_info_result"
@@ -187,6 +188,17 @@ type ImageAttachment struct {
 	Name     string `json:"name,omitempty"`
 	MIMEType string `json:"mimeType,omitempty"`
 	Data     string `json:"data"`
+}
+
+type TimelineAttachment struct {
+	ID            string `json:"id,omitempty"`
+	Kind          string `json:"kind,omitempty"`
+	Name          string `json:"name,omitempty"`
+	MIMEType      string `json:"mimeType,omitempty"`
+	Size          int64  `json:"size,omitempty"`
+	Path          string `json:"path,omitempty"`
+	PreviewStatus string `json:"previewStatus,omitempty"`
+	Source        string `json:"source,omitempty"`
 }
 
 type ReviewDecisionRequestEvent struct {
@@ -379,6 +391,12 @@ type FSListRequestEvent struct {
 type FSReadRequestEvent struct {
 	ClientEvent
 	Path string `json:"path,omitempty"`
+}
+
+type MediaPreviewRequestEvent struct {
+	ClientEvent
+	AttachmentID string `json:"attachmentId,omitempty"`
+	Path         string `json:"path,omitempty"`
 }
 
 type ADBDevicesRequestEvent struct {
@@ -597,16 +615,17 @@ type ReviewGroup struct {
 }
 
 type HistoryLogEntry struct {
-	Kind        string          `json:"kind"`
-	Message     string          `json:"message,omitempty"`
-	Label       string          `json:"label,omitempty"`
-	Timestamp   string          `json:"timestamp,omitempty"`
-	Stream      string          `json:"stream,omitempty"`
-	Text        string          `json:"text,omitempty"`
-	ExecutionID string          `json:"executionId,omitempty"`
-	Phase       string          `json:"phase,omitempty"`
-	ExitCode    *int            `json:"exitCode,omitempty"`
-	Context     *HistoryContext `json:"context,omitempty"`
+	Kind        string               `json:"kind"`
+	Message     string               `json:"message,omitempty"`
+	Label       string               `json:"label,omitempty"`
+	Timestamp   string               `json:"timestamp,omitempty"`
+	Stream      string               `json:"stream,omitempty"`
+	Text        string               `json:"text,omitempty"`
+	ExecutionID string               `json:"executionId,omitempty"`
+	Phase       string               `json:"phase,omitempty"`
+	ExitCode    *int                 `json:"exitCode,omitempty"`
+	Context     *HistoryContext      `json:"context,omitempty"`
+	Attachments []TimelineAttachment `json:"attachments,omitempty"`
 }
 
 type TerminalExecution struct {
@@ -973,6 +992,17 @@ type FSReadResultEvent struct {
 	IsText   bool   `json:"isText"`
 }
 
+type MediaPreviewResultEvent struct {
+	Event
+	AttachmentID string `json:"attachmentId,omitempty"`
+	Path         string `json:"path"`
+	Content      string `json:"content,omitempty"`
+	Size         int64  `json:"size,omitempty"`
+	MIMEType     string `json:"mimeType,omitempty"`
+	Status       string `json:"status"`
+	Message      string `json:"message,omitempty"`
+}
+
 type RuntimeInfoResultEvent struct {
 	Event
 	Query       string            `json:"query,omitempty"`
@@ -1281,6 +1311,19 @@ func NewFSReadResultEvent(sessionID, path, content string, size int64, lang, enc
 		Lang:     lang,
 		Encoding: encoding,
 		IsText:   isText,
+	}
+}
+
+func NewMediaPreviewResultEvent(sessionID, attachmentID, path, content string, size int64, mimeType, status, message string) MediaPreviewResultEvent {
+	return MediaPreviewResultEvent{
+		Event:        NewBaseEvent(EventTypeMediaPreviewResult, sessionID),
+		AttachmentID: attachmentID,
+		Path:         path,
+		Content:      content,
+		Size:         size,
+		MIMEType:     mimeType,
+		Status:       status,
+		Message:      message,
 	}
 }
 

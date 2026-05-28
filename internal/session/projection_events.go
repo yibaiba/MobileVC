@@ -606,6 +606,7 @@ func protocolLogEntries(items []data.SnapshotLogEntry) []protocol.HistoryLogEntr
 			Phase:       entry.Phase,
 			ExitCode:    entry.ExitCode,
 			Context:     HistoryContextFromSnapshot(entry.Context),
+			Attachments: append([]protocol.TimelineAttachment(nil), entry.Attachments...),
 		})
 	}
 	return entries

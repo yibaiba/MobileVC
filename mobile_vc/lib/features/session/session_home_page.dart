@@ -359,6 +359,8 @@ class _SessionHomePageState extends State<SessionHomePage> {
                                 child: ChatTimeline(
                                   items: controller.timeline,
                                   sessionId: controller.selectedSessionId,
+                                  mediaPreviewStates:
+                                      controller.mediaPreviewStates,
                                   activeReviewDiff:
                                       controller.currentReviewDiff,
                                   activeReviewGroup:
@@ -388,6 +390,10 @@ class _SessionHomePageState extends State<SessionHomePage> {
                                   onOpenRuntimeInfo: () =>
                                       _openRuntimeInfo(context),
                                   onOpenFile: () => _openFileViewer(context),
+                                  onOpenAttachment: (attachment) =>
+                                      _openAttachment(context, attachment),
+                                  onRequestMediaPreview:
+                                      controller.requestMediaPreview,
                                   onReviewDecision:
                                       controller.sendReviewDecision,
                                   onAcceptAll: controller.acceptAllPendingDiffs,
@@ -1234,6 +1240,21 @@ class _SessionHomePageState extends State<SessionHomePage> {
         );
       },
     );
+  }
+
+  Future<void> _openAttachment(
+    BuildContext context,
+    TimelineAttachment attachment,
+  ) async {
+    final path = attachment.path.trim();
+    if (path.isEmpty) {
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(const SnackBar(content: Text('附件缺少可打开的文件路径')));
+      return;
+    }
+    controller.openFile(path);
+    await _openFileViewer(context);
   }
 
   Future<void> _openRuntimeInfo(BuildContext context) async {

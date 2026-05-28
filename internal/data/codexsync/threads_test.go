@@ -7,8 +7,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"mobilevc/internal/data"
 
 	_ "modernc.org/sqlite"
 )
@@ -30,6 +33,30 @@ func TestFindNativeThreadLoadsOnlyRequestedRollout(t *testing.T) {
 	}
 	if len(thread.LogEntries) != 1 || thread.LogEntries[0].Message != "target reply" {
 		t.Fatalf("expected target rollout only, got %#v", thread.LogEntries)
+	}
+}
+
+func TestFindNativeThreadIncludesCodexNativeToolAndPatchEvents(t *testing.T) {
+	codexDir, db := setupCodexThreadsStore(t)
+	threadID := "native-codex-thread"
+	rolloutPath := filepath.Join(codexDir, "sessions", "native.jsonl")
+	writeNativeCodexRolloutFixture(t, rolloutPath)
+	now := time.Date(2026, 5, 28, 12, 0, 0, 0, time.UTC).Unix()
+	insertThread(t, db, threadID, "/workspace", "Native Codex", rolloutPath, now)
+
+	thread, err := FindNativeThread(context.Background(), threadID)
+	if err != nil {
+		t.Fatalf("find native thread: %v", err)
+	}
+
+	assertLogEntryContains(t, thread.LogEntries, "user", "请检查历史")
+	assertLogEntryContains(t, thread.LogEntries, "markdown", "已经检查完成")
+	assertLogEntryContains(t, thread.LogEntries, "system", "Codex 调用工具：exec_command")
+	assertLogEntryContains(t, thread.LogEntries, "system", "Codex 工具输出")
+	assertLogEntryContains(t, thread.LogEntries, "system", "Codex 调用工具：apply_patch")
+	assertLogEntryContains(t, thread.LogEntries, "system", "Codex 应用补丁：success")
+	if got := countLogEntryContains(thread.LogEntries, "markdown", "已经检查完成"); got != 1 {
+		t.Fatalf("expected one assistant final answer, got %d entries: %#v", got, thread.LogEntries)
 	}
 }
 
@@ -327,4 +354,129 @@ func writeRolloutFixture(t *testing.T, path, message string) {
 	if _, err := fmt.Fprintln(file); err != nil {
 		t.Fatalf("terminate rollout fixture: %v", err)
 	}
+}
+
+func writeNativeCodexRolloutFixture(t *testing.T, path string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir rollout dir: %v", err)
+	}
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("create native rollout fixture: %v", err)
+	}
+	defer file.Close()
+	lines := []map[string]any{
+		{
+			"timestamp": "2026-05-28T12:00:00.000Z",
+			"type":      "event_msg",
+			"payload": map[string]any{
+				"type":    "task_started",
+				"turn_id": "turn-1",
+			},
+		},
+		{
+			"timestamp": "2026-05-28T12:00:01.000Z",
+			"type":      "event_msg",
+			"payload": map[string]any{
+				"type":    "user_message",
+				"message": "请检查历史",
+			},
+		},
+		{
+			"timestamp": "2026-05-28T12:00:02.000Z",
+			"type":      "response_item",
+			"payload": map[string]any{
+				"type":      "function_call",
+				"name":      "exec_command",
+				"arguments": `{"cmd":"rg history"}`,
+				"call_id":   "call-1",
+			},
+		},
+		{
+			"timestamp": "2026-05-28T12:00:03.000Z",
+			"type":      "response_item",
+			"payload": map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call-1",
+				"output":  "history parser result",
+			},
+		},
+		{
+			"timestamp": "2026-05-28T12:00:04.000Z",
+			"type":      "response_item",
+			"payload": map[string]any{
+				"type":    "custom_tool_call",
+				"name":    "apply_patch",
+				"input":   "*** Begin Patch\n*** End Patch\n",
+				"call_id": "call-2",
+				"status":  "completed",
+			},
+		},
+		{
+			"timestamp": "2026-05-28T12:00:05.000Z",
+			"type":      "event_msg",
+			"payload": map[string]any{
+				"type":    "patch_apply_end",
+				"call_id": "call-2",
+				"success": true,
+				"stdout":  "Success. Updated the following files:\nM internal/data/codexsync/threads.go\n",
+				"changes": map[string]any{
+					"/workspace/internal/data/codexsync/threads.go": map[string]any{
+						"type": "update",
+					},
+				},
+			},
+		},
+		{
+			"timestamp": "2026-05-28T12:00:06.000Z",
+			"type":      "event_msg",
+			"payload": map[string]any{
+				"type":    "agent_message",
+				"message": "已经检查完成",
+			},
+		},
+		{
+			"timestamp": "2026-05-28T12:00:06.000Z",
+			"type":      "response_item",
+			"payload": map[string]any{
+				"type": "message",
+				"role": "assistant",
+				"content": []map[string]any{
+					{"text": "已经检查完成"},
+				},
+			},
+		},
+		{
+			"timestamp": "2026-05-28T12:00:07.000Z",
+			"type":      "event_msg",
+			"payload": map[string]any{
+				"type":               "task_complete",
+				"turn_id":            "turn-1",
+				"last_agent_message": "已经检查完成",
+			},
+		},
+	}
+	for _, line := range lines {
+		if err := json.NewEncoder(file).Encode(line); err != nil {
+			t.Fatalf("write native rollout fixture: %v", err)
+		}
+	}
+}
+
+func assertLogEntryContains(t *testing.T, entries []data.SnapshotLogEntry, kind, text string) {
+	t.Helper()
+	if countLogEntryContains(entries, kind, text) == 0 {
+		t.Fatalf("expected %s entry containing %q, got %#v", kind, text, entries)
+	}
+}
+
+func countLogEntryContains(entries []data.SnapshotLogEntry, kind, text string) int {
+	count := 0
+	for _, entry := range entries {
+		if entry.Kind == kind && strings.Contains(entry.Message, text) {
+			count++
+		}
+	}
+	return count
 }

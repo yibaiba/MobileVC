@@ -17,6 +17,7 @@ class ChatTimeline extends StatefulWidget {
     super.key,
     required this.items,
     required this.sessionId,
+    this.mediaPreviewStates = const {},
     this.activeReviewDiff,
     this.activeReviewGroup,
     this.pendingDiffCount = 0,
@@ -34,6 +35,8 @@ class ChatTimeline extends StatefulWidget {
     this.onOpenDiff,
     this.onOpenRuntimeInfo,
     this.onOpenFile,
+    this.onOpenAttachment,
+    this.onRequestMediaPreview,
     this.onReviewDecision,
     this.onAcceptAll,
     this.onPromptSubmit,
@@ -41,6 +44,7 @@ class ChatTimeline extends StatefulWidget {
 
   final List<TimelineItem> items;
   final String sessionId;
+  final Map<String, MediaPreviewState> mediaPreviewStates;
   final HistoryContext? activeReviewDiff;
   final ReviewGroup? activeReviewGroup;
   final int pendingDiffCount;
@@ -58,6 +62,8 @@ class ChatTimeline extends StatefulWidget {
   final VoidCallback? onOpenDiff;
   final VoidCallback? onOpenRuntimeInfo;
   final VoidCallback? onOpenFile;
+  final ValueChanged<TimelineAttachment>? onOpenAttachment;
+  final ValueChanged<TimelineAttachment>? onRequestMediaPreview;
   final ValueChanged<String>? onReviewDecision;
   final VoidCallback? onAcceptAll;
   final ValueChanged<String>? onPromptSubmit;
@@ -215,6 +221,9 @@ class _ChatTimelineState extends State<ChatTimeline> {
         }
         return EventCard(
           item: item,
+          mediaPreviewStates: widget.mediaPreviewStates,
+          onOpenAttachment: widget.onOpenAttachment,
+          onRequestMediaPreview: widget.onRequestMediaPreview,
           onTap: () {
             if (item.kind == 'runtime_info_result') {
               widget.onOpenRuntimeInfo?.call();

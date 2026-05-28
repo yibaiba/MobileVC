@@ -5,16 +5,25 @@ import 'package:flutter/services.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
 
 import '../data/models/events.dart';
+import '../data/models/session_models.dart';
 
 class EventCard extends StatefulWidget {
   const EventCard({
     super.key,
     required this.item,
     this.onTap,
+    this.mediaPreviewStates = const {},
+    this.mediaPreviewKeyFor,
+    this.onOpenAttachment,
+    this.onRequestMediaPreview,
   });
 
   final TimelineItem item;
   final VoidCallback? onTap;
+  final Map<String, MediaPreviewState> mediaPreviewStates;
+  final String Function(TimelineAttachment attachment)? mediaPreviewKeyFor;
+  final ValueChanged<TimelineAttachment>? onOpenAttachment;
+  final ValueChanged<TimelineAttachment>? onRequestMediaPreview;
 
   @override
   State<EventCard> createState() => _EventCardState();
@@ -24,11 +33,49 @@ class _EventCardState extends State<EventCard> {
   bool _selectionMode = false;
 
   @override
+  void initState() {
+    super.initState();
+    _requestMissingAttachmentPreviews();
+  }
+
+  @override
   void didUpdateWidget(covariant EventCard oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.item.id != widget.item.id) {
       _selectionMode = false;
     }
+    _requestMissingAttachmentPreviews();
+  }
+
+  void _requestMissingAttachmentPreviews() {
+    final requestPreview = widget.onRequestMediaPreview;
+    if (requestPreview == null) {
+      return;
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) {
+        return;
+      }
+      for (final attachment in widget.item.attachments) {
+        if (!attachment.isImage) {
+          continue;
+        }
+        final key = _previewKeyFor(attachment);
+        if (key.isEmpty || widget.mediaPreviewStates.containsKey(key)) {
+          continue;
+        }
+        requestPreview(attachment);
+      }
+    });
+  }
+
+  String _previewKeyFor(TimelineAttachment attachment) {
+    final resolver = widget.mediaPreviewKeyFor;
+    if (resolver != null) {
+      return resolver(attachment).trim();
+    }
+    final id = attachment.id.trim();
+    return id.isNotEmpty ? id : attachment.path.trim();
   }
 
   @override
@@ -39,9 +86,20 @@ class _EventCardState extends State<EventCard> {
     final isUser = widget.item.kind == 'user';
     final isMarkdown = widget.item.kind == 'markdown';
     final isCompaction = widget.item.kind == 'compaction';
+    final isCodexToolGroup = widget.item.kind == 'codex_tool_group';
 
     if (isCompaction) {
       return _CompactionMarker(item: widget.item);
+    }
+
+    if (isCodexToolGroup) {
+      return Align(
+        alignment: Alignment.centerLeft,
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 760),
+          child: _CodexToolGroupCard(item: widget.item, style: style),
+        ),
+      );
     }
 
     if (isMarkdown) {
@@ -59,7 +117,24 @@ class _EventCardState extends State<EventCard> {
         ),
         child: Padding(
           padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
-          child: _buildMarkdownText(context, style),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              if (widget.item.body.isNotEmpty)
+                _buildMarkdownText(context, style),
+              if (widget.item.attachments.isNotEmpty) ...[
+                if (widget.item.body.isNotEmpty) const SizedBox(height: 10),
+                _AttachmentStrip(
+                  attachments: widget.item.attachments,
+                  style: style,
+                  previewStates: widget.mediaPreviewStates,
+                  previewKeyFor: _previewKeyFor,
+                  onOpenAttachment: widget.onOpenAttachment,
+                ),
+              ],
+            ],
+          ),
         ),
       );
       return Align(
@@ -206,18 +281,39 @@ class _EventCardState extends State<EventCard> {
           color: style.bodyColor,
           fontWeight: FontWeight.w500,
         );
-    if (_selectionMode) {
-      return SelectableText(
-        widget.item.body,
-        style: textStyle,
-        textAlign: TextAlign.left,
-        contextMenuBuilder: _buildEditableContextMenu,
+    final children = <Widget>[];
+    if (widget.item.body.isNotEmpty) {
+      children.add(
+        _selectionMode
+            ? SelectableText(
+                widget.item.body,
+                style: textStyle,
+                textAlign: TextAlign.left,
+                contextMenuBuilder: _buildEditableContextMenu,
+              )
+            : Text(
+                widget.item.body,
+                style: textStyle,
+                textAlign: TextAlign.left,
+              ),
       );
     }
-    return Text(
-      widget.item.body,
-      style: textStyle,
-      textAlign: TextAlign.left,
+    if (widget.item.attachments.isNotEmpty) {
+      if (children.isNotEmpty) {
+        children.add(const SizedBox(height: 10));
+      }
+      children.add(_AttachmentStrip(
+        attachments: widget.item.attachments,
+        style: style,
+        previewStates: widget.mediaPreviewStates,
+        previewKeyFor: _previewKeyFor,
+        onOpenAttachment: widget.onOpenAttachment,
+      ));
+    }
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: children,
     );
   }
 
@@ -243,9 +339,6 @@ class _EventCardState extends State<EventCard> {
             useSelectionArea: _selectionMode,
             selectable: _selectionMode,
           );
-    if (!_selectionMode) {
-      return inner;
-    }
     return SelectionArea(
       contextMenuBuilder: _buildSelectionAreaContextMenu,
       child: inner,
@@ -294,6 +387,16 @@ class _EventCardState extends State<EventCard> {
                   style: style,
                   selectable: _selectionMode,
                   contextMenuBuilder: _buildEditableContextMenu,
+                ),
+              ],
+              if (widget.item.attachments.isNotEmpty) ...[
+                const SizedBox(height: 8),
+                _AttachmentStrip(
+                  attachments: widget.item.attachments,
+                  style: style,
+                  previewStates: widget.mediaPreviewStates,
+                  previewKeyFor: _previewKeyFor,
+                  onOpenAttachment: widget.onOpenAttachment,
                 ),
               ],
               if ((widget.item.context?.path ?? '').isNotEmpty) ...[
@@ -459,6 +562,17 @@ class _EventCardState extends State<EventCard> {
           shadow: scheme.shadow.withValues(alpha: 0.06),
           radius: 22,
         ),
+      'codex_tool_group' => _EventCardStyle(
+          background: scheme.surfaceContainerLow,
+          border: scheme.outlineVariant.withValues(alpha: 0.72),
+          titleColor: scheme.onSurface,
+          bodyColor: scheme.onSurfaceVariant,
+          subtitleColor: scheme.onSurfaceVariant.withValues(alpha: 0.82),
+          iconBackground: scheme.tertiaryContainer.withValues(alpha: 0.68),
+          iconColor: scheme.onTertiaryContainer,
+          shadow: Colors.transparent,
+          radius: 16,
+        ),
       'session' || 'system' => _EventCardStyle(
           background: scheme.surfaceContainerLow,
           border: scheme.outlineVariant.withValues(alpha: 0.7),
@@ -491,6 +605,7 @@ class _EventCardState extends State<EventCard> {
       'fs_read_result' => '文件',
       'runtime_info_result' => '运行时信息',
       'terminal' => '终端输出',
+      'codex_tool_group' => 'Codex 原生操作',
       'session' || 'system' => '系统提示',
       _ => kind,
     };
@@ -500,6 +615,344 @@ class _EventCardState extends State<EventCard> {
     final h = value.hour.toString().padLeft(2, '0');
     final m = value.minute.toString().padLeft(2, '0');
     return '$h:$m';
+  }
+}
+
+class _AttachmentStrip extends StatelessWidget {
+  const _AttachmentStrip({
+    required this.attachments,
+    required this.style,
+    required this.previewStates,
+    required this.previewKeyFor,
+    required this.onOpenAttachment,
+  });
+
+  final List<TimelineAttachment> attachments;
+  final _EventCardStyle style;
+  final Map<String, MediaPreviewState> previewStates;
+  final String Function(TimelineAttachment attachment) previewKeyFor;
+  final ValueChanged<TimelineAttachment>? onOpenAttachment;
+
+  @override
+  Widget build(BuildContext context) {
+    return Wrap(
+      spacing: 8,
+      runSpacing: 8,
+      children: [
+        for (final attachment in attachments)
+          _AttachmentChip(
+            attachment: attachment,
+            style: style,
+            previewState: previewStates[previewKeyFor(attachment)],
+            onOpen: onOpenAttachment == null
+                ? null
+                : () => onOpenAttachment!(attachment),
+          ),
+      ],
+    );
+  }
+}
+
+class _CodexToolGroupCard extends StatefulWidget {
+  const _CodexToolGroupCard({
+    required this.item,
+    required this.style,
+  });
+
+  final TimelineItem item;
+  final _EventCardStyle style;
+
+  @override
+  State<_CodexToolGroupCard> createState() => _CodexToolGroupCardState();
+}
+
+class _CodexToolGroupCardState extends State<_CodexToolGroupCard> {
+  bool _expanded = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final style = widget.style;
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        key: const ValueKey('codexToolGroupToggle'),
+        onTap: () => setState(() => _expanded = !_expanded),
+        borderRadius: BorderRadius.circular(style.radius),
+        child: Ink(
+          decoration: BoxDecoration(
+            color: style.background,
+            borderRadius: BorderRadius.circular(style.radius),
+            border: Border.all(color: style.border),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Container(
+                      width: 28,
+                      height: 28,
+                      decoration: BoxDecoration(
+                        color: style.iconBackground,
+                        shape: BoxShape.circle,
+                      ),
+                      child: Icon(
+                        Icons.build_circle_outlined,
+                        size: 17,
+                        color: style.iconColor,
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            widget.item.title.isEmpty
+                                ? 'Codex 原生操作'
+                                : widget.item.title,
+                            style: Theme.of(context)
+                                .textTheme
+                                .labelLarge
+                                ?.copyWith(
+                                  fontWeight: FontWeight.w800,
+                                  color: style.titleColor,
+                                ),
+                          ),
+                          if (widget.item.status.trim().isNotEmpty)
+                            Text(
+                              widget.item.status.trim(),
+                              style: Theme.of(context)
+                                  .textTheme
+                                  .bodySmall
+                                  ?.copyWith(color: style.subtitleColor),
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                        ],
+                      ),
+                    ),
+                    Icon(
+                      _expanded
+                          ? Icons.expand_less_rounded
+                          : Icons.expand_more_rounded,
+                      color: scheme.onSurfaceVariant,
+                    ),
+                  ],
+                ),
+                AnimatedSwitcher(
+                  duration: const Duration(milliseconds: 160),
+                  child: !_expanded
+                      ? const SizedBox.shrink()
+                      : Padding(
+                          key: const ValueKey('codexToolGroupDetail'),
+                          padding: const EdgeInsets.only(top: 10),
+                          child: _BodyContent(
+                            item: widget.item.copyWith(kind: 'markdown'),
+                            style: style,
+                            selectable: true,
+                          ),
+                        ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _AttachmentChip extends StatelessWidget {
+  const _AttachmentChip({
+    required this.attachment,
+    required this.style,
+    required this.previewState,
+    required this.onOpen,
+  });
+
+  final TimelineAttachment attachment;
+  final _EventCardStyle style;
+  final MediaPreviewState? previewState;
+  final VoidCallback? onOpen;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final foreground = style.bodyColor;
+    final surface = Color.alphaBlend(
+      foreground.withValues(alpha: 0.10),
+      style.background,
+    );
+    final border = foreground.withValues(alpha: 0.22);
+    final chip = Container(
+      key: ValueKey('timelineAttachment:${attachment.displayName}'),
+      constraints: const BoxConstraints(maxWidth: 260),
+      padding: const EdgeInsets.all(6),
+      decoration: BoxDecoration(
+        color: surface,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: border),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          _AttachmentPreviewBox(
+            attachment: attachment,
+            previewState: previewState,
+            foreground: foreground,
+            fallbackBackground: scheme.surfaceContainerHighest,
+          ),
+          const SizedBox(width: 8),
+          Flexible(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  attachment.displayName,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                        color: foreground,
+                        fontWeight: FontWeight.w700,
+                      ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  _attachmentSubtitle(attachment, previewState),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                        color: foreground.withValues(alpha: 0.76),
+                      ),
+                ),
+                if (attachment.path.trim().isNotEmpty) ...[
+                  const SizedBox(height: 2),
+                  Text(
+                    attachment.path.trim(),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                          color: foreground.withValues(alpha: 0.62),
+                        ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+    if (onOpen == null) {
+      return chip;
+    }
+    return InkWell(
+      onTap: onOpen,
+      borderRadius: BorderRadius.circular(14),
+      child: chip,
+    );
+  }
+
+  String _attachmentSubtitle(
+    TimelineAttachment attachment,
+    MediaPreviewState? previewState,
+  ) {
+    final parts = <String>[];
+    if (attachment.mimeType.trim().isNotEmpty) {
+      parts.add(attachment.mimeType.trim());
+    } else {
+      parts.add(attachment.isImage ? 'image' : 'file');
+    }
+    if (attachment.size > 0) {
+      parts.add(_formatBytes(attachment.size));
+    }
+    if (previewState?.loading == true) {
+      parts.add('加载预览');
+    } else if (previewState?.failed == true) {
+      parts.add(previewState?.message.trim().isNotEmpty == true
+          ? previewState!.message.trim()
+          : '预览不可用');
+    }
+    return parts.join(' · ');
+  }
+
+  String _formatBytes(int value) {
+    if (value >= 1024 * 1024) {
+      return '${(value / (1024 * 1024)).toStringAsFixed(1)} MB';
+    }
+    if (value >= 1024) {
+      return '${(value / 1024).toStringAsFixed(1)} KB';
+    }
+    return '$value B';
+  }
+}
+
+class _AttachmentPreviewBox extends StatelessWidget {
+  const _AttachmentPreviewBox({
+    required this.attachment,
+    required this.previewState,
+    required this.foreground,
+    required this.fallbackBackground,
+  });
+
+  final TimelineAttachment attachment;
+  final MediaPreviewState? previewState;
+  final Color foreground;
+  final Color fallbackBackground;
+
+  @override
+  Widget build(BuildContext context) {
+    final bytes = previewState?.bytes;
+    if (attachment.isImage && previewState?.ok == true && bytes != null) {
+      return ClipRRect(
+        borderRadius: BorderRadius.circular(10),
+        child: Image.memory(
+          bytes,
+          key: ValueKey('timelineAttachmentPreview:${attachment.displayName}'),
+          width: 44,
+          height: 44,
+          fit: BoxFit.cover,
+          errorBuilder: (context, error, stackTrace) => _iconBox(
+            Icons.broken_image_outlined,
+          ),
+        ),
+      );
+    }
+    if (previewState?.loading == true) {
+      return SizedBox(
+        width: 44,
+        height: 44,
+        child: Center(
+          child: SizedBox(
+            width: 18,
+            height: 18,
+            child: CircularProgressIndicator(
+              strokeWidth: 2,
+              color: foreground,
+            ),
+          ),
+        ),
+      );
+    }
+    return _iconBox(
+      attachment.isImage ? Icons.image_outlined : Icons.attach_file_rounded,
+    );
+  }
+
+  Widget _iconBox(IconData icon) {
+    return Container(
+      width: 44,
+      height: 44,
+      decoration: BoxDecoration(
+        color: fallbackBackground.withValues(alpha: 0.42),
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Icon(icon, size: 22, color: foreground),
+    );
   }
 }
 
@@ -588,6 +1041,7 @@ class _TypewriterMarkdownState extends State<_TypewriterMarkdown> {
         status: widget.item.status,
         meta: widget.item.meta,
         context: widget.item.context,
+        attachments: widget.item.attachments,
       ),
       style: widget.style,
       plain: widget.plain,

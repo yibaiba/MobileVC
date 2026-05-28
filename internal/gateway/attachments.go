@@ -26,7 +26,7 @@ var allowedImageMIMETypes = map[string]string{
 	"image/gif":  ".gif",
 }
 
-func persistImageAttachments(ctx context.Context, sessionID string, attachments []protocol.ImageAttachment) ([]string, error) {
+func persistImageAttachments(ctx context.Context, sessionID string, attachments []protocol.ImageAttachment) ([]protocol.TimelineAttachment, error) {
 	if len(attachments) == 0 {
 		return nil, nil
 	}
@@ -40,43 +40,63 @@ func persistImageAttachments(ctx context.Context, sessionID string, attachments 
 	if err := os.MkdirAll(baseDir, 0o700); err != nil {
 		return nil, fmt.Errorf("create attachment dir: %w", err)
 	}
-	paths := make([]string, 0, len(attachments))
+	saved := make([]protocol.TimelineAttachment, 0, len(attachments))
 	for index, attachment := range attachments {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		default:
 		}
-		path, err := persistImageAttachment(baseDir, index, attachment)
+		metadata, err := persistImageAttachment(baseDir, index, attachment)
 		if err != nil {
 			return nil, err
 		}
-		paths = append(paths, path)
+		saved = append(saved, metadata)
 	}
-	return paths, nil
+	return saved, nil
 }
 
-func persistImageAttachment(baseDir string, index int, attachment protocol.ImageAttachment) (string, error) {
+func persistImageAttachment(baseDir string, index int, attachment protocol.ImageAttachment) (protocol.TimelineAttachment, error) {
 	extension, err := imageAttachmentExtension(attachment)
 	if err != nil {
-		return "", err
+		return protocol.TimelineAttachment{}, err
 	}
 	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(attachment.Data))
 	if err != nil {
 		raw, err = base64.RawStdEncoding.DecodeString(strings.TrimSpace(attachment.Data))
 	}
 	if err != nil {
-		return "", fmt.Errorf("decode image attachment %d: %w", index+1, err)
+		return protocol.TimelineAttachment{}, fmt.Errorf("decode image attachment %d: %w", index+1, err)
 	}
 	if len(raw) == 0 || len(raw) > maxImageAttachmentBytes {
-		return "", fmt.Errorf("图片 %d 大小必须在 1B 到 %dB 之间", index+1, maxImageAttachmentBytes)
+		return protocol.TimelineAttachment{}, fmt.Errorf("图片 %d 大小必须在 1B 到 %dB 之间", index+1, maxImageAttachmentBytes)
 	}
-	name := fmt.Sprintf("%s-%02d-%s%s", time.Now().UTC().Format("20060102T150405Z"), index+1, uuid.NewString(), extension)
+	id := uuid.NewString()
+	name := fmt.Sprintf("%s-%02d-%s%s", time.Now().UTC().Format("20060102T150405Z"), index+1, id, extension)
 	path := filepath.Join(baseDir, name)
 	if err := os.WriteFile(path, raw, 0o600); err != nil {
-		return "", fmt.Errorf("write image attachment: %w", err)
+		return protocol.TimelineAttachment{}, fmt.Errorf("write image attachment: %w", err)
 	}
-	return path, nil
+	return protocol.TimelineAttachment{
+		ID:            id,
+		Kind:          "image",
+		Name:          fallback(strings.TrimSpace(attachment.Name), name),
+		MIMEType:      strings.ToLower(strings.TrimSpace(attachment.MIMEType)),
+		Size:          int64(len(raw)),
+		Path:          path,
+		PreviewStatus: "available",
+		Source:        "user_upload",
+	}, nil
+}
+
+func attachmentPaths(attachments []protocol.TimelineAttachment) []string {
+	paths := make([]string, 0, len(attachments))
+	for _, attachment := range attachments {
+		if strings.TrimSpace(attachment.Path) != "" {
+			paths = append(paths, attachment.Path)
+		}
+	}
+	return paths
 }
 
 func imageAttachmentExtension(attachment protocol.ImageAttachment) (string, error) {

@@ -10718,6 +10718,209 @@ void main() {
       );
     });
 
+    test('session_history 会折叠 Codex 原生工具事件', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        logEntries: const [
+          HistoryLogEntry(
+            kind: 'user',
+            message: '看一下项目',
+            timestamp: '2026-05-27T05:20:00Z',
+          ),
+          HistoryLogEntry(
+            kind: 'system',
+            message: '调用 shell',
+            timestamp: '2026-05-27T05:20:01Z',
+            context: HistoryContext(
+              source: 'codex-native',
+              type: 'codex_tool_call',
+              tool: 'functions.exec_command',
+              command: 'rg TODO',
+            ),
+          ),
+          HistoryLogEntry(
+            kind: 'system',
+            message: 'exit 0',
+            timestamp: '2026-05-27T05:20:02Z',
+            context: HistoryContext(
+              source: 'codex-native',
+              type: 'codex_tool_output',
+              tool: 'functions.exec_command',
+            ),
+          ),
+          HistoryLogEntry(
+            kind: 'system',
+            message: 'apply_patch success',
+            timestamp: '2026-05-27T05:20:03Z',
+            context: HistoryContext(
+              source: 'codex-native',
+              type: 'codex_patch',
+              status: 'success',
+            ),
+          ),
+          HistoryLogEntry(
+            kind: 'markdown',
+            message: '已经看完了',
+            timestamp: '2026-05-27T05:20:04Z',
+          ),
+        ],
+        resumeRuntimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+      ));
+      await _flushEvents();
+
+      expect(controller.timeline.map((item) => item.kind), [
+        'user',
+        'codex_tool_group',
+        'markdown',
+      ]);
+      final group = controller.timeline.singleWhere(
+        (item) => item.kind == 'codex_tool_group',
+      );
+      expect(group.status, contains('工具调用 1'));
+      expect(group.status, contains('输出 1'));
+      expect(group.status, contains('Patch 1'));
+      expect(group.body, contains('## 工具调用 (1)'));
+      expect(group.body, contains('## 工具输出 (1)'));
+      expect(group.body, contains('## Patch (1)'));
+      expect(group.body, contains('- **functions.exec_command**'));
+      expect(
+          controller.timeline.where((item) => item.kind == 'system'), isEmpty);
+    });
+
+    test('session_delta 会折叠 Codex 原生工具事件', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionDeltaEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'session_delta'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        appendLogEntries: const [
+          HistoryLogEntry(
+            kind: 'system',
+            message: 'task started',
+            timestamp: '2026-05-27T05:21:01Z',
+            context: HistoryContext(
+              source: 'codex-native',
+              type: 'codex_task',
+              status: 'started',
+            ),
+          ),
+          HistoryLogEntry(
+            kind: 'system',
+            message: '调用 shell',
+            timestamp: '2026-05-27T05:21:02Z',
+            context: HistoryContext(
+              source: 'codex-native',
+              type: 'codex_tool_call',
+              tool: 'functions.exec_command',
+            ),
+          ),
+          HistoryLogEntry(
+            kind: 'system',
+            message: 'exit 0',
+            timestamp: '2026-05-27T05:21:03Z',
+            context: HistoryContext(
+              source: 'codex-native',
+              type: 'codex_tool_output',
+              tool: 'functions.exec_command',
+            ),
+          ),
+        ],
+        resumeRuntimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+      ));
+      await _flushEvents();
+
+      expect(controller.timeline, hasLength(1));
+      final group = controller.timeline.single;
+      expect(group.kind, 'codex_tool_group');
+      expect(group.status, contains('工具调用 1'));
+      expect(group.status, contains('输出 1'));
+      expect(group.status, contains('任务状态 1'));
+      expect(group.body, contains('## 任务状态 (1)'));
+      expect(group.body, contains('## 工具调用 (1)'));
+      expect(group.body, contains('## 工具输出 (1)'));
+      expect(group.body, contains('- **started**'));
+      expect(group.body, contains('- **functions.exec_command**'));
+    });
+
+    test('session_history 会恢复用户消息附件并处理媒体预览结果', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        logEntries: const [
+          HistoryLogEntry(
+            kind: 'user',
+            message: '看图',
+            timestamp: '2026-05-27T05:20:00Z',
+            attachments: [
+              TimelineAttachment(
+                id: 'att-1',
+                kind: 'image',
+                name: 'screen.png',
+                mimeType: 'image/png',
+                size: 9,
+                path: '/tmp/screen.png',
+                previewStatus: 'available',
+                source: 'user_upload',
+              ),
+            ],
+          ),
+        ],
+        resumeRuntimeMeta: RuntimeMeta(command: 'claude'),
+      ));
+      await _flushEvents();
+
+      expect(controller.timeline, hasLength(1));
+      final attachment = controller.timeline.single.attachments.single;
+      expect(attachment.name, 'screen.png');
+
+      controller.requestMediaPreview(attachment);
+      expect(service.sentPayloads.last['action'], 'media_preview');
+      expect(service.sentPayloads.last['attachmentId'], 'att-1');
+      expect(service.sentPayloads.last['path'], '/tmp/screen.png');
+
+      service.emit(MediaPreviewResultEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(),
+        raw: const {'type': 'media_preview_result'},
+        attachmentId: 'att-1',
+        path: '/tmp/screen.png',
+        content: base64Encode(utf8.encode('png-bytes')),
+        status: 'ok',
+      ));
+      await _flushEvents();
+
+      final preview = controller.mediaPreviewStates['att-1'];
+      expect(preview?.ok, isTrue);
+      expect(utf8.decode(preview!.bytes!), 'png-bytes');
+    });
+
     test('loadSession 匹配 history 后先显示 timeline 再异步刷新目录和 delta', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);

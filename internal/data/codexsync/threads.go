@@ -58,18 +58,35 @@ type rolloutEnvelope struct {
 }
 
 type rolloutEventPayload struct {
-	Type    string `json:"type"`
-	Message string `json:"message"`
+	Type             string                           `json:"type"`
+	Message          string                           `json:"message"`
+	TurnID           string                           `json:"turn_id"`
+	CallID           string                           `json:"call_id"`
+	Stdout           string                           `json:"stdout"`
+	Stderr           string                           `json:"stderr"`
+	Success          *bool                            `json:"success"`
+	LastAgentMessage string                           `json:"last_agent_message"`
+	Changes          map[string]rolloutPatchApplyFile `json:"changes"`
 }
 
 type rolloutResponseItemPayload struct {
 	Type    string                   `json:"type"`
 	Role    string                   `json:"role"`
 	Content []rolloutResponseContent `json:"content"`
+	Name    string                   `json:"name"`
+	Status  string                   `json:"status"`
+	CallID  string                   `json:"call_id"`
+	Args    string                   `json:"arguments"`
+	Input   string                   `json:"input"`
+	Output  string                   `json:"output"`
 }
 
 type rolloutResponseContent struct {
 	Text string `json:"text"`
+}
+
+type rolloutPatchApplyFile struct {
+	Type string `json:"type"`
 }
 
 type nativeRolloutSnapshot struct {
@@ -556,6 +573,7 @@ func loadRollout(path string) (nativeRolloutSnapshot, error) {
 	scanner.Buffer(buf, 2*1024*1024)
 	taskOpen := false
 	seenMessages := map[string]struct{}{}
+	seenSystemEntries := map[string]struct{}{}
 	for scanner.Scan() {
 		var line rolloutEnvelope
 		if err := json.Unmarshal(scanner.Bytes(), &line); err != nil {
@@ -573,10 +591,30 @@ func loadRollout(path string) (nativeRolloutSnapshot, error) {
 				taskOpen = true
 				snapshot.ControllerState = data.ControllerStateThinking
 				snapshot.ClaudeLifecycle = "active"
+				appendNativeSystemEvent(&snapshot, seenSystemEntries, "Codex 开始执行任务", timestamp, data.SnapshotContext{
+					Type:        "codex_task",
+					Status:      "started",
+					ID:          payload.TurnID,
+					ExecutionID: payload.TurnID,
+					Source:      "codex-native",
+					Timestamp:   timestamp,
+				})
 			case "task_complete", "turn_aborted":
 				taskOpen = false
 				snapshot.ControllerState = data.ControllerStateIdle
 				snapshot.ClaudeLifecycle = "resumable"
+				status := "completed"
+				if strings.TrimSpace(payload.Type) == "turn_aborted" {
+					status = "aborted"
+				}
+				appendNativeSystemEvent(&snapshot, seenSystemEntries, nativeTaskCompleteMessage(payload, status), timestamp, data.SnapshotContext{
+					Type:        "codex_task",
+					Status:      status,
+					ID:          payload.TurnID,
+					ExecutionID: payload.TurnID,
+					Source:      "codex-native",
+					Timestamp:   timestamp,
+				})
 			case "user_message":
 				message := strings.TrimSpace(payload.Message)
 				if !isMeaningfulPromptText(message) {
@@ -585,24 +623,38 @@ func loadRollout(path string) (nativeRolloutSnapshot, error) {
 				appendNativeUserMessage(&snapshot, seenMessages, message, timestamp)
 			case "agent_message":
 				appendNativeAssistantMessage(&snapshot, seenMessages, payload.Message, timestamp)
+			case "patch_apply_end":
+				appendNativeSystemEvent(&snapshot, seenSystemEntries, nativePatchApplyMessage(payload), timestamp, data.SnapshotContext{
+					Type:        "codex_patch",
+					Status:      nativeBoolStatus(payload.Success),
+					ID:          payload.CallID,
+					ExecutionID: payload.CallID,
+					Tool:        "apply_patch",
+					Source:      "codex-native",
+					Timestamp:   timestamp,
+				})
 			}
 		case "response_item":
 			var payload rolloutResponseItemPayload
 			if err := json.Unmarshal(line.Payload, &payload); err != nil {
 				continue
 			}
-			if strings.TrimSpace(payload.Type) != "message" {
-				continue
-			}
-			message := strings.TrimSpace(responseItemText(payload.Content))
-			switch strings.TrimSpace(payload.Role) {
-			case "user":
-				if !isMeaningfulPromptText(message) {
-					continue
+			switch strings.TrimSpace(payload.Type) {
+			case "message":
+				message := strings.TrimSpace(responseItemText(payload.Content))
+				switch strings.TrimSpace(payload.Role) {
+				case "user":
+					if !isMeaningfulPromptText(message) {
+						continue
+					}
+					appendNativeUserMessage(&snapshot, seenMessages, message, timestamp)
+				case "assistant":
+					appendNativeAssistantMessage(&snapshot, seenMessages, message, timestamp)
 				}
-				appendNativeUserMessage(&snapshot, seenMessages, message, timestamp)
-			case "assistant":
-				appendNativeAssistantMessage(&snapshot, seenMessages, message, timestamp)
+			case "function_call", "custom_tool_call":
+				appendNativeToolCall(&snapshot, seenSystemEntries, payload, timestamp)
+			case "function_call_output", "custom_tool_call_output":
+				appendNativeToolOutput(&snapshot, seenSystemEntries, payload, timestamp)
 			}
 		}
 	}
@@ -614,6 +666,103 @@ func loadRollout(path string) (nativeRolloutSnapshot, error) {
 		snapshot.ClaudeLifecycle = "active"
 	}
 	return snapshot, nil
+}
+
+func appendNativeToolCall(snapshot *nativeRolloutSnapshot, seen map[string]struct{}, payload rolloutResponseItemPayload, timestamp string) {
+	tool := strings.TrimSpace(payload.Name)
+	if tool == "" {
+		tool = strings.TrimSpace(payload.Type)
+	}
+	body := strings.TrimSpace(firstNonEmpty(payload.Args, payload.Input))
+	message := "Codex 调用工具：" + tool
+	if body != "" {
+		message += "\n\n" + body
+	}
+	appendNativeSystemEvent(snapshot, seen, message, timestamp, data.SnapshotContext{
+		Type:        "codex_tool_call",
+		Status:      strings.TrimSpace(payload.Status),
+		ID:          strings.TrimSpace(payload.CallID),
+		ExecutionID: strings.TrimSpace(payload.CallID),
+		Tool:        tool,
+		Command:     body,
+		Source:      "codex-native",
+		Timestamp:   timestamp,
+	})
+}
+
+func appendNativeToolOutput(snapshot *nativeRolloutSnapshot, seen map[string]struct{}, payload rolloutResponseItemPayload, timestamp string) {
+	output := strings.TrimSpace(payload.Output)
+	if output == "" {
+		return
+	}
+	appendNativeSystemEvent(snapshot, seen, "Codex 工具输出\n\n"+output, timestamp, data.SnapshotContext{
+		Type:        "codex_tool_output",
+		Status:      strings.TrimSpace(payload.Status),
+		ID:          strings.TrimSpace(payload.CallID),
+		ExecutionID: strings.TrimSpace(payload.CallID),
+		Source:      "codex-native",
+		Timestamp:   timestamp,
+	})
+}
+
+func appendNativeSystemEvent(snapshot *nativeRolloutSnapshot, seen map[string]struct{}, message, timestamp string, context data.SnapshotContext) {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return
+	}
+	key := nativeMessageKey("system", message, timestamp)
+	if _, ok := seen[key]; ok {
+		return
+	}
+	seen[key] = struct{}{}
+	context.Message = firstNonEmpty(context.Message, message)
+	context.Timestamp = firstNonEmpty(context.Timestamp, timestamp)
+	context.Source = firstNonEmpty(context.Source, "codex-native")
+	snapshot.LogEntries = append(snapshot.LogEntries, data.SnapshotLogEntry{
+		Kind:        "system",
+		Label:       "Codex",
+		Message:     message,
+		Text:        message,
+		Timestamp:   timestamp,
+		ExecutionID: context.ExecutionID,
+		Context:     &context,
+	})
+}
+
+func nativeTaskCompleteMessage(payload rolloutEventPayload, status string) string {
+	if status == "aborted" {
+		return "Codex 任务已中止"
+	}
+	return "Codex 任务已完成"
+}
+
+func nativePatchApplyMessage(payload rolloutEventPayload) string {
+	lines := []string{"Codex 应用补丁：" + nativeBoolStatus(payload.Success)}
+	if len(payload.Changes) > 0 {
+		paths := make([]string, 0, len(payload.Changes))
+		for path, change := range payload.Changes {
+			paths = append(paths, strings.TrimSpace(change.Type)+" "+path)
+		}
+		sort.Strings(paths)
+		lines = append(lines, paths...)
+	}
+	if stdout := strings.TrimSpace(payload.Stdout); stdout != "" {
+		lines = append(lines, "", stdout)
+	}
+	if stderr := strings.TrimSpace(payload.Stderr); stderr != "" {
+		lines = append(lines, "", stderr)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func nativeBoolStatus(value *bool) string {
+	if value == nil {
+		return "unknown"
+	}
+	if *value {
+		return "success"
+	}
+	return "failed"
 }
 
 func codexNativePaths() (string, string, error) {
@@ -716,6 +865,9 @@ func latestMeaningfulPrompt(items []NativePrompt) string {
 
 func latestMeaningfulNativeLogText(entries []data.SnapshotLogEntry) string {
 	for i := len(entries) - 1; i >= 0; i-- {
+		if isNativeOperationalLogEntry(entries[i]) {
+			continue
+		}
 		text := strings.TrimSpace(firstNonEmpty(entries[i].Text, entries[i].Message))
 		if text == "" {
 			continue
@@ -726,6 +878,21 @@ func latestMeaningfulNativeLogText(entries []data.SnapshotLogEntry) string {
 		return text
 	}
 	return ""
+}
+
+func isNativeOperationalLogEntry(entry data.SnapshotLogEntry) bool {
+	if entry.Kind != "system" || entry.Context == nil {
+		return false
+	}
+	if strings.TrimSpace(entry.Context.Source) != "codex-native" {
+		return false
+	}
+	switch strings.TrimSpace(entry.Context.Type) {
+	case "codex_task", "codex_tool_call", "codex_tool_output", "codex_patch":
+		return true
+	default:
+		return false
+	}
 }
 
 func isMeaningfulPromptText(text string) bool {
