@@ -55,6 +55,7 @@ const (
 	EventTypeRelayDeviceListResult     = "relay_device_list_result"
 	EventTypeRelayDeviceRevokeResult   = "relay_device_revoke_result"
 	EventTypeRelayDeviceRotateResult   = "relay_device_rotate_result"
+	EventTypeThinking                  = "thinking"
 )
 
 type RuntimeMeta struct {
@@ -1050,6 +1051,11 @@ type ADBWebRTCStateEvent struct {
 	Message   string `json:"msg,omitempty"`
 }
 
+type ThinkingEvent struct {
+	Event
+	Content string `json:"content"`
+}
+
 func NewBaseEvent(eventType, sessionID string) Event {
 	return Event{
 		Type:      eventType,
@@ -1518,6 +1524,13 @@ func NewADBWebRTCStateEvent(sessionID string, running, connected bool, serial st
 	}
 }
 
+func NewThinkingEvent(sessionID, content string) ThinkingEvent {
+	return ThinkingEvent{
+		Event:   NewBaseEvent(EventTypeThinking, sessionID),
+		Content: content,
+	}
+}
+
 func MergeRuntimeMeta(base, overlay RuntimeMeta) RuntimeMeta {
 	merged := base
 	if overlay.Source != "" {
@@ -1751,6 +1764,9 @@ func ApplyRuntimeMeta(event any, meta RuntimeMeta) any {
 	case RuntimeProcessLogResultEvent:
 		e.RuntimeMeta = MergeRuntimeMeta(e.RuntimeMeta, meta)
 		return e
+	case ThinkingEvent:
+		e.RuntimeMeta = MergeRuntimeMeta(e.RuntimeMeta, meta)
+		return e
 	default:
 		return event
 	}
@@ -1867,6 +1883,9 @@ func ApplyEventCursor(event any, cursor int64) any {
 		e.EventCursor = cursor
 		return e
 	case RuntimeProcessLogResultEvent:
+		e.EventCursor = cursor
+		return e
+	case ThinkingEvent:
 		e.EventCursor = cursor
 		return e
 	default:

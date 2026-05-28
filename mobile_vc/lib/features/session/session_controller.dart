@@ -5165,6 +5165,12 @@ class SessionController extends ChangeNotifier {
         _syncDerivedState();
         _syncObservedSessionPolling();
         break;
+      case ThinkingEvent thinking:
+        if (!_eventTargetsCurrentSession(thinking.sessionId)) {
+          break;
+        }
+        _handleThinkingEvent(thinking);
+        break;
       case AIStatusEvent status:
         if (!_eventTargetsCurrentSession(status.sessionId)) {
           break;
@@ -6949,6 +6955,22 @@ class SessionController extends ChangeNotifier {
         body: message,
         stream: log.stream,
         meta: mergedMeta,
+      ),
+    );
+  }
+
+  void _handleThinkingEvent(ThinkingEvent thinking) {
+    final content = thinking.content.trim();
+    if (content.isEmpty) {
+      return;
+    }
+    _pushTimelineItem(
+      TimelineItem(
+        id: 'thinking-${thinking.timestamp.microsecondsSinceEpoch}',
+        kind: 'thinking',
+        timestamp: thinking.timestamp,
+        body: content,
+        meta: thinking.runtimeMeta,
       ),
     );
   }

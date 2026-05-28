@@ -32,20 +32,48 @@ enum _MemoryFilter { all, enabled, editable }
 
 class _MemoryManagementSheetState extends State<MemoryManagementSheet> {
   _MemoryFilter _filter = _MemoryFilter.all;
+  final TextEditingController _searchController = TextEditingController();
+  String _searchQuery = '';
+
+  @override
+  void dispose() {
+    _searchController.dispose();
+    super.dispose();
+  }
+
+  void _onSearchChanged(String value) {
+    setState(() {
+      _searchQuery = value.trim().toLowerCase();
+    });
+  }
 
   List<MemoryItem> get _filteredItems {
+    var items = widget.items;
+
+    // Apply filter
     switch (_filter) {
       case _MemoryFilter.enabled:
-        return widget.items
+        items = items
             .where((item) => widget.enabledMemoryIds.contains(item.id))
             .toList(growable: false);
       case _MemoryFilter.editable:
-        return widget.items
+        items = items
             .where((item) => item.editable)
             .toList(growable: false);
       case _MemoryFilter.all:
-        return widget.items;
+        break;
     }
+
+    // Apply search
+    if (_searchQuery.isNotEmpty) {
+      items = items.where((item) {
+        return item.id.toLowerCase().contains(_searchQuery) ||
+            item.title.toLowerCase().contains(_searchQuery) ||
+            item.content.toLowerCase().contains(_searchQuery);
+      }).toList(growable: false);
+    }
+
+    return items;
   }
 
   @override
@@ -95,6 +123,28 @@ class _MemoryManagementSheetState extends State<MemoryManagementSheet> {
               _StatusBanner(
                   message: widget.syncStatus, tone: _bannerTone(meta)),
             ],
+            const SizedBox(height: 12),
+            TextField(
+              controller: _searchController,
+              onChanged: _onSearchChanged,
+              decoration: InputDecoration(
+                hintText: '搜索 memory id、标题或内容',
+                prefixIcon: const Icon(Icons.search),
+                suffixIcon: _searchQuery.isNotEmpty
+                    ? IconButton(
+                        icon: const Icon(Icons.clear),
+                        onPressed: () {
+                          _searchController.clear();
+                          _onSearchChanged('');
+                        },
+                      )
+                    : null,
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+              ),
+            ),
             const SizedBox(height: 12),
             SingleChildScrollView(
               scrollDirection: Axis.horizontal,
@@ -601,8 +651,10 @@ class _HeroCard extends StatelessWidget {
       width: double.infinity,
       padding: const EdgeInsets.fromLTRB(16, 16, 16, 14),
       decoration: BoxDecoration(
-        gradient: const LinearGradient(
-          colors: [Color(0xFFF7F9FC), Color(0xFFFFFFFF)],
+        gradient: LinearGradient(
+          colors: theme.brightness == Brightness.dark
+              ? [const Color(0xFF1E1E1E), const Color(0xFF2A2A2A)]
+              : [const Color(0xFFF7F9FC), const Color(0xFFFFFFFF)],
           begin: Alignment.topLeft,
           end: Alignment.bottomRight,
         ),

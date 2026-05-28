@@ -2037,6 +2037,26 @@ class AdbWebRtcStateEvent extends AppEvent {
       );
 }
 
+class ThinkingEvent extends AppEvent {
+  const ThinkingEvent({
+    required super.timestamp,
+    required super.sessionId,
+    required super.runtimeMeta,
+    required super.raw,
+    this.content = '',
+  }) : super(type: 'thinking');
+
+  final String content;
+
+  factory ThinkingEvent.fromJson(Map<String, dynamic> json) => ThinkingEvent(
+        timestamp: _readTimestamp(json),
+        sessionId: (json['sessionId'] ?? '').toString(),
+        runtimeMeta: RuntimeMeta.fromJson(json),
+        raw: json,
+        content: (json['content'] ?? '').toString(),
+      );
+}
+
 @immutable
 class TimelineItem {
   const TimelineItem({

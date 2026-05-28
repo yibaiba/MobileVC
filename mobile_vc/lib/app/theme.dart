@@ -1,31 +1,45 @@
 import 'package:flutter/material.dart';
 
+class IOSTokens {
+  static const double radiusCard = 20;
+  static const double radiusInput = 16;
+  static const double radiusButton = 14;
+  static const double radiusSheet = 28;
+  static const Color iosBlue = Color(0xFF007AFF);
+  static const Color iosDarkBlue = Color(0xFF0A84FF);
+  static const Color iosBgLight = Color(0xFFF2F2F7);
+  static const Color iosBgDark = Color(0xFF000000);
+  static const Color iosSurfaceLight = Color(0xFFFFFFFF);
+  static const Color iosSurfaceDark = Color(0xFF1C1C1E);
+  static const Color iosRed = Color(0xFFFF3B30);
+}
+
 class AppTheme {
   static ThemeData light() {
-    const seed = Color(0xFF2563EB);
+    const seed = Color(0xFFCC785C);
     final scheme =
         ColorScheme.fromSeed(seedColor: seed, brightness: Brightness.light);
     return _build(
       scheme: scheme,
-      scaffoldBackground: const Color(0xFFF4F7FB),
-      surface: Colors.white,
-      snackBarBackground: const Color(0xFF0F172A),
-      snackBarForeground: Colors.white,
-      outlineAlpha: 0.72,
+      scaffoldBackground: const Color(0xFFFAF9F6),
+      surface: const Color(0xFFF5F4F1),
+      snackBarBackground: const Color(0xFF2D2B28),
+      snackBarForeground: const Color(0xFFFAF9F6),
+      outlineAlpha: 0.12,
     );
   }
 
   static ThemeData dark() {
-    const seed = Color(0xFF60A5FA);
+    const seed = IOSTokens.iosDarkBlue;
     final scheme =
         ColorScheme.fromSeed(seedColor: seed, brightness: Brightness.dark);
     return _build(
       scheme: scheme,
-      scaffoldBackground: const Color(0xFF0B1120),
-      surface: const Color(0xFF111827),
-      snackBarBackground: const Color(0xFFE5E7EB),
-      snackBarForeground: const Color(0xFF0F172A),
-      outlineAlpha: 0.36,
+      scaffoldBackground: IOSTokens.iosBgDark,
+      surface: IOSTokens.iosSurfaceDark,
+      snackBarBackground: const Color(0xFF2C2C2E),
+      snackBarForeground: Colors.white,
+      outlineAlpha: 0.18,
     );
   }
 
@@ -44,9 +58,15 @@ class AppTheme {
       brightness: scheme.brightness,
       scaffoldBackgroundColor: scaffoldBackground,
       dividerColor: outline,
+      pageTransitionsTheme: const PageTransitionsTheme(
+        builders: {
+          TargetPlatform.iOS: CupertinoPageTransitionsBuilder(),
+          TargetPlatform.android: CupertinoPageTransitionsBuilder(),
+        },
+      ),
       appBarTheme: AppBarTheme(
         centerTitle: false,
-        backgroundColor: scaffoldBackground.withValues(alpha: 0.92),
+        backgroundColor: Colors.transparent,
         foregroundColor: scheme.onSurface,
         elevation: 0,
         scrolledUnderElevation: 0,
@@ -58,16 +78,16 @@ class AppTheme {
         contentPadding:
             const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
         border: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(20),
+          borderRadius: BorderRadius.circular(IOSTokens.radiusInput),
           borderSide: BorderSide(color: outline),
         ),
         enabledBorder: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(20),
+          borderRadius: BorderRadius.circular(IOSTokens.radiusInput),
           borderSide: BorderSide(color: outline),
         ),
         focusedBorder: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(20),
-          borderSide: BorderSide(color: scheme.primary, width: 1.4),
+          borderRadius: BorderRadius.circular(IOSTokens.radiusInput),
+          borderSide: BorderSide(color: scheme.primary, width: 1.2),
         ),
       ),
       cardTheme: CardThemeData(
@@ -75,22 +95,22 @@ class AppTheme {
         color: surface,
         margin: EdgeInsets.zero,
         shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(24),
+          borderRadius: BorderRadius.circular(IOSTokens.radiusCard),
           side: BorderSide(color: outline),
         ),
       ),
       filledButtonTheme: FilledButtonThemeData(
         style: FilledButton.styleFrom(
           minimumSize: const Size(0, 46),
-          shape:
-              RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+          shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(IOSTokens.radiusButton)),
         ),
       ),
       outlinedButtonTheme: OutlinedButtonThemeData(
         style: OutlinedButton.styleFrom(
           minimumSize: const Size(0, 44),
-          shape:
-              RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+          shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(IOSTokens.radiusButton)),
           side: BorderSide(color: outline),
         ),
       ),
@@ -107,14 +127,14 @@ class AppTheme {
       ),
       dividerTheme: DividerThemeData(
         color: outline,
-        thickness: 1,
-        space: 1,
+        thickness: 0.5,
+        space: 0.5,
       ),
       snackBarTheme: SnackBarThemeData(
         behavior: SnackBarBehavior.floating,
         backgroundColor: snackBarBackground,
         contentTextStyle: TextStyle(color: snackBarForeground),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
       ),
     );
   }

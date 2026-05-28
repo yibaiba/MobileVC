@@ -1,5 +1,8 @@
+import 'dart:ui';
+
 import 'package:flutter/material.dart';
 
+import '../../app/theme.dart';
 import '../../data/models/session_models.dart';
 
 class CommandInputBar extends StatefulWidget {
@@ -222,12 +225,8 @@ class _CommandInputBarState extends State<CommandInputBar> {
                         ? '$engineLabel 处理中…'
                         : 'Shell 运行中')
                     : (widget.showClaudeMode ? '给 $engineLabel 发送消息' : '输入命令');
-    final panelColor = scheme.surfaceContainerLow.withValues(alpha: 0.96);
     final railColor = scheme.surfaceContainerLowest.withValues(alpha: 0.88);
     final inputColor = scheme.surfaceContainerHighest.withValues(alpha: 0.72);
-    final shadowColor = scheme.shadow.withValues(
-      alpha: theme.brightness == Brightness.dark ? 0.28 : 0.07,
-    );
 
     return Padding(
       padding: EdgeInsets.only(bottom: bottomInset),
@@ -235,32 +234,22 @@ class _CommandInputBarState extends State<CommandInputBar> {
         top: false,
         child: Padding(
           padding: EdgeInsets.fromLTRB(10, 6, 10, bottomInset > 0 ? 8 : 10),
-          child: Container(
-            padding: const EdgeInsets.fromLTRB(10, 10, 10, 10),
-            decoration: BoxDecoration(
-              gradient: LinearGradient(
-                colors: [
-                  panelColor,
-                  scheme.surface,
-                ],
-                begin: Alignment.topLeft,
-                end: Alignment.bottomRight,
-              ),
-              borderRadius: BorderRadius.circular(30),
-              border: Border.all(
-                color: scheme.outlineVariant.withValues(alpha: 0.5),
-              ),
-              boxShadow: [
-                BoxShadow(
-                  color: shadowColor,
-                  blurRadius: 28,
-                  offset: const Offset(0, 10),
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(IOSTokens.radiusInput),
+            child: BackdropFilter(
+              filter: ImageFilter.blur(sigmaX: 24, sigmaY: 24),
+              child: Container(
+                padding: const EdgeInsets.fromLTRB(10, 10, 10, 10),
+                decoration: BoxDecoration(
+                  color: scheme.surface.withValues(alpha: 0.72),
+                  borderRadius: BorderRadius.circular(IOSTokens.radiusInput),
+                  border: Border.all(
+                    color: scheme.outlineVariant.withValues(alpha: 0.36),
+                  ),
                 ),
-              ],
-            ),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
                 Container(
                   padding: const EdgeInsets.fromLTRB(8, 8, 8, 8),
                   decoration: BoxDecoration(
@@ -526,6 +515,8 @@ class _CommandInputBarState extends State<CommandInputBar> {
           ),
         ),
       ),
+    ),
+    ),
     );
   }
 }
@@ -605,16 +596,25 @@ class _ContextWindowUsageButton extends StatelessWidget {
                             ),
                           ),
                         ),
-                      Container(
-                        width: 5,
-                        height: 5,
-                        decoration: BoxDecoration(
-                          shape: BoxShape.circle,
-                          color: usage.isAvailable
-                              ? progressColor
-                              : scheme.outlineVariant.withValues(alpha: 0.82),
+                      if (usage.isAvailable)
+                        Text(
+                          '$percent%',
+                          style: TextStyle(
+                            fontSize: 9,
+                            fontWeight: FontWeight.w700,
+                            color: progressColor,
+                            height: 1,
+                          ),
+                        )
+                      else
+                        Container(
+                          width: 5,
+                          height: 5,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            color: scheme.outlineVariant.withValues(alpha: 0.82),
+                          ),
                         ),
-                      ),
                     ],
                   ),
                 ),

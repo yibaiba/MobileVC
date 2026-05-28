@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:ui';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
@@ -264,82 +265,16 @@ class _SessionHomePageState extends State<SessionHomePage> {
         ),
       ),
       resizeToAvoidBottomInset: true,
-      appBar: AppBar(
-        leading: IconButton(
-          onPressed: _openFileDrawer,
-          icon: const Icon(Icons.folder_outlined),
-          tooltip: '文件树',
-        ),
-        titleSpacing: 0,
-        title: Row(
-          children: [
-            Expanded(
-              child: Text(
-                controller.shouldShowSessionSurface
-                    ? controller.selectedSessionTitle
-                    : 'MobileVC',
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                      fontWeight: FontWeight.w700,
-                    ),
-              ),
-            ),
-            const SizedBox(width: 8),
-            _ConnectionDot(
-              connected: controller.connected,
-              label: controller.activeTransportLabel,
-            ),
-          ],
-        ),
-        actions: [
-          IconButton(
-            onPressed: controller.currentDiffContext == null
-                ? null
-                : () => _openDiff(context),
-            tooltip: 'Diff',
-            icon: Badge.count(
-              isLabelVisible: controller.pendingDiffCount > 0,
-              count: controller.pendingDiffCount > 0
-                  ? controller.pendingDiffCount
-                  : 1,
-              child: const Icon(Icons.difference_outlined),
-            ),
-          ),
-          IconButton(
-            onPressed: () => _openAdbDebug(context),
-            tooltip: 'ADB 调试',
-            icon: Badge(
-              isLabelVisible:
-                  controller.adbStreaming || controller.adbWebRtcStarting,
-              child: const Icon(Icons.phone_android_outlined),
-            ),
-          ),
-          IconButton(
-            onPressed: () => _openStatusDetails(context),
-            icon: const Icon(Icons.dashboard_outlined),
-          ),
-          IconButton(
-            onPressed: widget.onToggleTheme,
-            tooltip: widget.darkModeEnabled ? '切换浅色模式' : '切换深色模式',
-            icon: Icon(
-              widget.darkModeEnabled
-                  ? Icons.light_mode_outlined
-                  : Icons.dark_mode_outlined,
-            ),
-          ),
-          IconButton(
-            onPressed: () => _openConnectionConfig(context),
-            icon: const Icon(Icons.settings_outlined),
-          ),
-        ],
-      ),
-      body: controller.shouldShowSessionSurface
+      extendBodyBehindAppBar: true,
+      body: Stack(
+        children: [
+          controller.shouldShowSessionSurface
           ? GestureDetector(
               behavior: HitTestBehavior.translucent,
               onTap: () => FocusManager.instance.primaryFocus?.unfocus(),
               child: Column(
                 children: [
+                  SizedBox(height: MediaQuery.of(context).padding.top + kToolbarHeight),
                   if (controller.shouldShowSessionObservationBanner)
                     _SessionObservationBanner(controller: controller),
                   Expanded(
@@ -403,6 +338,110 @@ class _SessionHomePageState extends State<SessionHomePage> {
           : const Center(
               child: _LandingBrand(),
             ),
+          Positioned(
+            top: 0,
+            left: 0,
+            right: 0,
+            child: ClipRect(
+              child: BackdropFilter(
+                filter: ImageFilter.blur(sigmaX: 20, sigmaY: 20),
+                child: Container(
+                  color: Theme.of(context)
+                      .scaffoldBackgroundColor
+                      .withValues(alpha: 0.72),
+                  child: SafeArea(
+                    bottom: false,
+                    child: Container(
+                      height: kToolbarHeight,
+                      padding: const EdgeInsets.symmetric(horizontal: 4),
+                      decoration: BoxDecoration(
+                        border: Border(
+                          bottom: BorderSide(
+                            color: Theme.of(context)
+                                .colorScheme
+                                .outlineVariant
+                                .withValues(alpha: 0.2),
+                            width: 0.5,
+                          ),
+                        ),
+                      ),
+                      child: Row(
+                        children: [
+                          IconButton(
+                            onPressed: _openFileDrawer,
+                            icon: const Icon(Icons.folder_outlined),
+                            tooltip: '文件树',
+                          ),
+                          const SizedBox(width: 4),
+                          Expanded(
+                            child: Text(
+                              controller.shouldShowSessionSurface
+                                  ? controller.selectedSessionTitle
+                                  : 'MobileVC',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: Theme.of(context)
+                                  .textTheme
+                                  .titleMedium
+                                  ?.copyWith(fontWeight: FontWeight.w700),
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          _ConnectionDot(
+                            connected: controller.connected,
+                            label: controller.activeTransportLabel,
+                          ),
+                          IconButton(
+                            onPressed: controller.currentDiffContext == null
+                                ? null
+                                : () => _openDiff(context),
+                            tooltip: 'Diff',
+                            icon: Badge.count(
+                              isLabelVisible: controller.pendingDiffCount > 0,
+                              count: controller.pendingDiffCount > 0
+                                  ? controller.pendingDiffCount
+                                  : 1,
+                              child: const Icon(Icons.difference_outlined),
+                            ),
+                          ),
+                          IconButton(
+                            onPressed: () => _openAdbDebug(context),
+                            tooltip: 'ADB 调试',
+                            icon: Badge(
+                              isLabelVisible: controller.adbStreaming ||
+                                  controller.adbWebRtcStarting,
+                              child: const Icon(Icons.phone_android_outlined),
+                            ),
+                          ),
+                          IconButton(
+                            onPressed: () => _openStatusDetails(context),
+                            icon: const Icon(Icons.dashboard_outlined),
+                          ),
+                          IconButton(
+                            onPressed: widget.onToggleTheme,
+                            tooltip: widget.darkModeEnabled
+                                ? '切换浅色模式'
+                                : '切换深色模式',
+                            icon: Icon(
+                              widget.darkModeEnabled
+                                  ? Icons.light_mode_outlined
+                                  : Icons.dark_mode_outlined,
+                            ),
+                          ),
+                          IconButton(
+                            onPressed: () => _openConnectionConfig(context),
+                            icon: const Icon(Icons.settings_outlined),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
       bottomNavigationBar: CommandInputBar(
         awaitInput: controller.awaitInput,
         isBusy: controller.isSessionBusy,
@@ -673,6 +712,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
               final scannedRaw = await showModalBottomSheet<String>(
                 context: context,
                 isScrollControlled: true,
+                showDragHandle: true,
                 builder: (context) => const ConnectionScanSheet(),
               );
               if (!context.mounted || scannedRaw == null) {
@@ -775,34 +815,63 @@ class _SessionHomePageState extends State<SessionHomePage> {
                       '支持扫描局域网二维码或 Relay 配对二维码，也保留手动输入方式。',
                       style: Theme.of(context).textTheme.bodySmall,
                     ),
-                    const SizedBox(height: 12),
-                    SizedBox(
-                      width: double.infinity,
-                      child: OutlinedButton.icon(
-                        onPressed: connectionBusy ? null : handleScan,
-                        icon: const Icon(Icons.qr_code_scanner),
-                        label: const Text('扫码连接'),
+                    const SizedBox(height: 16),
+                    Container(
+                      padding: const EdgeInsets.all(16),
+                      decoration: BoxDecoration(
+                        color: Theme.of(context).colorScheme.surface,
+                        borderRadius: BorderRadius.circular(16),
+                        border: Border.all(
+                          color: Theme.of(context).colorScheme.outline.withValues(alpha: 0.12),
+                        ),
                       ),
-                    ),
-                    const SizedBox(height: 10),
-                    Row(
-                      children: [
-                        Expanded(
-                          child: TextField(
-                            controller: linkController,
-                            enabled: !connectionBusy,
-                            decoration: const InputDecoration(
-                              labelText: '连接链接',
-                              hintText: 'mobilevc://relay/v1?...',
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            children: [
+                              Icon(Icons.link, size: 20, color: Theme.of(context).colorScheme.primary),
+                              const SizedBox(width: 8),
+                              Text(
+                                '快速连接',
+                                style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                                  fontWeight: FontWeight.w600,
+                                  color: Theme.of(context).colorScheme.onSurface,
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 12),
+                          SizedBox(
+                            width: double.infinity,
+                            child: OutlinedButton.icon(
+                              onPressed: connectionBusy ? null : handleScan,
+                              icon: const Icon(Icons.qr_code_scanner),
+                              label: const Text('扫码连接'),
                             ),
                           ),
-                        ),
-                        const SizedBox(width: 10),
-                        FilledButton.tonal(
-                          onPressed: connectionBusy ? null : handlePasteLink,
-                          child: const Text('导入'),
-                        ),
-                      ],
+                          const SizedBox(height: 12),
+                          Row(
+                            children: [
+                              Expanded(
+                                child: TextField(
+                                  controller: linkController,
+                                  enabled: !connectionBusy,
+                                  decoration: const InputDecoration(
+                                    labelText: '连接链接',
+                                    hintText: 'mobilevc://relay/v1?...',
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(width: 10),
+                              FilledButton.tonal(
+                                onPressed: connectionBusy ? null : handlePasteLink,
+                                child: const Text('导入'),
+                              ),
+                            ],
+                          ),
+                        ],
+                      ),
                     ),
                     if (scanHint.isNotEmpty) ...[
                       const SizedBox(height: 8),
@@ -836,8 +905,34 @@ class _SessionHomePageState extends State<SessionHomePage> {
                           decoration:
                               const InputDecoration(labelText: 'Token')),
                     ],
-                    const SizedBox(height: 10),
-                    SegmentedButton<ConnectionMode>(
+                    const SizedBox(height: 16),
+                    Container(
+                      padding: const EdgeInsets.all(16),
+                      decoration: BoxDecoration(
+                        color: Theme.of(context).colorScheme.surface,
+                        borderRadius: BorderRadius.circular(16),
+                        border: Border.all(
+                          color: Theme.of(context).colorScheme.outline.withValues(alpha: 0.12),
+                        ),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            children: [
+                              Icon(Icons.settings_input_antenna, size: 20, color: Theme.of(context).colorScheme.primary),
+                              const SizedBox(width: 8),
+                              Text(
+                                '连接模式',
+                                style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                                  fontWeight: FontWeight.w600,
+                                  color: Theme.of(context).colorScheme.onSurface,
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 12),
+                          SegmentedButton<ConnectionMode>(
                       segments: const [
                         ButtonSegment(
                           value: ConnectionMode.direct,
@@ -899,13 +994,42 @@ class _SessionHomePageState extends State<SessionHomePage> {
                         style: Theme.of(context).textTheme.bodySmall,
                       ),
                     ],
-                    const SizedBox(height: 10),
-                    TextField(
-                        controller: cwdController,
-                        enabled: !connectionBusy,
-                        decoration: const InputDecoration(labelText: 'CWD')),
-                    const SizedBox(height: 10),
-                    DropdownButtonFormField<String>(
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                    Container(
+                      padding: const EdgeInsets.all(16),
+                      decoration: BoxDecoration(
+                        color: Theme.of(context).colorScheme.surface,
+                        borderRadius: BorderRadius.circular(16),
+                        border: Border.all(
+                          color: Theme.of(context).colorScheme.outline.withValues(alpha: 0.12),
+                        ),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            children: [
+                              Icon(Icons.tune, size: 20, color: Theme.of(context).colorScheme.primary),
+                              const SizedBox(width: 8),
+                              Text(
+                                '高级设置',
+                                style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                                  fontWeight: FontWeight.w600,
+                                  color: Theme.of(context).colorScheme.onSurface,
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 12),
+                          TextField(
+                              controller: cwdController,
+                              enabled: !connectionBusy,
+                              decoration: const InputDecoration(labelText: 'CWD')),
+                          const SizedBox(height: 10),
+                          DropdownButtonFormField<String>(
                       initialValue: selectedEngine,
                       decoration: const InputDecoration(labelText: 'Engine'),
                       items: const [
@@ -939,9 +1063,38 @@ class _SessionHomePageState extends State<SessionHomePage> {
                         enabled: !connectionBusy,
                         decoration: const InputDecoration(
                             labelText: 'Permission Mode')),
-                    const SizedBox(height: 10),
-                    TextField(
-                      controller: iceHostController,
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                    Container(
+                      padding: const EdgeInsets.all(16),
+                      decoration: BoxDecoration(
+                        color: Theme.of(context).colorScheme.surface,
+                        borderRadius: BorderRadius.circular(16),
+                        border: Border.all(
+                          color: Theme.of(context).colorScheme.outline.withValues(alpha: 0.12),
+                        ),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            children: [
+                              Icon(Icons.security, size: 20, color: Theme.of(context).colorScheme.primary),
+                              const SizedBox(width: 8),
+                              Text(
+                                'ADB ICE 配置',
+                                style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                                  fontWeight: FontWeight.w600,
+                                  color: Theme.of(context).colorScheme.onSurface,
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 12),
+                          TextField(
+                            controller: iceHostController,
                       decoration: const InputDecoration(
                         labelText: 'ADB TURN Host Override',
                         hintText: '留空则跟 Host 一致',
@@ -990,19 +1143,48 @@ class _SessionHomePageState extends State<SessionHomePage> {
                             ),
                       ),
                     ],
+                        ],
+                      ),
+                    ),
                     const SizedBox(height: 16),
-                    Row(
-                      children: [
-                        Expanded(
-                          child: FilledButton.tonal(
-                            onPressed:
-                                connectionBusy ? null : () => persistConfig(),
-                            child: const Text('保存'),
-                          ),
+                    Container(
+                      padding: const EdgeInsets.all(16),
+                      decoration: BoxDecoration(
+                        color: Theme.of(context).colorScheme.surface,
+                        borderRadius: BorderRadius.circular(16),
+                        border: Border.all(
+                          color: Theme.of(context).colorScheme.outline.withValues(alpha: 0.12),
                         ),
-                        const SizedBox(width: 10),
-                        Expanded(
-                          child: FilledButton(
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            children: [
+                              Icon(Icons.play_arrow, size: 20, color: Theme.of(context).colorScheme.primary),
+                              const SizedBox(width: 8),
+                              Text(
+                                '操作',
+                                style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                                  fontWeight: FontWeight.w600,
+                                  color: Theme.of(context).colorScheme.onSurface,
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 12),
+                          Row(
+                            children: [
+                              Expanded(
+                                child: FilledButton.tonal(
+                                  onPressed:
+                                      connectionBusy ? null : () => persistConfig(),
+                                  child: const Text('保存'),
+                                ),
+                              ),
+                              const SizedBox(width: 10),
+                              Expanded(
+                                child: FilledButton(
                             onPressed: connectionBusy || !canConnectRelay
                                 ? null
                                 : () async {
@@ -1094,6 +1276,9 @@ class _SessionHomePageState extends State<SessionHomePage> {
                         ),
                       ),
                     ],
+                        ],
+                      ),
+                    ),
                   ],
                 ),
               ),

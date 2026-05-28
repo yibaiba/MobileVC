@@ -88,7 +88,6 @@ bool looksLikeSessionNoiseText(String text) {
   return lower == 'ok' ||
       lower == 'done' ||
       lower == 'running' ||
-      lower == 'thinking' ||
       lower == 'processing' ||
       lower == 'active' ||
       lower == 'ready' ||

@@ -2343,6 +2343,13 @@ func (r *PtyRunner) readClaudeStreamJSON(ctx context.Context, reader io.Reader, 
 					sendEvent(sink, protocol.NewAgentStateEvent(sessionID, "THINKING", "思考中", false, "", "", ""))
 				}
 				switch block.Type {
+				case "thinking":
+					if text := strings.TrimSpace(block.Text); text != "" {
+						sendEvent(sink, protocol.ApplyRuntimeMeta(
+							protocol.NewThinkingEvent(sessionID, text),
+							protocol.RuntimeMeta{ResumeSessionID: envelope.SessionID, Engine: r.pendingReq.Engine},
+						))
+					}
 				case "tool_use":
 					target := extractToolTarget(block.Name, block.Input)
 					logx.Info("pty", "claude assistant tool_use: sessionID=%s tool=%s target=%q", sessionID, block.Name, target)
