@@ -820,6 +820,13 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			}
 			emit(event)
 		}
+		isPermissionPromptEvent := func(event any) bool {
+			e, ok := event.(protocol.PromptRequestEvent)
+			if !ok {
+				return false
+			}
+			return strings.TrimSpace(e.RuntimeMeta.BlockingKind) == "permission"
+		}
 		emitAIStatusEvent := func(status protocol.AIStatusEvent) {
 			event := any(status)
 			if sessionRuntime != nil {
@@ -829,15 +836,33 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 		}
 		return func(event any) {
 			switch event.(type) {
-			case protocol.PromptRequestEvent, protocol.InteractionRequestEvent:
+			case protocol.PromptRequestEvent:
+				if isPermissionPromptEvent(event) {
+					if requestID := permissionRequestIDFromEvent(event); requestID != "" {
+						currentProjection := buildRuntimeProjectionSnapshotForService(runtimeSessionID, sessionRuntimeSvc)
+						if isResolvedPermissionID(currentProjection.Controller.ResolvedPermissionIDs, requestID) {
+							logx.Info("ws", "permission event already resolved, skipping: sessionID=%s requestID=%s", runtimeSessionID, requestID)
+							return
+						}
+					}
+					autoApplyCtx, autoApplyCancel := sessionProjectionContext()
+					applied, err := maybeAutoApplyPermissionEvent(autoApplyCtx, h.SessionStore, runtimeSessionID, event, sessionRuntimeSvc, emitSessionEvent, emitAndPersistFor(runtimeSessionID))
+					autoApplyCancel()
+					if err == nil && applied {
+						logx.Info("ws", "permission event auto-applied: sessionID=%s", runtimeSessionID)
+						return
+					}
+					logx.Info("ws", "permission event forwarding to client: sessionID=%s eventType=%T", runtimeSessionID, event)
+				}
+			case protocol.InteractionRequestEvent:
 				autoApplyCtx, autoApplyCancel := sessionProjectionContext()
 				applied, err := maybeAutoApplyPermissionEvent(autoApplyCtx, h.SessionStore, runtimeSessionID, event, sessionRuntimeSvc, emitSessionEvent, emitAndPersistFor(runtimeSessionID))
 				autoApplyCancel()
 				if err == nil && applied {
-					logx.Info("ws", "permission event auto-applied: sessionID=%s", runtimeSessionID)
+					logx.Info("ws", "interaction event auto-applied: sessionID=%s", runtimeSessionID)
 					return
 				}
-				logx.Info("ws", "permission event forwarding to client: sessionID=%s eventType=%T", runtimeSessionID, event)
+				logx.Info("ws", "interaction event forwarding to client: sessionID=%s eventType=%T", runtimeSessionID, event)
 			}
 			switch e := event.(type) {
 			case protocol.CatalogAuthoringResultEvent:
@@ -2149,7 +2174,11 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				continue
 			}
 			_, service := runtimeForSession(selectedSessionID)
-			if err := service.StopActive(selectedSessionID, emitAndPersistFor(selectedSessionID)); err != nil && !errors.Is(err, session.ErrNoActiveRunner) {
+			if err := service.StopActive(selectedSessionID, emitAndPersistFor(selectedSessionID)); err != nil {
+				if errors.Is(err, session.ErrNoActiveRunner) {
+					emit(protocol.NewSessionStateEvent(selectedSessionID, "stopped", "当前没有可停止的运行"))
+					continue
+				}
 				logx.Warn("ws", "stop active runner failed: connectionID=%s sessionID=%s remoteAddr=%s action=stop err=%v", connectionID, selectedSessionID, remoteAddr, err)
 				emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
 			}
@@ -3315,6 +3344,22 @@ func isClaudeRuntime(runtime data.SessionRuntime) bool {
 	return head == "claude" || strings.HasSuffix(head, "/claude") || strings.HasSuffix(head, `\claude`) || head == "claude.exe"
 }
 
+func permissionRequestIDFromEvent(event any) string {
+	if e, ok := event.(protocol.PromptRequestEvent); ok {
+		return strings.TrimSpace(e.PermissionRequestID)
+	}
+	return ""
+}
+
+func isResolvedPermissionID(resolvedIDs []string, requestID string) bool {
+	for _, id := range resolvedIDs {
+		if strings.TrimSpace(id) == requestID {
+			return true
+		}
+	}
+	return false
+}
+
 func commandHead(command string) string {
 	fields := strings.Fields(strings.TrimSpace(command))
 	if len(fields) == 0 {
@@ -3814,14 +3859,19 @@ func applyAICommandPreferences(command, engine, model, reasoningEffort string) s
 	switch normalizedEngine {
 	case "claude":
 		model = strings.TrimSpace(model)
-		if model == "" || strings.EqualFold(model, "default") || strings.Contains(lower, " --model ") || strings.Contains(lower, " -m ") {
+		if strings.EqualFold(model, "default") {
+			return strings.Join(removeCommandFlagValue(fields, "-m", "--model"), " ")
+		}
+		if model == "" || strings.Contains(lower, " --model ") || strings.Contains(lower, " -m ") {
 			return trimmed
 		}
 		return trimmed + " --model " + shellQuote(model)
 	case "codex":
 		parts := append([]string(nil), fields...)
 		model = strings.TrimSpace(model)
-		if model != "" {
+		if strings.EqualFold(model, "default") {
+			parts = removeCommandFlagValue(parts, "-m", "--model")
+		} else if model != "" {
 			parts = upsertCommandFlagValue(parts, model, "-m", "--model")
 		}
 		effort := strings.TrimSpace(strings.ToLower(reasoningEffort))
@@ -3851,6 +3901,34 @@ func upsertCommandFlagValue(fields []string, value string, flags ...string) []st
 		}
 	}
 	return append(fields, flags[0], value)
+}
+
+func removeCommandFlagValue(fields []string, flags ...string) []string {
+	if len(fields) == 0 {
+		return fields
+	}
+	filtered := make([]string, 0, len(fields))
+	for i := 0; i < len(fields); i++ {
+		field := fields[i]
+		removed := false
+		for _, flag := range flags {
+			if field == flag {
+				removed = true
+				if i+1 < len(fields) {
+					i++
+				}
+				break
+			}
+			if strings.HasPrefix(field, flag+"=") {
+				removed = true
+				break
+			}
+		}
+		if !removed {
+			filtered = append(filtered, field)
+		}
+	}
+	return filtered
 }
 
 func upsertCodexReasoningEffort(fields []string, effort string) []string {

@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -84,11 +85,12 @@ type Controller struct {
 	recentDiff      DiffContext
 
 	// dedup fields
-	lastLogMsg     string
-	lastLogTime    time.Time
-	lastStepMsg    string
-	lastStepStatus string
-	lastPromptMsg  string
+	lastLogMsg              string
+	lastLogTime             time.Time
+	lastStepMsg             string
+	lastStepStatus          string
+	lastPromptMsg           string
+	resolvedPermissionIDs   []string
 }
 
 func (c *Controller) RecordUserInput(input string) {
@@ -411,6 +413,15 @@ func (c *Controller) OnInputSent(meta protocol.RuntimeMeta) []any {
 		return []any{c.newAgentStateEvent("已拒绝权限，可继续输入", true)}
 	}
 	if meta.Source == "permission-decision" {
+		requestID := strings.TrimSpace(meta.PermissionRequestID)
+		if requestID != "" {
+			if !slices.Contains(c.resolvedPermissionIDs, requestID) {
+				c.resolvedPermissionIDs = append(c.resolvedPermissionIDs, requestID)
+				if len(c.resolvedPermissionIDs) > 50 {
+					c.resolvedPermissionIDs = c.resolvedPermissionIDs[len(c.resolvedPermissionIDs)-50:]
+				}
+			}
+		}
 		c.activeMeta.PermissionRequestID = ""
 		c.activeMeta.BlockingKind = ""
 	}
@@ -475,18 +486,21 @@ func (c *Controller) RecentDiffs() []DiffContext {
 func (c *Controller) Snapshot() ControllerSnapshot {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	resolvedIDs := make([]string, len(c.resolvedPermissionIDs))
+	copy(resolvedIDs, c.resolvedPermissionIDs)
 	return ControllerSnapshot{
-		SessionID:       c.sessionID,
-		State:           c.currentState,
-		CurrentCommand:  c.currentCommand,
-		LastStep:        c.lastStep,
-		LastTool:        c.lastTool,
-		ResumeSession:   c.resumeSession,
-		ClaudeLifecycle: c.claudeLifecycle,
-		LastUserInput:   c.lastUserInput,
-		ActiveMeta:      c.activeMeta,
-		RecentDiffs:     append([]DiffContext(nil), c.recentDiffs...),
-		RecentDiff:      c.recentDiff,
+		SessionID:              c.sessionID,
+		State:                  c.currentState,
+		CurrentCommand:         c.currentCommand,
+		LastStep:               c.lastStep,
+		LastTool:               c.lastTool,
+		ResumeSession:          c.resumeSession,
+		ClaudeLifecycle:        c.claudeLifecycle,
+		LastUserInput:          c.lastUserInput,
+		ActiveMeta:             c.activeMeta,
+		RecentDiffs:            append([]DiffContext(nil), c.recentDiffs...),
+		RecentDiff:             c.recentDiff,
+		ResolvedPermissionIDs:  resolvedIDs,
 	}
 }
 
@@ -509,6 +523,9 @@ func (c *Controller) Restore(snapshot ControllerSnapshot) {
 	}
 	c.recentDiffs = append([]DiffContext(nil), snapshot.RecentDiffs...)
 	c.recentDiff = snapshot.RecentDiff
+	resolvedIDs := make([]string, len(snapshot.ResolvedPermissionIDs))
+	copy(resolvedIDs, snapshot.ResolvedPermissionIDs)
+	c.resolvedPermissionIDs = resolvedIDs
 	if len(c.recentDiffs) == 0 && strings.TrimSpace(c.recentDiff.ContextID+c.recentDiff.Path+c.recentDiff.Title) != "" {
 		c.recentDiffs = []DiffContext{c.recentDiff}
 	}

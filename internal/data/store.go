@@ -244,11 +244,12 @@ type ControllerSnapshot struct {
 	ResumeSession   string               `json:"resumeSession,omitempty"`
 	ClaudeLifecycle string               `json:"claudeLifecycle,omitempty"`
 	LastUserInput   string               `json:"lastUserInput,omitempty"`
-	ActiveMeta      protocol.RuntimeMeta `json:"activeMeta,omitempty"`
-	RecentDiffs     []DiffContext        `json:"recentDiffs,omitempty"`
-	RecentDiff      DiffContext          `json:"recentDiff,omitempty"`
-	ReviewGroups    []ReviewGroup        `json:"reviewGroups,omitempty"`
-	ActiveReviewID  string               `json:"activeReviewId,omitempty"`
+	ActiveMeta             protocol.RuntimeMeta `json:"activeMeta,omitempty"`
+	RecentDiffs            []DiffContext        `json:"recentDiffs,omitempty"`
+	RecentDiff             DiffContext          `json:"recentDiff,omitempty"`
+	ReviewGroups           []ReviewGroup        `json:"reviewGroups,omitempty"`
+	ActiveReviewID         string               `json:"activeReviewId,omitempty"`
+	ResolvedPermissionIDs  []string             `json:"resolvedPermissionIds,omitempty"`
 }
 
 type SnapshotLogEntry struct {

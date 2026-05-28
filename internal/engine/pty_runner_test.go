@@ -614,6 +614,26 @@ func TestPtyRunnerWritePermissionResponseApproveEncodesControlResponse(t *testin
 	}
 }
 
+func TestPtyRunnerWritePermissionResponseClearsPreviousControlRequest(t *testing.T) {
+	buf := &nopWriteCloser{}
+	runner := NewPtyRunner()
+	runner.writer = buf
+	runner.pendingReq = ExecRequest{SessionID: "s-control-previous"}
+	runner.pendingControlRequestID = "req-current"
+	runner.pendingControlRequestIDPrev = "req-previous"
+
+	if err := runner.WritePermissionResponse(context.Background(), "approve"); err != nil {
+		t.Fatalf("write permission response: %v", err)
+	}
+
+	if runner.HasPendingPermissionRequest() {
+		t.Fatalf("expected previous control request to be discarded, current=%q", runner.CurrentPermissionRequestID())
+	}
+	if strings.Contains(buf.String(), "req-previous") {
+		t.Fatalf("unexpected previous request in output: %q", buf.String())
+	}
+}
+
 func TestPtyRunnerWritePermissionResponseApproveIncludesToolInput(t *testing.T) {
 	buf := &nopWriteCloser{}
 	runner := NewPtyRunner()

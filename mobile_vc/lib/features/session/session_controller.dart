@@ -1043,11 +1043,10 @@ class SessionController extends ChangeNotifier {
     if (!connected) {
       return false;
     }
-    // 如果正在停止中，不允许再次点击
     if (_isStopping) {
       return false;
     }
-    if (awaitInput || _isClaudePendingReadyForInput) {
+    if (isObservingRemoteActiveSession) {
       return false;
     }
     if (_hasRunningTerminalExecution) {
@@ -1061,6 +1060,15 @@ class SessionController extends ChangeNotifier {
     }
     final sessionState = (_sessionState?.state ?? '').trim().toUpperCase();
     if (sessionState == 'THINKING' || sessionState == 'RUNNING_TOOL') {
+      return true;
+    }
+    if (awaitInput || _isClaudePendingReadyForInput) {
+      if (!_isSubmitting) {
+        return false;
+      }
+    }
+    if (!_selectedSessionExternalNative &&
+        (_sessionRuntimeAlive || _executionActive)) {
       return true;
     }
     if (sessionState != 'RUNNING') {
@@ -1077,6 +1085,18 @@ class SessionController extends ChangeNotifier {
     return runningKey != _lastAssistantReplyExecutionKey ||
         _isDefinitiveAgentState(agentState, sessionState) ||
         _executionActive;
+  }
+
+  void _clearStoppingState() {
+    if (!_isStopping) {
+      return;
+    }
+    _isStopping = false;
+    _activityHideDebounce?.cancel();
+    _activityHideDebounce = null;
+    _activityVisible = false;
+    _activityStartedAt = null;
+    _activityToolLabel = '';
   }
 
   bool get canCompactCurrentSession {
@@ -1503,6 +1523,7 @@ class SessionController extends ChangeNotifier {
     _connected = false;
     _connecting = false;
     _activeTransportPath = ActiveTransportPath.none;
+    _clearStoppingState();
     _connectionStage = SessionConnectionStage.disconnected;
     _latestError = null;
     _relayDevices.clear();
@@ -1903,11 +1924,11 @@ class SessionController extends ChangeNotifier {
     final normalizedEngine = engine.trim().toLowerCase();
     final configured = _configuredModelForEngine(normalizedEngine).trim();
     if (configured.isEmpty || configured.toLowerCase() == 'default') {
-      return '';
+      return 'default';
     }
     final resolved = _resolvedAiModel(normalizedEngine, configured).trim();
-    if (resolved.toLowerCase() == 'default') {
-      return '';
+    if (resolved.isEmpty || resolved.toLowerCase() == 'default') {
+      return 'default';
     }
     return resolved;
   }
@@ -2386,6 +2407,7 @@ class SessionController extends ChangeNotifier {
     _activityVisible = false;
     _activityHideDebounce?.cancel();
     _activityHideDebounce = null;
+    _clearStoppingState();
     _isSubmitting = false;
     _isSubmittingBaselineKey = '';
     _pendingAiLaunchAwaitingInput = false;
@@ -2408,6 +2430,7 @@ class SessionController extends ChangeNotifier {
     _connected = false;
     _connecting = false;
     _activeTransportPath = ActiveTransportPath.none;
+    _clearStoppingState();
     _isLoadingSession = false;
     _sessionListSyncedSinceConnect = false;
     _pendingSessionTargetId = '';
@@ -2568,6 +2591,8 @@ class SessionController extends ChangeNotifier {
       'session',
       '已在手机继续同一会话。电脑端原生终端仍可输入，请避免两端同时输入。',
     );
+    // 立即同步当前运行状态，避免 stop 按钮需要切后台才出现
+    _requestSessionDelta(reason: 'continue_same_session');
     _syncDerivedState();
     notifyListeners();
   }
@@ -2784,6 +2809,7 @@ class SessionController extends ChangeNotifier {
     _activityVisible = false;
     _activityHideDebounce?.cancel();
     _activityHideDebounce = null;
+    _clearStoppingState();
     _isSubmitting = false;
     _isSubmittingBaselineKey = '';
     _pendingAiLaunchAwaitingInput = false;
@@ -2822,6 +2848,7 @@ class SessionController extends ChangeNotifier {
     _activityVisible = false;
     _activityHideDebounce?.cancel();
     _activityHideDebounce = null;
+    _clearStoppingState();
     _isSubmitting = false;
     _isSubmittingBaselineKey = '';
     _pendingAiLaunchAwaitingInput = false;
@@ -4606,7 +4633,22 @@ class SessionController extends ChangeNotifier {
     // 设置停止中标记，按钮立即变灰，但状态栏继续显示
     _isStopping = true;
 
-    _service.send({'action': 'stop'});
+    final payload = <String, dynamic>{
+      'action': 'stop',
+      'clientActionId': _nextClientActionId(),
+    };
+    final sessionId = _selectedSessionId.trim();
+    if (sessionId.isNotEmpty) {
+      payload['sessionId'] = sessionId;
+    }
+    final sent = _service.send(payload);
+    if (!sent) {
+      _clearStoppingState();
+      _pushSystem('error', '停止请求发送失败：当前未连接');
+    } else {
+      // 请求 session delta 以快速同步后端停止状态，避免 UI 卡在"正在停止"
+      _requestSessionDelta(reason: 'stop_current_run');
+    }
     _syncDerivedState();
     notifyListeners();
   }
@@ -4872,6 +4914,9 @@ class SessionController extends ChangeNotifier {
         _canResumeCurrentSession = history.canResume;
         _resumeRuntimeMeta = history.resumeRuntimeMeta;
         _sessionRuntimeAlive = history.runtimeAlive;
+        if (!history.runtimeAlive) {
+          _clearStoppingState();
+        }
         _continueSameSessionEnabled = false;
         _continuedSameSessionId = '';
         _terminalExecutions
@@ -4977,6 +5022,9 @@ class SessionController extends ChangeNotifier {
         _connectionStage = SessionConnectionStage.ready;
         _connectionMessage = '已连接';
         _sessionRuntimeAlive = result.runtimeAlive;
+        if (!result.runtimeAlive) {
+          _clearStoppingState();
+        }
         if (!result.runtimeAlive && !canSendToContinuedSameSession) {
           _continueSameSessionEnabled = false;
           _continuedSameSessionId = '';
@@ -5013,7 +5061,7 @@ class SessionController extends ChangeNotifier {
         _syncRuntimePermissionMode();
 
         if (_isIdleLikeState(state.state)) {
-          _isStopping = false;
+          _clearStoppingState();
         }
 
         if (_isLoadingSession &&
@@ -5094,6 +5142,7 @@ class SessionController extends ChangeNotifier {
           _pendingInteraction = null;
         }
         if (_isIdleLikeState(agent.state) || agent.awaitInput) {
+          _clearStoppingState();
           _markTerminalExecutionFinished(
             agent.runtimeMeta,
             finishedAt: agent.timestamp,
@@ -6033,6 +6082,9 @@ class SessionController extends ChangeNotifier {
     _canResumeCurrentSession = delta.canResume;
     _resumeRuntimeMeta = delta.resumeRuntimeMeta;
     _sessionRuntimeAlive = delta.runtimeAlive;
+    if (!delta.runtimeAlive) {
+      _clearStoppingState();
+    }
     if (!delta.runtimeAlive && !canSendToContinuedSameSession) {
       _continueSameSessionEnabled = false;
       _continuedSameSessionId = '';
@@ -8384,6 +8436,7 @@ class SessionController extends ChangeNotifier {
       // Heartbeat snapshots use the backend runner state, which doesn't
       // track external native (desktop Claude) processes. Keep the state
       // from the authoritative session events for external sessions.
+      _clearStoppingState();
       if (!snapshot.syncing && _selectedSessionExternalNative) {
         return false;
       }
@@ -8412,6 +8465,9 @@ class SessionController extends ChangeNotifier {
       step: snapshot.step,
       tool: snapshot.tool,
     );
+    if (_isIdleLikeState(state) || snapshot.awaitInput) {
+      _clearStoppingState();
+    }
     if (snapshot.runtimeAlive) {
       _connectionStage = snapshot.syncing
           ? SessionConnectionStage.catchingUp

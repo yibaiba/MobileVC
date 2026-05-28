@@ -99,7 +99,7 @@ class _CommandInputBarState extends State<CommandInputBar> {
           widget.isBusy);
 
   bool get _showStopAction =>
-      !_inputLocked && widget.canStop && !widget.awaitInput;
+      !widget.isExternallyLocked && !widget.isSessionLoading && widget.canStop;
 
   String get _lockedHintText {
     if (widget.isExternallyLocked) {
@@ -486,11 +486,9 @@ class _CommandInputBarState extends State<CommandInputBar> {
                               width: 42,
                               height: 42,
                               child: FilledButton(
-                                onPressed: _inputLocked
-                                    ? null
-                                    : (_showStopAction
-                                        ? widget.onStop
-                                        : _submit),
+                                onPressed: _showStopAction
+                                    ? widget.onStop
+                                    : (_inputLocked ? null : _submit),
                                 style: FilledButton.styleFrom(
                                   elevation: 0,
                                   backgroundColor: _inputLocked
