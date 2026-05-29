@@ -181,6 +181,37 @@ void main() {
       expect(submitted, isFalse);
     });
 
+    testWidgets('选择图片后输入文字不会重建图片预览', (tester) async {
+      await tester.pumpWidget(
+        _buildTestApp(
+          awaitInput: true,
+          isBusy: true,
+          canStop: true,
+          currentEngine: 'codex',
+          onAttachImage: () async => ChatImageAttachment(
+            name: 'screen.png',
+            mimeType: 'image/png',
+            bytes: _transparentPngBytes,
+          ),
+        ),
+      );
+
+      await tester.tap(find.byTooltip('添加图片'));
+      await tester.pump();
+
+      final previewFinder =
+          find.byKey(const ValueKey('imageAttachmentPreview:screen.png'));
+      expect(previewFinder, findsOneWidget);
+      final previewBefore = tester.widget(previewFinder);
+
+      await tester.enterText(find.byType(TextField), '看下这张图');
+      await tester.pump();
+
+      expect(previewFinder, findsOneWidget);
+      expect(identical(tester.widget(previewFinder), previewBefore), isTrue);
+      expect(find.byIcon(Icons.arrow_upward), findsOneWidget);
+    });
+
     testWidgets('Codex 模式显示 Codex 状态与 hint', (tester) async {
       await tester.pumpWidget(
         _buildTestApp(
