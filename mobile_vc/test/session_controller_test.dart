@@ -10775,6 +10775,93 @@ void main() {
       );
     });
 
+    test('loadSession 请求首屏历史窗口，避免一次加载完整长会话', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.sentPayloads.clear();
+      controller.loadSession('session-window');
+
+      expect(service.sentPayloads, hasLength(1));
+      expect(service.sentPayloads.single['action'], 'session_load');
+      expect(service.sentPayloads.single['sessionId'], 'session-window');
+      expect(service.sentPayloads.single['limit'], 120);
+    });
+
+    test('session_history_page 会把更早历史插入 timeline 前面', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        logEntryStart: 2,
+        logEntryTotal: 4,
+        hasMoreBefore: true,
+        logEntries: const [
+          HistoryLogEntry(
+            kind: 'markdown',
+            message: '第三条',
+            timestamp: '2026-05-27T05:20:03Z',
+          ),
+          HistoryLogEntry(
+            kind: 'markdown',
+            message: '第四条',
+            timestamp: '2026-05-27T05:20:04Z',
+          ),
+        ],
+        resumeRuntimeMeta: RuntimeMeta(command: 'claude'),
+      ));
+      await _flushEvents();
+
+      expect(controller.hasOlderTimelineEntries, isTrue);
+      service.sentPayloads.clear();
+      controller.loadOlderTimelineEntries();
+      expect(service.sentPayloads.single['action'], 'session_history_page');
+      expect(service.sentPayloads.single['before'], 2);
+      expect(service.sentPayloads.single['limit'], 120);
+
+      service.emit(SessionHistoryPageEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_history_page'},
+        logEntryStart: 0,
+        logEntryTotal: 4,
+        hasMoreBefore: false,
+        logEntries: const [
+          HistoryLogEntry(
+            kind: 'markdown',
+            message: '第一条',
+            timestamp: '2026-05-27T05:20:01Z',
+          ),
+          HistoryLogEntry(
+            kind: 'markdown',
+            message: '第二条',
+            timestamp: '2026-05-27T05:20:02Z',
+          ),
+        ],
+        resumeRuntimeMeta: RuntimeMeta(command: 'claude'),
+      ));
+      await _flushEvents();
+
+      expect(
+        controller.timeline.map((item) => item.body).toList(),
+        ['第一条第二条', '第三条第四条'],
+      );
+      expect(controller.hasOlderTimelineEntries, isFalse);
+      expect(controller.isLoadingOlderTimelineEntries, isFalse);
+    });
+
     test('session_history 会折叠 Codex 原生工具事件', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);

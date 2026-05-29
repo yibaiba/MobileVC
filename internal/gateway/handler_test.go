@@ -757,6 +757,11 @@ func readUntilSessionHistory(t *testing.T, conn *websocket.Conn) map[string]any 
 	return readUntilType(t, conn, protocol.EventTypeSessionHistory)
 }
 
+func readUntilSessionHistoryPage(t *testing.T, conn *websocket.Conn) map[string]any {
+	t.Helper()
+	return readUntilType(t, conn, protocol.EventTypeSessionHistoryPage)
+}
+
 func readUntilSessionCreated(t *testing.T, conn *websocket.Conn) map[string]any {
 	t.Helper()
 	return readUntilType(t, conn, protocol.EventTypeSessionCreated)
@@ -6760,6 +6765,86 @@ func TestMergeSnapshotLogEntriesPreservesAppendOrder(t *testing.T) {
 	if merged[0].Message != "new runtime state" || merged[1].Message != "older cached state" {
 		t.Fatalf("expected append order to be preserved for generic merge, got %#v", merged)
 	}
+}
+
+func TestHandlerSessionLoadReturnsLimitedHistoryWindowAndOlderPage(t *testing.T) {
+	h := newTestHandler()
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	h.SessionStore = tempStore
+	now := time.Date(2026, 5, 29, 12, 0, 0, 0, time.UTC)
+	record := data.SessionRecord{
+		Summary: data.SessionSummary{
+			ID:        "history-window-session",
+			Title:     "History Window",
+			CreatedAt: now,
+			UpdatedAt: now,
+		},
+		Projection: data.ProjectionSnapshot{
+			LogEntries: []data.SnapshotLogEntry{
+				{Kind: "markdown", Message: "one", Timestamp: now.Add(time.Second).Format(time.RFC3339)},
+				{Kind: "markdown", Message: "two", Timestamp: now.Add(2 * time.Second).Format(time.RFC3339)},
+				{Kind: "markdown", Message: "three", Timestamp: now.Add(3 * time.Second).Format(time.RFC3339)},
+				{Kind: "markdown", Message: "four", Timestamp: now.Add(4 * time.Second).Format(time.RFC3339)},
+			},
+		},
+	}
+	if _, err := h.SessionStore.UpsertSession(context.Background(), record); err != nil {
+		t.Fatalf("upsert session: %v", err)
+	}
+
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+	if err := conn.WriteJSON(protocol.SessionLoadRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_load"},
+		SessionID:   record.Summary.ID,
+		Limit:       2,
+	}); err != nil {
+		t.Fatalf("write session_load request: %v", err)
+	}
+	history := readUntilSessionHistory(t, conn)
+	if got := int(history["logEntryStart"].(float64)); got != 2 {
+		t.Fatalf("history start: got %d", got)
+	}
+	if got := int(history["logEntryTotal"].(float64)); got != 4 {
+		t.Fatalf("history total: got %d", got)
+	}
+	if history["hasMoreBefore"] != true {
+		t.Fatalf("expected hasMoreBefore=true, got %#v", history)
+	}
+	entries := history["logEntries"].([]any)
+	if len(entries) != 2 || entries[0].(map[string]any)["message"] != "three" || entries[1].(map[string]any)["message"] != "four" {
+		t.Fatalf("unexpected limited history entries: %#v", entries)
+	}
+
+	if err := conn.WriteJSON(protocol.SessionHistoryPageRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_history_page"},
+		SessionID:   record.Summary.ID,
+		Before:      2,
+		Limit:       2,
+	}); err != nil {
+		t.Fatalf("write session_history_page request: %v", err)
+	}
+	page := readUntilSessionHistoryPage(t, conn)
+	if got := intFromJSONNumber(page["logEntryStart"]); got != 0 {
+		t.Fatalf("page start: got %d", got)
+	}
+	if page["hasMoreBefore"] == true {
+		t.Fatalf("expected page hasMoreBefore=false, got %#v", page)
+	}
+	pageEntries := page["logEntries"].([]any)
+	if len(pageEntries) != 2 || pageEntries[0].(map[string]any)["message"] != "one" || pageEntries[1].(map[string]any)["message"] != "two" {
+		t.Fatalf("unexpected page entries: %#v", pageEntries)
+	}
+}
+
+func intFromJSONNumber(value any) int {
+	if value == nil {
+		return 0
+	}
+	return int(value.(float64))
 }
 
 func TestHandlerSessionLoadPreservesCodexMirrorOverlayButDropsStaleCachedLogs(t *testing.T) {

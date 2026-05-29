@@ -32,11 +32,14 @@ class ChatTimeline extends StatefulWidget {
     this.shouldShowPlanChoices = false,
     this.isAiRunning = false,
     this.aiStatusLabel = '',
+    this.hasOlderItems = false,
+    this.isLoadingOlderItems = false,
     this.onOpenDiff,
     this.onOpenRuntimeInfo,
     this.onOpenFile,
     this.onOpenAttachment,
     this.onRequestMediaPreview,
+    this.onLoadOlderItems,
     this.onReviewDecision,
     this.onAcceptAll,
     this.onPromptSubmit,
@@ -59,11 +62,14 @@ class ChatTimeline extends StatefulWidget {
   final bool shouldShowPlanChoices;
   final bool isAiRunning;
   final String aiStatusLabel;
+  final bool hasOlderItems;
+  final bool isLoadingOlderItems;
   final VoidCallback? onOpenDiff;
   final VoidCallback? onOpenRuntimeInfo;
   final VoidCallback? onOpenFile;
   final ValueChanged<TimelineAttachment>? onOpenAttachment;
   final ValueChanged<TimelineAttachment>? onRequestMediaPreview;
+  final VoidCallback? onLoadOlderItems;
   final ValueChanged<String>? onReviewDecision;
   final VoidCallback? onAcceptAll;
   final ValueChanged<String>? onPromptSubmit;
@@ -83,9 +89,30 @@ class _ChatTimelineState extends State<ChatTimeline> {
   @override
   void initState() {
     super.initState();
+    _scrollController.addListener(_handleScroll);
     _lastCount = widget.items.length;
     if (widget.items.isNotEmpty) {
       _scrollToBottomAfterFrame();
+    }
+  }
+
+  @override
+  void dispose() {
+    _scrollController
+      ..removeListener(_handleScroll)
+      ..dispose();
+    super.dispose();
+  }
+
+  void _handleScroll() {
+    if (!widget.hasOlderItems || widget.isLoadingOlderItems) {
+      return;
+    }
+    if (!_scrollController.hasClients) {
+      return;
+    }
+    if (_scrollController.position.pixels <= 80) {
+      widget.onLoadOlderItems?.call();
     }
   }
 
@@ -106,19 +133,19 @@ class _ChatTimelineState extends State<ChatTimeline> {
         _timelineHistoryKey(oldWidget.items);
     final switchedSession =
         widget.sessionId.trim() != oldWidget.sessionId.trim();
-    if (currentCount > previousCount ||
-        widget.items.length > _lastCount ||
-        switchedHistory ||
-        switchedSession) {
+    final addedOlderItems = widget.items.length > oldWidget.items.length &&
+        widget.items.isNotEmpty &&
+        oldWidget.items.isNotEmpty &&
+        widget.items.last.id == oldWidget.items.last.id &&
+        widget.items.first.id != oldWidget.items.first.id;
+    if (!addedOlderItems &&
+        (currentCount > previousCount ||
+            widget.items.length > _lastCount ||
+            switchedHistory ||
+            switchedSession)) {
       _scrollToBottomAfterFrame();
     }
     _lastCount = widget.items.length;
-  }
-
-  @override
-  void dispose() {
-    _scrollController.dispose();
-    super.dispose();
   }
 
   void _scrollToBottomAfterFrame() {

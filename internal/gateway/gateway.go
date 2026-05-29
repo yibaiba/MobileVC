@@ -1151,7 +1151,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			})
 			loadRuntimeAlive := sessionRecordRuntimeAlive(record, runtimeSvc)
 			trace.Step("merge_projection")
-			emit(session.SessionHistoryEventFromRecord(record, loadRuntimeAlive))
+			emit(session.SessionHistoryWindowEventFromRecord(record, loadRuntimeAlive, req.Limit))
 			trace.Step("emit_history")
 			emitContextWindowUsageIfAvailable(record.Summary.ID, runtimeSvc)
 			emitReviewStateFromProjection(emit, selectedSessionID, record.Projection)
@@ -1165,6 +1165,49 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			emit(protocol.NewSessionStateEvent(selectedSessionID, string(session.StateActive), "history loaded"))
 			trace.Step("emit_session_state")
 			trace.Finish(record.Summary.ID, activeRuntimeLoad, projectionMetrics(record.Projection))
+		case "session_history_page":
+			var req protocol.SessionHistoryPageRequestEvent
+			if err := json.Unmarshal(payloadBytes, &req); err != nil {
+				logx.Warn("ws", "invalid session_history_page request: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
+				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid session_history_page request: %v", err), ""))
+				continue
+			}
+			targetSessionID := strings.TrimSpace(req.SessionID)
+			if targetSessionID == "" {
+				targetSessionID = strings.TrimSpace(selectedSessionID)
+			}
+			if targetSessionID == "" {
+				emit(protocol.NewErrorEvent(selectedSessionID, "session ID is required", ""))
+				continue
+			}
+			if targetSessionID != strings.TrimSpace(selectedSessionID) {
+				logx.Info("ws", "ignore session_history_page for non-selected session: connectionID=%s sessionID=%s requestedSessionID=%s remoteAddr=%s", connectionID, selectedSessionID, targetSessionID, remoteAddr)
+				continue
+			}
+			if h.SessionStore == nil {
+				emit(protocol.NewErrorEvent(selectedSessionID, "session store unavailable", ""))
+				continue
+			}
+			record, err := loadSessionDeltaRecord(targetSessionID)
+			if err != nil {
+				emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
+				continue
+			}
+			_, pageRuntimeSvc := runtimeForSession(record.Summary.ID)
+			if !isNativeMirrorSessionID(record.Summary.ID) {
+				record = mergeClaudeJSONLToRecord(ctx, h.SessionStore, record, pageRuntimeSvc)
+			}
+			freshProjection := session.NormalizeProjectionSnapshot(record.Projection)
+			runtimeProjection := finalizeProjectionSnapshotForService(record.Summary.ID, pageRuntimeSvc, freshProjection)
+			if isNativeMirrorSessionID(record.Summary.ID) {
+				record.Projection = mergeProjectionWithOptionalRuntime(freshProjection, runtimeProjection, pageRuntimeSvc, record.Summary.ID)
+			} else {
+				record.Projection = runtimeProjection
+			}
+			record.Summary.Runtime = record.Projection.Runtime
+			pageEvent := session.SessionHistoryPageEventFromRecord(record, req.Before, req.Limit)
+			logx.Info("ws", "session history page response: connectionID=%s sessionID=%s remoteAddr=%s before=%d limit=%d start=%d total=%d entries=%d", connectionID, record.Summary.ID, remoteAddr, req.Before, req.Limit, pageEvent.LogEntryStart, pageEvent.LogEntryTotal, len(pageEvent.LogEntries))
+			emit(pageEvent)
 		case "register_push_token":
 			var req protocol.RegisterPushTokenRequestEvent
 			if err := json.Unmarshal(payloadBytes, &req); err != nil {

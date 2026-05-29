@@ -64,6 +64,31 @@ func TestFindNativeThreadIncludesCodexNativeToolAndPatchEvents(t *testing.T) {
 	}
 }
 
+func TestFindNativeThreadFoldsLargeCodexNativeToolOutput(t *testing.T) {
+	codexDir, db := setupCodexThreadsStore(t)
+	threadID := "native-codex-large-output"
+	rolloutPath := filepath.Join(codexDir, "sessions", "large-output.jsonl")
+	writeNativeCodexLargeOutputFixture(t, rolloutPath)
+	now := time.Date(2026, 5, 28, 12, 0, 0, 0, time.UTC).Unix()
+	insertThread(t, db, threadID, "/workspace", "Native Codex", rolloutPath, now)
+
+	thread, err := FindNativeThread(context.Background(), threadID)
+	if err != nil {
+		t.Fatalf("find native thread: %v", err)
+	}
+
+	output := findLogEntryContains(t, thread.LogEntries, "system", "Codex 工具输出已折叠")
+	if len(output.Message) > maxNativeToolOutputMessageBytes+256 {
+		t.Fatalf("folded tool output still too large: %d bytes", len(output.Message))
+	}
+	if !strings.Contains(output.Message, "原始输出") {
+		t.Fatalf("folded output should expose truncation details: %q", output.Message)
+	}
+	if output.Context == nil || output.Context.Status != "truncated" {
+		t.Fatalf("expected truncated status, got %#v", output.Context)
+	}
+}
+
 func TestListNativeThreadsDoesNotLoadRolloutHistory(t *testing.T) {
 	codexDir, db := setupCodexThreadsStore(t)
 	targetID, targetRollout, otherRollout := seedTwoCodexThreads(t, codexDir, db)
@@ -458,6 +483,43 @@ func writeNativeCodexRolloutFixture(t *testing.T, path string) {
 				"type":               "task_complete",
 				"turn_id":            "turn-1",
 				"last_agent_message": "已经检查完成",
+			},
+		},
+	}
+	for _, line := range lines {
+		if err := json.NewEncoder(file).Encode(line); err != nil {
+			t.Fatalf("write native rollout fixture: %v", err)
+		}
+	}
+}
+
+func writeNativeCodexLargeOutputFixture(t *testing.T, path string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir rollout dir: %v", err)
+	}
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("create native rollout fixture: %v", err)
+	}
+	defer file.Close()
+	lines := []map[string]any{
+		{
+			"timestamp": "2026-05-28T12:00:02.000Z",
+			"type":      "response_item",
+			"payload": map[string]any{
+				"type":    "function_call",
+				"name":    "exec_command",
+				"call_id": "call-large",
+			},
+		},
+		{
+			"timestamp": "2026-05-28T12:00:03.000Z",
+			"type":      "response_item",
+			"payload": map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call-large",
+				"output":  strings.Repeat("0123456789abcdef\n", 2048),
 			},
 		},
 	}

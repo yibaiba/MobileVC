@@ -386,6 +386,10 @@ class _SessionHomePageState extends State<SessionHomePage> {
                                       controller.aiStatusIndicatorVisible,
                                   aiStatusLabel:
                                       controller.aiStatusIndicatorLabel,
+                                  hasOlderItems:
+                                      controller.hasOlderTimelineEntries,
+                                  isLoadingOlderItems:
+                                      controller.isLoadingOlderTimelineEntries,
                                   onOpenDiff: () => _openDiff(context),
                                   onOpenRuntimeInfo: () =>
                                       _openRuntimeInfo(context),
@@ -394,6 +398,8 @@ class _SessionHomePageState extends State<SessionHomePage> {
                                       _openAttachment(context, attachment),
                                   onRequestMediaPreview:
                                       controller.requestMediaPreview,
+                                  onLoadOlderItems:
+                                      controller.loadOlderTimelineEntries,
                                   onReviewDecision:
                                       controller.sendReviewDecision,
                                   onAcceptAll: controller.acceptAllPendingDiffs,

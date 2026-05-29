@@ -303,6 +303,51 @@ func TestSessionHistoryEventFromRecord(t *testing.T) {
 	}
 }
 
+func TestSessionHistoryWindowEventFromRecordReturnsTailWindow(t *testing.T) {
+	record := data.SessionRecord{
+		Summary: data.SessionSummary{ID: "s1"},
+		Projection: data.ProjectionSnapshot{
+			LogEntries: []data.SnapshotLogEntry{
+				{Kind: "markdown", Message: "a"},
+				{Kind: "markdown", Message: "b"},
+				{Kind: "markdown", Message: "c"},
+			},
+		},
+	}
+
+	got := SessionHistoryWindowEventFromRecord(record, false, 2)
+
+	if got.LogEntryStart != 1 || got.LogEntryTotal != 3 || !got.HasMoreBefore {
+		t.Fatalf("unexpected window metadata: start=%d total=%d hasMore=%v", got.LogEntryStart, got.LogEntryTotal, got.HasMoreBefore)
+	}
+	if len(got.LogEntries) != 2 || got.LogEntries[0].Message != "b" || got.LogEntries[1].Message != "c" {
+		t.Fatalf("unexpected window entries: %+v", got.LogEntries)
+	}
+}
+
+func TestSessionHistoryPageEventFromRecordReturnsEarlierWindow(t *testing.T) {
+	record := data.SessionRecord{
+		Summary: data.SessionSummary{ID: "s1"},
+		Projection: data.ProjectionSnapshot{
+			LogEntries: []data.SnapshotLogEntry{
+				{Kind: "markdown", Message: "a"},
+				{Kind: "markdown", Message: "b"},
+				{Kind: "markdown", Message: "c"},
+				{Kind: "markdown", Message: "d"},
+			},
+		},
+	}
+
+	got := SessionHistoryPageEventFromRecord(record, 2, 2)
+
+	if got.LogEntryStart != 0 || got.LogEntryTotal != 4 || got.HasMoreBefore {
+		t.Fatalf("unexpected page metadata: start=%d total=%d hasMore=%v", got.LogEntryStart, got.LogEntryTotal, got.HasMoreBefore)
+	}
+	if len(got.LogEntries) != 2 || got.LogEntries[0].Message != "a" || got.LogEntries[1].Message != "b" {
+		t.Fatalf("unexpected page entries: %+v", got.LogEntries)
+	}
+}
+
 func TestSessionDeltaEventFromRecord_FullDeliveryWhenKnownEmpty(t *testing.T) {
 	record := data.SessionRecord{
 		Summary: data.SessionSummary{ID: "s1"},

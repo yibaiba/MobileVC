@@ -363,6 +363,9 @@ class SessionController extends ChangeNotifier {
   final Set<String> _requestedMediaPreviewKeys = <String>{};
   final Map<String, Set<String>> _visibleHistoryLogEntryKeys =
       <String, Set<String>>{};
+  final Map<String, int> _historyLogEntryStartBySession = <String, int>{};
+  final Map<String, int> _historyLogEntryTotalBySession = <String, int>{};
+  final Set<String> _historyPageRequestsInFlight = <String>{};
   final List<ReviewGroup> _reviewGroups = [];
   final List<TerminalExecution> _terminalExecutions = [];
   final List<RuntimeProcessItem> _runtimeProcesses = [];
@@ -787,6 +790,16 @@ class SessionController extends ChangeNotifier {
       _continuedSameSessionId == _selectedSessionId.trim();
 
   List<TimelineItem> get timeline => _timelineView;
+  bool get hasOlderTimelineEntries {
+    final sessionId = _selectedSessionId.trim();
+    if (sessionId.isEmpty) {
+      return false;
+    }
+    return (_historyLogEntryStartBySession[sessionId] ?? 0) > 0;
+  }
+
+  bool get isLoadingOlderTimelineEntries =>
+      _historyPageRequestsInFlight.contains(_selectedSessionId.trim());
   Map<String, MediaPreviewState> get mediaPreviewStates =>
       UnmodifiableMapView(_mediaPreviewStates);
   List<ReviewGroup> get reviewGroups => _reviewGroupsView;
@@ -2893,7 +2906,28 @@ class SessionController extends ChangeNotifier {
       'action': 'session_load',
       'sessionId': targetId,
       'cwd': effectiveCwd,
+      'limit': 120,
     });
+  }
+
+  void loadOlderTimelineEntries() {
+    final sessionId = _selectedSessionId.trim();
+    if (sessionId.isEmpty || _historyPageRequestsInFlight.contains(sessionId)) {
+      return;
+    }
+    final before = _historyLogEntryStartBySession[sessionId] ?? 0;
+    if (before <= 0) {
+      return;
+    }
+    _historyPageRequestsInFlight.add(sessionId);
+    _service.send({
+      'action': 'session_history_page',
+      'sessionId': sessionId,
+      'cwd': effectiveCwd,
+      'before': before,
+      'limit': 120,
+    });
+    notifyListeners();
   }
 
   Future<void> loadSessionFromSummary(SessionSummary summary) async {
@@ -5031,6 +5065,11 @@ class SessionController extends ChangeNotifier {
           history.logEntries,
           history.resumeRuntimeMeta,
         );
+        _recordHistoryWindow(
+          resolvedHistorySummary.id,
+          history.logEntryStart,
+          history.logEntryTotal,
+        );
         _ensureVisibleHistoryForExternalCodex(history, resolvedHistorySummary);
         _recentDiffs
           ..clear()
@@ -5055,7 +5094,9 @@ class SessionController extends ChangeNotifier {
         _restoreTerminalLogs(history.rawTerminalByStream);
         _sessionDeltaKnown[resolvedHistorySummary.id] = SessionDeltaKnown(
           eventCursor: _sessionEventCursors[resolvedHistorySummary.id] ?? 0,
-          logEntryCount: history.logEntries.length,
+          logEntryCount: history.logEntryTotal > 0
+              ? history.logEntryTotal
+              : history.logEntries.length,
           diffCount: history.diffs.length,
           terminalExecutionCount: history.terminalExecutions.length,
           terminalStdoutLength: _terminalStdout.length,
@@ -5135,6 +5176,9 @@ class SessionController extends ChangeNotifier {
         _schedulePostHistoryBootstrap(
           sessionId: resolvedHistorySummary.id,
         );
+        break;
+      case SessionHistoryPageEvent page:
+        _handleSessionHistoryPage(page);
         break;
       case SessionDeltaEvent delta:
         _handleSessionDelta(delta);
@@ -6322,6 +6366,52 @@ class SessionController extends ChangeNotifier {
       sortedEntries,
       resumeMeta,
     );
+  }
+
+  void _recordHistoryWindow(String sessionId, int start, int total) {
+    final normalizedSessionId = sessionId.trim();
+    if (normalizedSessionId.isEmpty) {
+      return;
+    }
+    final normalizedStart = start < 0 ? 0 : start;
+    final normalizedTotal = total < 0 ? 0 : total;
+    _historyLogEntryStartBySession[normalizedSessionId] = normalizedStart;
+    _historyLogEntryTotalBySession[normalizedSessionId] = normalizedTotal;
+  }
+
+  void _handleSessionHistoryPage(SessionHistoryPageEvent page) {
+    final sessionId = page.sessionId.trim();
+    if (!_eventTargetsCurrentSession(sessionId)) {
+      _historyPageRequestsInFlight.remove(sessionId);
+      return;
+    }
+    _historyPageRequestsInFlight.remove(sessionId);
+    _recordHistoryWindow(sessionId, page.logEntryStart, page.logEntryTotal);
+    _prependHistoryTimelineEntries(
+      sessionId,
+      _sortedHistoryLogEntries(page.logEntries),
+      page.resumeRuntimeMeta,
+    );
+    _syncDerivedState();
+    notifyListeners();
+  }
+
+  void _prependHistoryTimelineEntries(
+    String sessionId,
+    List<HistoryLogEntry> entries,
+    RuntimeMeta resumeMeta,
+  ) {
+    if (entries.isEmpty) {
+      return;
+    }
+    final existing = List<TimelineItem>.from(_timeline);
+    _timeline.clear();
+    _appendHistoryTimelineEntries(sessionId, entries, resumeMeta);
+    final olderItems = List<TimelineItem>.from(_timeline);
+    _timeline
+      ..clear()
+      ..addAll(olderItems)
+      ..addAll(existing);
   }
 
   List<HistoryLogEntry> _sortedHistoryLogEntries(

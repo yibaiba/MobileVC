@@ -19,7 +19,10 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const mirrorPrefix = "codex-thread:"
+const (
+	mirrorPrefix                    = "codex-thread:"
+	maxNativeToolOutputMessageBytes = 16 * 1024
+)
 
 type NativeThread struct {
 	ThreadID         string
@@ -707,15 +710,37 @@ func appendNativeToolOutput(snapshot *nativeRolloutSnapshot, seen map[string]str
 	if output == "" {
 		return
 	}
-	appendNativeSystemEvent(snapshot, seen, "Codex 工具输出\n\n"+output, timestamp, data.SnapshotContext{
+	message, truncated := nativeToolOutputMessage(output)
+	status := strings.TrimSpace(payload.Status)
+	if truncated && status == "" {
+		status = "truncated"
+	}
+	appendNativeSystemEvent(snapshot, seen, message, timestamp, data.SnapshotContext{
 		Type:        "codex_tool_output",
-		Status:      strings.TrimSpace(payload.Status),
+		Status:      status,
 		ID:          strings.TrimSpace(payload.CallID),
 		ExecutionID: strings.TrimSpace(payload.CallID),
 		Tool:        strings.TrimSpace(payload.Name),
 		Source:      "codex-native",
 		Timestamp:   timestamp,
 	})
+}
+
+func nativeToolOutputMessage(output string) (string, bool) {
+	if len(output) <= maxNativeToolOutputMessageBytes {
+		return "Codex 工具输出\n\n" + output, false
+	}
+	preview := output[:maxNativeToolOutputMessageBytes]
+	if lastNewline := strings.LastIndex(preview, "\n"); lastNewline > 0 {
+		preview = preview[:lastNewline]
+	}
+	message := fmt.Sprintf(
+		"Codex 工具输出已折叠：原始输出 %d bytes，显示前 %d bytes。\n\n%s",
+		len(output),
+		len(preview),
+		strings.TrimSpace(preview),
+	)
+	return message, true
 }
 
 func appendNativeSystemEvent(snapshot *nativeRolloutSnapshot, seen map[string]struct{}, message, timestamp string, context data.SnapshotContext) {

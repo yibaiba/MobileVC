@@ -36,6 +36,7 @@ const (
 	EventTypeSessionCreated            = "session_created"
 	EventTypeSessionListResult         = "session_list_result"
 	EventTypeSessionHistory            = "session_history"
+	EventTypeSessionHistoryPage        = "session_history_page"
 	EventTypeSessionDelta              = "session_delta"
 	EventTypeReviewState               = "review_state"
 	EventTypeSkillCatalogResult        = "skill_catalog_result"
@@ -507,6 +508,7 @@ type SessionLoadRequestEvent struct {
 	SessionID string `json:"sessionId"`
 	CWD       string `json:"cwd,omitempty"`
 	Reason    string `json:"reason,omitempty"`
+	Limit     int    `json:"limit,omitempty"`
 }
 
 type RegisterPushTokenRequestEvent struct {
@@ -540,6 +542,14 @@ type SessionDeltaRequestEvent struct {
 	CWD       string            `json:"cwd,omitempty"`
 	Reason    string            `json:"reason,omitempty"`
 	Known     SessionDeltaKnown `json:"known,omitempty"`
+}
+
+type SessionHistoryPageRequestEvent struct {
+	ClientEvent
+	SessionID string `json:"sessionId"`
+	CWD       string `json:"cwd,omitempty"`
+	Before    int    `json:"before,omitempty"`
+	Limit     int    `json:"limit,omitempty"`
 }
 
 type SessionDeleteRequestEvent struct {
@@ -653,6 +663,9 @@ type SessionHistoryEvent struct {
 	Event
 	Summary             SessionSummary      `json:"summary"`
 	LogEntries          []HistoryLogEntry   `json:"logEntries,omitempty"`
+	LogEntryStart       int                 `json:"logEntryStart,omitempty"`
+	LogEntryTotal       int                 `json:"logEntryTotal,omitempty"`
+	HasMoreBefore       bool                `json:"hasMoreBefore,omitempty"`
 	Diffs               []HistoryContext    `json:"diffs,omitempty"`
 	CurrentDiff         *HistoryContext     `json:"currentDiff,omitempty"`
 	ReviewGroups        []ReviewGroup       `json:"reviewGroups,omitempty"`
@@ -692,6 +705,15 @@ type SessionDeltaEvent struct {
 	RuntimeAlive        bool                `json:"runtimeAlive,omitempty"`
 	ResumeRuntimeMeta   RuntimeMeta         `json:"resumeRuntimeMeta,omitempty"`
 	RequiresFullSync    bool                `json:"requiresFullSync,omitempty"`
+}
+
+type SessionHistoryPageEvent struct {
+	Event
+	LogEntries        []HistoryLogEntry `json:"logEntries,omitempty"`
+	LogEntryStart     int               `json:"logEntryStart,omitempty"`
+	LogEntryTotal     int               `json:"logEntryTotal,omitempty"`
+	HasMoreBefore     bool              `json:"hasMoreBefore,omitempty"`
+	ResumeRuntimeMeta RuntimeMeta       `json:"resumeRuntimeMeta,omitempty"`
 }
 
 type SessionResumeResultEvent struct {
@@ -1364,6 +1386,14 @@ func NewSessionHistoryEvent(sessionID string, summary SessionSummary, logEntries
 	}
 }
 
+func NewSessionHistoryWindowEvent(sessionID string, summary SessionSummary, logEntries []HistoryLogEntry, logEntryStart, logEntryTotal int, diffs []HistoryContext, currentDiff *HistoryContext, reviewGroups []ReviewGroup, activeReviewGroup *ReviewGroup, currentStep, latestError *HistoryContext, rawTerminalByStream map[string]string, terminalExecutions []TerminalExecution, contextWindowUsage ContextWindowUsage, sessionContext SessionContext, skillCatalogMeta, memoryCatalogMeta CatalogMetadata, canResume, runtimeAlive bool, resumeRuntimeMeta RuntimeMeta) SessionHistoryEvent {
+	event := NewSessionHistoryEvent(sessionID, summary, logEntries, diffs, currentDiff, reviewGroups, activeReviewGroup, currentStep, latestError, rawTerminalByStream, terminalExecutions, contextWindowUsage, sessionContext, skillCatalogMeta, memoryCatalogMeta, canResume, runtimeAlive, resumeRuntimeMeta)
+	event.LogEntryStart = logEntryStart
+	event.LogEntryTotal = logEntryTotal
+	event.HasMoreBefore = logEntryStart > 0
+	return event
+}
+
 func NewSessionDeltaEvent(sessionID string, summary SessionSummary, base, latest SessionDeltaKnown, appendLogEntries []HistoryLogEntry, upsertDiffs []HistoryContext, currentDiff *HistoryContext, reviewGroups []ReviewGroup, activeReviewGroup *ReviewGroup, currentStep, latestError *HistoryContext, rawTerminalByStream map[string]string, terminalExecutions []TerminalExecution, contextWindowUsage ContextWindowUsage, sessionContext SessionContext, skillCatalogMeta, memoryCatalogMeta CatalogMetadata, canResume, runtimeAlive bool, resumeRuntimeMeta RuntimeMeta, requiresFullSync bool) SessionDeltaEvent {
 	return SessionDeltaEvent{
 		Event:               NewBaseEvent(EventTypeSessionDelta, sessionID),
@@ -1387,6 +1417,17 @@ func NewSessionDeltaEvent(sessionID string, summary SessionSummary, base, latest
 		RuntimeAlive:        runtimeAlive,
 		ResumeRuntimeMeta:   resumeRuntimeMeta,
 		RequiresFullSync:    requiresFullSync,
+	}
+}
+
+func NewSessionHistoryPageEvent(sessionID string, logEntries []HistoryLogEntry, logEntryStart, logEntryTotal int, resumeRuntimeMeta RuntimeMeta) SessionHistoryPageEvent {
+	return SessionHistoryPageEvent{
+		Event:             NewBaseEvent(EventTypeSessionHistoryPage, sessionID),
+		LogEntries:        logEntries,
+		LogEntryStart:     logEntryStart,
+		LogEntryTotal:     logEntryTotal,
+		HasMoreBefore:     logEntryStart > 0,
+		ResumeRuntimeMeta: resumeRuntimeMeta,
 	}
 }
 
@@ -1746,6 +1787,9 @@ func ApplyRuntimeMeta(event any, meta RuntimeMeta) any {
 	case SessionHistoryEvent:
 		e.RuntimeMeta = MergeRuntimeMeta(e.RuntimeMeta, meta)
 		return e
+	case SessionHistoryPageEvent:
+		e.RuntimeMeta = MergeRuntimeMeta(e.RuntimeMeta, meta)
+		return e
 	case SessionDeltaEvent:
 		e.RuntimeMeta = MergeRuntimeMeta(e.RuntimeMeta, meta)
 		return e
@@ -1862,6 +1906,9 @@ func ApplyEventCursor(event any, cursor int64) any {
 		e.EventCursor = cursor
 		return e
 	case SessionHistoryEvent:
+		e.EventCursor = cursor
+		return e
+	case SessionHistoryPageEvent:
 		e.EventCursor = cursor
 		return e
 	case SessionDeltaEvent:
