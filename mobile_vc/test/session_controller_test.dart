@@ -5940,6 +5940,63 @@ void main() {
       expect(controller.selectedSessionId, 'session-current');
     });
 
+    test('session_list_result 大列表合并会保留已有可见摘要', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      service.emit(
+        SessionListResultEvent(
+          timestamp: _timestamp,
+          sessionId: '',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_list_result'},
+          items: [
+            const SessionSummary(
+              id: 'session-keep',
+              title: 'session',
+              lastPreview: '用户刚才的问题',
+            ),
+            ...List<SessionSummary>.generate(
+              240,
+              (index) => SessionSummary(
+                id: 'session-$index',
+                title: 'Old $index',
+              ),
+            ),
+          ],
+        ),
+      );
+      await _flushEvents();
+
+      service.emit(
+        SessionListResultEvent(
+          timestamp: _timestamp.add(const Duration(seconds: 1)),
+          sessionId: '',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_list_result'},
+          items: [
+            const SessionSummary(id: 'session-keep', title: 'session'),
+            ...List<SessionSummary>.generate(
+              240,
+              (index) => SessionSummary(
+                id: 'session-$index',
+                title: 'New $index',
+              ),
+            ),
+          ],
+        ),
+      );
+      await _flushEvents();
+
+      expect(controller.sessions, hasLength(241));
+      expect(controller.sessions.first.id, 'session-keep');
+      expect(controller.sessions.first.lastPreview, '用户刚才的问题');
+      expect(controller.sessions.last.id, 'session-239');
+      expect(controller.sessions.last.title, 'New 239');
+    });
+
     test('deleteSession 立即移除本地会话并发送删除请求', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);

@@ -4958,31 +4958,30 @@ class SessionController extends ChangeNotifier {
         _flushDeferredFirstInputIfNeeded();
         break;
       case SessionListResultEvent list:
+        final listedIds = {
+          for (final item in list.items) item.id,
+        };
         final confirmedIds = _pendingDeletedSessions.keys
-            .where((id) => !list.items.any((item) => item.id == id))
+            .where((id) => !listedIds.contains(id))
             .toList();
         for (final id in confirmedIds) {
           _pendingDeletedSessions.remove(id);
         }
+        final existingById = {
+          for (final item in _sessions) item.id: item,
+        };
         final mergedItems = list.items
             .where((item) => !_pendingDeletedSessions.containsKey(item.id))
-            .map((item) => _mergedSessionSummary(
-                  _sessions.cast<SessionSummary?>().firstWhere(
-                        (existing) => existing?.id == item.id,
-                        orElse: () => null,
-                      ),
-                  item,
-                ))
+            .map((item) => _mergedSessionSummary(existingById[item.id], item))
             .toList();
+        final mergedIds = {
+          for (final item in mergedItems) item.id,
+        };
         _sessionListSyncedSinceConnect = true;
         final selectedSessionId = _selectedSessionId.trim();
         if (selectedSessionId.isNotEmpty &&
-            !mergedItems.any((item) => item.id == selectedSessionId)) {
-          final preservedSelected =
-              _sessions.cast<SessionSummary?>().firstWhere(
-                    (existing) => existing?.id == selectedSessionId,
-                    orElse: () => null,
-                  );
+            !mergedIds.contains(selectedSessionId)) {
+          final preservedSelected = existingById[selectedSessionId];
           if (preservedSelected != null) {
             mergedItems.insert(0, preservedSelected);
           }

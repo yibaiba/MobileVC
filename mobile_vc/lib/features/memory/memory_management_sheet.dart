@@ -127,41 +127,40 @@ class _MemoryManagementSheetState extends State<MemoryManagementSheet> {
               child: LayoutBuilder(
                 builder: (context, constraints) {
                   final columns = constraints.maxWidth >= 720 ? 2 : 1;
-                  final gap = 10.0;
-                  final itemWidth =
-                      (constraints.maxWidth - gap * (columns - 1)) / columns;
-                  return SingleChildScrollView(
-                    child: Column(
-                      children: [
-                        if (items.isEmpty)
-                          const _EmptyState()
-                        else
-                          Align(
-                            alignment: Alignment.topLeft,
-                            child: Wrap(
-                              spacing: gap,
-                              runSpacing: gap,
-                              children: [
-                                for (final item in items)
-                                  SizedBox(
-                                    width: itemWidth,
-                                    child: _MemoryCard(
-                                      item: item,
-                                      enabled: widget.enabledMemoryIds
-                                          .contains(item.id),
-                                      onToggleEnabled: () =>
-                                          widget.onToggleEnabled(item.id),
-                                      onTap: () =>
-                                          _openDetailSheet(context, item),
-                                    ),
-                                  ),
-                              ],
-                            ),
+                  const gap = 10.0;
+                  return CustomScrollView(
+                    slivers: [
+                      if (items.isEmpty)
+                        const SliverToBoxAdapter(child: _EmptyState())
+                      else
+                        SliverGrid.builder(
+                          itemCount: items.length,
+                          gridDelegate:
+                              SliverGridDelegateWithFixedCrossAxisCount(
+                            crossAxisCount: columns,
+                            mainAxisSpacing: gap,
+                            crossAxisSpacing: gap,
+                            mainAxisExtent: 82,
                           ),
-                        const SizedBox(height: 12),
-                        _ComposerCard(onSave: widget.onSave),
-                      ],
-                    ),
+                          itemBuilder: (context, index) {
+                            final item = items[index];
+                            return _MemoryCard(
+                              item: item,
+                              enabled:
+                                  widget.enabledMemoryIds.contains(item.id),
+                              onToggleEnabled: () =>
+                                  widget.onToggleEnabled(item.id),
+                              onTap: () => _openDetailSheet(context, item),
+                            );
+                          },
+                        ),
+                      SliverToBoxAdapter(
+                        child: Padding(
+                          padding: const EdgeInsets.only(top: 12),
+                          child: _ComposerCard(onSave: widget.onSave),
+                        ),
+                      ),
+                    ],
                   );
                 },
               ),
