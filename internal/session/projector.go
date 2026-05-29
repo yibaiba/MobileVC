@@ -191,6 +191,10 @@ func (s *Service) BuildTaskSnapshotEvent(sessionID string, cursor TaskCursorSnap
 			state = "WAIT_INPUT"
 			message = "Task waiting for input"
 			awaitInput = true
+		} else if snapshot.CanAcceptInteractiveInput {
+			state = "WAIT_INPUT"
+			message = "Task waiting for input"
+			awaitInput = true
 		}
 	} else if strings.TrimSpace(meta.ResumeSessionID) != "" || strings.EqualFold(strings.TrimSpace(snapshot.ClaudeLifecycle), "resumable") {
 		state = "IDLE"
