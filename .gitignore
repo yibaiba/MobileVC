@@ -35,6 +35,7 @@ cmd/server/web/*
 
 # 依赖
 node_modules/
+mobile_vc/vendor/flutter_webrtc/android/.gradle/
 
 # 日志
 *.log
