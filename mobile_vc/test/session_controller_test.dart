@@ -4346,6 +4346,78 @@ void main() {
       expect(controller.canStopCurrentRun, isFalse);
     });
 
+    test('Codex 等待输入且只有 runtimeAlive 时选图会发送 input 而不是显示停止', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(
+        SessionHistoryEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-codex-idle',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_history'},
+          summary: const SessionSummary(
+            id: 'session-codex-idle',
+            title: 'Codex idle',
+            ownership: 'mobilevc',
+            runtime: RuntimeMeta(command: 'codex', engine: 'codex'),
+          ),
+          runtimeAlive: true,
+          resumeRuntimeMeta: const RuntimeMeta(
+            command: 'codex',
+            engine: 'codex',
+            claudeLifecycle: 'waiting_input',
+          ),
+        ),
+      );
+      service.emit(
+        AgentStateEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-codex-idle',
+          runtimeMeta: const RuntimeMeta(
+            command: 'codex',
+            engine: 'codex',
+            claudeLifecycle: 'waiting_input',
+          ),
+          raw: const {'type': 'agent_state'},
+          state: 'WAIT_INPUT',
+          message: '等待输入',
+          awaitInput: true,
+          command: 'codex',
+        ),
+      );
+      await _flushEvents();
+
+      expect(controller.awaitInput, isTrue);
+      expect(controller.isSessionBusy, isFalse);
+      expect(controller.canStopCurrentRun, isFalse);
+
+      service.sentPayloads.clear();
+      controller.stopCurrentRun();
+      expect(service.sentPayloads, isEmpty);
+
+      controller.sendInputTextWithImages(
+        '看下这张图',
+        [
+          ChatImageAttachment(
+            name: 'screen.png',
+            mimeType: 'image/png',
+            bytes: utf8.encode('png-bytes'),
+          ),
+        ],
+      );
+
+      expect(service.sentPayloads, hasLength(1));
+      final payload = service.sentPayloads.single;
+      expect(payload['action'], 'input');
+      expect(payload['data'], '看下这张图\n');
+      expect(payload.containsKey('imageAttachments'), isTrue);
+      expect(controller.canStopCurrentRun, isTrue);
+    });
+
     test('提交后未收到运行态时点击 stop 也会发送 stop action', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);

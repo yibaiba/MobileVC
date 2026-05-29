@@ -1095,8 +1095,10 @@ class SessionController extends ChangeNotifier {
         return false;
       }
     }
-    if (!_selectedSessionExternalNative &&
-        (_sessionRuntimeAlive || _executionActive)) {
+    if (_isSubmitting) {
+      return true;
+    }
+    if (!_selectedSessionExternalNative && _executionActive) {
       return true;
     }
     if (sessionState != 'RUNNING') {
@@ -4822,7 +4824,7 @@ class SessionController extends ChangeNotifier {
   }
 
   void stopCurrentRun() {
-    if (!connected || _isStopping) {
+    if (!canStopCurrentRun) {
       return;
     }
     _canResumeCurrentSession = false;
