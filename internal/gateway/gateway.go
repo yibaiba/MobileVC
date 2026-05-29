@@ -606,6 +606,9 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 		}
 		sessionRuntime := h.runtimeSessions.Ensure(targetSessionID)
 		if sessionRuntime != nil {
+			sessionRuntime.mu.Lock()
+			sessionRuntime.lastClientMessageAt = now
+			sessionRuntime.mu.Unlock()
 			accepted = sessionRuntime.markClientAction(clientActionID, now) && accepted
 		}
 		emit(protocol.NewClientActionAckEvent(targetSessionID, action, clientActionID, "accepted", !accepted))
@@ -890,7 +893,8 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 						return
 					}
 					eventCtx, eventCancel := sessionProjectionContext()
-					err := upsertMemoryItem(h.SessionStore, eventCtx, *e.Memory)
+					syncCWD := resolveCatalogSyncCWD(h.SessionStore, eventCtx, runtimeSessionID, "")
+					err := upsertMemoryItem(h.SessionStore, eventCtx, *e.Memory, syncCWD)
 					eventCancel()
 					if err != nil {
 						emitSessionEvent(protocol.NewErrorEvent(runtimeSessionID, err.Error(), ""))
@@ -1713,7 +1717,8 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid memory_upsert request: %v", err), ""))
 				continue
 			}
-			if err := upsertMemoryItem(h.SessionStore, ctx, req.Item); err != nil {
+			syncCWD := resolveCatalogSyncCWD(h.SessionStore, ctx, selectedSessionID, firstNonEmptyString(req.CWD, sessionListFilterCWD))
+			if err := upsertMemoryItem(h.SessionStore, ctx, req.Item, syncCWD); err != nil {
 				emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
 				continue
 			}
@@ -3211,7 +3216,7 @@ func syncExternalSkills(sessionStore data.Store, ctx context.Context, sourceOfTr
 	return sessionStore.SaveSkillCatalogSnapshot(ctx, snapshot)
 }
 
-func upsertMemoryItem(sessionStore data.Store, ctx context.Context, item protocol.MemoryItem) error {
+func upsertMemoryItem(sessionStore data.Store, ctx context.Context, item protocol.MemoryItem, cwd string) error {
 	if sessionStore == nil {
 		return fmt.Errorf("session store unavailable")
 	}
@@ -3253,7 +3258,64 @@ func upsertMemoryItem(sessionStore data.Store, ctx context.Context, item protoco
 	snapshot.Meta.SyncState = data.CatalogSyncStateDraft
 	snapshot.Meta.DriftDetected = true
 	snapshot.Meta.LastError = ""
-	return sessionStore.SaveMemoryCatalogSnapshot(ctx, snapshot)
+	if err := sessionStore.SaveMemoryCatalogSnapshot(ctx, snapshot); err != nil {
+		return err
+	}
+
+	// Write to disk for local items
+	if next.Source == "local" {
+		if writeErr := writeMemoryItemToDisk(next, cwd); writeErr != nil {
+			logx.Warn("ws", "failed to write memory to disk: id=%s cwd=%s err=%v", next.ID, cwd, writeErr)
+		}
+	}
+
+	return nil
+}
+
+func writeMemoryItemToDisk(item data.MemoryItem, cwd string) error {
+	if item.Source != "local" {
+		return nil
+	}
+
+	memoryDir, err := findClaudeProjectMemoryDir(cwd)
+	if err != nil {
+		return fmt.Errorf("find memory dir: %w", err)
+	}
+
+	if memoryDir == "" {
+		homeDir, err := os.UserHomeDir()
+		if err != nil {
+			return fmt.Errorf("get home dir: %w", err)
+		}
+		encodedPath := encodeClaudeProjectPath(cwd)
+		memoryDir = filepath.Join(homeDir, ".claude", "projects", encodedPath, "memory")
+	}
+
+	if err := os.MkdirAll(memoryDir, 0755); err != nil {
+		return fmt.Errorf("create memory dir: %w", err)
+	}
+
+	filePath := filepath.Join(memoryDir, item.ID+".md")
+
+	var content strings.Builder
+	content.WriteString("---\n")
+	content.WriteString(fmt.Sprintf("name: %s\n", item.ID))
+	if item.Title != "" {
+		content.WriteString(fmt.Sprintf("description: %s\n", item.Title))
+	}
+	content.WriteString("---\n")
+	if item.Content != "" {
+		content.WriteString(item.Content)
+		if !strings.HasSuffix(item.Content, "\n") {
+			content.WriteString("\n")
+		}
+	}
+
+	if err := os.WriteFile(filePath, []byte(content.String()), 0644); err != nil {
+		return fmt.Errorf("write memory file: %w", err)
+	}
+
+	return nil
 }
 
 func syncExternalMemories(sessionStore data.Store, ctx context.Context, cwd string, sourceOfTruth data.CatalogSourceOfTruth) error {

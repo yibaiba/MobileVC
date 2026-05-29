@@ -102,7 +102,9 @@ class _CommandInputBarState extends State<CommandInputBar> {
           widget.isBusy);
 
   bool get _showStopAction =>
-      !widget.isExternallyLocked && !widget.isSessionLoading && widget.canStop;
+      !widget.isExternallyLocked &&
+      !widget.isSessionLoading &&
+      widget.canStop;
 
   String get _lockedHintText {
     if (widget.isExternallyLocked) {
@@ -136,6 +138,26 @@ class _CommandInputBarState extends State<CommandInputBar> {
         oldWidget.shouldShowPlanChoices;
     if (_inputLocked && !oldLocked) {
       _focusNode.unfocus();
+    }
+
+    if (oldWidget.canStop != widget.canStop) {
+      if (widget.canStop) {
+        _canStopTransitionTime = DateTime.now();
+        Future.delayed(const Duration(milliseconds: 150), () {
+          if (mounted && widget.canStop) {
+            setState(() {
+              _debouncedCanStop = true;
+            });
+          }
+        });
+      } else {
+        _canStopTransitionTime = null;
+        if (_debouncedCanStop) {
+          setState(() {
+            _debouncedCanStop = false;
+          });
+        }
+      }
     }
   }
 

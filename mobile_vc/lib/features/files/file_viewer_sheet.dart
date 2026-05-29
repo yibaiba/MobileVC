@@ -81,6 +81,40 @@ class _FileViewerSheetState extends State<FileViewerSheet> {
       widget.shouldShowReviewChoices ||
       widget.shouldShowPlanChoices;
 
+  bool _shouldHidePassiveReadyPrompt(PromptRequestEvent prompt) {
+    if (prompt.isPermission) {
+      return false;
+    }
+    if (!prompt.isReady) {
+      return false;
+    }
+    if (prompt.options.any((option) => option.displayText.isNotEmpty)) {
+      return false;
+    }
+    final message = prompt.message.trim().toLowerCase();
+    if (message.isEmpty) {
+      return true;
+    }
+    return message.contains('会话已就绪') ||
+        message.contains('可继续输入') ||
+        message.contains('waiting for input') ||
+        message.contains('continue input') ||
+        message.contains('ready for input') ||
+        message == 'ready' ||
+        message == '等待输入';
+  }
+
+  PromptRequestEvent? get _visiblePrompt {
+    final prompt = widget.pendingPrompt;
+    if (prompt == null || !prompt.hasVisiblePrompt) {
+      return null;
+    }
+    if (_shouldHidePassiveReadyPrompt(prompt)) {
+      return null;
+    }
+    return prompt;
+  }
+
   String get _lockedHintText {
     if (widget.shouldShowPermissionChoices) {
       return '请先在上方确认授权';
@@ -421,12 +455,11 @@ class _FileViewerSheetState extends State<FileViewerSheet> {
                       ),
                     ],
                     if (!widget.shouldShowReviewChoices &&
-                        widget.pendingPrompt != null &&
-                        widget.pendingPrompt!.hasVisiblePrompt &&
+                        _visiblePrompt != null &&
                         !widget.shouldShowPermissionChoices) ...[
                       const SizedBox(height: 10),
                       _PromptRequestSection(
-                        prompt: widget.pendingPrompt!,
+                        prompt: _visiblePrompt!,
                         onSubmit: widget.onSubmitPrompt,
                       ),
                     ],
@@ -437,11 +470,10 @@ class _FileViewerSheetState extends State<FileViewerSheet> {
             if (!widget.showReviewActions &&
                 !widget.shouldShowReviewChoices &&
                 !widget.shouldShowPermissionChoices &&
-                widget.pendingPrompt != null &&
-                widget.pendingPrompt!.hasVisiblePrompt) ...[
+                _visiblePrompt != null) ...[
               const SizedBox(height: 8),
               _PromptRequestSection(
-                prompt: widget.pendingPrompt!,
+                prompt: _visiblePrompt!,
                 onSubmit: widget.onSubmitPrompt,
               ),
             ],

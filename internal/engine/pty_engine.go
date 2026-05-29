@@ -87,10 +87,12 @@ type PtyRunner struct {
 	// streamFirstLineSeen 用于在 claude stream 启动期 emit "engine_starting" phase，
 	// 在收到首条 raw line 时清掉，避免 resume 启动 + 首字延迟期间前端无反馈。
 	streamFirstLineSeen         bool
-	lastContextWindowUsedTokens int
-	lastContextWindowMaxTokens  int
-	hasContextWindowUsedTokens  bool
-	hasContextWindowMaxTokens   bool
+	lastContextWindowUsedTokens    int
+	lastContextWindowMaxTokens     int
+	hasContextWindowUsedTokens     bool
+	hasContextWindowMaxTokens      bool
+	lastEmittedContextUsedTokens   int
+	lastEmittedContextMaxTokens    int
 }
 
 type fileSnapshot struct {
@@ -2491,42 +2493,51 @@ func shouldEmitClaudeReadyPrompt(envelope claudeStreamEnvelope) bool {
 
 func (r *PtyRunner) emitClaudeContextWindowUsage(sessionID string, envelope claudeStreamEnvelope, sink EventSink) {
 	maxTokens := claudeContextWindowMaxTokens(envelope.ModelUsage)
-	if maxTokens > 0 {
-		r.mu.Lock()
-		r.lastContextWindowMaxTokens = maxTokens
-		r.hasContextWindowMaxTokens = true
-		r.mu.Unlock()
-	}
-
 	usedTokens := -1
-	if strings.EqualFold(strings.TrimSpace(envelope.Subtype), "task_progress") {
+	if len(envelope.Usage) > 0 {
 		usedTokens = claudeUsageTotalTokens(envelope.Usage)
-		if usedTokens >= 0 {
-			r.mu.Lock()
-			r.lastContextWindowUsedTokens = usedTokens
-			r.hasContextWindowUsedTokens = true
-			r.mu.Unlock()
+		if usedTokens < 0 && strings.EqualFold(strings.TrimSpace(envelope.Type), "result") {
+			usedTokens = claudeDerivedResultUsage(envelope.Usage)
 		}
 	}
 
 	r.mu.Lock()
+	if maxTokens > 0 {
+		r.lastContextWindowMaxTokens = maxTokens
+		r.hasContextWindowMaxTokens = true
+	}
+	freshUsed := false
+	if usedTokens >= 0 {
+		r.lastContextWindowUsedTokens = usedTokens
+		r.hasContextWindowUsedTokens = true
+		freshUsed = true
+	}
 	cachedUsed := r.lastContextWindowUsedTokens
 	cachedMax := r.lastContextWindowMaxTokens
 	hasUsed := r.hasContextWindowUsedTokens
 	hasMax := r.hasContextWindowMaxTokens
+	prevEmittedUsed := r.lastEmittedContextUsedTokens
+	prevEmittedMax := r.lastEmittedContextMaxTokens
 	r.mu.Unlock()
 
 	if !hasMax || cachedMax <= 0 {
 		return
 	}
 	if !hasUsed {
-		if strings.EqualFold(strings.TrimSpace(envelope.Type), "result") {
-			cachedUsed = claudeDerivedResultUsage(envelope.Usage)
-		}
-		if cachedUsed < 0 {
-			return
-		}
+		return
 	}
+	if !freshUsed {
+		return
+	}
+	if cachedUsed == prevEmittedUsed && cachedMax == prevEmittedMax {
+		return
+	}
+
+	r.mu.Lock()
+	r.lastEmittedContextUsedTokens = cachedUsed
+	r.lastEmittedContextMaxTokens = cachedMax
+	r.mu.Unlock()
+
 	sendEvent(sink, protocol.ApplyRuntimeMeta(
 		protocol.NewContextWindowUsageEvent(sessionID, protocol.ContextWindowUsage{
 			TokensUsed: cachedUsed,
