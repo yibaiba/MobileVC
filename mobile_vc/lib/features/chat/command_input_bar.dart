@@ -89,6 +89,8 @@ class _CommandInputBarState extends State<CommandInputBar> {
   final FocusNode _focusNode = FocusNode();
   final List<ChatImageAttachment> _imageAttachments = [];
   bool _pickingImage = false;
+  DateTime? _canStopTransitionTime;
+  bool _debouncedCanStop = false;
 
   bool get _inputLocked =>
       widget.isExternallyLocked ||
@@ -104,7 +106,7 @@ class _CommandInputBarState extends State<CommandInputBar> {
   bool get _showStopAction =>
       !widget.isExternallyLocked &&
       !widget.isSessionLoading &&
-      widget.canStop;
+      _debouncedCanStop;
 
   String get _lockedHintText {
     if (widget.isExternallyLocked) {

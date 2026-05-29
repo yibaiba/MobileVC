@@ -4918,8 +4918,10 @@ class SessionController extends ChangeNotifier {
         if (!history.runtimeAlive) {
           _clearStoppingState();
         }
-        _continueSameSessionEnabled = false;
-        _continuedSameSessionId = '';
+        if (!history.runtimeAlive && !canSendToContinuedSameSession) {
+          _continueSameSessionEnabled = false;
+          _continuedSameSessionId = '';
+        }
         _terminalExecutions
           ..clear()
           ..addAll(history.terminalExecutions);

@@ -1,0 +1,17 @@
+待修复问题清单 - 2026-05-29
+
+1. 会话接管后台切换问题
+   - 问题：iOS端接管会话后，切后台再切回来会回到观察模式，需要重新点击接管
+   - 现象：接管状态没有被正确持久化或恢复
+   - 需要调查：SessionController 的 AppLifecycleState 处理逻辑
+
+2. 发送按钮状态闪烁
+   - 问题：接管会话后发送消息时，蓝色发送按钮先变为停止按钮，然后又回退为发送按钮
+   - 现象：CommandInputBar 的 isRunning 状态切换异常
+   - 需要调查：发送按钮状态管理逻辑，后端 PTY 接管是否正确
+
+3. 任务执行不显示思考过程
+   - 问题：Claude 执行任务时 iOS 端没有显示 thinking 内容
+   - 已实现：ThinkingEvent 类型、pty_engine.go 解析、Flutter 模型和 UI
+   - 已部署：iOS OTA 1.0.0 (20260529015155)，后端已重启
+   - 需要验证：iOS 客户端版本、后端进程状态、Claude API 返回的 thinking 块位置
