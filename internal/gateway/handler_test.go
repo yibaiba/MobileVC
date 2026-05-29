@@ -515,6 +515,28 @@ func TestHandlerFileAccessReadsAbsolutePath(t *testing.T) {
 	}
 }
 
+func TestHandlerFileAccessRejectsOversizedTextFile(t *testing.T) {
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "large.log")
+	largeContent := bytes.Repeat([]byte("x"), maxInlineFileReadBytes+1)
+	if err := os.WriteFile(filePath, largeContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h := newTestHandler()
+	conn := newTestConn(t, h)
+
+	if err := conn.WriteJSON(protocol.FSReadRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "fs_read"},
+		Path:        filePath,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	errorEvent := readUntilType(t, conn, protocol.EventTypeError)
+	if msg := fmt.Sprint(errorEvent["msg"]); !strings.Contains(msg, "file exceeds inline read limit") {
+		t.Fatalf("message: got %#v", errorEvent["msg"])
+	}
+}
+
 func TestHandlerFileAccessReadsImageAsBase64(t *testing.T) {
 	dir := t.TempDir()
 	filePath := filepath.Join(dir, "screen.png")
@@ -537,6 +559,28 @@ func TestHandlerFileAccessReadsImageAsBase64(t *testing.T) {
 	}
 	if readEvent["isText"] != false {
 		t.Fatalf("isText: got %#v", readEvent["isText"])
+	}
+}
+
+func TestHandlerFileAccessRejectsOversizedImage(t *testing.T) {
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "large.png")
+	largeContent := append([]byte{0x89, 0x50, 0x4E, 0x47}, bytes.Repeat([]byte("x"), maxInlineFileReadBytes+1)...)
+	if err := os.WriteFile(filePath, largeContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h := newTestHandler()
+	conn := newTestConn(t, h)
+
+	if err := conn.WriteJSON(protocol.FSReadRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "fs_read"},
+		Path:        filePath,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	errorEvent := readUntilType(t, conn, protocol.EventTypeError)
+	if msg := fmt.Sprint(errorEvent["msg"]); !strings.Contains(msg, "file exceeds inline read limit") {
+		t.Fatalf("message: got %#v", errorEvent["msg"])
 	}
 }
 
@@ -566,6 +610,35 @@ func TestHandlerMediaPreviewReadsImageAsBase64(t *testing.T) {
 	}
 	if result["content"] != base64.StdEncoding.EncodeToString(raw) {
 		t.Fatalf("content: got %#v", result["content"])
+	}
+}
+
+func TestHandlerMediaPreviewRejectsOversizedImage(t *testing.T) {
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "large.png")
+	largeContent := append([]byte{0x89, 0x50, 0x4E, 0x47}, bytes.Repeat([]byte("x"), maxImageAttachmentBytes+1)...)
+	if err := os.WriteFile(filePath, largeContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h := newTestHandler()
+	conn := newTestConn(t, h)
+
+	if err := conn.WriteJSON(protocol.MediaPreviewRequestEvent{
+		ClientEvent:  protocol.ClientEvent{Action: "media_preview"},
+		AttachmentID: "att-large",
+		Path:         filePath,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	result := readUntilType(t, conn, protocol.EventTypeMediaPreviewResult)
+	if result["status"] != "unsupported" {
+		t.Fatalf("status: got %#v", result["status"])
+	}
+	if msg := fmt.Sprint(result["message"]); !strings.Contains(msg, "image exceeds") {
+		t.Fatalf("message: got %#v", result["message"])
+	}
+	if content := fmt.Sprint(result["content"]); content != "" && content != "<nil>" {
+		t.Fatalf("content should be empty for oversized image, got %#v", result["content"])
 	}
 }
 

@@ -4126,6 +4126,9 @@ func readFile(sessionID, rawPath string) (protocol.FSReadResultEvent, error) {
 	if info.IsDir() {
 		return protocol.FSReadResultEvent{}, fmt.Errorf("path is a directory")
 	}
+	if info.Size() > maxInlineFileReadBytes {
+		return protocol.FSReadResultEvent{}, fmt.Errorf("file exceeds inline read limit of %d bytes; use file download", maxInlineFileReadBytes)
+	}
 
 	content, err := os.ReadFile(absPath)
 	if err != nil {

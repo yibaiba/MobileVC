@@ -17,6 +17,7 @@ import (
 const (
 	maxImageAttachmentBytes = 4 * 1024 * 1024
 	maxImageAttachments     = 4
+	maxInlineFileReadBytes  = 4 * 1024 * 1024
 )
 
 var allowedImageMIMETypes = map[string]string{
