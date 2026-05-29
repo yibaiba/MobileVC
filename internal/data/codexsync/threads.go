@@ -574,6 +574,7 @@ func loadRollout(path string) (nativeRolloutSnapshot, error) {
 	taskOpen := false
 	seenMessages := map[string]struct{}{}
 	seenSystemEntries := map[string]struct{}{}
+	toolNamesByCallID := map[string]string{}
 	for scanner.Scan() {
 		var line rolloutEnvelope
 		if err := json.Unmarshal(scanner.Bytes(), &line); err != nil {
@@ -652,8 +653,10 @@ func loadRollout(path string) (nativeRolloutSnapshot, error) {
 					appendNativeAssistantMessage(&snapshot, seenMessages, message, timestamp)
 				}
 			case "function_call", "custom_tool_call":
+				rememberNativeToolName(toolNamesByCallID, payload)
 				appendNativeToolCall(&snapshot, seenSystemEntries, payload, timestamp)
 			case "function_call_output", "custom_tool_call_output":
+				payload.Name = firstNonEmpty(payload.Name, toolNamesByCallID[strings.TrimSpace(payload.CallID)])
 				appendNativeToolOutput(&snapshot, seenSystemEntries, payload, timestamp)
 			}
 		}
@@ -666,6 +669,15 @@ func loadRollout(path string) (nativeRolloutSnapshot, error) {
 		snapshot.ClaudeLifecycle = "active"
 	}
 	return snapshot, nil
+}
+
+func rememberNativeToolName(toolsByCallID map[string]string, payload rolloutResponseItemPayload) {
+	callID := strings.TrimSpace(payload.CallID)
+	tool := strings.TrimSpace(payload.Name)
+	if callID == "" || tool == "" {
+		return
+	}
+	toolsByCallID[callID] = tool
 }
 
 func appendNativeToolCall(snapshot *nativeRolloutSnapshot, seen map[string]struct{}, payload rolloutResponseItemPayload, timestamp string) {
@@ -700,6 +712,7 @@ func appendNativeToolOutput(snapshot *nativeRolloutSnapshot, seen map[string]str
 		Status:      strings.TrimSpace(payload.Status),
 		ID:          strings.TrimSpace(payload.CallID),
 		ExecutionID: strings.TrimSpace(payload.CallID),
+		Tool:        strings.TrimSpace(payload.Name),
 		Source:      "codex-native",
 		Timestamp:   timestamp,
 	})

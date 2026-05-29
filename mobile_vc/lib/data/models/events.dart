@@ -2092,6 +2092,7 @@ class TimelineItem {
     this.meta = const RuntimeMeta(),
     this.context,
     this.attachments = const [],
+    this.codexSteps = const [],
     this.animateBody = true,
   });
 
@@ -2106,6 +2107,7 @@ class TimelineItem {
   final RuntimeMeta meta;
   final HistoryContext? context;
   final List<TimelineAttachment> attachments;
+  final List<String> codexSteps;
   final bool animateBody;
 
   TimelineItem copyWith({
@@ -2120,6 +2122,7 @@ class TimelineItem {
     RuntimeMeta? meta,
     HistoryContext? context,
     List<TimelineAttachment>? attachments,
+    List<String>? codexSteps,
     bool? animateBody,
   }) {
     return TimelineItem(
@@ -2134,6 +2137,7 @@ class TimelineItem {
       meta: meta ?? this.meta,
       context: context ?? this.context,
       attachments: attachments ?? this.attachments,
+      codexSteps: codexSteps ?? this.codexSteps,
       animateBody: animateBody ?? this.animateBody,
     );
   }

@@ -114,6 +114,10 @@ void main() {
                   '## 工具输出 (1)\n\n'
                   '- **functions.exec_command**\n'
                   '  exit 0',
+              codexSteps: const [
+                '正在读取 codex_transport.go',
+                '正在创建智能体：agent-019e7126',
+              ],
             ),
           ),
         ),
@@ -122,6 +126,9 @@ void main() {
 
     expect(find.text('Codex 原生操作'), findsOneWidget);
     expect(find.text('工具调用 1 · 输出 1 · Patch 1'), findsOneWidget);
+    expect(find.text('正在读取 codex_transport.go'), findsOneWidget);
+    expect(find.text('正在创建智能体：agent-019e7126'), findsOneWidget);
+    expect(find.byKey(const ValueKey('codexToolGroupSteps')), findsOneWidget);
     expect(find.text('工具调用 (1)'), findsNothing);
 
     await tester.tap(find.byKey(const ValueKey('codexToolGroupToggle')));

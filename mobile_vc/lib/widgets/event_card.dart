@@ -673,6 +673,10 @@ class _CodexToolGroupCardState extends State<_CodexToolGroupCard> {
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     final style = widget.style;
+    final steps = widget.item.codexSteps
+        .map((step) => step.trim())
+        .where((name) => name.isNotEmpty)
+        .toList();
     return Material(
       color: Colors.transparent,
       child: InkWell(
@@ -743,6 +747,44 @@ class _CodexToolGroupCardState extends State<_CodexToolGroupCard> {
                     ),
                   ],
                 ),
+                if (steps.isNotEmpty) ...[
+                  const SizedBox(height: 10),
+                  Column(
+                    key: const ValueKey('codexToolGroupSteps'),
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      for (final step in steps)
+                        Padding(
+                          padding: const EdgeInsets.only(bottom: 6),
+                          child: Row(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Icon(
+                                _stepIcon(step),
+                                size: 15,
+                                color: style.iconColor,
+                              ),
+                              const SizedBox(width: 8),
+                              Expanded(
+                                child: Text(
+                                  step,
+                                  maxLines: 2,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: Theme.of(context)
+                                      .textTheme
+                                      .bodySmall
+                                      ?.copyWith(
+                                        color: style.bodyColor,
+                                        height: 1.35,
+                                      ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                    ],
+                  ),
+                ],
                 AnimatedSwitcher(
                   duration: const Duration(milliseconds: 160),
                   child: !_expanded
@@ -763,6 +805,22 @@ class _CodexToolGroupCardState extends State<_CodexToolGroupCard> {
         ),
       ),
     );
+  }
+
+  IconData _stepIcon(String step) {
+    if (step.contains('智能体')) {
+      return Icons.smart_toy_outlined;
+    }
+    if (step.contains('读取') || step.contains('查看')) {
+      return Icons.description_outlined;
+    }
+    if (step.contains('补丁')) {
+      return Icons.data_object_rounded;
+    }
+    if (step.contains('命令')) {
+      return Icons.terminal_rounded;
+    }
+    return Icons.play_circle_outline_rounded;
   }
 }
 

@@ -55,6 +55,10 @@ func TestFindNativeThreadIncludesCodexNativeToolAndPatchEvents(t *testing.T) {
 	assertLogEntryContains(t, thread.LogEntries, "system", "Codex 工具输出")
 	assertLogEntryContains(t, thread.LogEntries, "system", "Codex 调用工具：apply_patch")
 	assertLogEntryContains(t, thread.LogEntries, "system", "Codex 应用补丁：success")
+	output := findLogEntryContains(t, thread.LogEntries, "system", "Codex 工具输出")
+	if output.Context == nil || output.Context.Tool != "exec_command" {
+		t.Fatalf("expected tool output to inherit call tool, got %#v", output.Context)
+	}
 	if got := countLogEntryContains(thread.LogEntries, "markdown", "已经检查完成"); got != 1 {
 		t.Fatalf("expected one assistant final answer, got %d entries: %#v", got, thread.LogEntries)
 	}
@@ -469,6 +473,17 @@ func assertLogEntryContains(t *testing.T, entries []data.SnapshotLogEntry, kind,
 	if countLogEntryContains(entries, kind, text) == 0 {
 		t.Fatalf("expected %s entry containing %q, got %#v", kind, text, entries)
 	}
+}
+
+func findLogEntryContains(t *testing.T, entries []data.SnapshotLogEntry, kind, text string) data.SnapshotLogEntry {
+	t.Helper()
+	for _, entry := range entries {
+		if entry.Kind == kind && strings.Contains(entry.Message, text) {
+			return entry
+		}
+	}
+	t.Fatalf("expected %s entry containing %q, got %#v", kind, text, entries)
+	return data.SnapshotLogEntry{}
 }
 
 func countLogEntryContains(entries []data.SnapshotLogEntry, kind, text string) int {

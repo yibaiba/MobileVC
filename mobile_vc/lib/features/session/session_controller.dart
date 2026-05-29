@@ -132,6 +132,16 @@ class _DeferredFirstInput {
   final String text;
 }
 
+class _CodexNativeVisibleStep {
+  const _CodexNativeVisibleStep({
+    required this.index,
+    required this.text,
+  });
+
+  final int index;
+  final String text;
+}
+
 enum ActiveTransportPath { none, lan, relay }
 
 class _PendingOutboundAction {
@@ -6451,6 +6461,7 @@ class SessionController extends ChangeNotifier {
     final endedAt = _historyLogEntryTimestamp(last) ?? startedAt;
     final summary = _codexNativeOperationalSummary(entries);
     final detail = _codexNativeOperationalDetail(entries);
+    final visibleSteps = _codexNativeOperationalVisibleSteps(entries);
     return TimelineItem(
       id: 'history-codex-tools-${startedAt.microsecondsSinceEpoch}-${endedAt.microsecondsSinceEpoch}-${entries.length}-${detail.hashCode}',
       kind: 'codex_tool_group',
@@ -6460,6 +6471,7 @@ class SessionController extends ChangeNotifier {
       status: summary,
       meta: _historyRuntimeMetaForEntry(first, resumeMeta),
       context: first.context,
+      codexSteps: visibleSteps,
       animateBody: false,
     );
   }
@@ -6499,6 +6511,188 @@ class SessionController extends ChangeNotifier {
       if (failures > 0) '失败 $failures',
     ];
     return parts.isEmpty ? '已折叠 ${entries.length} 条原生事件' : parts.join(' · ');
+  }
+
+  List<String> _codexNativeOperationalVisibleSteps(
+    List<HistoryLogEntry> entries,
+  ) {
+    const maxVisibleSteps = 6;
+    final latestByStep = <String, _CodexNativeVisibleStep>{};
+    for (var index = 0; index < entries.length; index++) {
+      final entry = entries[index];
+      final step = _codexNativeOperationalVisibleStep(entry);
+      if (step.isEmpty) {
+        continue;
+      }
+      latestByStep[step] = _CodexNativeVisibleStep(index: index, text: step);
+    }
+    final steps = latestByStep.values.toList()
+      ..sort((left, right) => left.index.compareTo(right.index));
+    if (steps.length <= maxVisibleSteps) {
+      return steps.map((step) => step.text).toList();
+    }
+    final selected = <_CodexNativeVisibleStep>[];
+    final selectedTexts = <String>{};
+    void select(_CodexNativeVisibleStep step) {
+      if (selectedTexts.add(step.text)) {
+        selected.add(step);
+      }
+    }
+
+    for (final step in steps.reversed) {
+      if (_isKeyCodexVisibleStep(step.text)) {
+        select(step);
+      }
+      if (selected.length >= maxVisibleSteps) {
+        break;
+      }
+    }
+    for (final step in steps.reversed) {
+      select(step);
+      if (selected.length >= maxVisibleSteps) {
+        break;
+      }
+    }
+    selected.sort((left, right) => left.index.compareTo(right.index));
+    return selected.map((step) => step.text).toList();
+  }
+
+  bool _isKeyCodexVisibleStep(String step) {
+    return step.contains('智能体') ||
+        step.contains('补丁') ||
+        step.contains('中止') ||
+        step.contains('失败');
+  }
+
+  String _codexNativeOperationalVisibleStep(HistoryLogEntry entry) {
+    final context = entry.context;
+    if (context == null) {
+      return '';
+    }
+    final type = context.type.trim();
+    if (type == 'codex_task') {
+      return switch (context.status.trim().toLowerCase()) {
+        'started' => 'Codex 开始执行任务',
+        'completed' => 'Codex 任务已完成',
+        'aborted' => 'Codex 任务已中止',
+        _ => '',
+      };
+    }
+    if (type == 'codex_patch') {
+      final status = context.status.trim();
+      return status.isEmpty ? '正在应用补丁' : '补丁结果：$status';
+    }
+    if (type != 'codex_tool_call' && type != 'codex_tool_output') {
+      return '';
+    }
+    if (type == 'codex_tool_output') {
+      return _codexToolOutputVisibleStep(context);
+    }
+    final tool = context.tool.trim();
+    final args = _codexToolArguments(context.command);
+    return _codexToolCallVisibleStep(tool, args);
+  }
+
+  String _codexToolCallVisibleStep(String tool, Map<String, dynamic> args) {
+    final normalizedTool = _normalizeCodexToolName(tool);
+    switch (normalizedTool) {
+      case 'spawn_agent':
+        final taskName = _stringArg(args, 'task_name');
+        final label = taskName.isEmpty ? '智能体' : taskName;
+        return '正在创建智能体：$label';
+      case 'exec_command':
+        final command = _stringArg(args, 'cmd');
+        if (_looksLikeReadCommand(command)) {
+          final path = _pathFromReadCommand(command);
+          return path.isEmpty ? '正在读取文件' : '正在读取 ${_fileNameOfPath(path)}';
+        }
+        final head = _toolLabelFromCommand(command);
+        return head.isEmpty ? '正在执行命令' : '正在执行命令：$head';
+      case 'read_mcp_resource':
+        final uri = _stringArg(args, 'uri');
+        return uri.isEmpty ? '正在读取资源' : '正在读取 ${_fileNameOfPath(uri)}';
+      case 'view_image':
+        final path = _stringArg(args, 'path');
+        return path.isEmpty ? '正在查看图片' : '正在查看 ${_fileNameOfPath(path)}';
+      case 'apply_patch':
+        return '正在应用补丁';
+      default:
+        final label = tool.trim().isNotEmpty ? tool.trim() : '工具';
+        return '正在调用 $label';
+    }
+  }
+
+  String _codexToolOutputVisibleStep(HistoryContext context) {
+    final tool = _normalizeCodexToolName(context.tool);
+    if (tool == 'spawn_agent') {
+      final agentId = _firstRegexGroup(
+        _restoredHistoryBody(
+          HistoryLogEntry(kind: 'system', message: context.message),
+        ),
+        RegExp(r'agent[-_][A-Za-z0-9_-]+'),
+      );
+      return agentId.isEmpty ? '智能体已创建' : '已创建智能体：$agentId';
+    }
+    return '';
+  }
+
+  Map<String, dynamic> _codexToolArguments(String command) {
+    final trimmed = command.trim();
+    if (trimmed.isEmpty || !trimmed.startsWith('{')) {
+      return const {};
+    }
+    try {
+      final decoded = jsonDecode(trimmed);
+      if (decoded is Map<String, dynamic>) {
+        return decoded;
+      }
+      if (decoded is Map) {
+        return Map<String, dynamic>.from(decoded);
+      }
+    } on FormatException {
+      return const {};
+    }
+    return const {};
+  }
+
+  String _normalizeCodexToolName(String tool) {
+    var normalized = tool.trim();
+    final index = normalized.lastIndexOf('.');
+    if (index != -1 && index < normalized.length - 1) {
+      normalized = normalized.substring(index + 1);
+    }
+    return normalized.toLowerCase();
+  }
+
+  String _stringArg(Map<String, dynamic> args, String key) {
+    final value = args[key];
+    return value == null ? '' : value.toString().trim();
+  }
+
+  bool _looksLikeReadCommand(String command) {
+    final trimmed = command.trim();
+    return trimmed.startsWith('sed ') ||
+        trimmed.startsWith('cat ') ||
+        trimmed.startsWith('nl ') ||
+        trimmed.startsWith('head ') ||
+        trimmed.startsWith('tail ') ||
+        trimmed.startsWith('awk ') ||
+        trimmed.startsWith('less ') ||
+        trimmed.startsWith('more ') ||
+        trimmed.startsWith('rg ') ||
+        trimmed.startsWith('find ');
+  }
+
+  String _pathFromReadCommand(String command) {
+    final match = RegExp(
+            r'''(?:^|\s)(/[^\s'"|;&<>]+|[A-Za-z0-9_./-]+\.[A-Za-z0-9_+-]+)''')
+        .firstMatch(command);
+    return match?.group(1)?.trim() ?? '';
+  }
+
+  String _firstRegexGroup(String value, RegExp pattern) {
+    final match = pattern.firstMatch(value);
+    return match?.group(0)?.trim() ?? '';
   }
 
   String _codexNativeOperationalDetail(List<HistoryLogEntry> entries) {
@@ -6650,6 +6844,10 @@ class SessionController extends ChangeNotifier {
   ) {
     final restoredBody = _restoredHistoryBody(entry);
     final restoredKind = _restoredHistoryKind(entry, restoredBody);
+    final attachments = _mergeTimelineAttachments(
+      entry.attachments,
+      _timelineAttachmentsFromText(restoredBody),
+    );
     return TimelineItem(
       id: 'history-$restoredKind-${entry.timestamp}-${restoredBody.hashCode}',
       kind: restoredKind,
@@ -6662,7 +6860,7 @@ class SessionController extends ChangeNotifier {
       trigger: entry.context?.trigger ?? '',
       meta: _historyRuntimeMetaForEntry(entry, resumeMeta),
       context: entry.context,
-      attachments: entry.attachments,
+      attachments: attachments,
       animateBody: false,
     );
   }

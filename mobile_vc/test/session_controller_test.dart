@@ -10745,7 +10745,8 @@ void main() {
               source: 'codex-native',
               type: 'codex_tool_call',
               tool: 'functions.exec_command',
-              command: 'rg TODO',
+              command:
+                  '{"cmd":"sed -n \'1,80p\' internal/engine/codex_transport.go"}',
             ),
           ),
           HistoryLogEntry(
@@ -10789,6 +10790,12 @@ void main() {
       expect(group.status, contains('工具调用 1'));
       expect(group.status, contains('输出 1'));
       expect(group.status, contains('Patch 1'));
+      expect(
+          group.codexSteps,
+          containsAll([
+            '正在读取 codex_transport.go',
+            '补丁结果：success',
+          ]));
       expect(group.body, contains('## 工具调用 (1)'));
       expect(group.body, contains('## 工具输出 (1)'));
       expect(group.body, contains('## Patch (1)'));
@@ -10859,6 +10866,159 @@ void main() {
       expect(group.body, contains('- **functions.exec_command**'));
     });
 
+    test('session_history 会把 Codex 子智能体事件整理成可见状态', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        logEntries: const [
+          HistoryLogEntry(
+            kind: 'system',
+            message: 'spawn subagent',
+            timestamp: '2026-05-27T05:22:01Z',
+            context: HistoryContext(
+              source: 'codex-native',
+              type: 'codex_tool_call',
+              tool: 'functions.spawn_agent',
+              command: '{"task_name":"agent-019e7126","message":"分析通信层"}',
+            ),
+          ),
+          HistoryLogEntry(
+            kind: 'system',
+            message: 'read source',
+            timestamp: '2026-05-27T05:22:02Z',
+            context: HistoryContext(
+              source: 'codex-native',
+              type: 'codex_tool_call',
+              tool: 'functions.exec_command',
+              command:
+                  '{"cmd":"sed -n \'1,120p\' internal/engine/codex_transport.go"}',
+            ),
+          ),
+        ],
+        resumeRuntimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+      ));
+      await _flushEvents();
+
+      final group = controller.timeline.single;
+      expect(group.kind, 'codex_tool_group');
+      expect(group.codexSteps, [
+        '正在创建智能体：agent-019e7126',
+        '正在读取 codex_transport.go',
+      ]);
+    });
+
+    test('Codex 可见状态优先保留后续关键智能体和补丁状态', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        logEntries: const [
+          HistoryLogEntry(
+            kind: 'system',
+            message: 'read 1',
+            timestamp: '2026-05-27T05:23:01Z',
+            context: HistoryContext(
+              source: 'codex-native',
+              type: 'codex_tool_call',
+              tool: 'functions.exec_command',
+              command: '{"cmd":"sed -n \'1,40p\' lib/a.dart"}',
+            ),
+          ),
+          HistoryLogEntry(
+            kind: 'system',
+            message: 'read 2',
+            timestamp: '2026-05-27T05:23:02Z',
+            context: HistoryContext(
+              source: 'codex-native',
+              type: 'codex_tool_call',
+              tool: 'functions.exec_command',
+              command: '{"cmd":"cat lib/b.dart"}',
+            ),
+          ),
+          HistoryLogEntry(
+            kind: 'system',
+            message: 'read 3',
+            timestamp: '2026-05-27T05:23:03Z',
+            context: HistoryContext(
+              source: 'codex-native',
+              type: 'codex_tool_call',
+              tool: 'functions.exec_command',
+              command: '{"cmd":"rg SessionController lib/c.dart"}',
+            ),
+          ),
+          HistoryLogEntry(
+            kind: 'system',
+            message: 'read 4',
+            timestamp: '2026-05-27T05:23:04Z',
+            context: HistoryContext(
+              source: 'codex-native',
+              type: 'codex_tool_call',
+              tool: 'functions.exec_command',
+              command: '{"cmd":"find lib -name d.dart"}',
+            ),
+          ),
+          HistoryLogEntry(
+            kind: 'system',
+            message: 'read 5',
+            timestamp: '2026-05-27T05:23:05Z',
+            context: HistoryContext(
+              source: 'codex-native',
+              type: 'codex_tool_call',
+              tool: 'functions.exec_command',
+              command: '{"cmd":"head -20 lib/e.dart"}',
+            ),
+          ),
+          HistoryLogEntry(
+            kind: 'system',
+            message: 'spawn subagent',
+            timestamp: '2026-05-27T05:23:06Z',
+            context: HistoryContext(
+              source: 'codex-native',
+              type: 'codex_tool_call',
+              tool: 'functions.spawn_agent',
+              command: '{"task_name":"agent-review","message":"审查"}',
+            ),
+          ),
+          HistoryLogEntry(
+            kind: 'system',
+            message: 'patch success',
+            timestamp: '2026-05-27T05:23:07Z',
+            context: HistoryContext(
+              source: 'codex-native',
+              type: 'codex_patch',
+              status: 'success',
+            ),
+          ),
+        ],
+        resumeRuntimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+      ));
+      await _flushEvents();
+
+      final steps = controller.timeline.single.codexSteps;
+      expect(steps, hasLength(6));
+      expect(steps, contains('正在创建智能体：agent-review'));
+      expect(steps, contains('补丁结果：success'));
+      expect(steps, contains('正在读取 e.dart'));
+      expect(steps, isNot(contains('正在读取 a.dart')));
+    });
+
     test('session_history 会恢复用户消息附件并处理媒体预览结果', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);
@@ -10919,6 +11079,46 @@ void main() {
       final preview = controller.mediaPreviewStates['att-1'];
       expect(preview?.ok, isTrue);
       expect(utf8.decode(preview!.bytes!), 'png-bytes');
+    });
+
+    test('Codex 原生历史会从本地图片路径恢复附件卡片', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'codex-thread:local-image',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(
+          id: 'codex-thread:local-image',
+          title: 'Codex 图片会话',
+          source: 'codex-native',
+        ),
+        logEntries: const [
+          HistoryLogEntry(
+            kind: 'markdown',
+            message: '已生成图片：![preview](/tmp/codex-output/screen.png)',
+            timestamp: '2026-05-27T05:20:00Z',
+          ),
+        ],
+        resumeRuntimeMeta: RuntimeMeta(command: 'codex', engine: 'codex'),
+      ));
+      await _flushEvents();
+
+      expect(controller.timeline, hasLength(1));
+      final item = controller.timeline.single;
+      expect(item.kind, 'markdown');
+      expect(item.attachments, hasLength(1));
+      final attachment = item.attachments.single;
+      expect(attachment.kind, 'image');
+      expect(attachment.name, 'screen.png');
+      expect(attachment.mimeType, 'image/png');
+      expect(attachment.path, '/tmp/codex-output/screen.png');
+      expect(attachment.source, 'assistant_path');
     });
 
     test('loadSession 匹配 history 后先显示 timeline 再异步刷新目录和 delta', () async {
