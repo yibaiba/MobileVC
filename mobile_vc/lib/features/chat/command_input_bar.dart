@@ -101,17 +101,17 @@ class _CommandInputBarState extends State<CommandInputBar> {
           !widget.canStop &&
           widget.isBusy);
 
-  bool _showStopActionForText(String text) =>
+  bool get _showStopAction =>
       !widget.isExternallyLocked &&
       !widget.isSessionLoading &&
       widget.canStop &&
-      !_canSubmitLocalDraftForText(text);
+      !_canSubmitLocalDraft;
 
-  bool _hasLocalDraftForText(String text) =>
-      text.trim().isNotEmpty || _imageAttachments.isNotEmpty;
+  bool get _hasLocalDraft =>
+      _controller.text.trim().isNotEmpty || _imageAttachments.isNotEmpty;
 
-  bool _canSubmitLocalDraftForText(String text) =>
-      _hasLocalDraftForText(text) &&
+  bool get _canSubmitLocalDraft =>
+      _hasLocalDraft &&
       !_inputLocked &&
       (!widget.isBusy ||
           widget.awaitInput ||
@@ -492,43 +492,35 @@ class _CommandInputBarState extends State<CommandInputBar> {
                                 child: SizedBox(
                                   width: 42,
                                   height: 42,
-                                  child:
-                                      ValueListenableBuilder<TextEditingValue>(
-                                    valueListenable: _controller,
-                                    builder: (context, value, _) {
-                                      final showStopAction =
-                                          _showStopActionForText(value.text);
-                                      return FilledButton(
-                                        onPressed: showStopAction
-                                            ? widget.onStop
-                                            : (_inputLocked ? null : _submit),
-                                        style: FilledButton.styleFrom(
-                                          elevation: 0,
-                                          backgroundColor: _inputLocked
-                                              ? scheme.surfaceContainerHighest
-                                              : showStopAction
-                                                  ? scheme.error
-                                                  : scheme.primary,
-                                          foregroundColor: _inputLocked
-                                              ? scheme.onSurfaceVariant
-                                              : showStopAction
-                                                  ? scheme.onError
-                                                  : scheme.onPrimary,
-                                          padding: EdgeInsets.zero,
-                                          minimumSize: const Size(42, 42),
-                                          shape: RoundedRectangleBorder(
-                                            borderRadius:
-                                                BorderRadius.circular(999),
-                                          ),
-                                        ),
-                                        child: Icon(
-                                          showStopAction
-                                              ? Icons.stop_rounded
-                                              : Icons.arrow_upward,
-                                          size: 18,
-                                        ),
-                                      );
-                                    },
+                                  child: FilledButton(
+                                    onPressed: _showStopAction
+                                        ? widget.onStop
+                                        : (_inputLocked ? null : _submit),
+                                    style: FilledButton.styleFrom(
+                                      elevation: 0,
+                                      backgroundColor: _inputLocked
+                                          ? scheme.surfaceContainerHighest
+                                          : _showStopAction
+                                              ? scheme.error
+                                              : scheme.primary,
+                                      foregroundColor: _inputLocked
+                                          ? scheme.onSurfaceVariant
+                                          : _showStopAction
+                                              ? scheme.onError
+                                              : scheme.onPrimary,
+                                      padding: EdgeInsets.zero,
+                                      minimumSize: const Size(42, 42),
+                                      shape: RoundedRectangleBorder(
+                                        borderRadius:
+                                            BorderRadius.circular(999),
+                                      ),
+                                    ),
+                                    child: Icon(
+                                      _showStopAction
+                                          ? Icons.stop_rounded
+                                          : Icons.arrow_upward,
+                                      size: 18,
+                                    ),
                                   ),
                                 ),
                               ),

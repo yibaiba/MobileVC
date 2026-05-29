@@ -212,6 +212,24 @@ void main() {
       expect(find.byIcon(Icons.arrow_upward), findsOneWidget);
     });
 
+    testWidgets('纯文字输入不会重建发送按钮', (tester) async {
+      await tester.pumpWidget(
+        _buildTestApp(
+          onSubmit: (_, __) {},
+        ),
+      );
+
+      final buttonFinder = find.byType(FilledButton);
+      expect(buttonFinder, findsOneWidget);
+      final buttonBefore = tester.widget(buttonFinder);
+
+      await tester.enterText(find.byType(TextField), '只输入文字');
+      await tester.pump();
+
+      expect(buttonFinder, findsOneWidget);
+      expect(identical(tester.widget(buttonFinder), buttonBefore), isTrue);
+    });
+
     testWidgets('Codex 模式显示 Codex 状态与 hint', (tester) async {
       await tester.pumpWidget(
         _buildTestApp(
