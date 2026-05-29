@@ -1229,6 +1229,35 @@ func TestApplyAICommandPreferencesReplacesStaleCodexModel(t *testing.T) {
 	}
 }
 
+func TestApplyAICommandPreferencesDefaultModelRemovesStaleModelFlag(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		command string
+		engine  string
+		want    string
+	}{
+		{
+			name:    "claude",
+			command: "claude --model sonnet",
+			engine:  "claude",
+			want:    "claude",
+		},
+		{
+			name:    "codex",
+			command: "codex -m gpt-5-codex --config model_reasoning_effort=medium",
+			engine:  "codex",
+			want:    "codex --config model_reasoning_effort=medium",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := applyAICommandPreferences(tc.command, tc.engine, "default", "")
+			if got != tc.want {
+				t.Fatalf("unexpected command: got %q want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestAIStatusAssistantReplySettlesAndProjectionIdles(t *testing.T) {
 	sessionID := "session-1"
 	logEvent := protocol.NewLogEvent(sessionID, "我已经处理好了，可以继续。", "stdout")
@@ -4120,6 +4149,36 @@ func TestHandlerInputWithoutRunner(t *testing.T) {
 			}
 			return
 		}
+	}
+}
+
+func TestHandlerStopWithoutActiveRunnerEmitsStoppedState(t *testing.T) {
+	h := newTestHandler()
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	h.SessionStore = tempStore
+	conn := newTestConn(t, h)
+	defer closeConnAndCleanupRuntime(t, conn, h)
+
+	sessionID := createHistorySessionForHandlerTest(t, h, conn, "stop target")
+	if err := conn.WriteJSON(protocol.ClientEvent{
+		Action:         "stop",
+		ClientActionID: "stop-no-runner-1",
+	}); err != nil {
+		t.Fatalf("write stop request: %v", err)
+	}
+
+	event := readUntilType(t, conn, protocol.EventTypeSessionState)
+	if got, _ := event["sessionId"].(string); got != sessionID {
+		t.Fatalf("session id: got %q want %q", got, sessionID)
+	}
+	if got, _ := event["state"].(string); got != "stopped" {
+		t.Fatalf("state: got %q want stopped; event=%#v", got, event)
+	}
+	if msg, _ := event["msg"].(string); !strings.Contains(msg, "没有可停止") {
+		t.Fatalf("message should explain no active runner, got %#v", event)
 	}
 }
 

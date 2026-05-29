@@ -79,7 +79,7 @@ void main() {
       expect(field.decoration?.hintText, '回复 Claude');
     });
 
-    testWidgets('等待输入时即使 canStop 为 true 也显示发送按钮', (tester) async {
+    testWidgets('canStop 为 true 时优先显示停止按钮', (tester) async {
       var submitted = false;
       var stopped = false;
       await tester.pumpWidget(
@@ -97,17 +97,16 @@ void main() {
       expect(
           find.descendant(
             of: find.byType(FilledButton),
-            matching: find.byIcon(Icons.arrow_upward),
+            matching: find.byIcon(Icons.stop_rounded),
           ),
           findsOneWidget);
-      expect(find.byIcon(Icons.stop_rounded), findsNothing);
+      expect(find.byIcon(Icons.arrow_upward), findsNothing);
 
-      await tester.enterText(find.byType(TextField), '继续');
       await tester.tap(find.byType(FilledButton));
       await tester.pump();
 
-      expect(submitted, isTrue);
-      expect(stopped, isFalse);
+      expect(submitted, isFalse);
+      expect(stopped, isTrue);
     });
 
     testWidgets('Codex 模式显示 Codex 状态与 hint', (tester) async {
@@ -149,6 +148,30 @@ void main() {
       );
 
       expect(find.byIcon(Icons.stop_rounded), findsOneWidget);
+
+      await tester.tap(find.byType(FilledButton));
+      await tester.pump();
+
+      expect(stopped, isTrue);
+    });
+
+    testWidgets('权限提示锁住输入时仍允许停止运行任务', (tester) async {
+      var stopped = false;
+      await tester.pumpWidget(
+        _buildTestApp(
+          shouldShowPermissionChoices: true,
+          isBusy: true,
+          canStop: true,
+          onStop: () => stopped = true,
+        ),
+      );
+
+      final field = tester.widget<TextField>(find.byType(TextField));
+      final button = tester.widget<FilledButton>(find.byType(FilledButton));
+
+      expect(field.enabled, isFalse);
+      expect(find.byIcon(Icons.stop_rounded), findsOneWidget);
+      expect(button.onPressed, isNotNull);
 
       await tester.tap(find.byType(FilledButton));
       await tester.pump();

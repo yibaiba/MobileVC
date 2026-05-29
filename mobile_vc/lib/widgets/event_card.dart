@@ -158,8 +158,8 @@ class _EventCardState extends State<EventCard> {
             : [
                 BoxShadow(
                   color: style.shadow,
-                  blurRadius: isMarkdown ? 18 : 20,
-                  offset: const Offset(0, 10),
+                  blurRadius: 4,
+                  offset: const Offset(0, 1),
                 ),
               ],
       ),
@@ -513,32 +513,37 @@ class _EventCardState extends State<EventCard> {
   }
 
   bool _isCompactKind(String kind) {
-    return kind == 'session' || kind == 'system' || kind == 'compaction';
+    return kind == 'session' || kind == 'system' || kind == 'compaction' || kind == 'thinking';
   }
 
   _EventCardStyle _styleForKind(ColorScheme scheme, String kind) {
+    const iMessageBlue = Color(0xFF007AFF);
+    final isDark = scheme.brightness == Brightness.dark;
+
     return switch (kind) {
       'user' => _EventCardStyle(
-          background: scheme.primary,
-          border: scheme.primary,
-          titleColor: scheme.onPrimary,
-          bodyColor: scheme.onPrimary,
-          subtitleColor: scheme.onPrimary.withValues(alpha: 0.76),
-          iconBackground: scheme.onPrimary.withValues(alpha: 0.14),
-          iconColor: scheme.onPrimary,
-          shadow: scheme.primary.withValues(alpha: 0.18),
-          radius: 22,
+          background: iMessageBlue,
+          border: iMessageBlue,
+          titleColor: Colors.white,
+          bodyColor: Colors.white,
+          subtitleColor: Colors.white.withValues(alpha: 0.76),
+          iconBackground: Colors.white.withValues(alpha: 0.14),
+          iconColor: Colors.white,
+          shadow: iMessageBlue.withValues(alpha: 0.12),
+          radius: 20,
         ),
       'markdown' => _EventCardStyle(
-          background: scheme.surfaceContainerLowest,
-          border: scheme.outlineVariant.withValues(alpha: 0.55),
+          background: isDark
+              ? const Color(0xFF1C1C1E)
+              : const Color(0xFFF2F2F7),
+          border: scheme.outlineVariant.withValues(alpha: isDark ? 0.18 : 0.36),
           titleColor: scheme.onSurface,
           bodyColor: scheme.onSurface,
           subtitleColor: scheme.onSurfaceVariant,
           iconBackground: scheme.primaryContainer,
           iconColor: scheme.primary,
-          shadow: Colors.black.withValues(alpha: 0.05),
-          radius: 24,
+          shadow: Colors.black.withValues(alpha: 0.04),
+          radius: 20,
         ),
       'error' => _EventCardStyle(
           background: scheme.errorContainer.withValues(alpha: 0.72),
@@ -548,19 +553,21 @@ class _EventCardState extends State<EventCard> {
           subtitleColor: scheme.onErrorContainer.withValues(alpha: 0.74),
           iconBackground: scheme.error.withValues(alpha: 0.10),
           iconColor: scheme.error,
-          shadow: scheme.error.withValues(alpha: 0.10),
-          radius: 22,
+          shadow: scheme.error.withValues(alpha: 0.06),
+          radius: 20,
         ),
       'terminal' || 'log' => _EventCardStyle(
-          background: scheme.surfaceContainerLowest,
-          border: scheme.outlineVariant.withValues(alpha: 0.7),
+          background: isDark
+              ? const Color(0xFF1C1C1E)
+              : const Color(0xFFF2F2F7),
+          border: scheme.outlineVariant.withValues(alpha: isDark ? 0.18 : 0.36),
           titleColor: scheme.onSurface,
           bodyColor: scheme.onSurface,
           subtitleColor: scheme.onSurfaceVariant,
           iconBackground: scheme.surfaceContainerHighest,
           iconColor: scheme.primary,
-          shadow: scheme.shadow.withValues(alpha: 0.06),
-          radius: 22,
+          shadow: Colors.black.withValues(alpha: 0.04),
+          radius: 20,
         ),
       'codex_tool_group' => _EventCardStyle(
           background: scheme.surfaceContainerLow,
@@ -575,25 +582,40 @@ class _EventCardState extends State<EventCard> {
         ),
       'session' || 'system' => _EventCardStyle(
           background: scheme.surfaceContainerLow,
-          border: scheme.outlineVariant.withValues(alpha: 0.7),
+          border: scheme.outlineVariant.withValues(alpha: isDark ? 0.18 : 0.36),
           titleColor: scheme.onSurfaceVariant,
           bodyColor: scheme.onSurfaceVariant,
           subtitleColor: scheme.onSurfaceVariant.withValues(alpha: 0.84),
           iconBackground: scheme.surfaceContainerHighest,
           iconColor: scheme.primary,
           shadow: Colors.transparent,
-          radius: 18,
+          radius: 16,
+        ),
+      'thinking' => _EventCardStyle(
+          background: isDark
+              ? const Color(0xFF2C2C2E)
+              : const Color(0xFFF5F5F7),
+          border: scheme.outlineVariant.withValues(alpha: isDark ? 0.12 : 0.24),
+          titleColor: scheme.onSurfaceVariant,
+          bodyColor: scheme.onSurfaceVariant,
+          subtitleColor: scheme.onSurfaceVariant.withValues(alpha: 0.6),
+          iconBackground: scheme.tertiaryContainer,
+          iconColor: scheme.tertiary,
+          shadow: Colors.transparent,
+          radius: 14,
         ),
       _ => _EventCardStyle(
-          background: scheme.surfaceContainerLowest,
-          border: scheme.outlineVariant.withValues(alpha: 0.7),
+          background: isDark
+              ? const Color(0xFF1C1C1E)
+              : const Color(0xFFF2F2F7),
+          border: scheme.outlineVariant.withValues(alpha: isDark ? 0.18 : 0.36),
           titleColor: scheme.onSurface,
           bodyColor: scheme.onSurface,
           subtitleColor: scheme.onSurfaceVariant,
           iconBackground: scheme.surfaceContainerHighest,
           iconColor: scheme.primary,
-          shadow: scheme.shadow.withValues(alpha: 0.06),
-          radius: 22,
+          shadow: Colors.black.withValues(alpha: 0.04),
+          radius: 20,
         ),
     };
   }
@@ -607,6 +629,7 @@ class _EventCardState extends State<EventCard> {
       'terminal' => '终端输出',
       'codex_tool_group' => 'Codex 原生操作',
       'session' || 'system' => '系统提示',
+      'thinking' => '思考过程',
       _ => kind,
     };
   }

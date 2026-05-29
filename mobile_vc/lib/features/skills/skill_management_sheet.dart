@@ -36,20 +36,48 @@ enum _SkillFilter { all, enabled, editable }
 
 class _SkillManagementSheetState extends State<SkillManagementSheet> {
   _SkillFilter _filter = _SkillFilter.all;
+  final TextEditingController _searchController = TextEditingController();
+  String _searchQuery = '';
+
+  @override
+  void dispose() {
+    _searchController.dispose();
+    super.dispose();
+  }
+
+  void _onSearchChanged(String value) {
+    setState(() {
+      _searchQuery = value.trim().toLowerCase();
+    });
+  }
 
   List<SkillDefinition> get _filteredSkills {
+    var items = widget.skills;
+
+    // Apply filter
     switch (_filter) {
       case _SkillFilter.enabled:
-        return widget.skills
+        items = items
             .where((item) => widget.enabledSkillNames.contains(item.name))
             .toList(growable: false);
       case _SkillFilter.editable:
-        return widget.skills
+        items = items
             .where((item) => item.editable)
             .toList(growable: false);
       case _SkillFilter.all:
-        return widget.skills;
+        break;
     }
+
+    // Apply search
+    if (_searchQuery.isNotEmpty) {
+      items = items.where((item) {
+        return item.name.toLowerCase().contains(_searchQuery) ||
+            item.description.toLowerCase().contains(_searchQuery) ||
+            item.prompt.toLowerCase().contains(_searchQuery);
+      }).toList(growable: false);
+    }
+
+    return items;
   }
 
   @override
@@ -106,6 +134,28 @@ class _SkillManagementSheetState extends State<SkillManagementSheet> {
                 tone: _bannerTone(meta),
               ),
             ],
+            const SizedBox(height: 12),
+            TextField(
+              controller: _searchController,
+              onChanged: _onSearchChanged,
+              decoration: InputDecoration(
+                hintText: '搜索 skill 名称、描述或 prompt',
+                prefixIcon: const Icon(Icons.search),
+                suffixIcon: _searchQuery.isNotEmpty
+                    ? IconButton(
+                        icon: const Icon(Icons.clear),
+                        onPressed: () {
+                          _searchController.clear();
+                          _onSearchChanged('');
+                        },
+                      )
+                    : null,
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+              ),
+            ),
             const SizedBox(height: 12),
             SingleChildScrollView(
               scrollDirection: Axis.horizontal,
@@ -575,8 +625,10 @@ class _HeroCard extends StatelessWidget {
       width: double.infinity,
       padding: const EdgeInsets.fromLTRB(16, 16, 16, 14),
       decoration: BoxDecoration(
-        gradient: const LinearGradient(
-          colors: [Color(0xFFF7F9FC), Color(0xFFFFFFFF)],
+        gradient: LinearGradient(
+          colors: theme.brightness == Brightness.dark
+              ? [const Color(0xFF1E1E1E), const Color(0xFF2A2A2A)]
+              : [const Color(0xFFF7F9FC), const Color(0xFFFFFFFF)],
           begin: Alignment.topLeft,
           end: Alignment.bottomRight,
         ),

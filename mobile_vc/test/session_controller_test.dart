@@ -3087,7 +3087,7 @@ void main() {
       expect(service.sentPayloads, hasLength(1));
       expect(service.sentPayloads[0]['action'], 'ai_turn');
       expect(service.sentPayloads[0]['engine'], 'claude');
-      expect(service.sentPayloads[0].containsKey('model'), isFalse);
+      expect(service.sentPayloads[0]['model'], 'default');
     });
 
     test('Claude 模型切换会把选中的模型注入启动命令', () async {
@@ -3134,7 +3134,7 @@ void main() {
       expect(service.sentPayloads, hasLength(1));
       expect(service.sentPayloads[0]['action'], 'ai_turn');
       expect(service.sentPayloads[0]['engine'], 'claude');
-      expect(service.sentPayloads[0].containsKey('model'), isFalse);
+      expect(service.sentPayloads[0]['model'], 'default');
     });
 
     test('sendInputText 非等待态输入 claude 后跟正文时会启动 Claude 并通过 input 发送正文',
@@ -3152,7 +3152,7 @@ void main() {
       expect(service.sentPayloads, hasLength(1));
       expect(service.sentPayloads[0]['action'], 'ai_turn');
       expect(service.sentPayloads[0]['engine'], 'claude');
-      expect(service.sentPayloads[0].containsKey('model'), isFalse);
+      expect(service.sentPayloads[0]['model'], 'default');
       expect(service.sentPayloads[0]['data'], '请帮我总结当前问题\n');
     });
 
@@ -3352,7 +3352,7 @@ void main() {
       expect(service.sentPayloads[0]['action'], 'ai_turn');
       expect(service.sentPayloads[0]['engine'], 'codex');
       expect(service.sentPayloads[0]['reasoningEffort'], 'high');
-      expect(service.sentPayloads[0].containsKey('model'), isFalse);
+      expect(service.sentPayloads[0]['model'], 'default');
     });
 
     test('输入 codex 后等待后端 runtime meta 确认模式', () async {
@@ -3376,7 +3376,7 @@ void main() {
       expect(service.sentPayloads, hasLength(1));
       expect(service.sentPayloads[0]['action'], 'ai_turn');
       expect(service.sentPayloads[0]['engine'], 'codex');
-      expect(service.sentPayloads[0].containsKey('model'), isFalse);
+      expect(service.sentPayloads[0]['model'], 'default');
       expect(service.sentPayloads[0].containsKey('reasoningEffort'), isFalse);
     });
 
@@ -4274,6 +4274,78 @@ void main() {
       expect(service.sentPayloads.last['action'], 'stop');
     });
 
+    test('恢复历史只带 runtimeAlive 时也允许停止 MobileVC 管理的运行', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(
+        SessionHistoryEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-restored-running',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_history'},
+          summary: const SessionSummary(
+            id: 'session-restored-running',
+            title: 'Restored',
+            ownership: 'mobilevc',
+            executionActive: true,
+            runtime: RuntimeMeta(command: 'codex', engine: 'codex'),
+          ),
+          runtimeAlive: true,
+          resumeRuntimeMeta:
+              const RuntimeMeta(command: 'codex', engine: 'codex'),
+        ),
+      );
+      await _flushEvents();
+
+      expect(controller.isSessionReadOnly, isFalse);
+      expect(controller.canStopCurrentRun, isTrue);
+
+      service.sentPayloads.clear();
+      controller.stopCurrentRun();
+
+      expect(service.sentPayloads, hasLength(1));
+      expect(service.sentPayloads.single['action'], 'stop');
+      expect(service.sentPayloads.single['clientActionId'], isNotEmpty);
+      expect(
+          service.sentPayloads.single['sessionId'], 'session-restored-running');
+    });
+
+    test('外部原生观察态只有 runtimeAlive 时不会误显示停止', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(
+        SessionHistoryEvent(
+          timestamp: _timestamp,
+          sessionId: 'codex-thread:running',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_history'},
+          summary: const SessionSummary(
+            id: 'codex-thread:running',
+            title: 'Native Codex',
+            source: 'codex-native',
+            external: true,
+            executionActive: true,
+            runtime: RuntimeMeta(command: 'codex', engine: 'codex'),
+          ),
+          runtimeAlive: true,
+          resumeRuntimeMeta:
+              const RuntimeMeta(command: 'codex', engine: 'codex'),
+        ),
+      );
+      await _flushEvents();
+
+      expect(controller.isSessionReadOnly, isTrue);
+      expect(controller.canStopCurrentRun, isFalse);
+    });
+
     test('提交后未收到运行态时点击 stop 也会发送 stop action', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);
@@ -4320,6 +4392,56 @@ void main() {
       expect(controller.isSessionBusy, isFalse);
       expect(controller.canStopCurrentRun, isFalse);
       expect(controller.activityBannerVisible, isFalse);
+    });
+
+    test('stop 后收到 idle task snapshot 也会退出停止中', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(
+        SessionHistoryEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-1',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_history'},
+          summary: const SessionSummary(id: 'session-1', title: 'Stop target'),
+        ),
+      );
+      service.emit(
+        SessionStateEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-1',
+          runtimeMeta:
+              const RuntimeMeta(command: 'codex', executionId: 'exec-stop-2'),
+          raw: const {'type': 'session_state'},
+          state: 'RUNNING',
+          message: 'codex running',
+        ),
+      );
+      await _flushEvents();
+
+      controller.stopCurrentRun();
+      expect(controller.activityBannerTitle, '正在停止');
+
+      service.emit(
+        TaskSnapshotEvent(
+          timestamp: _timestamp.add(const Duration(seconds: 1)),
+          sessionId: 'session-1',
+          runtimeMeta:
+              const RuntimeMeta(command: 'codex', executionId: 'exec-stop-2'),
+          raw: const {'type': 'task_snapshot'},
+          state: 'IDLE',
+          message: 'heartbeat idle',
+          runtimeAlive: false,
+        ),
+      );
+      await _flushEvents();
+
+      expect(controller.activityBannerVisible, isFalse);
+      expect(controller.canStopCurrentRun, isFalse);
     });
 
     test('运行中点击 stop 后只发送停止请求并显示停止中', () async {

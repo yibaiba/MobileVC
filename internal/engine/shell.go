@@ -159,7 +159,22 @@ func newCodexAppServerCommand(ctx context.Context, command string) *exec.Cmd {
 		cmd.Env = shellEnvironmentWithPath(spec, command, launch.pathEnv)
 		return cmd
 	}
-	return newShellCommand(ctx, launch.executable+" app-server --listen stdio://", ModeExec)
+
+	executable := launch.executable
+	lowerExt := strings.ToLower(filepath.Ext(executable))
+	if lowerExt == ".cmd" || lowerExt == ".bat" {
+		if shortExe, err := windowsShortPath(executable); err == nil && shortExe != "" {
+			executable = shortExe
+		}
+		cmdLine := executable + " app-server --listen stdio://"
+		cmd := exec.CommandContext(ctx, "cmd.exe", "/C", cmdLine)
+		cmd.Env = shellEnvironmentWithPath(spec, command, launch.pathEnv)
+		return cmd
+	}
+
+	cmd := exec.CommandContext(ctx, launch.executable, "app-server", "--listen", "stdio://")
+	cmd.Env = shellEnvironmentWithPath(spec, command, launch.pathEnv)
+	return cmd
 }
 
 func shouldUseWindowsClaudeEntry(command string, spec shellSpec) bool {

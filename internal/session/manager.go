@@ -1127,13 +1127,13 @@ func detectRuntimeModel(command, engine string) string {
 	case head == "codex" || strings.HasSuffix(head, "/codex") || strings.HasSuffix(head, `\codex`) || head == "codex.exe":
 		return ""
 	case head == "claude" || strings.HasSuffix(head, "/claude") || strings.HasSuffix(head, `\claude`) || head == "claude.exe":
-		return "sonnet"
+		return ""
 	}
 	switch strings.TrimSpace(strings.ToLower(engine)) {
 	case "codex":
 		return ""
 	case "claude":
-		return "sonnet"
+		return ""
 	default:
 		return ""
 	}

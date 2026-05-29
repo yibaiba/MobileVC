@@ -114,6 +114,8 @@ class _FileViewerSheetState extends State<FileViewerSheet> {
 
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
     final result = widget.file;
     final diff = widget.reviewDiff;
     final activeGroup = _activeGroup();
@@ -139,17 +141,17 @@ class _FileViewerSheetState extends State<FileViewerSheet> {
               width: double.infinity,
               padding: const EdgeInsets.fromLTRB(16, 16, 16, 14),
               decoration: BoxDecoration(
-                gradient: const LinearGradient(
-                  colors: [Color(0xFFF7F9FC), Color(0xFFFFFFFF)],
+                gradient: LinearGradient(
+                  colors: [
+                    scheme.surfaceContainerHigh,
+                    scheme.surfaceContainerLow,
+                  ],
                   begin: Alignment.topLeft,
                   end: Alignment.bottomRight,
                 ),
                 borderRadius: BorderRadius.circular(22),
                 border: Border.all(
-                  color: Theme.of(context)
-                      .colorScheme
-                      .outlineVariant
-                      .withValues(alpha: 0.45),
+                  color: scheme.outlineVariant.withValues(alpha: 0.45),
                 ),
               ),
               child: Column(
@@ -157,10 +159,10 @@ class _FileViewerSheetState extends State<FileViewerSheet> {
                 children: [
                   Text(
                     result?.title ?? '文件内容',
-                    style: Theme.of(context).textTheme.titleLarge?.copyWith(
-                          fontWeight: FontWeight.w800,
-                          letterSpacing: -0.2,
-                        ),
+                    style: theme.textTheme.titleLarge?.copyWith(
+                      fontWeight: FontWeight.w800,
+                      color: scheme.onSurface,
+                    ),
                   ),
                   const SizedBox(height: 6),
                   Text(
@@ -169,10 +171,10 @@ class _FileViewerSheetState extends State<FileViewerSheet> {
                             ? '查看当前文件与所属修改组中的待审核内容'
                             : '查看当前文件与待审核改动内容')
                         : '查看当前文件内容，并可直接基于它继续提问',
-                    style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                          color: Theme.of(context).colorScheme.onSurfaceVariant,
-                          height: 1.45,
-                        ),
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: scheme.onSurfaceVariant,
+                      height: 1.45,
+                    ),
                   ),
                 ],
               ),
@@ -236,18 +238,17 @@ class _FileViewerSheetState extends State<FileViewerSheet> {
                 padding:
                     const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
                 decoration: BoxDecoration(
-                  color: Colors.white,
+                  color: scheme.surfaceContainerLow,
                   borderRadius: BorderRadius.circular(16),
                   border: Border.all(
-                    color: Theme.of(context)
-                        .colorScheme
-                        .outlineVariant
-                        .withValues(alpha: 0.35),
+                    color: scheme.outlineVariant.withValues(alpha: 0.35),
                   ),
                 ),
                 child: SelectableText(
                   result!.path,
-                  style: Theme.of(context).textTheme.bodySmall,
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: scheme.onSurfaceVariant,
+                  ),
                 ),
               ),
             ],
@@ -482,28 +483,27 @@ class _FileViewerSheetState extends State<FileViewerSheet> {
   }
 
   Widget _buildFileContent(BuildContext context, FileReadResult result) {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
     if (result.isText) {
       return SingleChildScrollView(
         child: Container(
           width: double.infinity,
           padding: const EdgeInsets.all(14),
           decoration: BoxDecoration(
-            color: Colors.white,
+            color: scheme.surfaceContainerLowest,
             borderRadius: BorderRadius.circular(18),
             border: Border.all(
-              color: Theme.of(context)
-                  .colorScheme
-                  .outlineVariant
-                  .withValues(alpha: 0.45),
+              color: scheme.outlineVariant.withValues(alpha: 0.45),
             ),
           ),
           child: SelectableText(
             result.content,
-            style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                  color: Theme.of(context).colorScheme.onSurface,
-                  fontFamily: 'monospace',
-                  height: 1.45,
-                ),
+            style: theme.textTheme.bodyMedium?.copyWith(
+              color: scheme.onSurface,
+              fontFamily: 'monospace',
+              height: 1.45,
+            ),
           ),
         ),
       );
@@ -515,13 +515,10 @@ class _FileViewerSheetState extends State<FileViewerSheet> {
         return Container(
           width: double.infinity,
           decoration: BoxDecoration(
-            color: const Color(0xFFF8FAFC),
+            color: scheme.surfaceContainerLow,
             borderRadius: BorderRadius.circular(20),
             border: Border.all(
-              color: Theme.of(context)
-                  .colorScheme
-                  .outlineVariant
-                  .withValues(alpha: 0.5),
+              color: scheme.outlineVariant.withValues(alpha: 0.5),
             ),
           ),
           child: ClipRRect(

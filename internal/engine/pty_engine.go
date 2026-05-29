@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -554,6 +555,10 @@ func (r *PtyRunner) Write(ctx context.Context, data []byte) error {
 			return ctx.Err()
 		case err := <-writeDone:
 			if err != nil {
+				if errors.Is(err, syscall.EPIPE) || strings.Contains(err.Error(), "broken pipe") {
+					logx.Info("pty", "write pty input: pipe already closed (process exited): sessionID=%s", req.SessionID)
+					return nil
+				}
 				return fmt.Errorf("write pty input: %w", err)
 			}
 			return nil
@@ -837,12 +842,8 @@ func (r *PtyRunner) WritePermissionResponse(ctx context.Context, decision string
 		r.pendingControlRequestID = ""
 		r.pendingControlInput = nil
 		r.pendingPromptOptions = nil
-		if r.pendingControlRequestIDPrev != "" {
-			r.pendingControlRequestID = r.pendingControlRequestIDPrev
-			r.pendingControlInput = r.pendingControlInputPrev
-			r.pendingControlRequestIDPrev = ""
-			r.pendingControlInputPrev = nil
-		}
+		r.pendingControlRequestIDPrev = ""
+		r.pendingControlInputPrev = nil
 	}
 	r.mu.Unlock()
 	return nil
@@ -2342,6 +2343,13 @@ func (r *PtyRunner) readClaudeStreamJSON(ctx context.Context, reader io.Reader, 
 					sendEvent(sink, protocol.NewAgentStateEvent(sessionID, "THINKING", "思考中", false, "", "", ""))
 				}
 				switch block.Type {
+				case "thinking":
+					if text := strings.TrimSpace(block.Text); text != "" {
+						sendEvent(sink, protocol.ApplyRuntimeMeta(
+							protocol.NewThinkingEvent(sessionID, text),
+							protocol.RuntimeMeta{ResumeSessionID: envelope.SessionID, Engine: r.pendingReq.Engine},
+						))
+					}
 				case "tool_use":
 					target := extractToolTarget(block.Name, block.Input)
 					logx.Info("pty", "claude assistant tool_use: sessionID=%s tool=%s target=%q", sessionID, block.Name, target)
@@ -2949,7 +2957,7 @@ func (r *PtyRunner) readOutput(ctx context.Context, reader io.Reader, sessionID 
 		}
 
 		if err != nil {
-			if errors.Is(err, os.ErrClosed) || errors.Is(err, io.EOF) {
+			if errors.Is(err, os.ErrClosed) || errors.Is(err, io.EOF) || errors.Is(err, syscall.EIO) {
 				logx.Info("pty", "read %s reached EOF/closed: sessionID=%s err=%v", stream, sessionID, err)
 				break
 			}
