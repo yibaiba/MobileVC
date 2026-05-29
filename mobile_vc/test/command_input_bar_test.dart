@@ -109,6 +109,78 @@ void main() {
       expect(stopped, isTrue);
     });
 
+    testWidgets('选择图片后即使 canStop 为 true 也优先显示发送按钮', (tester) async {
+      String? submittedText;
+      List<ChatImageAttachment> submittedImages = const [];
+      var stopped = false;
+      await tester.pumpWidget(
+        _buildTestApp(
+          awaitInput: true,
+          isBusy: true,
+          canStop: true,
+          currentEngine: 'codex',
+          onAttachImage: () async => ChatImageAttachment(
+            name: 'screen.png',
+            mimeType: 'image/png',
+            bytes: _transparentPngBytes,
+          ),
+          onSubmit: (text, images) {
+            submittedText = text;
+            submittedImages = images;
+          },
+          onStop: () => stopped = true,
+        ),
+      );
+
+      expect(find.byIcon(Icons.stop_rounded), findsOneWidget);
+
+      await tester.tap(find.byTooltip('添加图片'));
+      await tester.pump();
+
+      expect(find.byIcon(Icons.stop_rounded), findsNothing);
+      expect(find.byIcon(Icons.arrow_upward), findsOneWidget);
+
+      await tester.tap(find.byType(FilledButton));
+      await tester.pump();
+
+      expect(stopped, isFalse);
+      expect(submittedText, '');
+      expect(submittedImages, hasLength(1));
+      expect(find.byKey(const ValueKey('imageAttachmentPreview:screen.png')),
+          findsNothing);
+    });
+
+    testWidgets('运行中不可提交草稿时选择图片仍保留停止按钮', (tester) async {
+      var submitted = false;
+      var stopped = false;
+      await tester.pumpWidget(
+        _buildTestApp(
+          isBusy: true,
+          canStop: true,
+          currentEngine: 'codex',
+          onAttachImage: () async => ChatImageAttachment(
+            name: 'screen.png',
+            mimeType: 'image/png',
+            bytes: _transparentPngBytes,
+          ),
+          onSubmit: (_, __) => submitted = true,
+          onStop: () => stopped = true,
+        ),
+      );
+
+      await tester.tap(find.byTooltip('添加图片'));
+      await tester.pump();
+
+      expect(find.byIcon(Icons.stop_rounded), findsOneWidget);
+      expect(find.byIcon(Icons.arrow_upward), findsNothing);
+
+      await tester.tap(find.byType(FilledButton));
+      await tester.pump();
+
+      expect(stopped, isTrue);
+      expect(submitted, isFalse);
+    });
+
     testWidgets('Codex 模式显示 Codex 状态与 hint', (tester) async {
       await tester.pumpWidget(
         _buildTestApp(

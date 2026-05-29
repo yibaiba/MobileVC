@@ -102,7 +102,20 @@ class _CommandInputBarState extends State<CommandInputBar> {
           widget.isBusy);
 
   bool get _showStopAction =>
-      !widget.isExternallyLocked && !widget.isSessionLoading && widget.canStop;
+      !widget.isExternallyLocked &&
+      !widget.isSessionLoading &&
+      widget.canStop &&
+      !_canSubmitLocalDraft;
+
+  bool get _hasLocalDraft =>
+      _controller.text.trim().isNotEmpty || _imageAttachments.isNotEmpty;
+
+  bool get _canSubmitLocalDraft =>
+      _hasLocalDraft &&
+      !_inputLocked &&
+      (!widget.isBusy ||
+          widget.awaitInput ||
+          widget.canSendToContinuedSameSession);
 
   String get _lockedHintText {
     if (widget.isExternallyLocked) {
@@ -140,10 +153,21 @@ class _CommandInputBarState extends State<CommandInputBar> {
   }
 
   @override
+  void initState() {
+    super.initState();
+    _controller.addListener(_handleTextChanged);
+  }
+
+  @override
   void dispose() {
+    _controller.removeListener(_handleTextChanged);
     _controller.dispose();
     _focusNode.dispose();
     super.dispose();
+  }
+
+  void _handleTextChanged() {
+    setState(() {});
   }
 
   void _submit() {
