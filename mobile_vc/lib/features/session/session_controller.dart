@@ -7410,6 +7410,9 @@ class SessionController extends ChangeNotifier {
         item.kind == 'codex_tool_group') {
       return false;
     }
+    if (_continuesMarkdownLink(previous.body, item.body)) {
+      return true;
+    }
     if (previous.attachments.isNotEmpty || item.attachments.isNotEmpty) {
       return false;
     }
