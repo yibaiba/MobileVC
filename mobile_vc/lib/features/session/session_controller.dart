@@ -1942,6 +1942,7 @@ class SessionController extends ChangeNotifier {
           const RuntimeMeta(),
     );
     _isSubmitting = true;
+    _currentStepSummary = '';
     // 任何正在排队的"延迟消隐"都立即取消，保证发送瞬间状态球不会被旧 timer 打灭。
     _activityHideDebounce?.cancel();
     _activityHideDebounce = null;
@@ -2667,8 +2668,6 @@ class SessionController extends ChangeNotifier {
     _selectedSessionExternalNative = false;
     _executionActive = false;
     _sessionRuntimeAlive = false;
-    _continueSameSessionEnabled = false;
-    _continuedSameSessionId = '';
     _agentState = null;
     _sessionState = null;
     _runtimePhase = null;
@@ -2783,7 +2782,9 @@ class SessionController extends ChangeNotifier {
       '已在手机继续同一会话。电脑端原生终端仍可输入，请避免两端同时输入。',
     );
     // 立即同步当前运行状态，避免 stop 按钮需要切后台才出现
-    _requestSessionDelta(reason: 'continue_same_session');
+    requestTaskSnapshot();
+    _requestSessionResume(reason: 'continue_same_session');
+    _requestSessionDelta(reason: 'continue_same_session', force: true);
     _syncDerivedState();
     notifyListeners();
   }
@@ -5133,8 +5134,10 @@ class SessionController extends ChangeNotifier {
         if (!history.runtimeAlive) {
           _clearStoppingState();
         }
-        _continueSameSessionEnabled = false;
-        _continuedSameSessionId = '';
+        if (!history.runtimeAlive && !canSendToContinuedSameSession) {
+          _continueSameSessionEnabled = false;
+          _continuedSameSessionId = '';
+        }
         _terminalExecutions
           ..clear()
           ..addAll(history.terminalExecutions);
@@ -5374,6 +5377,13 @@ class SessionController extends ChangeNotifier {
           _pendingInteraction = null;
           _pendingPrompt = null;
           _runtimePhase = null;
+          _currentStep = null;
+          _currentStepSummary = '';
+          _activityToolLabel = '';
+          _activityStartedAt = null;
+          _activityVisible = false;
+          _activityHideDebounce?.cancel();
+          _activityHideDebounce = null;
         }
         _checkAndClearExecutionState(agent.state);
         _syncStepSummary(
@@ -8111,7 +8121,7 @@ class SessionController extends ChangeNotifier {
         normalized.endsWith(']')) {
       return false;
     }
-    return RegExp(r'\p{Script=Han}|[A-Za-z]', unicode: true)
+    return RegExp(r'\p{Script=Han}|[A-Za-z]|\p{So}', unicode: true)
         .hasMatch(normalized);
   }
 

@@ -15,14 +15,15 @@ const defaultRuntimeSessionPendingLimit = 512
 const defaultRuntimeSessionSinkBufferSize = 1024
 
 type runtimeSession struct {
-	mu            sync.RWMutex
-	service       *session.Service
-	listeners     map[string]func(any)
-	releaseTimer  *time.Timer
-	pendingCursor int64
-	pendingEvents []any
-	lastOutputAt  time.Time
-	clientActions map[string]time.Time
+	mu                  sync.RWMutex
+	service             *session.Service
+	listeners           map[string]func(any)
+	releaseTimer        *time.Timer
+	pendingCursor       int64
+	pendingEvents       []any
+	lastOutputAt        time.Time
+	lastClientMessageAt time.Time
+	clientActions       map[string]time.Time
 
 	persistedCursor atomic.Int64
 
@@ -377,7 +378,16 @@ func (r *runtimeSessionRegistry) HasActiveConnection(sessionID string) bool {
 	if !ok {
 		return false
 	}
-	return entry.listenerCount() > 0
+	if entry.listenerCount() == 0 {
+		return false
+	}
+	entry.mu.RLock()
+	lastClientMsg := entry.lastClientMessageAt
+	entry.mu.RUnlock()
+	if lastClientMsg.IsZero() {
+		return true
+	}
+	return time.Since(lastClientMsg) < 10*time.Second
 }
 
 func (r *runtimeSessionRegistry) FindByResumeSessionID(resumeSessionID string) (string, *runtimeSession) {
@@ -418,6 +428,9 @@ func (r *runtimeSessionRegistry) Attach(sessionID, listenerID string, listener f
 	entry := r.ensureLocked(sessionID)
 	entry.setListener(listenerID, listener)
 	entry.EnsureBufferedSink()
+	entry.mu.Lock()
+	entry.lastClientMessageAt = time.Now()
+	entry.mu.Unlock()
 	if entry.releaseTimer != nil {
 		entry.releaseTimer.Stop()
 		entry.releaseTimer = nil

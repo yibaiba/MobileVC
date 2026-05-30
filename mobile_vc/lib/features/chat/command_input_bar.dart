@@ -87,6 +87,7 @@ class _CommandInputBarState extends State<CommandInputBar> {
   final FocusNode _focusNode = FocusNode();
   final List<ChatImageAttachment> _imageAttachments = [];
   bool _pickingImage = false;
+  bool _debouncedCanStop = false;
 
   bool get _inputLocked =>
       widget.isExternallyLocked ||
@@ -109,8 +110,14 @@ class _CommandInputBarState extends State<CommandInputBar> {
   bool _shouldShowStopAction(String text) =>
       !widget.isExternallyLocked &&
       !widget.isSessionLoading &&
-      widget.canStop &&
+      _debouncedCanStop &&
       !_canSubmitDraft(text);
+
+  @override
+  void initState() {
+    super.initState();
+    _debouncedCanStop = widget.canStop;
+  }
 
   String get _lockedHintText {
     if (widget.isExternallyLocked) {
@@ -144,6 +151,24 @@ class _CommandInputBarState extends State<CommandInputBar> {
         oldWidget.shouldShowPlanChoices;
     if (_inputLocked && !oldLocked) {
       _focusNode.unfocus();
+    }
+
+    if (oldWidget.canStop != widget.canStop) {
+      if (widget.canStop) {
+        Future.delayed(const Duration(milliseconds: 150), () {
+          if (mounted && widget.canStop) {
+            setState(() {
+              _debouncedCanStop = true;
+            });
+          }
+        });
+      } else {
+        if (_debouncedCanStop) {
+          setState(() {
+            _debouncedCanStop = false;
+          });
+        }
+      }
     }
   }
 

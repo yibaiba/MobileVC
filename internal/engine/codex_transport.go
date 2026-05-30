@@ -57,6 +57,7 @@ type codexAppSession struct {
 
 	cmd    *exec.Cmd
 	stdin  io.WriteCloser
+	stdout io.ReadCloser
 	stderr io.ReadCloser
 
 	writeMu sync.Mutex
@@ -238,6 +239,7 @@ func newCodexAppSession(processCtx context.Context, rpcCtx context.Context, runn
 		sink:      sink,
 		cmd:       cmd,
 		stdin:     stdin,
+		stdout:    stdout,
 		stderr:    stderr,
 		pending:   make(map[string]chan codexRPCResponse),
 	}

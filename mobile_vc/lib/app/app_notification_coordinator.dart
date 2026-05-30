@@ -16,6 +16,7 @@ class AppNotificationCoordinator {
   AppLifecycleState _lifecycleState = AppLifecycleState.resumed;
   int _lastHandledSignalId = 0;
   String _lastHandledNotificationFingerprint = '';
+  DateTime? _lastActionNeededNotificationTime;
   bool _initialized = false;
 
   bool get isAppForeground => _lifecycleState == AppLifecycleState.resumed;
@@ -91,6 +92,13 @@ class AppNotificationCoordinator {
         (!forceForegroundCatchUp && !canShowBackgroundNotification)) {
       return;
     }
+    // 时间窗口去重：5秒内不重复发送相同消息的通知
+    final now = DateTime.now();
+    if (_lastActionNeededNotificationTime != null &&
+        now.difference(_lastActionNeededNotificationTime!).inSeconds < 5) {
+      _lastHandledSignalId = signal.id;
+      return;
+    }
     try {
       await _notificationService.showNotification(
         NotificationPayload(
@@ -104,6 +112,7 @@ class AppNotificationCoordinator {
         ),
       );
       _lastHandledSignalId = signal.id;
+      _lastActionNeededNotificationTime = now;
     } catch (error, stack) {
       debugPrint('[startup] notification drain failed: $error');
       debugPrintStack(
