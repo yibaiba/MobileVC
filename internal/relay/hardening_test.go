@@ -43,6 +43,91 @@ func TestRelayClosesClientWhenDisconnectedAgentExpires(t *testing.T) {
 	}
 }
 
+func TestRelayKeepsTrustedDeviceSessionAfterAgentGrace(t *testing.T) {
+	relayServer, server := newInspectableRelayServer(t, Config{AgentGracePeriod: testShortAgentGrace})
+	defer server.Close()
+
+	sessionID := "rs_keep_bound_device"
+	pairingSecret := "pair-secret-128-bit-minimum"
+	agentReconnectSecret := "agent-reconnect-secret"
+	agent := dialRelay(t, server.URL, "/relay/agent")
+	registerAgent(t, agent, sessionID, pairingSecret, agentReconnectSecret, time.Now().Add(time.Minute))
+	client := dialRelay(t, server.URL, "/relay/client")
+	clientID, clientReconnectSecret := pairClientWithReconnectSecret(t, client, sessionID, pairingSecret)
+	readAttached(t, agent, clientID)
+
+	_ = client.Close()
+	_ = agent.Close()
+	time.Sleep(testShortAgentGrace * 2)
+
+	relayServer.mu.Lock()
+	state := relayServer.sessions[sessionID]
+	if state == nil {
+		relayServer.mu.Unlock()
+		t.Fatal("expected bound-device session to survive agent grace expiry")
+	}
+	if state.agent != nil || state.client != nil {
+		relayServer.mu.Unlock()
+		t.Fatalf("expected disconnected session, got agent=%v client=%v", state.agent != nil, state.client != nil)
+	}
+	relayServer.mu.Unlock()
+
+	reconnectedAgent := dialRelay(t, server.URL, "/relay/agent")
+	defer reconnectedAgent.Close()
+	reconnectAgent(t, reconnectedAgent, sessionID, agentReconnectSecret)
+
+	reconnectedClient := dialRelay(t, server.URL, "/relay/client")
+	defer reconnectedClient.Close()
+	reconnectClient(t, reconnectedClient, sessionID, clientID, clientReconnectSecret)
+	readAttached(t, reconnectedAgent, clientID)
+}
+
+func TestRelayClientReconnectReportsAgentDisconnectedAfterGraceForTrustedDevice(t *testing.T) {
+	server := newLimitedTestRelayServer(t, Config{AgentGracePeriod: testShortAgentGrace})
+	defer server.Close()
+
+	sessionID := "rs_bound_device_agent_absent"
+	pairingSecret := "pair-secret-128-bit-minimum"
+	agentReconnectSecret := "agent-reconnect-secret"
+	agent := dialRelay(t, server.URL, "/relay/agent")
+	registerAgent(t, agent, sessionID, pairingSecret, agentReconnectSecret, time.Now().Add(time.Minute))
+	client := dialRelay(t, server.URL, "/relay/client")
+	clientID, clientReconnectSecret := pairClientWithReconnectSecret(t, client, sessionID, pairingSecret)
+	readAttached(t, agent, clientID)
+
+	_ = client.Close()
+	_ = agent.Close()
+	time.Sleep(testShortAgentGrace * 2)
+
+	reconnectingClient := dialRelay(t, server.URL, "/relay/client")
+	defer reconnectingClient.Close()
+	writeReconnectClient(t, reconnectingClient, sessionID, clientID, clientReconnectSecret)
+	readRelayError(t, reconnectingClient, CodeAgentDisconnected)
+}
+
+func TestRelayClientReconnectWithWrongSecretAfterAgentGraceStaysUnknown(t *testing.T) {
+	server := newLimitedTestRelayServer(t, Config{AgentGracePeriod: testShortAgentGrace})
+	defer server.Close()
+
+	sessionID := "rs_bound_device_wrong_secret"
+	pairingSecret := "pair-secret-128-bit-minimum"
+	agentReconnectSecret := "agent-reconnect-secret"
+	agent := dialRelay(t, server.URL, "/relay/agent")
+	registerAgent(t, agent, sessionID, pairingSecret, agentReconnectSecret, time.Now().Add(time.Minute))
+	client := dialRelay(t, server.URL, "/relay/client")
+	clientID, _ := pairClientWithReconnectSecret(t, client, sessionID, pairingSecret)
+	readAttached(t, agent, clientID)
+
+	_ = client.Close()
+	_ = agent.Close()
+	time.Sleep(testShortAgentGrace * 2)
+
+	reconnectingClient := dialRelay(t, server.URL, "/relay/client")
+	defer reconnectingClient.Close()
+	writeReconnectClient(t, reconnectingClient, sessionID, clientID, "wrong-secret")
+	readRelayError(t, reconnectingClient, CodeDeviceUnknown)
+}
+
 func TestRelayNotifiesAgentWhenClientAttaches(t *testing.T) {
 	server := newTestRelayServer(t)
 	defer server.Close()

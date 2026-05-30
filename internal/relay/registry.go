@@ -132,7 +132,8 @@ func (s *Server) canReconnectAgent(state *sessionState, secret string) bool {
 		return false
 	}
 	if !state.agentDisconnectedAt.IsZero() &&
-		time.Since(state.agentDisconnectedAt) > s.cfg.AgentGracePeriod {
+		time.Since(state.agentDisconnectedAt) > s.cfg.AgentGracePeriod &&
+		!state.hasReconnectableDevices() {
 		delete(s.sessions, state.id)
 		return false
 	}
@@ -248,12 +249,6 @@ func (s *Server) reconnectableDevice(state *sessionState, clientID string, secre
 	if state == nil {
 		return nil, newCodeError(CodeDeviceUnknown, "client reconnect rejected")
 	}
-	if state.agent == nil {
-		if state.agentDisconnectedWithinGrace(s.cfg.AgentGracePeriod) {
-			return nil, newCodeError(CodeAgentDisconnected, "agent is reconnecting")
-		}
-		return nil, newCodeError(CodeDeviceUnknown, "client reconnect rejected")
-	}
 	normalizedID := strings.TrimSpace(clientID)
 	if normalizedID == "" {
 		return nil, newCodeError(CodeDeviceUnknown, "client reconnect rejected")
@@ -266,6 +261,13 @@ func (s *Server) reconnectableDevice(state *sessionState, clientID string, secre
 		return nil, newCodeError(CodeDeviceRevoked, "client reconnect rejected")
 	}
 	if !SecretHashMatches(device.ReconnectHash, secret) {
+		return nil, newCodeError(CodeDeviceUnknown, "client reconnect rejected")
+	}
+	if state.agent == nil {
+		if state.agentDisconnectedWithinGrace(s.cfg.AgentGracePeriod) ||
+			state.hasReconnectableDevices() {
+			return nil, newCodeError(CodeAgentDisconnected, "agent is reconnecting")
+		}
 		return nil, newCodeError(CodeDeviceUnknown, "client reconnect rejected")
 	}
 	return device, nil
