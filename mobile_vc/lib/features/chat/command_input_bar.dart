@@ -89,7 +89,6 @@ class _CommandInputBarState extends State<CommandInputBar> {
   final FocusNode _focusNode = FocusNode();
   final List<ChatImageAttachment> _imageAttachments = [];
   bool _pickingImage = false;
-  DateTime? _canStopTransitionTime;
   bool _debouncedCanStop = false;
 
   @override
@@ -150,7 +149,6 @@ class _CommandInputBarState extends State<CommandInputBar> {
 
     if (oldWidget.canStop != widget.canStop) {
       if (widget.canStop) {
-        _canStopTransitionTime = DateTime.now();
         Future.delayed(const Duration(milliseconds: 150), () {
           if (mounted && widget.canStop) {
             setState(() {
@@ -159,7 +157,6 @@ class _CommandInputBarState extends State<CommandInputBar> {
           }
         });
       } else {
-        _canStopTransitionTime = null;
         if (_debouncedCanStop) {
           setState(() {
             _debouncedCanStop = false;
@@ -235,7 +232,8 @@ class _CommandInputBarState extends State<CommandInputBar> {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final scheme = Theme.of(context).colorScheme;
+    final scheme = theme.colorScheme;
+    final isLight = theme.brightness == Brightness.light;
     final bottomInset = MediaQuery.of(context).viewInsets.bottom;
     final engineLabel =
         _engineLabel(widget.currentEngine, widget.showClaudeMode);
@@ -255,8 +253,18 @@ class _CommandInputBarState extends State<CommandInputBar> {
                         ? '$engineLabel 处理中…'
                         : 'Shell 运行中')
                     : (widget.showClaudeMode ? '给 $engineLabel 发送消息' : '输入命令');
-    final railColor = scheme.surfaceContainerLowest.withValues(alpha: 0.88);
-    final inputColor = scheme.surfaceContainerHighest.withValues(alpha: 0.72);
+    final railColor = isLight
+        ? Color.alphaBlend(
+            scheme.primary.withValues(alpha: 0.025),
+            scheme.surfaceContainerLow,
+          )
+        : scheme.surfaceContainerLowest.withValues(alpha: 0.88);
+    final inputColor = isLight
+        ? scheme.surface
+        : scheme.surfaceContainerHighest.withValues(alpha: 0.72);
+    final dockBorderColor = scheme.outlineVariant.withValues(
+      alpha: isLight ? 0.62 : 0.36,
+    );
 
     return Padding(
       padding: EdgeInsets.only(bottom: bottomInset),
@@ -271,282 +279,313 @@ class _CommandInputBarState extends State<CommandInputBar> {
               child: Container(
                 padding: const EdgeInsets.fromLTRB(10, 10, 10, 10),
                 decoration: BoxDecoration(
-                  color: scheme.surface.withValues(alpha: 0.72),
+                  color:
+                      scheme.surface.withValues(alpha: isLight ? 0.94 : 0.72),
                   borderRadius: BorderRadius.circular(IOSTokens.radiusInput),
-                  border: Border.all(
-                    color: scheme.outlineVariant.withValues(alpha: 0.36),
-                  ),
+                  border: Border.all(color: dockBorderColor),
+                  boxShadow: [
+                    if (isLight)
+                      BoxShadow(
+                        color: Colors.black.withValues(alpha: 0.08),
+                        blurRadius: 24,
+                        offset: const Offset(0, 12),
+                      ),
+                  ],
                 ),
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                Container(
-                  padding: const EdgeInsets.fromLTRB(8, 8, 8, 8),
-                  decoration: BoxDecoration(
-                    color: railColor,
-                    borderRadius: BorderRadius.circular(24),
-                    border: Border.all(
-                      color: scheme.outlineVariant.withValues(alpha: 0.26),
-                    ),
-                  ),
-                  child: Row(
-                    children: [
-                      Expanded(
-                        child: SingleChildScrollView(
-                          scrollDirection: Axis.horizontal,
-                          child: Row(
-                            children: [
-                              _ToolChip(
-                                icon: Icons.history,
-                                label: '会话',
-                                onPressed: widget.onOpenSessions,
-                              ),
-                              const SizedBox(width: 8),
-                              if (widget.canCompact || widget.isCompacting) ...[
-                                _ToolChip(
-                                  icon: widget.isCompacting
-                                      ? Icons.hourglass_top_rounded
-                                      : Icons.content_cut_rounded,
-                                  label: compactChipLabel,
-                                  onPressed: widget.isCompacting
-                                      ? null
-                                      : widget.onCompact,
-                                  highlighted: widget.isCompacting,
-                                  showSpinner: widget.isCompacting,
-                                ),
-                                const SizedBox(width: 8),
-                              ],
-                              _ToolChip(
-                                icon: Icons.terminal,
-                                label: '日志',
-                                onPressed: widget.onOpenLogs,
-                              ),
-                              const SizedBox(width: 8),
-                              _ToolChip(
-                                icon: Icons.extension_outlined,
-                                label: 'Skill',
-                                onPressed: widget.onOpenSkills,
-                              ),
-                              const SizedBox(width: 8),
-                              _ToolChip(
-                                icon: Icons.psychology_alt_outlined,
-                                label: 'Memory',
-                                onPressed: widget.onOpenMemory,
-                              ),
-                              const SizedBox(width: 8),
-                              _ToolChip(
-                                icon: Icons.verified_user_outlined,
-                                label: '权限 · ${widget.permissionRuleSummary}',
-                                onPressed: widget.onOpenPermissions,
-                              ),
-                              const SizedBox(width: 8),
-                              _ToolChip(
-                                key: const ValueKey('command-bar-model-button'),
-                                icon: Icons.model_training_outlined,
-                                label: '模型 · ${widget.modelSummary}',
-                                onPressed: widget.onOpenModels,
-                              ),
-                            ],
-                          ),
+                    Container(
+                      padding: const EdgeInsets.fromLTRB(8, 8, 8, 8),
+                      decoration: BoxDecoration(
+                        color: railColor,
+                        borderRadius: BorderRadius.circular(24),
+                        border: Border.all(
+                          color: scheme.outlineVariant
+                              .withValues(alpha: isLight ? 0.46 : 0.26),
                         ),
                       ),
-                      const SizedBox(width: 10),
-                      _ContextWindowUsageButton(
-                        usage: widget.contextWindowUsage,
-                        onPressed: widget.onOpenContextWindowUsage,
-                      ),
-                      const SizedBox(width: 8),
-                      DecoratedBox(
-                        decoration: BoxDecoration(
-                          color: inputColor,
-                          borderRadius: BorderRadius.circular(999),
-                          border: Border.all(
-                            color: scheme.outlineVariant.withValues(alpha: 0.4),
-                          ),
-                        ),
-                        child: Padding(
-                          padding: const EdgeInsets.symmetric(horizontal: 12),
-                          child: DropdownButtonHideUnderline(
-                            child: DropdownButton<String>(
-                              value: widget.permissionMode,
-                              borderRadius: BorderRadius.circular(16),
-                              style: theme.textTheme.bodySmall?.copyWith(
-                                fontWeight: FontWeight.w600,
-                              ),
-                              items: const [
-                                DropdownMenuItem(
-                                  value: 'auto',
-                                  child: Text('自动模式'),
-                                ),
-                                DropdownMenuItem(
-                                  value: 'default',
-                                  child: Text('手动审核'),
-                                ),
-                                DropdownMenuItem(
-                                  value: 'bypassPermissions',
-                                  child: Text('跳过权限确认'),
-                                ),
-                              ],
-                              onChanged: (value) {
-                                if (value != null) {
-                                  widget.onPermissionModeChanged(value);
-                                }
-                              },
-                            ),
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-                const SizedBox(height: 10),
-                Container(
-                  constraints: const BoxConstraints(minHeight: 56),
-                  decoration: BoxDecoration(
-                    gradient: LinearGradient(
-                      colors: [
-                        inputColor,
-                        scheme.surface.withValues(alpha: 0.94),
-                      ],
-                      begin: Alignment.topLeft,
-                      end: Alignment.bottomRight,
-                    ),
-                    borderRadius: BorderRadius.circular(28),
-                    border: Border.all(
-                      color: scheme.outlineVariant.withValues(alpha: 0.24),
-                    ),
-                  ),
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      if (_imageAttachments.isNotEmpty)
-                        _AttachmentPreviewStrip(
-                          attachments: _imageAttachments,
-                          onRemove:
-                              _inputLocked ? null : _removeImageAttachment,
-                        ),
-                      Row(
-                        crossAxisAlignment: CrossAxisAlignment.end,
+                      child: Row(
                         children: [
                           Expanded(
-                            child: TextField(
-                              controller: _controller,
-                              focusNode: _focusNode,
-                              enabled: !_inputLocked,
-                              readOnly: _inputLocked,
-                              canRequestFocus: !_inputLocked,
-                              minLines: 1,
-                              maxLines: 6,
-                              textInputAction: TextInputAction.send,
-                              onTap: _inputLocked
-                                  ? () => _focusNode.unfocus()
-                                  : null,
-                              onSubmitted:
-                                  _inputLocked ? null : (_) => _submit(),
-                              textAlignVertical: TextAlignVertical.center,
-                              style: Theme.of(context)
-                                  .textTheme
-                                  .bodyMedium
-                                  ?.copyWith(
-                                    height: 1.45,
+                            child: SingleChildScrollView(
+                              scrollDirection: Axis.horizontal,
+                              child: Row(
+                                children: [
+                                  _ToolChip(
+                                    icon: Icons.history,
+                                    label: '会话',
+                                    onPressed: widget.onOpenSessions,
                                   ),
-                              decoration: InputDecoration(
-                                hintText: hintText,
-                                hintStyle: Theme.of(context)
-                                    .textTheme
-                                    .bodyMedium
-                                    ?.copyWith(
-                                      color: scheme.onSurfaceVariant,
+                                  const SizedBox(width: 8),
+                                  if (widget.canCompact ||
+                                      widget.isCompacting) ...[
+                                    _ToolChip(
+                                      icon: widget.isCompacting
+                                          ? Icons.hourglass_top_rounded
+                                          : Icons.content_cut_rounded,
+                                      label: compactChipLabel,
+                                      onPressed: widget.isCompacting
+                                          ? null
+                                          : widget.onCompact,
+                                      highlighted: widget.isCompacting,
+                                      showSpinner: widget.isCompacting,
                                     ),
-                                filled: false,
-                                isCollapsed: false,
-                                contentPadding: const EdgeInsets.fromLTRB(
-                                  18,
-                                  14,
-                                  8,
-                                  14,
-                                ),
-                                border: InputBorder.none,
-                                enabledBorder: InputBorder.none,
-                                focusedBorder: InputBorder.none,
-                                disabledBorder: InputBorder.none,
-                              ),
-                            ),
-                          ),
-                          Padding(
-                            padding: const EdgeInsets.fromLTRB(0, 0, 4, 7),
-                            child: SizedBox(
-                              width: 42,
-                              height: 42,
-                              child: IconButton.filledTonal(
-                                onPressed: _inputLocked || _pickingImage
-                                    ? null
-                                    : _attachImage,
-                                tooltip: '添加图片',
-                                icon: _pickingImage
-                                    ? SizedBox(
-                                        width: 18,
-                                        height: 18,
-                                        child: CircularProgressIndicator(
-                                          strokeWidth: 2,
-                                          color: scheme.primary,
-                                        ),
-                                      )
-                                    : const Icon(
-                                        Icons.image_outlined,
-                                        size: 20,
-                                      ),
-                              ),
-                            ),
-                          ),
-                          Padding(
-                            padding: const EdgeInsets.fromLTRB(0, 0, 7, 7),
-                            child: SizedBox(
-                              width: 42,
-                              height: 42,
-                              child: FilledButton(
-                                onPressed: _showStopAction
-                                    ? widget.onStop
-                                    : (_inputLocked ? null : _submit),
-                                style: FilledButton.styleFrom(
-                                  elevation: 0,
-                                  backgroundColor: _inputLocked
-                                      ? scheme.surfaceContainerHighest
-                                      : _showStopAction
-                                          ? scheme.error
-                                          : scheme.primary,
-                                  foregroundColor: _inputLocked
-                                      ? scheme.onSurfaceVariant
-                                      : _showStopAction
-                                          ? scheme.onError
-                                          : scheme.onPrimary,
-                                  padding: EdgeInsets.zero,
-                                  minimumSize: const Size(42, 42),
-                                  shape: RoundedRectangleBorder(
-                                    borderRadius: BorderRadius.circular(999),
+                                    const SizedBox(width: 8),
+                                  ],
+                                  _ToolChip(
+                                    icon: Icons.terminal,
+                                    label: '日志',
+                                    onPressed: widget.onOpenLogs,
                                   ),
-                                ),
-                                child: Icon(
-                                  _showStopAction
-                                      ? Icons.stop_rounded
-                                      : Icons.arrow_upward,
-                                  size: 18,
+                                  const SizedBox(width: 8),
+                                  _ToolChip(
+                                    icon: Icons.extension_outlined,
+                                    label: 'Skill',
+                                    onPressed: widget.onOpenSkills,
+                                  ),
+                                  const SizedBox(width: 8),
+                                  _ToolChip(
+                                    icon: Icons.psychology_alt_outlined,
+                                    label: 'Memory',
+                                    onPressed: widget.onOpenMemory,
+                                  ),
+                                  const SizedBox(width: 8),
+                                  _ToolChip(
+                                    icon: Icons.verified_user_outlined,
+                                    label:
+                                        '权限 · ${widget.permissionRuleSummary}',
+                                    onPressed: widget.onOpenPermissions,
+                                  ),
+                                  const SizedBox(width: 8),
+                                  _ToolChip(
+                                    key: const ValueKey(
+                                        'command-bar-model-button'),
+                                    icon: Icons.model_training_outlined,
+                                    label: '模型 · ${widget.modelSummary}',
+                                    onPressed: widget.onOpenModels,
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 10),
+                          _ContextWindowUsageButton(
+                            usage: widget.contextWindowUsage,
+                            onPressed: widget.onOpenContextWindowUsage,
+                          ),
+                          const SizedBox(width: 8),
+                          DecoratedBox(
+                            decoration: BoxDecoration(
+                              color: inputColor,
+                              borderRadius: BorderRadius.circular(999),
+                              border: Border.all(
+                                color: scheme.outlineVariant
+                                    .withValues(alpha: 0.4),
+                              ),
+                            ),
+                            child: Padding(
+                              padding:
+                                  const EdgeInsets.symmetric(horizontal: 12),
+                              child: DropdownButtonHideUnderline(
+                                child: DropdownButton<String>(
+                                  value: widget.permissionMode,
+                                  borderRadius: BorderRadius.circular(16),
+                                  style: theme.textTheme.bodySmall?.copyWith(
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                  items: const [
+                                    DropdownMenuItem(
+                                      value: 'auto',
+                                      child: Text('自动模式'),
+                                    ),
+                                    DropdownMenuItem(
+                                      value: 'default',
+                                      child: Text('手动审核'),
+                                    ),
+                                    DropdownMenuItem(
+                                      value: 'bypassPermissions',
+                                      child: Text('跳过权限确认'),
+                                    ),
+                                  ],
+                                  onChanged: (value) {
+                                    if (value != null) {
+                                      widget.onPermissionModeChanged(value);
+                                    }
+                                  },
                                 ),
                               ),
                             ),
                           ),
                         ],
                       ),
-                    ],
-                  ),
+                    ),
+                    const SizedBox(height: 10),
+                    Container(
+                      constraints: const BoxConstraints(minHeight: 56),
+                      decoration: BoxDecoration(
+                        gradient: LinearGradient(
+                          colors: [
+                            inputColor,
+                            isLight
+                                ? Color.alphaBlend(
+                                    scheme.secondary.withValues(alpha: 0.025),
+                                    scheme.surfaceContainerLowest,
+                                  )
+                                : scheme.surface.withValues(alpha: 0.94),
+                          ],
+                          begin: Alignment.topLeft,
+                          end: Alignment.bottomRight,
+                        ),
+                        borderRadius: BorderRadius.circular(28),
+                        border: Border.all(
+                          color: _inputLocked
+                              ? scheme.outlineVariant
+                                  .withValues(alpha: isLight ? 0.42 : 0.24)
+                              : scheme.primary
+                                  .withValues(alpha: isLight ? 0.20 : 0.12),
+                        ),
+                        boxShadow: [
+                          if (isLight)
+                            BoxShadow(
+                              color: scheme.primary.withValues(alpha: 0.06),
+                              blurRadius: 18,
+                              offset: const Offset(0, 8),
+                            ),
+                        ],
+                      ),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          if (_imageAttachments.isNotEmpty)
+                            _AttachmentPreviewStrip(
+                              attachments: _imageAttachments,
+                              onRemove:
+                                  _inputLocked ? null : _removeImageAttachment,
+                            ),
+                          Row(
+                            crossAxisAlignment: CrossAxisAlignment.end,
+                            children: [
+                              Expanded(
+                                child: TextField(
+                                  controller: _controller,
+                                  focusNode: _focusNode,
+                                  enabled: !_inputLocked,
+                                  readOnly: _inputLocked,
+                                  canRequestFocus: !_inputLocked,
+                                  minLines: 1,
+                                  maxLines: 6,
+                                  textInputAction: TextInputAction.send,
+                                  onTap: _inputLocked
+                                      ? () => _focusNode.unfocus()
+                                      : null,
+                                  onSubmitted:
+                                      _inputLocked ? null : (_) => _submit(),
+                                  textAlignVertical: TextAlignVertical.center,
+                                  style: Theme.of(context)
+                                      .textTheme
+                                      .bodyMedium
+                                      ?.copyWith(
+                                        height: 1.45,
+                                      ),
+                                  decoration: InputDecoration(
+                                    hintText: hintText,
+                                    hintStyle: Theme.of(context)
+                                        .textTheme
+                                        .bodyMedium
+                                        ?.copyWith(
+                                          color: scheme.onSurfaceVariant,
+                                        ),
+                                    filled: false,
+                                    isCollapsed: false,
+                                    contentPadding: const EdgeInsets.fromLTRB(
+                                      18,
+                                      14,
+                                      8,
+                                      14,
+                                    ),
+                                    border: InputBorder.none,
+                                    enabledBorder: InputBorder.none,
+                                    focusedBorder: InputBorder.none,
+                                    disabledBorder: InputBorder.none,
+                                  ),
+                                ),
+                              ),
+                              Padding(
+                                padding: const EdgeInsets.fromLTRB(0, 0, 4, 7),
+                                child: SizedBox(
+                                  width: 42,
+                                  height: 42,
+                                  child: IconButton.filledTonal(
+                                    onPressed: _inputLocked || _pickingImage
+                                        ? null
+                                        : _attachImage,
+                                    tooltip: '添加图片',
+                                    icon: _pickingImage
+                                        ? SizedBox(
+                                            width: 18,
+                                            height: 18,
+                                            child: CircularProgressIndicator(
+                                              strokeWidth: 2,
+                                              color: scheme.primary,
+                                            ),
+                                          )
+                                        : const Icon(
+                                            Icons.image_outlined,
+                                            size: 20,
+                                          ),
+                                  ),
+                                ),
+                              ),
+                              Padding(
+                                padding: const EdgeInsets.fromLTRB(0, 0, 7, 7),
+                                child: SizedBox(
+                                  width: 42,
+                                  height: 42,
+                                  child: FilledButton(
+                                    onPressed: _showStopAction
+                                        ? widget.onStop
+                                        : (_inputLocked ? null : _submit),
+                                    style: FilledButton.styleFrom(
+                                      elevation: 0,
+                                      backgroundColor: _inputLocked
+                                          ? scheme.surfaceContainerHighest
+                                          : _showStopAction
+                                              ? scheme.error
+                                              : scheme.primary,
+                                      foregroundColor: _inputLocked
+                                          ? scheme.onSurfaceVariant
+                                          : _showStopAction
+                                              ? scheme.onError
+                                              : scheme.onPrimary,
+                                      padding: EdgeInsets.zero,
+                                      minimumSize: const Size(42, 42),
+                                      shape: RoundedRectangleBorder(
+                                        borderRadius:
+                                            BorderRadius.circular(999),
+                                      ),
+                                    ),
+                                    child: Icon(
+                                      _showStopAction
+                                          ? Icons.stop_rounded
+                                          : Icons.arrow_upward,
+                                      size: 18,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
                 ),
-              ],
+              ),
             ),
           ),
         ),
       ),
-    ),
-    ),
     );
   }
 }
@@ -642,7 +681,8 @@ class _ContextWindowUsageButton extends StatelessWidget {
                           height: 5,
                           decoration: BoxDecoration(
                             shape: BoxShape.circle,
-                            color: scheme.outlineVariant.withValues(alpha: 0.82),
+                            color:
+                                scheme.outlineVariant.withValues(alpha: 0.82),
                           ),
                         ),
                     ],
@@ -792,12 +832,17 @@ class _ToolChip extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
     final scheme = Theme.of(context).colorScheme;
+    final isLight = theme.brightness == Brightness.light;
     final enabled = onPressed != null;
     return Material(
       color: highlighted
-          ? scheme.primaryContainer.withValues(alpha: 0.94)
-          : scheme.surfaceContainerHigh.withValues(alpha: enabled ? 0.82 : 0.5),
+          ? scheme.primaryContainer.withValues(alpha: isLight ? 0.86 : 0.94)
+          : isLight
+              ? Colors.white.withValues(alpha: enabled ? 0.92 : 0.58)
+              : scheme.surfaceContainerHigh
+                  .withValues(alpha: enabled ? 0.82 : 0.5),
       borderRadius: BorderRadius.circular(999),
       child: InkWell(
         onTap: onPressed,
@@ -808,9 +853,9 @@ class _ToolChip extends StatelessWidget {
             borderRadius: BorderRadius.circular(999),
             border: Border.all(
               color: highlighted
-                  ? scheme.primary.withValues(alpha: 0.42)
+                  ? scheme.primary.withValues(alpha: isLight ? 0.32 : 0.42)
                   : scheme.outlineVariant
-                      .withValues(alpha: enabled ? 0.38 : 0.22),
+                      .withValues(alpha: enabled ? 0.48 : 0.22),
             ),
           ),
           child: Row(
