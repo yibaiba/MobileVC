@@ -414,10 +414,8 @@ class _CommandInputBarState extends State<CommandInputBar> {
                             maxLines: 6,
                             keyboardType: TextInputType.multiline,
                             textInputAction: TextInputAction.send,
-                            autocorrect: false,
-                            enableSuggestions: false,
-                            smartDashesType: SmartDashesType.disabled,
-                            smartQuotesType: SmartQuotesType.disabled,
+                            autocorrect: true,
+                            enableSuggestions: true,
                             onTap: _inputLocked
                                 ? () => _focusNode.unfocus()
                                 : null,

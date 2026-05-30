@@ -59,6 +59,9 @@ void main() {
       final button = tester.widget<FilledButton>(find.byType(FilledButton));
 
       expect(field.enabled, isTrue);
+      expect(field.autocorrect, isTrue);
+      expect(field.enableSuggestions, isTrue);
+      expect(field.obscureText, isFalse);
       expect(button.onPressed, isNotNull);
 
       await tester.enterText(find.byType(TextField), 'hello');
