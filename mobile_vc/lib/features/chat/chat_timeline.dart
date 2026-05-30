@@ -32,6 +32,7 @@ class ChatTimeline extends StatefulWidget {
     this.shouldShowPlanChoices = false,
     this.isAiRunning = false,
     this.aiStatusLabel = '',
+    this.bottomPadding = 128,
     this.hasOlderItems = false,
     this.isLoadingOlderItems = false,
     this.onOpenDiff,
@@ -62,6 +63,7 @@ class ChatTimeline extends StatefulWidget {
   final bool shouldShowPlanChoices;
   final bool isAiRunning;
   final String aiStatusLabel;
+  final double bottomPadding;
   final bool hasOlderItems;
   final bool isLoadingOlderItems;
   final VoidCallback? onOpenDiff;
@@ -202,7 +204,7 @@ class _ChatTimelineState extends State<ChatTimeline> {
     final listView = ListView.separated(
       controller: _scrollController,
       reverse: false,
-      padding: const EdgeInsets.fromLTRB(16, 16, 16, 128),
+      padding: EdgeInsets.fromLTRB(16, 16, 16, widget.bottomPadding),
       itemBuilder: (context, index) {
         final item = _timelineItemAt(
           index,

@@ -9,6 +9,8 @@ import 'package:mobile_vc/data/models/events.dart';
 import 'package:mobile_vc/data/models/runtime_meta.dart';
 import 'package:mobile_vc/data/models/session_models.dart';
 import 'package:mobile_vc/data/services/mobilevc_ws_service.dart';
+import 'package:mobile_vc/features/chat/chat_timeline.dart';
+import 'package:mobile_vc/features/chat/command_input_bar.dart';
 import 'package:mobile_vc/features/session/session_controller.dart';
 import 'package:mobile_vc/features/session/session_home_page.dart';
 
@@ -17,6 +19,92 @@ void main() {
 
   setUp(() {
     SharedPreferences.setMockInitialValues({});
+  });
+
+  testWidgets('键盘弹出只移动输入栏，不整体 resize 时间线', (tester) async {
+    await _useTallSurface(tester);
+    final service = _FakeMobileVcWsService();
+    final controller = SessionController(service: service);
+
+    await controller.connect();
+    for (var i = 0; i < 40; i++) {
+      controller.pushSystemMessage('markdown', '历史消息 $i');
+    }
+
+    await tester.pumpWidget(
+      _buildHomeWithInsets(controller, EdgeInsets.zero),
+    );
+    await _pumpFrames(tester);
+
+    final timelineSizeBefore = tester.getSize(find.byType(ChatTimeline));
+    final commandBarSizeBefore = tester.getSize(find.byType(CommandInputBar));
+    final timelineBefore = tester.widget<ChatTimeline>(
+      find.byType(ChatTimeline),
+    );
+    expect(
+      timelineBefore.bottomPadding,
+      greaterThanOrEqualTo(commandBarSizeBefore.height),
+    );
+
+    await tester.pumpWidget(
+      _buildHomeWithInsets(
+        controller,
+        const EdgeInsets.only(bottom: 320),
+      ),
+    );
+    await _pumpFrames(tester);
+
+    final timelineSizeAfter = tester.getSize(find.byType(ChatTimeline));
+    final scaffold = tester.widget<Scaffold>(find.byType(Scaffold).first);
+    expect(scaffold.resizeToAvoidBottomInset, isFalse);
+    expect(scaffold.bottomNavigationBar, isNull);
+    expect(timelineSizeAfter, timelineSizeBefore);
+    final timelineAfter = tester.widget<ChatTimeline>(
+      find.byType(ChatTimeline),
+    );
+    expect(timelineAfter.bottomPadding, timelineBefore.bottomPadding);
+
+    final keyboardPadding = tester.widget<AnimatedPadding>(
+      find.byKey(const ValueKey('command-bar-keyboard-padding')),
+    );
+    expect(keyboardPadding.padding, const EdgeInsets.only(bottom: 320));
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    await controller.disposeController();
+  });
+
+  testWidgets('输入栏重建后仍用实际高度作为时间线底部留白', (tester) async {
+    await _useTallSurface(tester);
+    final service = _FakeMobileVcWsService();
+    final controller = SessionController(service: service);
+
+    await controller.connect();
+    for (var i = 0; i < 40; i++) {
+      controller.pushSystemMessage('markdown', '历史消息 $i');
+    }
+
+    await tester.pumpWidget(
+      _buildHomeWithInsets(controller, EdgeInsets.zero),
+    );
+    await _pumpFrames(tester);
+
+    await tester.enterText(
+      find.byType(TextField),
+      List<String>.filled(6, '长输入内容').join('\n'),
+    );
+    await _pumpFrames(tester);
+
+    final commandBarSize = tester.getSize(find.byType(CommandInputBar));
+    final expandedTimeline = tester.widget<ChatTimeline>(
+      find.byType(ChatTimeline),
+    );
+    expect(
+      expandedTimeline.bottomPadding,
+      greaterThanOrEqualTo(commandBarSize.height),
+    );
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    await controller.disposeController();
   });
 
   test('主界面顶部上下文胶囊已完全移除', () async {
@@ -193,7 +281,11 @@ void main() {
 
     await tester.tap(find.byIcon(Icons.settings_outlined));
     await _pumpFrames(tester);
+    await tester.ensureVisible(find.text('连接'));
+    await tester.pump();
     await tester.tap(find.text('连接'));
+    await tester.pump();
+    await tester.ensureVisible(find.text('连接中'));
     await tester.pump();
     await tester.tap(find.text('连接中'));
     await tester.pump();
@@ -273,6 +365,21 @@ Future<void> _pumpFrames(
   for (var i = 0; i < count; i++) {
     await tester.pump(step);
   }
+}
+
+Widget _buildHomeWithInsets(
+  SessionController controller,
+  EdgeInsets viewInsets,
+) {
+  return MaterialApp(
+    home: MediaQuery(
+      data: MediaQueryData(
+        size: const Size(900, 1100),
+        viewInsets: viewInsets,
+      ),
+      child: SessionHomePage(controller: controller),
+    ),
+  );
 }
 
 class _FakeMobileVcWsService extends MobileVcWsService {

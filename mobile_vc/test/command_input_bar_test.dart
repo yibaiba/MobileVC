@@ -2,7 +2,9 @@ import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:mobile_vc/data/models/events.dart';
 import 'package:mobile_vc/data/models/session_models.dart';
+import 'package:mobile_vc/features/chat/chat_timeline.dart';
 import 'package:mobile_vc/features/chat/command_input_bar.dart';
 
 void main() {
@@ -212,22 +214,83 @@ void main() {
       expect(find.byIcon(Icons.arrow_upward), findsOneWidget);
     });
 
-    testWidgets('纯文字输入不会重建发送按钮', (tester) async {
+    testWidgets('等待输入时纯文字草稿显示发送按钮并可提交', (tester) async {
+      String? submitted;
       await tester.pumpWidget(
         _buildTestApp(
-          onSubmit: (_, __) {},
+          awaitInput: true,
+          isBusy: true,
+          canStop: true,
+          currentEngine: 'codex',
+          onSubmit: (text, _) => submitted = text,
         ),
       );
 
-      final buttonFinder = find.byType(FilledButton);
-      expect(buttonFinder, findsOneWidget);
-      final buttonBefore = tester.widget(buttonFinder);
+      expect(find.byIcon(Icons.stop_rounded), findsOneWidget);
 
       await tester.enterText(find.byType(TextField), '只输入文字');
       await tester.pump();
 
-      expect(buttonFinder, findsOneWidget);
-      expect(identical(tester.widget(buttonFinder), buttonBefore), isTrue);
+      expect(find.byIcon(Icons.arrow_upward), findsOneWidget);
+      expect(find.byIcon(Icons.stop_rounded), findsNothing);
+
+      await tester.tap(find.byType(FilledButton));
+      await tester.pump();
+
+      expect(submitted, '只输入文字');
+      expect(find.byIcon(Icons.stop_rounded), findsOneWidget);
+    });
+
+    testWidgets('纯文字输入不会重建同页时间线兄弟节点', (tester) async {
+      var timelineBuilds = 0;
+      await tester.pumpWidget(
+        _buildTestApp(
+          body: _BuildCounter(
+            onBuild: () => timelineBuilds++,
+            child: ChatTimeline(
+              sessionId: 'input-session',
+              items: [
+                TimelineItem(
+                  id: 'item-1',
+                  kind: 'markdown',
+                  timestamp: DateTime(2026, 1, 1),
+                  body: '历史消息',
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+
+      expect(find.byType(ChatTimeline), findsOneWidget);
+      final buildsBeforeInput = timelineBuilds;
+
+      await tester.enterText(find.byType(TextField), '只输入文字');
+      await tester.pump();
+
+      expect(timelineBuilds, buildsBeforeInput);
+      expect(find.byIcon(Icons.arrow_upward), findsOneWidget);
+    });
+
+    testWidgets('输入栏不使用键盘期间高成本 BackdropFilter', (tester) async {
+      await tester.pumpWidget(_buildTestApp());
+
+      expect(find.byType(BackdropFilter), findsNothing);
+    });
+
+    testWidgets('键盘 inset 不会额外撑高输入栏底部 padding', (tester) async {
+      await tester.pumpWidget(
+        _buildTestApp(
+          viewInsets: const EdgeInsets.only(bottom: 320),
+        ),
+      );
+
+      final paddings = tester
+          .widgetList<Padding>(find.byType(Padding))
+          .map((padding) => padding.padding)
+          .toList();
+      expect(paddings, contains(const EdgeInsets.fromLTRB(10, 6, 10, 10)));
+      expect(paddings, isNot(contains(const EdgeInsets.only(bottom: 320))));
     });
 
     testWidgets('Codex 模式显示 Codex 状态与 hint', (tester) async {
@@ -413,44 +476,66 @@ Widget _buildTestApp({
       onSubmit,
   Future<ChatImageAttachment?> Function()? onAttachImage,
   VoidCallback? onStop,
+  EdgeInsets viewInsets = EdgeInsets.zero,
+  Widget body = const SizedBox.shrink(),
 }) {
   return MaterialApp(
     home: Scaffold(
-      bottomNavigationBar: CommandInputBar(
-        awaitInput: awaitInput,
-        isBusy: isBusy,
-        canStop: canStop,
-        canCompact: false,
-        isCompacting: false,
-        compactStatusLabel: '',
-        contextWindowUsage: contextWindowUsage,
-        onOpenContextWindowUsage: () {},
-        hasPendingReview: false,
-        fastMode: false,
-        permissionMode: 'default',
-        shouldShowPermissionChoices: shouldShowPermissionChoices,
-        shouldShowReviewChoices: shouldShowReviewChoices,
-        onSubmit: onSubmit ?? (text, images) {},
-        onAttachImage: onAttachImage ?? () async => null,
-        onStop: onStop ?? () {},
-        onCompact: () {},
-        onOpenSessions: () {},
-        onOpenRuntimeInfo: () {},
-        onOpenLogs: () {},
-        onOpenSkills: () {},
-        onOpenMemory: () {},
-        onOpenPermissions: () {},
-        onOpenModels: () {},
-        onPermissionModeChanged: (_) {},
-        showClaudeMode: showClaudeMode,
-        currentEngine: currentEngine,
-        modelSummary: 'Sonnet',
-        permissionRuleSummary: '默认',
-        shouldShowPlanChoices: false,
-        isSessionLoading: isSessionLoading,
+      body: body,
+      bottomNavigationBar: MediaQuery(
+        data: MediaQueryData(viewInsets: viewInsets),
+        child: CommandInputBar(
+          awaitInput: awaitInput,
+          isBusy: isBusy,
+          canStop: canStop,
+          canCompact: false,
+          isCompacting: false,
+          compactStatusLabel: '',
+          contextWindowUsage: contextWindowUsage,
+          onOpenContextWindowUsage: () {},
+          hasPendingReview: false,
+          fastMode: false,
+          permissionMode: 'default',
+          shouldShowPermissionChoices: shouldShowPermissionChoices,
+          shouldShowReviewChoices: shouldShowReviewChoices,
+          onSubmit: onSubmit ?? (text, images) {},
+          onAttachImage: onAttachImage ?? () async => null,
+          onStop: onStop ?? () {},
+          onCompact: () {},
+          onOpenSessions: () {},
+          onOpenRuntimeInfo: () {},
+          onOpenLogs: () {},
+          onOpenSkills: () {},
+          onOpenMemory: () {},
+          onOpenPermissions: () {},
+          onOpenModels: () {},
+          onPermissionModeChanged: (_) {},
+          showClaudeMode: showClaudeMode,
+          currentEngine: currentEngine,
+          modelSummary: 'Sonnet',
+          permissionRuleSummary: '默认',
+          shouldShowPlanChoices: false,
+          isSessionLoading: isSessionLoading,
+        ),
       ),
     ),
   );
+}
+
+class _BuildCounter extends StatelessWidget {
+  const _BuildCounter({
+    required this.onBuild,
+    required this.child,
+  });
+
+  final VoidCallback onBuild;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    onBuild();
+    return child;
+  }
 }
 
 final _transparentPngBytes = Uint8List.fromList([

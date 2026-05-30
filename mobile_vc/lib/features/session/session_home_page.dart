@@ -4,6 +4,7 @@ import 'dart:ui';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -53,12 +54,15 @@ class SessionHomePage extends StatefulWidget {
 
 class _SessionHomePageState extends State<SessionHomePage> {
   static const int _maxImageAttachmentBytes = 4 * 1024 * 1024;
+  static const double _defaultTimelineBottomPadding = 128;
+  static const double _commandBarGap = 12;
 
   final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
   int _lastCompactFeedbackId = 0;
   static const String _tipCommandModePrefsKey = 'tip_command_mode_shown_v2';
   bool _lastConnected = false;
   bool _checkingTipShown = false;
+  double _timelineBottomPadding = _defaultTimelineBottomPadding;
 
   SessionController get controller => widget.controller;
 
@@ -264,92 +268,102 @@ class _SessionHomePageState extends State<SessionHomePage> {
           },
         ),
       ),
-      resizeToAvoidBottomInset: true,
+      resizeToAvoidBottomInset: false,
       extendBodyBehindAppBar: true,
       body: Stack(
         children: [
           controller.shouldShowSessionSurface
-          ? GestureDetector(
-              behavior: HitTestBehavior.translucent,
-              onTap: () => FocusManager.instance.primaryFocus?.unfocus(),
-              child: Column(
-                children: [
-                  SizedBox(height: MediaQuery.of(context).padding.top + kToolbarHeight),
-                  if (controller.shouldShowSessionObservationBanner)
-                    _SessionObservationBanner(controller: controller),
-                  Expanded(
-                    child: (controller.timeline.isEmpty &&
-                            controller.pendingPrompt?.hasVisiblePrompt !=
-                                true &&
-                            controller.pendingInteraction?.hasVisiblePrompt !=
-                                true &&
-                            !controller.shouldShowPlanChoices &&
-                            !controller.aiStatusIndicatorVisible)
-                        ? const Center(child: _LandingBrand())
-                        : Column(
-                            children: [
-                              if (controller.hasCompactContextSelection)
-                                _ContextSelectionBar(controller: controller),
-                              Expanded(
-                                child: ChatTimeline(
-                                  items: controller.timeline,
-                                  sessionId: controller.selectedSessionId,
-                                  mediaPreviewStates:
-                                      controller.mediaPreviewStates,
-                                  activeReviewDiff:
-                                      controller.currentReviewDiff,
-                                  activeReviewGroup:
-                                      controller.activeReviewGroup,
-                                  pendingDiffCount: controller.pendingDiffCount,
-                                  pendingReviewGroupCount:
-                                      controller.pendingReviewGroupCount,
-                                  isManualReviewMode:
-                                      controller.isManualReviewMode,
-                                  isAutoAcceptMode: controller.isAutoAcceptMode,
-                                  pendingPrompt: controller.pendingPrompt,
-                                  pendingInteraction:
-                                      controller.pendingInteraction,
-                                  shouldShowReviewChoices:
-                                      controller.shouldShowReviewChoices,
-                                  pendingPlanQuestion:
-                                      controller.pendingPlanQuestion,
-                                  pendingPlanProgressLabel:
-                                      controller.pendingPlanProgressLabel,
-                                  shouldShowPlanChoices:
-                                      controller.shouldShowPlanChoices,
-                                  isAiRunning:
-                                      controller.aiStatusIndicatorVisible,
-                                  aiStatusLabel:
-                                      controller.aiStatusIndicatorLabel,
-                                  hasOlderItems:
-                                      controller.hasOlderTimelineEntries,
-                                  isLoadingOlderItems:
-                                      controller.isLoadingOlderTimelineEntries,
-                                  onOpenDiff: () => _openDiff(context),
-                                  onOpenRuntimeInfo: () =>
-                                      _openRuntimeInfo(context),
-                                  onOpenFile: () => _openFileViewer(context),
-                                  onOpenAttachment: (attachment) =>
-                                      _openAttachment(context, attachment),
-                                  onRequestMediaPreview:
-                                      controller.requestMediaPreview,
-                                  onLoadOlderItems:
-                                      controller.loadOlderTimelineEntries,
-                                  onReviewDecision:
-                                      controller.sendReviewDecision,
-                                  onAcceptAll: controller.acceptAllPendingDiffs,
-                                  onPromptSubmit: controller.submitPromptOption,
-                                ),
+              ? GestureDetector(
+                  behavior: HitTestBehavior.translucent,
+                  onTap: () => FocusManager.instance.primaryFocus?.unfocus(),
+                  child: Column(
+                    children: [
+                      SizedBox(
+                          height: MediaQuery.of(context).padding.top +
+                              kToolbarHeight),
+                      if (controller.shouldShowSessionObservationBanner)
+                        _SessionObservationBanner(controller: controller),
+                      Expanded(
+                        child: (controller.timeline.isEmpty &&
+                                controller.pendingPrompt?.hasVisiblePrompt !=
+                                    true &&
+                                controller
+                                        .pendingInteraction?.hasVisiblePrompt !=
+                                    true &&
+                                !controller.shouldShowPlanChoices &&
+                                !controller.aiStatusIndicatorVisible)
+                            ? const Center(child: _LandingBrand())
+                            : Column(
+                                children: [
+                                  if (controller.hasCompactContextSelection)
+                                    _ContextSelectionBar(
+                                        controller: controller),
+                                  Expanded(
+                                    child: ChatTimeline(
+                                      items: controller.timeline,
+                                      sessionId: controller.selectedSessionId,
+                                      mediaPreviewStates:
+                                          controller.mediaPreviewStates,
+                                      activeReviewDiff:
+                                          controller.currentReviewDiff,
+                                      activeReviewGroup:
+                                          controller.activeReviewGroup,
+                                      pendingDiffCount:
+                                          controller.pendingDiffCount,
+                                      pendingReviewGroupCount:
+                                          controller.pendingReviewGroupCount,
+                                      isManualReviewMode:
+                                          controller.isManualReviewMode,
+                                      isAutoAcceptMode:
+                                          controller.isAutoAcceptMode,
+                                      pendingPrompt: controller.pendingPrompt,
+                                      pendingInteraction:
+                                          controller.pendingInteraction,
+                                      shouldShowReviewChoices:
+                                          controller.shouldShowReviewChoices,
+                                      pendingPlanQuestion:
+                                          controller.pendingPlanQuestion,
+                                      pendingPlanProgressLabel:
+                                          controller.pendingPlanProgressLabel,
+                                      shouldShowPlanChoices:
+                                          controller.shouldShowPlanChoices,
+                                      isAiRunning:
+                                          controller.aiStatusIndicatorVisible,
+                                      aiStatusLabel:
+                                          controller.aiStatusIndicatorLabel,
+                                      bottomPadding: _timelineBottomPadding,
+                                      hasOlderItems:
+                                          controller.hasOlderTimelineEntries,
+                                      isLoadingOlderItems: controller
+                                          .isLoadingOlderTimelineEntries,
+                                      onOpenDiff: () => _openDiff(context),
+                                      onOpenRuntimeInfo: () =>
+                                          _openRuntimeInfo(context),
+                                      onOpenFile: () =>
+                                          _openFileViewer(context),
+                                      onOpenAttachment: (attachment) =>
+                                          _openAttachment(context, attachment),
+                                      onRequestMediaPreview:
+                                          controller.requestMediaPreview,
+                                      onLoadOlderItems:
+                                          controller.loadOlderTimelineEntries,
+                                      onReviewDecision:
+                                          controller.sendReviewDecision,
+                                      onAcceptAll:
+                                          controller.acceptAllPendingDiffs,
+                                      onPromptSubmit:
+                                          controller.submitPromptOption,
+                                    ),
+                                  ),
+                                ],
                               ),
-                            ],
-                          ),
+                      ),
+                    ],
                   ),
-                ],
-              ),
-            )
-          : const Center(
-              child: _LandingBrand(),
-            ),
+                )
+              : const Center(
+                  child: _LandingBrand(),
+                ),
           Positioned(
             top: 0,
             left: 0,
@@ -431,9 +445,8 @@ class _SessionHomePageState extends State<SessionHomePage> {
                           ),
                           IconButton(
                             onPressed: widget.onToggleTheme,
-                            tooltip: widget.darkModeEnabled
-                                ? '切换浅色模式'
-                                : '切换深色模式',
+                            tooltip:
+                                widget.darkModeEnabled ? '切换浅色模式' : '切换深色模式',
                             icon: Icon(
                               widget.darkModeEnabled
                                   ? Icons.light_mode_outlined
@@ -452,44 +465,77 @@ class _SessionHomePageState extends State<SessionHomePage> {
               ),
             ),
           ),
+          Positioned(
+            left: 0,
+            right: 0,
+            bottom: 0,
+            child: AnimatedPadding(
+              key: const ValueKey('command-bar-keyboard-padding'),
+              duration: const Duration(milliseconds: 180),
+              curve: Curves.easeOutCubic,
+              padding: EdgeInsets.only(
+                bottom: MediaQuery.viewInsetsOf(context).bottom,
+              ),
+              child: _MeasuredSize(
+                onChanged: _handleCommandBarSizeChanged,
+                child: _buildCommandInputBar(context),
+              ),
+            ),
+          ),
         ],
       ),
-      bottomNavigationBar: CommandInputBar(
-        awaitInput: controller.awaitInput,
-        isBusy: controller.isSessionBusy,
-        canStop: controller.canStopCurrentRun,
-        canCompact: controller.shouldShowCompactButton,
-        isCompacting: controller.isCompacting,
-        compactStatusLabel: controller.compactStatusLabel,
-        contextWindowUsage: controller.contextWindowUsage,
-        onOpenContextWindowUsage: () => _openContextWindowUsage(context),
-        hasPendingReview: controller.hasPendingReview,
-        fastMode: controller.fastMode,
-        permissionMode: controller.displayPermissionMode,
-        shouldShowPermissionChoices: controller.shouldShowPermissionChoices,
-        shouldShowReviewChoices: controller.shouldShowReviewChoices,
-        shouldShowPlanChoices: controller.shouldShowPlanChoices,
-        onSubmit: controller.sendInputTextWithImages,
-        onAttachImage: () => _pickImageAttachment(context),
-        onStop: controller.stopCurrentRun,
-        onCompact: controller.compactCurrentSession,
-        onOpenSessions: () => _openSessions(context),
-        onOpenRuntimeInfo: () => _openRuntimeInfo(context),
-        onOpenLogs: () => _openLogs(context),
-        onOpenSkills: () => _openSkills(context),
-        onOpenMemory: () => _openMemory(context),
-        onOpenPermissions: () => _openPermissions(context),
-        onOpenModels: () => _openModelSwitcher(context),
-        onPermissionModeChanged: controller.updatePermissionMode,
-        showClaudeMode: controller.shouldShowClaudeMode,
-        currentEngine: controller.commandBarEngine,
-        modelSummary: controller.commandBarModelSummary,
-        permissionRuleSummary: controller.permissionRuleSummary,
-        isSessionLoading: controller.isLoadingSession,
-        canSendToContinuedSameSession: controller.canSendToContinuedSameSession,
-        isExternallyLocked: controller.isSessionReadOnly,
-        externalLockedHint: controller.sessionReadOnlyHint,
-      ),
+    );
+  }
+
+  void _handleCommandBarSizeChanged(Size size) {
+    if (!mounted) {
+      return;
+    }
+    final nextPadding = size.height + _commandBarGap;
+    if ((nextPadding - _timelineBottomPadding).abs() < 0.5) {
+      return;
+    }
+    setState(() {
+      _timelineBottomPadding = nextPadding;
+    });
+  }
+
+  Widget _buildCommandInputBar(BuildContext context) {
+    return CommandInputBar(
+      awaitInput: controller.awaitInput,
+      isBusy: controller.isSessionBusy,
+      canStop: controller.canStopCurrentRun,
+      canCompact: controller.shouldShowCompactButton,
+      isCompacting: controller.isCompacting,
+      compactStatusLabel: controller.compactStatusLabel,
+      contextWindowUsage: controller.contextWindowUsage,
+      onOpenContextWindowUsage: () => _openContextWindowUsage(context),
+      hasPendingReview: controller.hasPendingReview,
+      fastMode: controller.fastMode,
+      permissionMode: controller.displayPermissionMode,
+      shouldShowPermissionChoices: controller.shouldShowPermissionChoices,
+      shouldShowReviewChoices: controller.shouldShowReviewChoices,
+      shouldShowPlanChoices: controller.shouldShowPlanChoices,
+      onSubmit: controller.sendInputTextWithImages,
+      onAttachImage: () => _pickImageAttachment(context),
+      onStop: controller.stopCurrentRun,
+      onCompact: controller.compactCurrentSession,
+      onOpenSessions: () => _openSessions(context),
+      onOpenRuntimeInfo: () => _openRuntimeInfo(context),
+      onOpenLogs: () => _openLogs(context),
+      onOpenSkills: () => _openSkills(context),
+      onOpenMemory: () => _openMemory(context),
+      onOpenPermissions: () => _openPermissions(context),
+      onOpenModels: () => _openModelSwitcher(context),
+      onPermissionModeChanged: controller.updatePermissionMode,
+      showClaudeMode: controller.shouldShowClaudeMode,
+      currentEngine: controller.commandBarEngine,
+      modelSummary: controller.commandBarModelSummary,
+      permissionRuleSummary: controller.permissionRuleSummary,
+      isSessionLoading: controller.isLoadingSession,
+      canSendToContinuedSameSession: controller.canSendToContinuedSameSession,
+      isExternallyLocked: controller.isSessionReadOnly,
+      externalLockedHint: controller.sessionReadOnlyHint,
     );
   }
 
@@ -834,7 +880,10 @@ class _SessionHomePageState extends State<SessionHomePage> {
                         color: Theme.of(context).colorScheme.surface,
                         borderRadius: BorderRadius.circular(16),
                         border: Border.all(
-                          color: Theme.of(context).colorScheme.outline.withValues(alpha: 0.12),
+                          color: Theme.of(context)
+                              .colorScheme
+                              .outline
+                              .withValues(alpha: 0.12),
                         ),
                       ),
                       child: Column(
@@ -842,14 +891,21 @@ class _SessionHomePageState extends State<SessionHomePage> {
                         children: [
                           Row(
                             children: [
-                              Icon(Icons.link, size: 20, color: Theme.of(context).colorScheme.primary),
+                              Icon(Icons.link,
+                                  size: 20,
+                                  color: Theme.of(context).colorScheme.primary),
                               const SizedBox(width: 8),
                               Text(
                                 '快速连接',
-                                style: Theme.of(context).textTheme.titleSmall?.copyWith(
-                                  fontWeight: FontWeight.w600,
-                                  color: Theme.of(context).colorScheme.onSurface,
-                                ),
+                                style: Theme.of(context)
+                                    .textTheme
+                                    .titleSmall
+                                    ?.copyWith(
+                                      fontWeight: FontWeight.w600,
+                                      color: Theme.of(context)
+                                          .colorScheme
+                                          .onSurface,
+                                    ),
                               ),
                             ],
                           ),
@@ -877,7 +933,8 @@ class _SessionHomePageState extends State<SessionHomePage> {
                               ),
                               const SizedBox(width: 10),
                               FilledButton.tonal(
-                                onPressed: connectionBusy ? null : handlePasteLink,
+                                onPressed:
+                                    connectionBusy ? null : handlePasteLink,
                                 child: const Text('导入'),
                               ),
                             ],
@@ -924,7 +981,10 @@ class _SessionHomePageState extends State<SessionHomePage> {
                         color: Theme.of(context).colorScheme.surface,
                         borderRadius: BorderRadius.circular(16),
                         border: Border.all(
-                          color: Theme.of(context).colorScheme.outline.withValues(alpha: 0.12),
+                          color: Theme.of(context)
+                              .colorScheme
+                              .outline
+                              .withValues(alpha: 0.12),
                         ),
                       ),
                       child: Column(
@@ -932,80 +992,91 @@ class _SessionHomePageState extends State<SessionHomePage> {
                         children: [
                           Row(
                             children: [
-                              Icon(Icons.settings_input_antenna, size: 20, color: Theme.of(context).colorScheme.primary),
+                              Icon(Icons.settings_input_antenna,
+                                  size: 20,
+                                  color: Theme.of(context).colorScheme.primary),
                               const SizedBox(width: 8),
                               Text(
                                 '连接模式',
-                                style: Theme.of(context).textTheme.titleSmall?.copyWith(
-                                  fontWeight: FontWeight.w600,
-                                  color: Theme.of(context).colorScheme.onSurface,
-                                ),
+                                style: Theme.of(context)
+                                    .textTheme
+                                    .titleSmall
+                                    ?.copyWith(
+                                      fontWeight: FontWeight.w600,
+                                      color: Theme.of(context)
+                                          .colorScheme
+                                          .onSurface,
+                                    ),
                               ),
                             ],
                           ),
                           const SizedBox(height: 12),
                           SegmentedButton<ConnectionMode>(
-                      segments: const [
-                        ButtonSegment(
-                          value: ConnectionMode.direct,
-                          icon: Icon(Icons.lan_outlined),
-                          label: Text('直连'),
-                        ),
-                        ButtonSegment(
-                          value: ConnectionMode.auto,
-                          icon: Icon(Icons.swap_horiz_outlined),
-                          label: Text('自动'),
-                        ),
-                        ButtonSegment(
-                          value: ConnectionMode.relay,
-                          icon: Icon(Icons.hub_outlined),
-                          label: Text('中继'),
-                        ),
-                      ],
-                      selected: {
-                        ConnectionMode.values.firstWhere(
-                          (mode) => mode.name == pendingConfig.connectionMode,
-                          orElse: () => ConnectionMode.direct,
-                        ),
-                      },
-                      onSelectionChanged: connectionBusy
-                          ? null
-                          : (selection) {
-                              final mode = selection.first;
-                              setSheetState(() {
-                                if (mode == ConnectionMode.direct) {
-                                  pendingConfig = pendingConfig.copyWith(
-                                    connectionMode: ConnectionMode.direct.name,
-                                  );
-                                  scanHint = '已切换为局域网直连模式';
-                                  return;
-                                }
-                                if (pendingConfig.relayUrl.trim().isEmpty ||
-                                    pendingConfig.relaySessionId
-                                        .trim()
-                                        .isEmpty) {
-                                  scanHint = '请先导入 Relay 配对链接';
-                                  return;
-                                }
-                                pendingConfig = pendingConfig.copyWith(
-                                  connectionMode: mode.name,
-                                );
-                                scanHint = mode == ConnectionMode.auto
-                                    ? '已切换为自动模式：优先 LAN，Relay 兜底'
-                                    : '已切换为 Relay 中继模式';
-                              });
+                            segments: const [
+                              ButtonSegment(
+                                value: ConnectionMode.direct,
+                                icon: Icon(Icons.lan_outlined),
+                                label: Text('直连'),
+                              ),
+                              ButtonSegment(
+                                value: ConnectionMode.auto,
+                                icon: Icon(Icons.swap_horiz_outlined),
+                                label: Text('自动'),
+                              ),
+                              ButtonSegment(
+                                value: ConnectionMode.relay,
+                                icon: Icon(Icons.hub_outlined),
+                                label: Text('中继'),
+                              ),
+                            ],
+                            selected: {
+                              ConnectionMode.values.firstWhere(
+                                (mode) =>
+                                    mode.name == pendingConfig.connectionMode,
+                                orElse: () => ConnectionMode.direct,
+                              ),
                             },
-                    ),
-                    if (relayModeSelected &&
-                        pendingConfig.relayNodeFingerprintHex
-                            .trim()
-                            .isNotEmpty) ...[
-                      const SizedBox(height: 8),
-                      Text(
-                        '节点指纹：${_shortFingerprint(pendingConfig.relayNodeFingerprintHex)}',
-                        style: Theme.of(context).textTheme.bodySmall,
-                      ),
-                    ],
+                            onSelectionChanged: connectionBusy
+                                ? null
+                                : (selection) {
+                                    final mode = selection.first;
+                                    setSheetState(() {
+                                      if (mode == ConnectionMode.direct) {
+                                        pendingConfig = pendingConfig.copyWith(
+                                          connectionMode:
+                                              ConnectionMode.direct.name,
+                                        );
+                                        scanHint = '已切换为局域网直连模式';
+                                        return;
+                                      }
+                                      if (pendingConfig.relayUrl
+                                              .trim()
+                                              .isEmpty ||
+                                          pendingConfig.relaySessionId
+                                              .trim()
+                                              .isEmpty) {
+                                        scanHint = '请先导入 Relay 配对链接';
+                                        return;
+                                      }
+                                      pendingConfig = pendingConfig.copyWith(
+                                        connectionMode: mode.name,
+                                      );
+                                      scanHint = mode == ConnectionMode.auto
+                                          ? '已切换为自动模式：优先 LAN，Relay 兜底'
+                                          : '已切换为 Relay 中继模式';
+                                    });
+                                  },
+                          ),
+                          if (relayModeSelected &&
+                              pendingConfig.relayNodeFingerprintHex
+                                  .trim()
+                                  .isNotEmpty) ...[
+                            const SizedBox(height: 8),
+                            Text(
+                              '节点指纹：${_shortFingerprint(pendingConfig.relayNodeFingerprintHex)}',
+                              style: Theme.of(context).textTheme.bodySmall,
+                            ),
+                          ],
                         ],
                       ),
                     ),
@@ -1016,7 +1087,10 @@ class _SessionHomePageState extends State<SessionHomePage> {
                         color: Theme.of(context).colorScheme.surface,
                         borderRadius: BorderRadius.circular(16),
                         border: Border.all(
-                          color: Theme.of(context).colorScheme.outline.withValues(alpha: 0.12),
+                          color: Theme.of(context)
+                              .colorScheme
+                              .outline
+                              .withValues(alpha: 0.12),
                         ),
                       ),
                       child: Column(
@@ -1024,14 +1098,21 @@ class _SessionHomePageState extends State<SessionHomePage> {
                         children: [
                           Row(
                             children: [
-                              Icon(Icons.tune, size: 20, color: Theme.of(context).colorScheme.primary),
+                              Icon(Icons.tune,
+                                  size: 20,
+                                  color: Theme.of(context).colorScheme.primary),
                               const SizedBox(width: 8),
                               Text(
                                 '高级设置',
-                                style: Theme.of(context).textTheme.titleSmall?.copyWith(
-                                  fontWeight: FontWeight.w600,
-                                  color: Theme.of(context).colorScheme.onSurface,
-                                ),
+                                style: Theme.of(context)
+                                    .textTheme
+                                    .titleSmall
+                                    ?.copyWith(
+                                      fontWeight: FontWeight.w600,
+                                      color: Theme.of(context)
+                                          .colorScheme
+                                          .onSurface,
+                                    ),
                               ),
                             ],
                           ),
@@ -1039,42 +1120,44 @@ class _SessionHomePageState extends State<SessionHomePage> {
                           TextField(
                               controller: cwdController,
                               enabled: !connectionBusy,
-                              decoration: const InputDecoration(labelText: 'CWD')),
+                              decoration:
+                                  const InputDecoration(labelText: 'CWD')),
                           const SizedBox(height: 10),
                           DropdownButtonFormField<String>(
-                      initialValue: selectedEngine,
-                      decoration: const InputDecoration(labelText: 'Engine'),
-                      items: const [
-                        DropdownMenuItem(
-                          value: 'claude',
-                          child: Text('Claude'),
-                        ),
-                        DropdownMenuItem(
-                          value: 'codex',
-                          child: Text('Codex'),
-                        ),
-                        DropdownMenuItem(
-                          value: 'gemini',
-                          child: Text('Gemini'),
-                        ),
-                      ],
-                      onChanged: connectionBusy
-                          ? null
-                          : (value) {
-                              if (value == null) {
-                                return;
-                              }
-                              setSheetState(() {
-                                selectedEngine = value;
-                              });
-                            },
-                    ),
-                    const SizedBox(height: 10),
-                    TextField(
-                        controller: permissionController,
-                        enabled: !connectionBusy,
-                        decoration: const InputDecoration(
-                            labelText: 'Permission Mode')),
+                            initialValue: selectedEngine,
+                            decoration:
+                                const InputDecoration(labelText: 'Engine'),
+                            items: const [
+                              DropdownMenuItem(
+                                value: 'claude',
+                                child: Text('Claude'),
+                              ),
+                              DropdownMenuItem(
+                                value: 'codex',
+                                child: Text('Codex'),
+                              ),
+                              DropdownMenuItem(
+                                value: 'gemini',
+                                child: Text('Gemini'),
+                              ),
+                            ],
+                            onChanged: connectionBusy
+                                ? null
+                                : (value) {
+                                    if (value == null) {
+                                      return;
+                                    }
+                                    setSheetState(() {
+                                      selectedEngine = value;
+                                    });
+                                  },
+                          ),
+                          const SizedBox(height: 10),
+                          TextField(
+                              controller: permissionController,
+                              enabled: !connectionBusy,
+                              decoration: const InputDecoration(
+                                  labelText: 'Permission Mode')),
                         ],
                       ),
                     ),
@@ -1085,7 +1168,10 @@ class _SessionHomePageState extends State<SessionHomePage> {
                         color: Theme.of(context).colorScheme.surface,
                         borderRadius: BorderRadius.circular(16),
                         border: Border.all(
-                          color: Theme.of(context).colorScheme.outline.withValues(alpha: 0.12),
+                          color: Theme.of(context)
+                              .colorScheme
+                              .outline
+                              .withValues(alpha: 0.12),
                         ),
                       ),
                       child: Column(
@@ -1093,68 +1179,79 @@ class _SessionHomePageState extends State<SessionHomePage> {
                         children: [
                           Row(
                             children: [
-                              Icon(Icons.security, size: 20, color: Theme.of(context).colorScheme.primary),
+                              Icon(Icons.security,
+                                  size: 20,
+                                  color: Theme.of(context).colorScheme.primary),
                               const SizedBox(width: 8),
                               Text(
                                 'ADB ICE 配置',
-                                style: Theme.of(context).textTheme.titleSmall?.copyWith(
-                                  fontWeight: FontWeight.w600,
-                                  color: Theme.of(context).colorScheme.onSurface,
-                                ),
+                                style: Theme.of(context)
+                                    .textTheme
+                                    .titleSmall
+                                    ?.copyWith(
+                                      fontWeight: FontWeight.w600,
+                                      color: Theme.of(context)
+                                          .colorScheme
+                                          .onSurface,
+                                    ),
                               ),
                             ],
                           ),
                           const SizedBox(height: 12),
                           TextField(
                             controller: iceHostController,
-                      decoration: const InputDecoration(
-                        labelText: 'ADB TURN Host Override',
-                        hintText: '留空则跟 Host 一致',
-                      ),
-                      enabled: !relayModeSelected && !connectionBusy,
-                      onChanged: (_) => setSheetState(() {}),
-                    ),
-                    const SizedBox(height: 10),
-                    TextField(
-                      controller: iceUsernameController,
-                      enabled: !connectionBusy,
-                      decoration: const InputDecoration(
-                        labelText: 'ADB TURN Username',
-                        hintText: 'mobilevc',
-                      ),
-                    ),
-                    const SizedBox(height: 10),
-                    TextField(
-                      controller: iceCredentialController,
-                      enabled: !connectionBusy,
-                      decoration: const InputDecoration(
-                        labelText: 'ADB TURN Credential',
-                        hintText: 'credential',
-                      ),
-                    ),
-                    const SizedBox(height: 6),
-                    Text(
-                      'ADB ICE 默认使用当前 Host，也可单独指定 TURN Host。',
-                      style: Theme.of(context).textTheme.bodySmall,
-                    ),
-                    const SizedBox(height: 4),
-                    Text(
-                      'STUN: stun:$normalizedIceHost:${AppConfig.adbIcePort}',
-                      style: Theme.of(context).textTheme.bodySmall,
-                    ),
-                    Text(
-                      'TURN: turn:$normalizedIceHost:${AppConfig.adbIcePort}?transport=udp / tcp',
-                      style: Theme.of(context).textTheme.bodySmall,
-                    ),
-                    if (hadLegacyIceConfig) ...[
-                      const SizedBox(height: 6),
-                      Text(
-                        '检测到旧版自定义 ICE JSON。保存后会切换为自动 Host 模式。',
-                        style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                              color: Theme.of(context).colorScheme.primary,
+                            decoration: const InputDecoration(
+                              labelText: 'ADB TURN Host Override',
+                              hintText: '留空则跟 Host 一致',
                             ),
-                      ),
-                    ],
+                            enabled: !relayModeSelected && !connectionBusy,
+                            onChanged: (_) => setSheetState(() {}),
+                          ),
+                          const SizedBox(height: 10),
+                          TextField(
+                            controller: iceUsernameController,
+                            enabled: !connectionBusy,
+                            decoration: const InputDecoration(
+                              labelText: 'ADB TURN Username',
+                              hintText: 'mobilevc',
+                            ),
+                          ),
+                          const SizedBox(height: 10),
+                          TextField(
+                            controller: iceCredentialController,
+                            enabled: !connectionBusy,
+                            decoration: const InputDecoration(
+                              labelText: 'ADB TURN Credential',
+                              hintText: 'credential',
+                            ),
+                          ),
+                          const SizedBox(height: 6),
+                          Text(
+                            'ADB ICE 默认使用当前 Host，也可单独指定 TURN Host。',
+                            style: Theme.of(context).textTheme.bodySmall,
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            'STUN: stun:$normalizedIceHost:${AppConfig.adbIcePort}',
+                            style: Theme.of(context).textTheme.bodySmall,
+                          ),
+                          Text(
+                            'TURN: turn:$normalizedIceHost:${AppConfig.adbIcePort}?transport=udp / tcp',
+                            style: Theme.of(context).textTheme.bodySmall,
+                          ),
+                          if (hadLegacyIceConfig) ...[
+                            const SizedBox(height: 6),
+                            Text(
+                              '检测到旧版自定义 ICE JSON。保存后会切换为自动 Host 模式。',
+                              style: Theme.of(context)
+                                  .textTheme
+                                  .bodySmall
+                                  ?.copyWith(
+                                    color:
+                                        Theme.of(context).colorScheme.primary,
+                                  ),
+                            ),
+                          ],
                         ],
                       ),
                     ),
@@ -1165,7 +1262,10 @@ class _SessionHomePageState extends State<SessionHomePage> {
                         color: Theme.of(context).colorScheme.surface,
                         borderRadius: BorderRadius.circular(16),
                         border: Border.all(
-                          color: Theme.of(context).colorScheme.outline.withValues(alpha: 0.12),
+                          color: Theme.of(context)
+                              .colorScheme
+                              .outline
+                              .withValues(alpha: 0.12),
                         ),
                       ),
                       child: Column(
@@ -1173,14 +1273,21 @@ class _SessionHomePageState extends State<SessionHomePage> {
                         children: [
                           Row(
                             children: [
-                              Icon(Icons.play_arrow, size: 20, color: Theme.of(context).colorScheme.primary),
+                              Icon(Icons.play_arrow,
+                                  size: 20,
+                                  color: Theme.of(context).colorScheme.primary),
                               const SizedBox(width: 8),
                               Text(
                                 '操作',
-                                style: Theme.of(context).textTheme.titleSmall?.copyWith(
-                                  fontWeight: FontWeight.w600,
-                                  color: Theme.of(context).colorScheme.onSurface,
-                                ),
+                                style: Theme.of(context)
+                                    .textTheme
+                                    .titleSmall
+                                    ?.copyWith(
+                                      fontWeight: FontWeight.w600,
+                                      color: Theme.of(context)
+                                          .colorScheme
+                                          .onSurface,
+                                    ),
                               ),
                             ],
                           ),
@@ -1189,105 +1296,109 @@ class _SessionHomePageState extends State<SessionHomePage> {
                             children: [
                               Expanded(
                                 child: FilledButton.tonal(
-                                  onPressed:
-                                      connectionBusy ? null : () => persistConfig(),
+                                  onPressed: connectionBusy
+                                      ? null
+                                      : () => persistConfig(),
                                   child: const Text('保存'),
                                 ),
                               ),
                               const SizedBox(width: 10),
                               Expanded(
                                 child: FilledButton(
-                            onPressed: connectionBusy || !canConnectRelay
-                                ? null
-                                : () async {
-                                    setSheetState(() {
-                                      connectingFromSheet = true;
-                                      scanHint = relayModeSelected
-                                          ? '正在连接 Relay：配对链接会一次性使用，请等待结果。'
-                                          : '正在连接...';
-                                    });
-                                    var connected = false;
-                                    try {
-                                      connected =
-                                          await persistConfig(connect: true);
-                                    } catch (error) {
-                                      if (!context.mounted) {
-                                        return;
-                                      }
-                                      setSheetState(() {
-                                        connectingFromSheet = false;
-                                        pendingConfig = controller.config;
-                                        scanHint = '连接配置失败：$error';
-                                      });
-                                    }
-                                    if (!context.mounted ||
-                                        connected ||
-                                        controller.connected) {
-                                      return;
-                                    }
-                                    setSheetState(() {
-                                      connectingFromSheet = false;
-                                      pendingConfig = controller.config;
-                                      scanHint = controller.connectionMessage;
-                                    });
-                                    ScaffoldMessenger.of(context).showSnackBar(
-                                      SnackBar(
-                                        content:
-                                            Text(controller.connectionMessage),
-                                      ),
-                                    );
-                                  },
-                            child: connectionBusy
-                                ? const Row(
-                                    mainAxisAlignment: MainAxisAlignment.center,
-                                    mainAxisSize: MainAxisSize.min,
-                                    children: [
-                                      SizedBox(
-                                        width: 16,
-                                        height: 16,
-                                        child: CircularProgressIndicator(
-                                          strokeWidth: 2,
-                                        ),
-                                      ),
-                                      SizedBox(width: 8),
-                                      Text('连接中'),
-                                    ],
-                                  )
-                                : const Text('连接'),
+                                  onPressed: connectionBusy || !canConnectRelay
+                                      ? null
+                                      : () async {
+                                          setSheetState(() {
+                                            connectingFromSheet = true;
+                                            scanHint = relayModeSelected
+                                                ? '正在连接 Relay：配对链接会一次性使用，请等待结果。'
+                                                : '正在连接...';
+                                          });
+                                          var connected = false;
+                                          try {
+                                            connected = await persistConfig(
+                                                connect: true);
+                                          } catch (error) {
+                                            if (!context.mounted) {
+                                              return;
+                                            }
+                                            setSheetState(() {
+                                              connectingFromSheet = false;
+                                              pendingConfig = controller.config;
+                                              scanHint = '连接配置失败：$error';
+                                            });
+                                          }
+                                          if (!context.mounted ||
+                                              connected ||
+                                              controller.connected) {
+                                            return;
+                                          }
+                                          setSheetState(() {
+                                            connectingFromSheet = false;
+                                            pendingConfig = controller.config;
+                                            scanHint =
+                                                controller.connectionMessage;
+                                          });
+                                          ScaffoldMessenger.of(context)
+                                              .showSnackBar(
+                                            SnackBar(
+                                              content: Text(
+                                                  controller.connectionMessage),
+                                            ),
+                                          );
+                                        },
+                                  child: connectionBusy
+                                      ? const Row(
+                                          mainAxisAlignment:
+                                              MainAxisAlignment.center,
+                                          mainAxisSize: MainAxisSize.min,
+                                          children: [
+                                            SizedBox(
+                                              width: 16,
+                                              height: 16,
+                                              child: CircularProgressIndicator(
+                                                strokeWidth: 2,
+                                              ),
+                                            ),
+                                            SizedBox(width: 8),
+                                            Text('连接中'),
+                                          ],
+                                        )
+                                      : const Text('连接'),
+                                ),
+                              ),
+                            ],
                           ),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 10),
-                    if (controller.connected)
-                      SizedBox(
-                        width: double.infinity,
-                        child: OutlinedButton(
-                          onPressed: connectionBusy
-                              ? null
-                              : () async {
-                                  await controller.disconnect();
-                                  if (context.mounted) {
-                                    Navigator.pop(context);
-                                  }
-                                },
-                          child: const Text('断开连接'),
-                        ),
-                      ),
-                    if (controller.config.connectionMode !=
-                        ConnectionMode.direct.name) ...[
-                      const SizedBox(height: 10),
-                      SizedBox(
-                        width: double.infinity,
-                        child: OutlinedButton.icon(
-                          onPressed: connectionBusy
-                              ? null
-                              : () => _openRelaySecurity(context),
-                          icon: const Icon(Icons.verified_user_outlined),
-                          label: const Text('Relay 安全设备'),
-                        ),
-                      ),
-                    ],
+                          const SizedBox(height: 10),
+                          if (controller.connected)
+                            SizedBox(
+                              width: double.infinity,
+                              child: OutlinedButton(
+                                onPressed: connectionBusy
+                                    ? null
+                                    : () async {
+                                        await controller.disconnect();
+                                        if (context.mounted) {
+                                          Navigator.pop(context);
+                                        }
+                                      },
+                                child: const Text('断开连接'),
+                              ),
+                            ),
+                          if (controller.config.connectionMode !=
+                              ConnectionMode.direct.name) ...[
+                            const SizedBox(height: 10),
+                            SizedBox(
+                              width: double.infinity,
+                              child: OutlinedButton.icon(
+                                onPressed: connectionBusy
+                                    ? null
+                                    : () => _openRelaySecurity(context),
+                                icon: const Icon(Icons.verified_user_outlined),
+                                label: const Text('Relay 安全设备'),
+                              ),
+                            ),
+                          ],
                         ],
                       ),
                     ),
@@ -3327,6 +3438,48 @@ String _portForHostInput(String rawHost, String rawPort) {
     return uri.port.toString();
   }
   return rawPort.trim();
+}
+
+class _MeasuredSize extends SingleChildRenderObjectWidget {
+  const _MeasuredSize({
+    required super.child,
+    required this.onChanged,
+  });
+
+  final ValueChanged<Size> onChanged;
+
+  @override
+  RenderObject createRenderObject(BuildContext context) {
+    return _MeasuredSizeRenderObject(onChanged);
+  }
+
+  @override
+  void updateRenderObject(
+    BuildContext context,
+    covariant _MeasuredSizeRenderObject renderObject,
+  ) {
+    renderObject.onChanged = onChanged;
+  }
+}
+
+class _MeasuredSizeRenderObject extends RenderProxyBox {
+  _MeasuredSizeRenderObject(this.onChanged);
+
+  ValueChanged<Size> onChanged;
+  Size? _lastSize;
+
+  @override
+  void performLayout() {
+    super.performLayout();
+    final currentSize = size;
+    if (currentSize == _lastSize) {
+      return;
+    }
+    _lastSize = currentSize;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      onChanged(currentSize);
+    });
+  }
 }
 
 class _TipSection extends StatelessWidget {
