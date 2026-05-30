@@ -2799,6 +2799,7 @@ class SessionController extends ChangeNotifier {
     _clearPlanInteractionState();
     _runtimePhase = null;
     _runtimePermissionMode = '';
+    _contextWindowUsage = const ContextWindowUsage();
     _agentState = null;
     _sessionState = null;
     _currentStep = null;
@@ -3371,6 +3372,12 @@ class SessionController extends ChangeNotifier {
       'sessionId': _selectedSessionId.trim(),
       'cwd': effectiveCwd,
     });
+  }
+
+  void _applyContextWindowUsage(ContextWindowUsage usage) {
+    if (usage.isAvailable || !_contextWindowUsage.isAvailable) {
+      _contextWindowUsage = usage;
+    }
   }
 
   Future<void> prepareAdbDebug() async {
@@ -4791,7 +4798,7 @@ class SessionController extends ChangeNotifier {
         if (!_eventTargetsCurrentSession(usageEvent.sessionId)) {
           break;
         }
-        _contextWindowUsage = usageEvent.usage;
+        _applyContextWindowUsage(usageEvent.usage);
         break;
       case CompactResultEvent result:
         if (_eventTargetsCurrentSession(result.sessionId) ||
@@ -4885,7 +4892,7 @@ class SessionController extends ChangeNotifier {
             _isExternalNativeSession(resolvedHistorySummary);
         _executionActive = resolvedHistorySummary.executionActive;
         _sendCachedPushTokenIfPossible();
-        _contextWindowUsage = history.contextWindowUsage;
+        _applyContextWindowUsage(history.contextWindowUsage);
         _sessionContext = history.sessionContext;
         _skillCatalogMeta = history.skillCatalogMeta;
         _memoryCatalogMeta = history.memoryCatalogMeta;
@@ -6093,7 +6100,7 @@ class SessionController extends ChangeNotifier {
       _upsertSession(resolvedSummary);
     }
     _sessionContext = delta.sessionContext;
-    _contextWindowUsage = delta.contextWindowUsage;
+    _applyContextWindowUsage(delta.contextWindowUsage);
     _skillCatalogMeta = delta.skillCatalogMeta;
     _memoryCatalogMeta = delta.memoryCatalogMeta;
     _runtimePermissionMode = delta.resumeRuntimeMeta.permissionMode.trim();

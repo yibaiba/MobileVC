@@ -86,13 +86,13 @@ type PtyRunner struct {
 	toolUsePending bool
 	// streamFirstLineSeen 用于在 claude stream 启动期 emit "engine_starting" phase，
 	// 在收到首条 raw line 时清掉，避免 resume 启动 + 首字延迟期间前端无反馈。
-	streamFirstLineSeen         bool
-	lastContextWindowUsedTokens    int
-	lastContextWindowMaxTokens     int
-	hasContextWindowUsedTokens     bool
-	hasContextWindowMaxTokens      bool
-	lastEmittedContextUsedTokens   int
-	lastEmittedContextMaxTokens    int
+	streamFirstLineSeen          bool
+	lastContextWindowUsedTokens  int
+	lastContextWindowMaxTokens   int
+	hasContextWindowUsedTokens   bool
+	hasContextWindowMaxTokens    bool
+	lastEmittedContextUsedTokens int
+	lastEmittedContextMaxTokens  int
 }
 
 type fileSnapshot struct {
@@ -2495,22 +2495,23 @@ func (r *PtyRunner) emitClaudeContextWindowUsage(sessionID string, envelope clau
 	maxTokens := claudeContextWindowMaxTokens(envelope.ModelUsage)
 	usedTokens := -1
 	if len(envelope.Usage) > 0 {
-		usedTokens = claudeUsageTotalTokens(envelope.Usage)
-		if usedTokens < 0 && strings.EqualFold(strings.TrimSpace(envelope.Type), "result") {
-			usedTokens = claudeDerivedResultUsage(envelope.Usage)
-		}
+		usedTokens = claudeEffectiveUsageTokens(envelope.Usage, envelope.Type)
 	}
 
 	r.mu.Lock()
 	if maxTokens > 0 {
-		r.lastContextWindowMaxTokens = maxTokens
+		if !r.hasContextWindowMaxTokens || maxTokens > r.lastContextWindowMaxTokens {
+			r.lastContextWindowMaxTokens = maxTokens
+		}
 		r.hasContextWindowMaxTokens = true
 	}
 	freshUsed := false
 	if usedTokens >= 0 {
-		r.lastContextWindowUsedTokens = usedTokens
-		r.hasContextWindowUsedTokens = true
-		freshUsed = true
+		if usedTokens > 0 || !r.hasContextWindowUsedTokens {
+			r.lastContextWindowUsedTokens = usedTokens
+			r.hasContextWindowUsedTokens = true
+			freshUsed = true
+		}
 	}
 	cachedUsed := r.lastContextWindowUsedTokens
 	cachedMax := r.lastContextWindowMaxTokens
@@ -2582,6 +2583,18 @@ func claudeUsageTotalTokens(raw json.RawMessage) int {
 		return -1
 	}
 	return firstNonNegativeInt(usage["total_tokens"], usage["totalTokens"])
+}
+
+func claudeEffectiveUsageTokens(raw json.RawMessage, envelopeType string) int {
+	total := claudeUsageTotalTokens(raw)
+	if !strings.EqualFold(strings.TrimSpace(envelopeType), "result") {
+		return total
+	}
+	derived := claudeDerivedResultUsage(raw)
+	if derived > total {
+		return derived
+	}
+	return total
 }
 
 func claudeDerivedResultUsage(raw json.RawMessage) int {

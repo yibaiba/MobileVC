@@ -4479,6 +4479,120 @@ void main() {
       expect(controller.canStopCurrentRun, isFalse);
     });
 
+    test('空的 history/delta context usage 不覆盖已有 Claude 用量', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(
+        SessionHistoryEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-context-usage',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_history'},
+          summary:
+              const SessionSummary(id: 'session-context-usage', title: 'Usage'),
+          resumeRuntimeMeta:
+              const RuntimeMeta(command: 'claude', engine: 'claude'),
+        ),
+      );
+      service.emit(
+        ContextWindowUsageEvent(
+          timestamp: _timestamp.add(const Duration(milliseconds: 1)),
+          sessionId: 'session-context-usage',
+          runtimeMeta: const RuntimeMeta(command: 'claude', engine: 'claude'),
+          raw: const {'type': 'context_window_usage'},
+          usage: const ContextWindowUsage(
+            tokensUsed: 40000,
+            tokenLimit: 200000,
+          ),
+        ),
+      );
+      await _flushEvents();
+
+      expect(controller.contextWindowUsage.tokensUsed, 40000);
+      expect(controller.contextWindowUsage.tokenLimit, 200000);
+
+      service.emit(
+        SessionDeltaEvent(
+          timestamp: _timestamp.add(const Duration(milliseconds: 2)),
+          sessionId: 'session-context-usage',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_delta'},
+          summary:
+              const SessionSummary(id: 'session-context-usage', title: 'Usage'),
+          resumeRuntimeMeta:
+              const RuntimeMeta(command: 'claude', engine: 'claude'),
+        ),
+      );
+      await _flushEvents();
+
+      expect(controller.contextWindowUsage.tokensUsed, 40000);
+      expect(controller.contextWindowUsage.tokenLimit, 200000);
+    });
+
+    test('切换会话时会清掉上一条 Claude context usage', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(
+        SessionHistoryEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-context-source',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_history'},
+          summary: const SessionSummary(
+            id: 'session-context-source',
+            title: 'Source',
+          ),
+          resumeRuntimeMeta:
+              const RuntimeMeta(command: 'claude', engine: 'claude'),
+        ),
+      );
+      service.emit(
+        ContextWindowUsageEvent(
+          timestamp: _timestamp.add(const Duration(milliseconds: 1)),
+          sessionId: 'session-context-source',
+          runtimeMeta: const RuntimeMeta(command: 'claude', engine: 'claude'),
+          raw: const {'type': 'context_window_usage'},
+          usage: const ContextWindowUsage(
+            tokensUsed: 40000,
+            tokenLimit: 200000,
+          ),
+        ),
+      );
+      await _flushEvents();
+
+      expect(controller.contextWindowUsage.isAvailable, isTrue);
+
+      controller.loadSession('session-context-target');
+
+      expect(controller.contextWindowUsage.isAvailable, isFalse);
+
+      service.emit(
+        SessionHistoryEvent(
+          timestamp: _timestamp.add(const Duration(milliseconds: 2)),
+          sessionId: 'session-context-target',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_history'},
+          summary: const SessionSummary(
+            id: 'session-context-target',
+            title: 'Target',
+          ),
+          resumeRuntimeMeta:
+              const RuntimeMeta(command: 'claude', engine: 'claude'),
+        ),
+      );
+      await _flushEvents();
+
+      expect(controller.contextWindowUsage.isAvailable, isFalse);
+    });
+
     test('提交后未收到运行态时点击 stop 也会发送 stop action', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);
