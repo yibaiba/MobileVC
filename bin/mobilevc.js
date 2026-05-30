@@ -19,6 +19,7 @@ const DEFAULT_PORT = '8001';
 const DEFAULT_LANGUAGE = 'zh';
 const DEFAULT_RELAY_URL = 'ws://127.0.0.1:9000';
 const RELAY_PAIRING_EVENT_PREFIX = 'mobilevc-relay-pairing-';
+const RELAY_AGENT_SESSION_PREFIX = 'mobilevc-relay-agent-session-';
 
 const PLATFORM_PACKAGES = {
   'darwin-arm64': '@justprove/mobilevc-server-darwin-arm64',
@@ -338,6 +339,7 @@ async function runStart(options = {}) {
 
   const logPath = path.join(LOG_DIR, `mobilevc-${timestampForFile()}.log`);
   const pairingEventPath = relayAccess.enabled ? createRelayPairingEventPath() : '';
+  const relayAgentSessionStatePath = relayAccess.enabled ? createRelayAgentSessionStatePath() : '';
   fs.writeFileSync(logPath, '', { mode: 0o600 });
   try {
     fs.chmodSync(logPath, 0o600);
@@ -356,6 +358,7 @@ async function runStart(options = {}) {
   };
   if (relayAccess.enabled) {
     env.RELAY_PAIRING_EVENT_PATH = pairingEventPath;
+    env.RELAY_AGENT_SESSION_STATE_PATH = relayAgentSessionStatePath;
   }
 
   fs.appendFileSync(logPath, `launcher starting binary=${binaryInfo.binaryPath} target=${platformTarget}\n`);
@@ -379,6 +382,7 @@ async function runStart(options = {}) {
     }
     clearState();
     removeRelayPairingEventFile(pairingEventPath);
+    removeRelayAgentSessionStateFile(relayAgentSessionStatePath);
     throw new Error(formatStartupFailure(language, startup, logPath));
   }
 
@@ -390,6 +394,7 @@ async function runStart(options = {}) {
     }
     clearState();
     removeRelayPairingEventFile(pairingEventPath);
+    removeRelayAgentSessionStateFile(relayAgentSessionStatePath);
     throw new Error(message(language, 'relayPairingTimedOut', logPath));
   }
 
@@ -402,6 +407,7 @@ async function runStart(options = {}) {
     relayMode: relayAccess.enabled,
     relayUrl: relayAccess.url || '',
     networkExposureMode: relayAccess.networkExposureMode || '',
+    relayAgentSessionStatePath,
   };
   writeJson(STATE_PATH, state);
 
@@ -481,6 +487,7 @@ async function runStop(options = {}) {
   }
 
   if (!isPidAlive(state.pid)) {
+    removeRelayAgentSessionStateFile(state.relayAgentSessionStatePath);
     clearState();
     if (!options.silent) {
       console.log(message(language, 'backendNotRunning'));
@@ -496,6 +503,7 @@ async function runStop(options = {}) {
     await waitForExit(state.pid, 2000);
   }
 
+  removeRelayAgentSessionStateFile(state.relayAgentSessionStatePath);
   clearState();
   if (!options.silent) {
     console.log(message(language, 'stoppedBackend'));
@@ -728,6 +736,11 @@ function createRelayPairingEventPath() {
   return path.join(STATE_DIR, `${RELAY_PAIRING_EVENT_PREFIX}${suffix}.json`);
 }
 
+function createRelayAgentSessionStatePath() {
+  const suffix = `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return path.join(STATE_DIR, `${RELAY_AGENT_SESSION_PREFIX}${suffix}.json`);
+}
+
 function waitForRelayPairing(eventPath, timeoutMs) {
   return new Promise((resolve) => {
     const started = Date.now();
@@ -768,6 +781,15 @@ function removeRelayPairingEventFile(eventPath) {
   }
   try {
     fs.unlinkSync(eventPath);
+  } catch (_) {}
+}
+
+function removeRelayAgentSessionStateFile(filePath) {
+  if (!filePath) {
+    return;
+  }
+  try {
+    fs.unlinkSync(filePath);
   } catch (_) {}
 }
 
@@ -1384,7 +1406,9 @@ if (require.main === module) {
     assertValidRelayURL,
     buildRelayAccessConfig,
     buildRelayPairingUri,
+    createRelayAgentSessionStatePath,
     readRelayPairingEventFile,
+    removeRelayAgentSessionStateFile,
     isPortOccupied,
     removeRelayPairingEventFile,
     parseInvocation,
