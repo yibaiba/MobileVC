@@ -54,6 +54,7 @@ type codexAppSession struct {
 	req       ExecRequest
 	cwd       string
 	sink      EventSink
+	defaults  codexConfigDefaults
 
 	cmd    *exec.Cmd
 	stdin  io.WriteCloser
@@ -230,6 +231,12 @@ func newCodexAppSession(processCtx context.Context, rpcCtx context.Context, runn
 		_ = stdin.Close()
 		return nil, fmt.Errorf("start codex app-server: %w", err)
 	}
+	defaults, err := loadCodexConfigDefaults()
+	if err != nil {
+		_ = stdin.Close()
+		_ = cmd.Process.Kill()
+		return nil, err
+	}
 
 	app := &codexAppSession{
 		runner:    runner,
@@ -237,6 +244,7 @@ func newCodexAppSession(processCtx context.Context, rpcCtx context.Context, runn
 		req:       req,
 		cwd:       cwd,
 		sink:      sink,
+		defaults:  defaults,
 		cmd:       cmd,
 		stdin:     stdin,
 		stdout:    stdout,
@@ -294,6 +302,8 @@ func (s *codexAppSession) startOrResumeThread(ctx context.Context, resumeSession
 		}
 		if model := extractCodexModelFlag(s.req.Command); model != "" {
 			params["model"] = model
+		} else if model := s.defaults.model; model != "" {
+			params["model"] = model
 		}
 	}
 	if err := s.call(ctx, method, params, &resp); err != nil {
@@ -345,8 +355,12 @@ func (s *codexAppSession) SendUserInput(ctx context.Context, data []byte) error 
 	}
 	if model := extractCodexModelFlag(s.req.Command); model != "" {
 		params["model"] = model
+	} else if model := s.defaults.model; model != "" {
+		params["model"] = model
 	}
 	if effort := extractCodexReasoningEffortFlag(s.req.Command); effort != "" {
+		params["effort"] = effort
+	} else if effort := s.defaults.reasoningEffort; effort != "" {
 		params["effort"] = effort
 	}
 	var resp codexTurnStartResponse

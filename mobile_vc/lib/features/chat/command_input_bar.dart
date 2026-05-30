@@ -94,11 +94,7 @@ class _CommandInputBarState extends State<CommandInputBar> {
       widget.isSessionLoading ||
       widget.shouldShowPermissionChoices ||
       widget.shouldShowReviewChoices ||
-      widget.shouldShowPlanChoices ||
-      (!widget.canSendToContinuedSameSession &&
-          !widget.awaitInput &&
-          !widget.canStop &&
-          widget.isBusy);
+      widget.shouldShowPlanChoices;
 
   bool _canSubmitDraft(String text) =>
       (text.trim().isNotEmpty || _imageAttachments.isNotEmpty) &&
@@ -136,9 +132,6 @@ class _CommandInputBarState extends State<CommandInputBar> {
     }
     if (widget.shouldShowPlanChoices) {
       return '请先在上方完成计划选择';
-    }
-    if (!widget.awaitInput && !widget.canStop && widget.isBusy) {
-      return '正在停止，请稍候...';
     }
     return '';
   }

@@ -309,7 +309,7 @@ void main() {
       expect(field.decoration?.hintText, '回复 Codex');
     });
 
-    testWidgets('shell 模式显示 Shell 状态与 hint', (tester) async {
+    testWidgets('shell 运行中仍可继续编辑草稿', (tester) async {
       await tester.pumpWidget(
         _buildTestApp(
           isBusy: true,
@@ -319,7 +319,39 @@ void main() {
       );
 
       final field = tester.widget<TextField>(find.byType(TextField));
-      expect(field.decoration?.hintText, '正在停止，请稍候...');
+      expect(field.enabled, isTrue);
+      expect(field.readOnly, isFalse);
+      expect(field.canRequestFocus, isTrue);
+      expect(field.decoration?.hintText, 'Shell 运行中');
+    });
+
+    testWidgets('busy 状态抖动不会打断正在输入的草稿', (tester) async {
+      await tester.pumpWidget(
+        _buildTestApp(
+          awaitInput: true,
+          isBusy: true,
+          canStop: true,
+          currentEngine: 'codex',
+        ),
+      );
+
+      await tester.enterText(find.byType(TextField), '测试输入');
+      await tester.pump();
+
+      await tester.pumpWidget(
+        _buildTestApp(
+          isBusy: true,
+          canStop: false,
+          currentEngine: 'codex',
+        ),
+      );
+      await tester.pump();
+
+      final field = tester.widget<TextField>(find.byType(TextField));
+      expect(field.enabled, isTrue);
+      expect(field.readOnly, isFalse);
+      expect(field.canRequestFocus, isTrue);
+      expect(find.text('测试输入'), findsOneWidget);
     });
 
     testWidgets('busy 且非等待输入时发送按钮切为停止按钮', (tester) async {
