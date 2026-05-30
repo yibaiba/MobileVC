@@ -4346,6 +4346,139 @@ void main() {
       expect(controller.canStopCurrentRun, isFalse);
     });
 
+    test('外部原生 history 落地后立即启动观察增量同步', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.sentPayloads.clear();
+      service.emit(
+        SessionHistoryEvent(
+          timestamp: _timestamp,
+          sessionId: 'codex-thread:observe',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_history'},
+          summary: const SessionSummary(
+            id: 'codex-thread:observe',
+            title: 'Native Codex',
+            source: 'codex-native',
+            external: true,
+            executionActive: true,
+            runtime: RuntimeMeta(command: 'codex', engine: 'codex'),
+          ),
+          runtimeAlive: true,
+          resumeRuntimeMeta:
+              const RuntimeMeta(command: 'codex', engine: 'codex'),
+        ),
+      );
+      await _flushEvents();
+
+      expect(
+        service.sentPayloads.any((payload) =>
+            payload['action'] == 'session_delta_get' &&
+            payload['sessionId'] == 'codex-thread:observe' &&
+            payload['reason'] == 'observe_active_session_start'),
+        isTrue,
+      );
+    });
+
+    test('summary executionActive=false 会清掉陈旧 stop 锁存', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(
+        SessionHistoryEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-latched',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_history'},
+          summary: const SessionSummary(
+            id: 'session-latched',
+            title: 'Latched',
+            ownership: 'mobilevc',
+            executionActive: true,
+            runtime: RuntimeMeta(command: 'codex', engine: 'codex'),
+          ),
+          runtimeAlive: true,
+          resumeRuntimeMeta:
+              const RuntimeMeta(command: 'codex', engine: 'codex'),
+        ),
+      );
+      await _flushEvents();
+      expect(controller.canStopCurrentRun, isTrue);
+
+      service.emit(
+        SessionDeltaEvent(
+          timestamp: _timestamp.add(const Duration(seconds: 1)),
+          sessionId: 'session-latched',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_delta'},
+          summary: const SessionSummary(
+            id: 'session-latched',
+            title: 'Latched',
+            ownership: 'mobilevc',
+            executionActive: false,
+            runtime: RuntimeMeta(command: 'codex', engine: 'codex'),
+          ),
+          runtimeAlive: false,
+          resumeRuntimeMeta:
+              const RuntimeMeta(command: 'codex', engine: 'codex'),
+        ),
+      );
+      await _flushEvents();
+
+      expect(controller.canStopCurrentRun, isFalse);
+    });
+
+    test('idle task snapshot 会清掉 executionActive stop 状态', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(
+        SessionHistoryEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-snapshot-idle',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_history'},
+          summary: const SessionSummary(
+            id: 'session-snapshot-idle',
+            title: 'Snapshot idle',
+            ownership: 'mobilevc',
+            executionActive: true,
+            runtime: RuntimeMeta(command: 'codex', engine: 'codex'),
+          ),
+          runtimeAlive: true,
+          resumeRuntimeMeta:
+              const RuntimeMeta(command: 'codex', engine: 'codex'),
+        ),
+      );
+      await _flushEvents();
+      expect(controller.canStopCurrentRun, isTrue);
+
+      service.emit(
+        TaskSnapshotEvent(
+          timestamp: _timestamp.add(const Duration(seconds: 1)),
+          sessionId: 'session-snapshot-idle',
+          runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+          raw: const {'type': 'task_snapshot'},
+          state: 'IDLE',
+          message: 'Task idle',
+          runtimeAlive: false,
+        ),
+      );
+      await _flushEvents();
+
+      expect(controller.canStopCurrentRun, isFalse);
+    });
+
     test('提交后未收到运行态时点击 stop 也会发送 stop action', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);

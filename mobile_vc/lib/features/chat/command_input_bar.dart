@@ -92,6 +92,12 @@ class _CommandInputBarState extends State<CommandInputBar> {
   DateTime? _canStopTransitionTime;
   bool _debouncedCanStop = false;
 
+  @override
+  void initState() {
+    super.initState();
+    _debouncedCanStop = widget.canStop;
+  }
+
   bool get _inputLocked =>
       widget.isExternallyLocked ||
       widget.isSessionLoading ||
