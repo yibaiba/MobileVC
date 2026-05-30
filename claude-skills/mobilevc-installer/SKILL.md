@@ -9,14 +9,14 @@ description: |
   - "把 Claude Code 装到手机" / "mobile claude code"
   - "扫码连手机" 这类与 mobilevc 关联的请求
 
-  This skill installs the published npm package `@justprove/mobilevc`, runs `mobilevc start` (which prints a LAN QR code), and points the user to https://mobilevc.top/install to grab the iOS / Android client.
+  This skill installs the published npm package `@justprove/mobilevc`, runs `mobilevc start` (which prints a LAN QR code), and points the user to https://www.mobilevc.top to install the iOS / Android client. iOS installs through the TestFlight link on the homepage; Android installs through the APK download link.
 
   Skip if the user asks to MODIFY MobileVC source code or rebuild it from scratch — this skill is a launcher, not a dev environment bootstrapper.
 ---
 
 # mobilevc-installer
 
-Install and run MobileVC for the user. The user's dev machine becomes the Claude Code backend; the phone runs the official client app and connects to it over LAN or via the public install site.
+Install and run MobileVC for the user. The user's dev machine becomes the Claude Code backend; the phone runs the official client app and connects to it over LAN or through the public Relay flow.
 
 GitHub: https://github.com/JayCRL/MobileVC
 npm:    https://www.npmjs.com/package/@justprove/mobilevc
@@ -66,6 +66,8 @@ Tell the user that `mobilevc start` will ask three questions on first run:
 
 If the user has not picked a token yet, suggest something memorable but non-trivial (e.g. `mvc-` plus 8 random chars).
 
+Important: token input is hidden in the terminal. Tell the user to type the token normally and press Enter even though no characters are shown.
+
 ### Step 4 — Start the backend
 
 ```bash
@@ -87,10 +89,11 @@ Tell the user (verbatim, in the user's preferred language):
 
 ```
 后端已启动。请在手机上：
-1. 用 Safari (iOS) / 浏览器 (Android) 打开 https://mobilevc.top/install
-2. iOS 选择「一键安装」，安装后到「设置 → VPN 与设备管理」信任证书
-3. Android 选择「下载 APK」，按系统提示允许安装
-4. 打开 MobileVC App，扫描终端里刚刚打印的二维码
+1. 打开 MobileVC 官网首页：https://www.mobilevc.top
+2. iOS 通过官网上的 TestFlight 链接安装
+3. Android 通过官网上的 APK 下载入口安装
+4. 如果官网打不开，先切换到国内网络环境后再试
+5. 打开 MobileVC App，扫描终端里刚刚打印的二维码
 ```
 
 (English variant if the user is using English.)
@@ -109,6 +112,7 @@ Tell the user the helper commands they will need later:
 - `mobilevc stop` — stop backend
 - `mobilevc restart` — restart with same config
 - `mobilevc setup` — reconfigure (port / token / language)
+- `mobilevc public --relay wss://relay.mobilevc.top:9443` — connect through the official Relay when the phone is not on the same WiFi
 
 ## Important rules
 
