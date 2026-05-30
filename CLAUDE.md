@@ -19,7 +19,7 @@ nohup ./server > server.log 2>&1 &
 
 ### Flutter 改动流程
 1. 编译检查
-2. 打包上传 iOS OTA：`source ~/.zshrc && mobilevc-ota`
+2. 打包上传 iOS OTA：调用 `/ios-ota-deploy` skill 或直接执行 `source ~/.zshrc && mobilevc-ota`
 3. 详细流程参考 memory 中的 `ios_ota_build_workflow.md`
 
 ### 改动范围原则
