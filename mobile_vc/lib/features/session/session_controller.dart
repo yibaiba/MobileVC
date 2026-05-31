@@ -4303,11 +4303,27 @@ class SessionController extends ChangeNotifier {
       _pushSystem('session', '当前会话暂不支持原生 Compact');
       return;
     }
+    final compactMeta = currentMeta.merge(
+      RuntimeMeta(
+        source: 'compact',
+        target: 'compact',
+        targetType: 'compact',
+        targetText: 'manual',
+        command: currentMeta.command.trim().isNotEmpty
+            ? currentMeta.command
+            : 'codex',
+        engine: 'codex',
+        cwd: effectiveCwd,
+        permissionMode: _config.permissionMode,
+        claudeLifecycle: 'active',
+      ),
+    );
     final sent = _service.send({
       'action': 'compact',
       'sessionId': sessionId,
+      ...compactMeta.toJson(),
       'cwd': effectiveCwd,
-      'engine': _config.engine,
+      'engine': 'codex',
       'permissionMode': _config.permissionMode,
     });
     if (!sent) {
@@ -4329,21 +4345,7 @@ class SessionController extends ChangeNotifier {
       trigger: 'manual',
       message: '',
       timestamp: DateTime.now(),
-      meta: currentMeta.merge(
-        RuntimeMeta(
-          source: 'compact',
-          target: 'compact',
-          targetType: 'compact',
-          targetText: 'manual',
-          command: currentMeta.command.trim().isNotEmpty
-              ? currentMeta.command
-              : 'codex',
-          engine: 'codex',
-          cwd: effectiveCwd,
-          permissionMode: _config.permissionMode,
-          claudeLifecycle: 'active',
-        ),
-      ),
+      meta: compactMeta,
     );
     notifyListeners();
   }

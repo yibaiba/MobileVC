@@ -281,26 +281,32 @@ func (s *Service) StopActive(sessionID string, emit func(any)) error {
 	return nil
 }
 
-func (s *Service) Compact(ctx context.Context, sessionID string, emit func(any)) error {
+func (s *Service) Compact(ctx context.Context, sessionID string, requestMeta protocol.RuntimeMeta, emit func(any)) error {
 	currentRunner, activeMeta, currentSessionID := s.manager.current()
+	snapshot := s.manager.snapshot()
+	effectiveMeta := protocol.MergeRuntimeMeta(
+		protocol.MergeRuntimeMeta(snapshot.ActiveMeta, activeMeta),
+		requestMeta,
+	)
 	if currentRunner == nil || currentSessionID == "" {
 		restartReq, err := s.buildDetachedResumeRequest(ExecuteRequest{
-			Command:        firstNonEmptyRuntimeValue(activeMeta.Command, s.manager.snapshot().ActiveMeta.Command),
-			CWD:            firstNonEmptyRuntimeValue(activeMeta.CWD, s.manager.snapshot().ActiveMeta.CWD),
+			Command:        firstNonEmptyRuntimeValue(effectiveMeta.Command, activeMeta.Command, snapshot.ActiveMeta.Command),
+			CWD:            firstNonEmptyRuntimeValue(effectiveMeta.CWD, activeMeta.CWD, snapshot.ActiveMeta.CWD),
 			Mode:           engine.ModePTY,
-			PermissionMode: firstNonEmptyRuntimeValue(activeMeta.PermissionMode, s.manager.snapshot().ActiveMeta.PermissionMode),
+			PermissionMode: firstNonEmptyRuntimeValue(effectiveMeta.PermissionMode, activeMeta.PermissionMode, snapshot.ActiveMeta.PermissionMode),
 			RuntimeMeta: protocol.RuntimeMeta{
-				Command:        firstNonEmptyRuntimeValue(activeMeta.Command, s.manager.snapshot().ActiveMeta.Command),
-				Engine:         firstNonEmptyRuntimeValue(activeMeta.Engine, s.manager.snapshot().ActiveMeta.Engine),
-				CWD:            firstNonEmptyRuntimeValue(activeMeta.CWD, s.manager.snapshot().ActiveMeta.CWD),
-				PermissionMode: firstNonEmptyRuntimeValue(activeMeta.PermissionMode, s.manager.snapshot().ActiveMeta.PermissionMode),
+				Command:        firstNonEmptyRuntimeValue(effectiveMeta.Command, activeMeta.Command, snapshot.ActiveMeta.Command),
+				Engine:         firstNonEmptyRuntimeValue(effectiveMeta.Engine, activeMeta.Engine, snapshot.ActiveMeta.Engine),
+				CWD:            firstNonEmptyRuntimeValue(effectiveMeta.CWD, activeMeta.CWD, snapshot.ActiveMeta.CWD),
+				PermissionMode: firstNonEmptyRuntimeValue(effectiveMeta.PermissionMode, activeMeta.PermissionMode, snapshot.ActiveMeta.PermissionMode),
 				ResumeSessionID: firstNonEmptyRuntimeValue(
+					effectiveMeta.ResumeSessionID,
 					activeMeta.ResumeSessionID,
-					s.manager.snapshot().ActiveMeta.ResumeSessionID,
-					s.manager.snapshot().ResumeSessionID,
+					snapshot.ActiveMeta.ResumeSessionID,
+					snapshot.ResumeSessionID,
 				),
 			},
-		}, firstNonEmptyRuntimeValue(activeMeta.PermissionMode, s.manager.snapshot().ActiveMeta.PermissionMode))
+		}, firstNonEmptyRuntimeValue(effectiveMeta.PermissionMode, activeMeta.PermissionMode, snapshot.ActiveMeta.PermissionMode))
 		if err != nil {
 			return ErrNoActiveRunner
 		}
@@ -314,6 +320,7 @@ func (s *Service) Compact(ctx context.Context, sessionID string, emit func(any))
 		if currentRunner == nil || currentSessionID == "" {
 			return ErrNoActiveRunner
 		}
+		effectiveMeta = protocol.MergeRuntimeMeta(activeMeta, requestMeta)
 	}
 	compactor, ok := currentRunner.(engine.ContextCompactor)
 	if !ok {
@@ -325,7 +332,6 @@ func (s *Service) Compact(ctx context.Context, sessionID string, emit func(any))
 		}
 		return err
 	}
-	effectiveMeta := activeMeta
 	effectiveMeta.Source = "compact"
 	effectiveMeta.Target = "compact"
 	effectiveMeta.TargetType = "compact"

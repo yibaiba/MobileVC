@@ -304,6 +304,7 @@ type CompactRequestEvent struct {
 	CWD            string `json:"cwd,omitempty"`
 	Engine         string `json:"engine,omitempty"`
 	PermissionMode string `json:"permissionMode,omitempty"`
+	RuntimeMeta
 }
 
 type SkillCatalogRequestEvent struct {

@@ -530,7 +530,7 @@ func TestCompactRestartsDetachedCodexResumeSession(t *testing.T) {
 		m.ResumeSessionID = "resume-codex-123"
 	})
 
-	err := svc.Compact(context.Background(), "s1", func(any) {})
+	err := svc.Compact(context.Background(), "s1", protocol.RuntimeMeta{}, func(any) {})
 	if !errors.Is(err, engine.ErrInputNotSupported) {
 		t.Fatalf("expected detached codex resume runner to restart into compact path and fail on missing compactor, got %v", err)
 	}
@@ -539,6 +539,48 @@ func TestCompactRestartsDetachedCodexResumeSession(t *testing.T) {
 	lower := strings.ToLower(strings.TrimSpace(resumed.lastReq.Command))
 	if !strings.HasPrefix(lower, "codex resume resume-codex-123") {
 		t.Fatalf("expected codex resume command before compact, got %q", resumed.lastReq.Command)
+	}
+}
+
+func TestCompactDetachedCodexResumePrefersRequestRuntimeMeta(t *testing.T) {
+	resumed := newResumeStubRunner("resume-request", true)
+	svc := NewService("s1", Dependencies{
+		NewExecRunner: func() engine.Runner { return newResumeStubRunner("", true) },
+		NewPtyRunner:  func() engine.Runner { return resumed },
+	})
+	svc.manager.updateResumeSessionID("resume-stale")
+	svc.manager.updateMeta(func(m *protocol.RuntimeMeta) {
+		m.Command = "codex resume resume-stale"
+		m.Engine = "codex"
+		m.CWD = "/tmp/stale"
+		m.PermissionMode = "default"
+		m.ResumeSessionID = "resume-stale"
+	})
+
+	err := svc.Compact(context.Background(), "s1", protocol.RuntimeMeta{
+		Command:         "codex -m gpt-5.5",
+		Engine:          "codex",
+		CWD:             "/tmp/request",
+		PermissionMode:  "bypassPermissions",
+		ResumeSessionID: "resume-request",
+	}, func(any) {})
+	if !errors.Is(err, engine.ErrInputNotSupported) {
+		t.Fatalf("expected detached codex resume runner to restart into compact path and fail on missing compactor, got %v", err)
+	}
+
+	waitSignal(t, resumed.started, "detached codex compact request-meta resume runner start")
+	lower := strings.ToLower(strings.TrimSpace(resumed.lastReq.Command))
+	if !strings.HasPrefix(lower, "codex resume resume-request") {
+		t.Fatalf("expected request resume id to win over stale cache, got %q", resumed.lastReq.Command)
+	}
+	if strings.Contains(lower, "resume-stale") {
+		t.Fatalf("did not expect stale resume id in command, got %q", resumed.lastReq.Command)
+	}
+	if resumed.lastReq.CWD != "/tmp/request" {
+		t.Fatalf("expected request cwd on detached compact resume, got %q", resumed.lastReq.CWD)
+	}
+	if resumed.lastReq.PermissionMode != "bypassPermissions" {
+		t.Fatalf("expected request permission mode on detached compact resume, got %q", resumed.lastReq.PermissionMode)
 	}
 }
 
@@ -570,7 +612,7 @@ func TestCompactWaitsForDetachedCodexResumeRunnerToBecomeInteractive(t *testing.
 	})
 
 	start := time.Now()
-	err := svc.Compact(context.Background(), "s1", func(any) {})
+	err := svc.Compact(context.Background(), "s1", protocol.RuntimeMeta{}, func(any) {})
 	if !errors.Is(err, engine.ErrInputNotSupported) {
 		t.Fatalf("expected detached codex resume runner to reach compactor check after interactive wait, got %v", err)
 	}

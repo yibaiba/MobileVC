@@ -1118,6 +1118,65 @@ void main() {
     });
   });
 
+  group('SessionController compact', () {
+    test('手动 Compact 会携带当前 Codex resume 元信息', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.saveConfig(const AppConfig(
+        cwd: '/workspace/MobileVC',
+        engine: 'codex',
+        permissionMode: 'bypassPermissions',
+      ));
+      await controller.connect();
+      service.emit(
+        SessionHistoryEvent(
+          timestamp: _timestamp,
+          sessionId: 'codex-thread:thread-current',
+          runtimeMeta: const RuntimeMeta(engine: 'codex'),
+          raw: const {'type': 'session_history'},
+          summary: const SessionSummary(
+            id: 'codex-thread:thread-current',
+            title: 'Codex thread',
+            runtime: RuntimeMeta(
+              engine: 'codex',
+              command: 'codex -m gpt-5.5',
+              cwd: '/workspace/MobileVC',
+              resumeSessionId: 'thread-current',
+            ),
+          ),
+          canResume: true,
+          runtimeAlive: true,
+          resumeRuntimeMeta: const RuntimeMeta(
+            engine: 'codex',
+            command: 'codex -m gpt-5.5',
+            cwd: '/workspace/MobileVC',
+            resumeSessionId: 'thread-current',
+            claudeLifecycle: 'waiting_input',
+          ),
+        ),
+      );
+      await _flushEvents();
+      service.sentPayloads.clear();
+
+      controller.compactCurrentSession();
+
+      expect(service.sentPayloads, hasLength(1));
+      final payload = service.sentPayloads.single;
+      expect(payload['action'], 'compact');
+      expect(payload['sessionId'], 'codex-thread:thread-current');
+      expect(payload['resumeSessionId'], 'thread-current');
+      expect(payload['command'], 'codex -m gpt-5.5');
+      expect(payload['engine'], 'codex');
+      expect(payload['cwd'], '/workspace/MobileVC');
+      expect(payload['permissionMode'], 'bypassPermissions');
+      expect(payload['source'], 'compact');
+      expect(payload['targetType'], 'compact');
+    });
+  });
+
   group('SessionController action needed signal', () {
     test(
         'initialize reconnects when previous page had active connection intent',

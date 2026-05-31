@@ -2834,7 +2834,12 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			if sessionRuntime != nil {
 				service.SetSink(sessionRuntime.EnsureBufferedSinkWithProcessor(emitAndPersist))
 			}
-			if err := service.Compact(ctx, targetSessionID, emitAndPersist); err != nil {
+			compactMeta := protocol.MergeRuntimeMeta(compactReq.RuntimeMeta, protocol.RuntimeMeta{
+				CWD:            compactReq.CWD,
+				Engine:         compactReq.Engine,
+				PermissionMode: compactReq.PermissionMode,
+			})
+			if err := service.Compact(ctx, targetSessionID, compactMeta, emitAndPersist); err != nil {
 				logx.Error("ws", "handle compact failed: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, targetSessionID, remoteAddr, err)
 				emit(protocol.NewCompactResultEvent(targetSessionID, false, err.Error()))
 				continue
