@@ -3740,6 +3740,80 @@ void main() {
       );
     });
 
+    test('Codex 目标模式关闭时不带目标上下文', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+      await controller.saveConfig(
+        controller.config.copyWith(
+          engine: 'codex',
+          codexTargetMode: false,
+        ),
+      );
+
+      await controller.connect();
+      service.emit(
+        FileDiffEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-1',
+          runtimeMeta: const RuntimeMeta(
+            command: 'codex',
+            engine: 'codex',
+            targetPath: '/workspace/lib/main.dart',
+          ),
+          raw: const {'type': 'file_diff'},
+          path: '/workspace/lib/main.dart',
+          title: 'main.dart',
+          diff: '@@ -1 +1 @@\n-old\n+new',
+          lang: 'dart',
+        ),
+      );
+      await _flushEvents();
+
+      service.sentPayloads.clear();
+      controller.sendInputText('codex fix it');
+
+      expect(service.sentPayloads[0]['action'], 'ai_turn');
+      expect(service.sentPayloads[0]['engine'], 'codex');
+      expect(service.sentPayloads[0].containsKey('targetPath'), isFalse);
+      expect(service.sentPayloads[0].containsKey('targetDiff'), isFalse);
+    });
+
+    test('Codex 目标模式开启时带目标上下文', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+      await controller.saveConfig(
+        controller.config.copyWith(
+          engine: 'codex',
+          codexTargetMode: true,
+        ),
+      );
+
+      await controller.connect();
+      service.emit(
+        FileDiffEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-1',
+          runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+          raw: const {'type': 'file_diff'},
+          path: '/workspace/lib/main.dart',
+          title: 'main.dart',
+          diff: '@@ -1 +1 @@\n-old\n+new',
+          lang: 'dart',
+        ),
+      );
+      await _flushEvents();
+
+      service.sentPayloads.clear();
+      controller.sendInputText('codex fix it');
+
+      expect(service.sentPayloads[0]['targetPath'], '/workspace/lib/main.dart');
+      expect(service.sentPayloads[0]['targetDiff'], contains('-old'));
+    });
+
     test('sendInputText 在 Claude 模式下继续普通文本时走 ai_turn', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);

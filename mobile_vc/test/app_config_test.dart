@@ -643,11 +643,15 @@ void main() {
       const config = AppConfig(
         engine: 'codex',
         codexSandboxMode: 'danger-full-access',
+        codexTargetMode: true,
+        permissionMode: 'config',
       );
 
       final restored = AppConfig.fromJson(config.toJson());
 
       expect(restored.codexSandboxMode, 'danger-full-access');
+      expect(restored.codexTargetMode, isTrue);
+      expect(restored.permissionMode, 'config');
     });
 
     test('launch uri overrides saved cwd token host and port', () {

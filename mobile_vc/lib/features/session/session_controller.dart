@@ -818,6 +818,7 @@ class SessionController extends ChangeNotifier {
   AppNotificationSignal? get notificationSignal => _notificationSignal;
   CompactFeedbackSignal? get compactFeedbackSignal => _compactFeedbackSignal;
   bool get fastMode => _config.fastMode;
+  bool get codexTargetMode => _config.codexTargetMode;
   String get displayPermissionMode => _normalizeDisplayPermissionMode(
         _config.permissionMode.isNotEmpty
             ? _config.permissionMode
@@ -2104,6 +2105,14 @@ class SessionController extends ChangeNotifier {
     }
     if (normalizedEngine == 'codex') {
       payload['codexSandboxMode'] = _config.codexSandboxMode;
+      if (!_config.codexTargetMode) {
+        payload.remove('target');
+        payload.remove('targetType');
+        payload.remove('targetPath');
+        payload.remove('targetText');
+        payload.remove('targetTitle');
+        payload.remove('targetDiff');
+      }
     } else {
       payload.remove('codexSandboxMode');
     }
@@ -3197,6 +3206,15 @@ class SessionController extends ChangeNotifier {
         'Permission mode 已切换为 ${_permissionModeLabel(normalizedMode)}，将对下一次交互生效');
     _syncDerivedState();
     _runtimePermissionMode = normalizedMode;
+    notifyListeners();
+  }
+
+  void updateCodexTargetMode(bool enabled) {
+    if (_config.codexTargetMode == enabled) {
+      return;
+    }
+    _config = _config.copyWith(codexTargetMode: enabled);
+    unawaited(_persistCurrentConfig());
     notifyListeners();
   }
 
@@ -10013,6 +10031,8 @@ class SessionController extends ChangeNotifier {
     switch (permissionMode.trim()) {
       case 'bypassPermissions':
         return '跳过权限确认';
+      case 'config':
+        return '自定义(config.toml)';
       case 'default':
         return '手动审核';
       case 'auto':
@@ -10026,6 +10046,8 @@ class SessionController extends ChangeNotifier {
     switch (permissionMode.trim()) {
       case 'bypassPermissions':
         return 'bypassPermissions';
+      case 'config':
+        return 'config';
       case 'default':
         return 'default';
       default:

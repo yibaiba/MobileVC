@@ -29,6 +29,8 @@ class CommandInputBar extends StatefulWidget {
     required this.onOpenPermissions,
     required this.onOpenModels,
     required this.onPermissionModeChanged,
+    required this.codexTargetMode,
+    required this.onCodexTargetModeChanged,
     required this.showClaudeMode,
     required this.currentEngine,
     required this.modelSummary,
@@ -66,6 +68,8 @@ class CommandInputBar extends StatefulWidget {
   final VoidCallback onOpenPermissions;
   final VoidCallback onOpenModels;
   final ValueChanged<String> onPermissionModeChanged;
+  final bool codexTargetMode;
+  final ValueChanged<bool> onCodexTargetModeChanged;
   final bool showClaudeMode;
   final String currentEngine;
   final String modelSummary;
@@ -239,6 +243,7 @@ class _CommandInputBarState extends State<CommandInputBar> {
     final scheme = Theme.of(context).colorScheme;
     final engineLabel =
         _engineLabel(widget.currentEngine, widget.showClaudeMode);
+    final isCodex = widget.currentEngine.trim().toLowerCase() == 'codex';
     final compactChipLabel = widget.isCompacting
         ? (widget.compactStatusLabel.trim().isEmpty
             ? '压缩中'
@@ -367,20 +372,39 @@ class _CommandInputBarState extends State<CommandInputBar> {
                             style: theme.textTheme.bodySmall?.copyWith(
                               fontWeight: FontWeight.w600,
                             ),
-                            items: const [
-                              DropdownMenuItem(
-                                value: 'auto',
-                                child: Text('自动模式'),
-                              ),
-                              DropdownMenuItem(
-                                value: 'default',
-                                child: Text('手动审核'),
-                              ),
-                              DropdownMenuItem(
-                                value: 'bypassPermissions',
-                                child: Text('跳过权限确认'),
-                              ),
-                            ],
+                            items: isCodex
+                                ? const [
+                                    DropdownMenuItem(
+                                      value: 'default',
+                                      child: Text('默认权限'),
+                                    ),
+                                    DropdownMenuItem(
+                                      value: 'auto',
+                                      child: Text('自动审查'),
+                                    ),
+                                    DropdownMenuItem(
+                                      value: 'bypassPermissions',
+                                      child: Text('完全访问权限'),
+                                    ),
+                                    DropdownMenuItem(
+                                      value: 'config',
+                                      child: Text('自定义(config.toml)'),
+                                    ),
+                                  ]
+                                : const [
+                                    DropdownMenuItem(
+                                      value: 'auto',
+                                      child: Text('自动模式'),
+                                    ),
+                                    DropdownMenuItem(
+                                      value: 'default',
+                                      child: Text('手动审核'),
+                                    ),
+                                    DropdownMenuItem(
+                                      value: 'bypassPermissions',
+                                      child: Text('跳过权限确认'),
+                                    ),
+                                  ],
                             onChanged: (value) {
                               if (value != null) {
                                 widget.onPermissionModeChanged(value);
@@ -390,6 +414,13 @@ class _CommandInputBarState extends State<CommandInputBar> {
                         ),
                       ),
                     ),
+                    if (isCodex) ...[
+                      const SizedBox(width: 8),
+                      _TargetModeSwitch(
+                        enabled: widget.codexTargetMode,
+                        onChanged: widget.onCodexTargetModeChanged,
+                      ),
+                    ],
                   ],
                 ),
               ),
@@ -853,6 +884,56 @@ class _ToolChip extends StatelessWidget {
               ),
             ],
           ),
+        ),
+      ),
+    );
+  }
+}
+
+class _TargetModeSwitch extends StatelessWidget {
+  const _TargetModeSwitch({
+    required this.enabled,
+    required this.onChanged,
+  });
+
+  final bool enabled;
+  final ValueChanged<bool> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: scheme.surfaceContainerHigh.withValues(alpha: 0.82),
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(
+          color: scheme.outlineVariant.withValues(alpha: 0.38),
+        ),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.only(left: 10, right: 4),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              Icons.track_changes_outlined,
+              size: 16,
+              color: scheme.onSurfaceVariant,
+            ),
+            const SizedBox(width: 6),
+            Text(
+              '请求目标',
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    fontWeight: FontWeight.w600,
+                    color: scheme.onSurface,
+                  ),
+            ),
+            Switch.adaptive(
+              value: enabled,
+              onChanged: onChanged,
+              materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            ),
+          ],
         ),
       ),
     );

@@ -122,6 +122,8 @@ String _permissionModeLabel(String permissionMode) {
   switch (permissionMode.trim()) {
     case 'bypassPermissions':
       return '跳过权限确认';
+    case 'config':
+      return '自定义(config.toml)';
     case 'auto':
     case 'acceptEdits':
     case 'default':

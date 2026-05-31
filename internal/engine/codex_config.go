@@ -11,6 +11,8 @@ import (
 type codexConfigDefaults struct {
 	model           string
 	reasoningEffort string
+	approvalPolicy  string
+	sandboxMode     string
 }
 
 func loadCodexConfigDefaults() (codexConfigDefaults, error) {
@@ -69,6 +71,10 @@ func readCodexConfigDefaults(path string) (codexConfigDefaults, error) {
 			defaults.model = value
 		case "model_reasoning_effort":
 			defaults.reasoningEffort = strings.ToLower(value)
+		case "approval_policy":
+			defaults.approvalPolicy = value
+		case "sandbox_mode":
+			defaults.sandboxMode = value
 		}
 	}
 	if err := scanner.Err(); err != nil {

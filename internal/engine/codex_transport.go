@@ -292,13 +292,13 @@ func (s *codexAppSession) startOrResumeThread(ctx context.Context, resumeSession
 		params = map[string]any{"threadId": resumeSessionID}
 	} else {
 		method = "thread/start"
-		sandbox, err := normalizeCodexSandboxMode(s.req.RuntimeMeta.CodexSandboxMode)
+		sandbox, err := normalizeCodexSandboxMode(s.req.RuntimeMeta.CodexSandboxMode, s.defaults)
 		if err != nil {
 			return err
 		}
 		params = map[string]any{
 			"cwd":                   s.cwd,
-			"approvalPolicy":        codexApprovalPolicy(s.runner.currentPermissionMode()),
+			"approvalPolicy":        codexApprovalPolicy(s.runner.currentPermissionMode(), s.defaults),
 			"approvalsReviewer":     "user",
 			"sandbox":               sandbox,
 			"serviceName":           "MobileVC",
@@ -355,7 +355,7 @@ func (s *codexAppSession) SendUserInput(ctx context.Context, data []byte) error 
 	params := map[string]any{
 		"threadId":       threadID,
 		"input":          input,
-		"approvalPolicy": codexApprovalPolicy(s.runner.currentPermissionMode()),
+		"approvalPolicy": codexApprovalPolicy(s.runner.currentPermissionMode(), s.defaults),
 	}
 	if model := extractCodexModelFlag(s.req.Command); model != "" {
 		params["model"] = model
@@ -1406,7 +1406,7 @@ func codexDrainAssistantChunks(buffer *strings.Builder, flushAll bool) []string 
 	return emitted
 }
 
-func codexApprovalPolicy(permissionMode string) string {
+func codexApprovalPolicy(permissionMode string, defaults codexConfigDefaults) string {
 	// Codex 默认必须走 on-request，避免文件修改或命令执行在未显式授权时直接放行。
 	// 只有用户显式配置 bypassPermissions 时，才允许完全跳过审批。
 	// 如果线上看起来“Codex 文件修改不需要授权”，更可能是该改动没有走
@@ -1414,12 +1414,17 @@ func codexApprovalPolicy(permissionMode string) string {
 	switch strings.TrimSpace(permissionMode) {
 	case "bypassPermissions":
 		return "never"
+	case "config":
+		if policy := strings.TrimSpace(defaults.approvalPolicy); policy != "" {
+			return policy
+		}
+		return "on-request"
 	default:
 		return "on-request"
 	}
 }
 
-func normalizeCodexSandboxMode(value string) (string, error) {
+func normalizeCodexSandboxMode(value string, defaults codexConfigDefaults) (string, error) {
 	switch strings.TrimSpace(value) {
 	case "", "workspace-write":
 		return "workspace-write", nil
@@ -1427,6 +1432,11 @@ func normalizeCodexSandboxMode(value string) (string, error) {
 		return "read-only", nil
 	case "danger-full-access":
 		return "danger-full-access", nil
+	case "config":
+		if mode := strings.TrimSpace(defaults.sandboxMode); mode != "" {
+			return normalizeCodexSandboxMode(mode, codexConfigDefaults{})
+		}
+		return "workspace-write", nil
 	default:
 		return "", fmt.Errorf("invalid Codex sandbox mode: %s", value)
 	}

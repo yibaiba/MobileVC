@@ -23,6 +23,7 @@ class AppConfig {
     this.codexModel = '',
     this.codexReasoningEffort = '',
     this.codexSandboxMode = 'workspace-write',
+    this.codexTargetMode = false,
     this.permissionMode = 'auto',
     this.fastMode = false,
     this.adbIceServersJson = '',
@@ -49,6 +50,7 @@ class AppConfig {
   final String codexModel;
   final String codexReasoningEffort;
   final String codexSandboxMode;
+  final bool codexTargetMode;
   final String permissionMode;
   final bool fastMode;
   final String adbIceServersJson;
@@ -134,6 +136,7 @@ class AppConfig {
     String? codexModel,
     String? codexReasoningEffort,
     String? codexSandboxMode,
+    bool? codexTargetMode,
     String? permissionMode,
     bool? fastMode,
     String? adbIceServersJson,
@@ -177,6 +180,7 @@ class AppConfig {
       codexReasoningEffort: nextModels.codexReasoningEffort,
       codexSandboxMode:
           normalizeCodexSandboxMode(codexSandboxMode ?? this.codexSandboxMode),
+      codexTargetMode: codexTargetMode ?? this.codexTargetMode,
       permissionMode: _normalizePermissionMode(
         permissionMode ?? this.permissionMode,
       ),
@@ -251,6 +255,7 @@ class AppConfig {
         'codexModel': codexModel,
         'codexReasoningEffort': codexReasoningEffort,
         'codexSandboxMode': codexSandboxMode,
+        'codexTargetMode': codexTargetMode,
         'permissionMode': permissionMode,
         'fastMode': fastMode,
         'adbIceServersJson': adbIceServersJson,
@@ -297,6 +302,7 @@ class AppConfig {
       codexSandboxMode: normalizeCodexSandboxMode(
         (json['codexSandboxMode'] ?? 'workspace-write').toString(),
       ),
+      codexTargetMode: json['codexTargetMode'] == true,
       permissionMode: _normalizePermissionMode(
         (json['permissionMode'] ?? 'auto').toString(),
       ),
@@ -323,9 +329,15 @@ class AppConfig {
   }
 
   static String _normalizePermissionMode(String value) {
+    return normalizePermissionModeForDisplay(value);
+  }
+
+  static String normalizePermissionModeForDisplay(String value) {
     switch (value.trim()) {
       case 'bypassPermissions':
         return 'bypassPermissions';
+      case 'config':
+        return 'config';
       case 'default':
         return 'default';
       default:
@@ -339,6 +351,8 @@ class AppConfig {
         return 'read-only';
       case 'danger-full-access':
         return 'danger-full-access';
+      case 'config':
+        return 'config';
       case 'workspace-write':
       default:
         return 'workspace-write';

@@ -13,6 +13,8 @@ func TestLoadCodexConfigDefaultsReadsCodexHome(t *testing.T) {
 	config := `model_provider = "custom"
 model = "gpt-5.5"
 model_reasoning_effort = "xhigh"
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
 
 [features]
 model = "ignored"
@@ -30,6 +32,12 @@ model = "ignored"
 	}
 	if defaults.reasoningEffort != "xhigh" {
 		t.Fatalf("expected reasoning effort default, got %q", defaults.reasoningEffort)
+	}
+	if defaults.approvalPolicy != "never" {
+		t.Fatalf("expected approval policy default, got %q", defaults.approvalPolicy)
+	}
+	if defaults.sandboxMode != "danger-full-access" {
+		t.Fatalf("expected sandbox mode default, got %q", defaults.sandboxMode)
 	}
 }
 
@@ -57,7 +65,7 @@ func TestParseCodexConfigAssignmentIgnoresCommentsInQuotes(t *testing.T) {
 
 func TestNormalizeCodexSandboxMode(t *testing.T) {
 	for _, mode := range []string{"", "workspace-write", "read-only", "danger-full-access"} {
-		got, err := normalizeCodexSandboxMode(mode)
+		got, err := normalizeCodexSandboxMode(mode, codexConfigDefaults{})
 		if err != nil {
 			t.Fatalf("normalize sandbox %q: %v", mode, err)
 		}
@@ -74,7 +82,24 @@ func TestNormalizeCodexSandboxMode(t *testing.T) {
 }
 
 func TestNormalizeCodexSandboxModeRejectsInvalidValue(t *testing.T) {
-	if _, err := normalizeCodexSandboxMode("full"); err == nil {
+	if _, err := normalizeCodexSandboxMode("full", codexConfigDefaults{}); err == nil {
 		t.Fatal("expected invalid sandbox mode to fail")
+	}
+}
+
+func TestCodexConfigPermissionAndSandboxModesUseConfigDefaults(t *testing.T) {
+	defaults := codexConfigDefaults{
+		approvalPolicy: "never",
+		sandboxMode:    "danger-full-access",
+	}
+	if got := codexApprovalPolicy("config", defaults); got != "never" {
+		t.Fatalf("expected config approval policy, got %q", got)
+	}
+	gotSandbox, err := normalizeCodexSandboxMode("config", defaults)
+	if err != nil {
+		t.Fatalf("normalize config sandbox: %v", err)
+	}
+	if gotSandbox != "danger-full-access" {
+		t.Fatalf("expected config sandbox mode, got %q", gotSandbox)
 	}
 }

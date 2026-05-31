@@ -528,6 +528,8 @@ class _SessionHomePageState extends State<SessionHomePage> {
       onOpenPermissions: () => _openPermissions(context),
       onOpenModels: () => _openModelSwitcher(context),
       onPermissionModeChanged: controller.updatePermissionMode,
+      codexTargetMode: controller.codexTargetMode,
+      onCodexTargetModeChanged: controller.updateCodexTargetMode,
       showClaudeMode: controller.shouldShowClaudeMode,
       currentEngine: controller.commandBarEngine,
       modelSummary: controller.commandBarModelSummary,
@@ -668,6 +670,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
         ? 'claude'
         : controller.config.engine.trim();
     var selectedCodexSandboxMode = controller.config.codexSandboxMode;
+    var selectedCodexTargetMode = controller.config.codexTargetMode;
     var pendingConfig = controller.config;
     var connectingFromSheet = false;
 
@@ -713,6 +716,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
                   ? selectedEngine
                   : scanned.engine.trim();
               selectedCodexSandboxMode = scanned.codexSandboxMode;
+              selectedCodexTargetMode = scanned.codexTargetMode;
               scanHint = scanned.connectionMode != ConnectionMode.direct.name
                   ? '已导入 Relay 配对，点击连接完成配对'
                   : '已回填 ${scanned.displayHost}:${scanned.port}${scanned.token.isNotEmpty ? ' 与 token' : ''}';
@@ -735,6 +739,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
                     cwd: cwdController.text.trim(),
                     engine: selectedEngine,
                     codexSandboxMode: selectedCodexSandboxMode,
+                    codexTargetMode: selectedCodexTargetMode,
                     permissionMode: permissionController.text.trim(),
                     fastMode: controller.fastMode,
                     adbIceServersJson: encodedIceConfig(),
@@ -844,6 +849,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
                 cwd: cwdController.text.trim(),
                 engine: selectedEngine,
                 codexSandboxMode: selectedCodexSandboxMode,
+                codexTargetMode: selectedCodexTargetMode,
                 permissionMode: permissionController.text.trim(),
                 fastMode: controller.fastMode,
                 adbIceServersJson: encodedIceConfig(),
@@ -1167,15 +1173,19 @@ class _SessionHomePageState extends State<SessionHomePage> {
                               items: const [
                                 DropdownMenuItem(
                                   value: 'workspace-write',
-                                  child: Text('Workspace Write'),
+                                  child: Text('工作区写入'),
                                 ),
                                 DropdownMenuItem(
                                   value: 'danger-full-access',
-                                  child: Text('Danger Full Access'),
+                                  child: Text('完全访问权限'),
                                 ),
                                 DropdownMenuItem(
                                   value: 'read-only',
-                                  child: Text('Read Only'),
+                                  child: Text('只读'),
+                                ),
+                                DropdownMenuItem(
+                                  value: 'config',
+                                  child: Text('自定义(config.toml)'),
                                 ),
                               ],
                               onChanged: connectionBusy
@@ -1192,13 +1202,68 @@ class _SessionHomePageState extends State<SessionHomePage> {
                                       });
                                     },
                             ),
+                            const SizedBox(height: 10),
+                            SwitchListTile.adaptive(
+                              contentPadding: EdgeInsets.zero,
+                              secondary:
+                                  const Icon(Icons.track_changes_outlined),
+                              title: const Text('请求目标'),
+                              subtitle:
+                                  const Text('开启后 Codex 请求会携带当前文件或 diff 目标上下文'),
+                              value: selectedCodexTargetMode,
+                              onChanged: connectionBusy
+                                  ? null
+                                  : (value) {
+                                      setSheetState(() {
+                                        selectedCodexTargetMode = value;
+                                      });
+                                    },
+                            ),
                           ],
                           const SizedBox(height: 10),
-                          TextField(
+                          if (selectedEngine.trim().toLowerCase() == 'codex')
+                            DropdownButtonFormField<String>(
+                              initialValue:
+                                  AppConfig.normalizePermissionModeForDisplay(
+                                permissionController.text,
+                              ),
+                              decoration: const InputDecoration(
+                                labelText: 'Codex 权限',
+                              ),
+                              items: const [
+                                DropdownMenuItem(
+                                  value: 'default',
+                                  child: Text('默认权限'),
+                                ),
+                                DropdownMenuItem(
+                                  value: 'auto',
+                                  child: Text('自动审查'),
+                                ),
+                                DropdownMenuItem(
+                                  value: 'bypassPermissions',
+                                  child: Text('完全访问权限'),
+                                ),
+                                DropdownMenuItem(
+                                  value: 'config',
+                                  child: Text('自定义(config.toml)'),
+                                ),
+                              ],
+                              onChanged: connectionBusy
+                                  ? null
+                                  : (value) {
+                                      if (value == null) {
+                                        return;
+                                      }
+                                      permissionController.text = value;
+                                    },
+                            )
+                          else
+                            TextField(
                               controller: permissionController,
                               enabled: !connectionBusy,
                               decoration: const InputDecoration(
-                                  labelText: 'Permission Mode')),
+                                  labelText: 'Permission Mode'),
+                            ),
                         ],
                       ),
                     ),

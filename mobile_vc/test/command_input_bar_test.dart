@@ -84,6 +84,33 @@ void main() {
       expect(field.decoration?.hintText, '回复 Claude');
     });
 
+    testWidgets('Codex 模式显示 Codex 权限文案和请求目标开关', (tester) async {
+      var targetMode = false;
+      await tester.pumpWidget(
+        _buildTestApp(
+          showClaudeMode: true,
+          currentEngine: 'codex',
+          codexTargetMode: targetMode,
+          onCodexTargetModeChanged: (value) => targetMode = value,
+        ),
+      );
+
+      expect(find.text('请求目标'), findsOneWidget);
+      await tester.tap(find.byType(DropdownButton<String>));
+      await tester.pumpAndSettle();
+
+      expect(find.text('默认权限'), findsAtLeastNWidgets(1));
+      expect(find.text('自动审查'), findsOneWidget);
+      expect(find.text('完全访问权限'), findsOneWidget);
+      expect(find.text('自定义(config.toml)'), findsOneWidget);
+
+      await tester.tap(find.text('自动审查'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byType(Switch).first);
+      await tester.pump();
+      expect(targetMode, isTrue);
+    });
+
     testWidgets('canStop 为 true 时优先显示停止按钮', (tester) async {
       var submitted = false;
       var stopped = false;
@@ -505,6 +532,8 @@ Widget _buildTestApp({
   bool canStop = false,
   bool showClaudeMode = true,
   String currentEngine = 'claude',
+  bool codexTargetMode = false,
+  ValueChanged<bool>? onCodexTargetModeChanged,
   bool isSessionLoading = false,
   ContextWindowUsage contextWindowUsage = const ContextWindowUsage(),
   void Function(String text, List<ChatImageAttachment> imageAttachments)?
@@ -545,6 +574,8 @@ Widget _buildTestApp({
           onOpenPermissions: () {},
           onOpenModels: () {},
           onPermissionModeChanged: (_) {},
+          codexTargetMode: codexTargetMode,
+          onCodexTargetModeChanged: onCodexTargetModeChanged ?? (_) {},
           showClaudeMode: showClaudeMode,
           currentEngine: currentEngine,
           modelSummary: 'Sonnet',
