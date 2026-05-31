@@ -233,7 +233,7 @@ void main() {
     );
     await _pumpFrames(tester);
 
-    await _tapCommandBarModel(tester, '模型 · Default · HIGH');
+    await _tapCommandBarModel(tester, '模型 · Default · config.toml');
     await _pumpFrames(tester);
 
     expect(controller.catalogRequestCount, 1);

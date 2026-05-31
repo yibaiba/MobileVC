@@ -10162,7 +10162,15 @@ class SessionController extends ChangeNotifier {
       case 'codex':
         final label =
             model.trim().isEmpty ? 'Default' : _codexModelDisplayLabel(model);
-        return '$label · ${_resolvedDisplayAiReasoningEffort('codex', model, reasoningEffort).toUpperCase()}';
+        final effortLabel = _resolvedDisplayAiReasoningEffort(
+          'codex',
+          model,
+          reasoningEffort,
+        );
+        if (effortLabel.isEmpty) {
+          return '$label · config.toml';
+        }
+        return '$label · ${effortLabel.toUpperCase()}';
       case 'claude':
         return _claudeModelLabel(model);
       case 'gemini':
@@ -10186,7 +10194,7 @@ class SessionController extends ChangeNotifier {
     }
     final normalizedModel = model.trim().toLowerCase();
     if (normalizedModel.isEmpty || normalizedModel == 'default') {
-      return _preferredCodexReasoningEffortForModel('', fallback: '');
+      return '';
     }
     return _resolvedAiReasoningEffort(
       engine,
@@ -10201,10 +10209,11 @@ class SessionController extends ChangeNotifier {
   }) {
     final normalizedFallback =
         _normalizeCodexReasoningEffort(fallback.trim().toLowerCase());
-    final entry = _findCodexModelCatalogEntry(model) ??
-        (model.trim().isEmpty || model.trim().toLowerCase() == 'default'
-            ? _defaultCodexModelCatalogEntry()
-            : null);
+    final normalizedModel = model.trim().toLowerCase();
+    if (normalizedModel.isEmpty || normalizedModel == 'default') {
+      return normalizedFallback;
+    }
+    final entry = _findCodexModelCatalogEntry(model);
     if (entry == null) {
       return normalizedFallback.isNotEmpty ? normalizedFallback : 'medium';
     }
@@ -10223,15 +10232,6 @@ class SessionController extends ChangeNotifier {
       return supported.first;
     }
     return normalizedFallback.isNotEmpty ? normalizedFallback : 'medium';
-  }
-
-  CodexModelCatalogEntry? _defaultCodexModelCatalogEntry() {
-    for (final entry in codexModelCatalog) {
-      if (entry.isDefault) {
-        return entry;
-      }
-    }
-    return codexModelCatalog.isNotEmpty ? codexModelCatalog.first : null;
   }
 
   String _parentDirectory(String path) {

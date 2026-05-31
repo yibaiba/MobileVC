@@ -2312,6 +2312,10 @@ class _ModelSwitcherSheetState extends State<_ModelSwitcherSheet> {
         final isCodex = engine == 'codex';
         final isClaude = engine == 'claude';
         final supportsModels = isClaude || isCodex;
+        final selectedCodexDefault = isCodex && selectedModel.trim().isEmpty;
+        final selectedCodexModelLabel = selectedCodexDefault
+            ? 'Default'
+            : controller.codexModelDisplayLabel(selectedModel);
 
         // 判断是否加载失败
         final modelOptions = isCodex
@@ -2469,10 +2473,7 @@ class _ModelSwitcherSheetState extends State<_ModelSwitcherSheet> {
                                                   CrossAxisAlignment.start,
                                               children: [
                                                 Text(
-                                                  controller
-                                                      .codexModelDisplayLabel(
-                                                    selectedModel,
-                                                  ),
+                                                  selectedCodexModelLabel,
                                                   style: theme
                                                       .textTheme.titleMedium
                                                       ?.copyWith(
@@ -2490,7 +2491,9 @@ class _ModelSwitcherSheetState extends State<_ModelSwitcherSheet> {
                                                           true
                                                       ? selectedCatalogEntry!
                                                           .description
-                                                      : '当前选择的 Codex 模型',
+                                                      : selectedCodexDefault
+                                                          ? '模型和推理强度将跟随 Codex config.toml'
+                                                          : '当前选择的 Codex 模型',
                                                   style: theme
                                                       .textTheme.bodySmall
                                                       ?.copyWith(
@@ -2536,8 +2539,8 @@ class _ModelSwitcherSheetState extends State<_ModelSwitcherSheet> {
                                             )
                                           else ...[
                                             Text(
-                                              selectedModel.trim().isEmpty
-                                                  ? '先选择一个 Codex 模型。'
+                                              selectedCodexDefault
+                                                  ? '模型和推理强度将跟随 Codex config.toml；MobileVC 不会下发 model_reasoning_effort 覆盖。'
                                                   : '当前保存的模型不在 Codex 原生目录中，因此这里只保留已保存强度，不展示额外原生选项。',
                                               style: theme.textTheme.bodySmall
                                                   ?.copyWith(
@@ -2545,7 +2548,14 @@ class _ModelSwitcherSheetState extends State<_ModelSwitcherSheet> {
                                                     .onSurfaceVariant,
                                               ),
                                             ),
-                                            if (selectedEffort
+                                            if (selectedCodexDefault) ...[
+                                              const SizedBox(height: 8),
+                                              const ChoiceChip(
+                                                label: Text('跟随 config.toml'),
+                                                selected: true,
+                                                onSelected: null,
+                                              ),
+                                            ] else if (selectedEffort
                                                 .trim()
                                                 .isNotEmpty) ...[
                                               const SizedBox(height: 8),
@@ -2694,18 +2704,24 @@ class _ModelSwitcherSheetState extends State<_ModelSwitcherSheet> {
                                                                   .isEmpty),
                                                   onTap: () {
                                                     setState(() {
-                                                      selectedModel =
+                                                      final isDefaultOption =
                                                           option.value ==
-                                                                  'default'
+                                                              'default';
+                                                      selectedModel =
+                                                          isDefaultOption
                                                               ? ''
                                                               : option.value;
                                                       if (isCodex) {
-                                                        selectedEffort = controller
-                                                            .preferredCodexReasoningEffortForModel(
-                                                          option.value,
-                                                          fallback:
-                                                              selectedEffort,
-                                                        );
+                                                        selectedEffort =
+                                                            isDefaultOption
+                                                                ? ''
+                                                                : controller
+                                                                    .preferredCodexReasoningEffortForModel(
+                                                                    option
+                                                                        .value,
+                                                                    fallback:
+                                                                        selectedEffort,
+                                                                  );
                                                         sheetStep =
                                                             _ModelSwitcherStep
                                                                 .effort;

@@ -3330,6 +3330,43 @@ void main() {
       expect(controller.commandBarModelSummary, 'gpt-5.5 · HIGH');
     });
 
+    test('Codex Default 模型跟随 config.toml 且不下发推理强度覆盖', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.saveConfig(
+        const AppConfig(
+          engine: 'codex',
+          codexModel: 'gpt-5.5',
+          codexReasoningEffort: 'high',
+        ),
+      );
+      await controller.connect();
+
+      await controller.updateAiModelSelection(
+        model: '',
+        reasoningEffort: '',
+        engine: 'codex',
+      );
+
+      expect(controller.config.codexModel, isEmpty);
+      expect(controller.config.codexReasoningEffort, isEmpty);
+      expect(controller.commandBarModelSummary, 'Default · config.toml');
+
+      service.sentPayloads.clear();
+      controller.sendInputText('codex');
+
+      expect(service.sentPayloads.single['action'], 'ai_turn');
+      expect(service.sentPayloads.single['engine'], 'codex');
+      expect(service.sentPayloads.single['model'], 'default');
+      expect(
+        service.sentPayloads.single.containsKey('reasoningEffort'),
+        isFalse,
+      );
+    });
+
     test('Codex 启动时不会把残留的 Claude 模型配置发给后端', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);
@@ -3593,14 +3630,14 @@ void main() {
           '',
           fallback: '',
         ),
-        'high',
+        '',
       );
       await controller.saveConfig(
         controller.config.copyWith(engine: 'codex'),
       );
       expect(controller.configuredAiModel, isEmpty);
-      expect(controller.configuredAiReasoningEffort, 'high');
-      expect(controller.commandBarModelSummary, 'Default · HIGH');
+      expect(controller.configuredAiReasoningEffort, isEmpty);
+      expect(controller.commandBarModelSummary, 'Default · config.toml');
     });
 
     test('手动应用 Codex 配置后不会被旧运行时模型回填覆盖', () async {
