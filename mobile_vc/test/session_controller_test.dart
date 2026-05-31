@@ -3483,6 +3483,22 @@ void main() {
       expect(service.sentPayloads.first['query'], 'codex_models');
     });
 
+    test('请求 Voice API 配置候选会发送 voice_api_configs 查询', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+      await controller.connect();
+      service.sentPayloads.clear();
+
+      controller.requestVoiceApiConfigCandidates();
+
+      expect(controller.voiceApiConfigLoading, isTrue);
+      expect(service.sentPayloads, hasLength(1));
+      expect(service.sentPayloads.first['action'], 'runtime_info');
+      expect(service.sentPayloads.first['query'], 'voice_api_configs');
+    });
+
     test('codex_models 结果会填充动态 Codex 模型目录且不覆盖普通 runtime info', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);
@@ -3601,6 +3617,72 @@ void main() {
       expect(controller.configuredAiModel, isEmpty);
       expect(controller.configuredAiReasoningEffort, 'high');
       expect(controller.commandBarModelSummary, 'Default · HIGH');
+    });
+
+    test('voice_api_configs 结果会填充候选项且不覆盖普通 runtime info', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+      await controller.connect();
+
+      service.emit(
+        RuntimeInfoResultEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-1',
+          runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+          raw: const {'type': 'runtime_info_result'},
+          query: 'context',
+          items: const [
+            RuntimeInfoItem(
+              label: 'cwd',
+              value: '.',
+              available: true,
+            ),
+          ],
+        ),
+      );
+      await _flushEvents();
+      expect(controller.runtimeInfo?.query, 'context');
+
+      service.emit(
+        RuntimeInfoResultEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-1',
+          runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+          raw: const {'type': 'runtime_info_result'},
+          query: 'voice_api_configs',
+          message: '已读取 1 个可同步 Voice API 配置。',
+          items: const [
+            RuntimeInfoItem(
+              label: 'Codex',
+              value: 'gpt-5.5 · responses',
+              status: 'ready',
+              available: true,
+              detail: '来自 ~/.codex/config.toml 和 ~/.codex/auth.json',
+              meta: {
+                'provider': 'codex',
+                'apiUrl': 'https://api.example.test/v1/responses',
+                'apiKey': 'codex-key',
+                'modelName': 'gpt-5.5',
+                'endpointType': 'responses',
+              },
+            ),
+          ],
+        ),
+      );
+      await _flushEvents();
+
+      expect(controller.voiceApiConfigLoading, isFalse);
+      expect(controller.voiceApiConfigMessage, '已读取 1 个可同步 Voice API 配置。');
+      expect(controller.runtimeInfo?.query, 'context');
+      expect(controller.voiceApiConfigCandidates, hasLength(1));
+      final candidate = controller.voiceApiConfigCandidates.single;
+      expect(candidate.provider, 'codex');
+      expect(candidate.apiUrl, 'https://api.example.test/v1/responses');
+      expect(candidate.apiKey, 'codex-key');
+      expect(candidate.modelName, 'gpt-5.5');
+      expect(candidate.hasUsableConfig, isTrue);
     });
 
     test('手动应用 Codex 配置后不会被旧运行时模型回填覆盖', () async {

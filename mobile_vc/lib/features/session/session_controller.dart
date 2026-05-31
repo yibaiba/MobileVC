@@ -318,6 +318,10 @@ class SessionController extends ChangeNotifier {
   bool _claudeModelCatalogLoading = false;
   String _claudeModelCatalogMessage = '';
   bool _claudeModelCatalogUnavailable = false;
+  final List<VoiceApiConfigCandidate> _voiceApiConfigCandidates = [];
+  bool _voiceApiConfigLoading = false;
+  String _voiceApiConfigMessage = '';
+  bool _voiceApiConfigUnavailable = false;
   FileDiffEvent? _currentDiff;
   PromptRequestEvent? _pendingPrompt;
   InteractionRequestEvent? _pendingInteraction;
@@ -560,6 +564,11 @@ class SessionController extends ChangeNotifier {
   bool get claudeModelCatalogLoading => _claudeModelCatalogLoading;
   String get claudeModelCatalogMessage => _claudeModelCatalogMessage;
   bool get claudeModelCatalogUnavailable => _claudeModelCatalogUnavailable;
+  List<VoiceApiConfigCandidate> get voiceApiConfigCandidates =>
+      List.unmodifiable(_voiceApiConfigCandidates);
+  bool get voiceApiConfigLoading => _voiceApiConfigLoading;
+  String get voiceApiConfigMessage => _voiceApiConfigMessage;
+  bool get voiceApiConfigUnavailable => _voiceApiConfigUnavailable;
   FileDiffEvent? get currentDiff => _currentDiff;
   PromptRequestEvent? get pendingPrompt {
     final prompt = _pendingPrompt;
@@ -706,6 +715,20 @@ class SessionController extends ChangeNotifier {
   bool get hasPendingPlanPrompt =>
       pendingInteraction?.isPlan == true || pendingPrompt?.isPlan == true;
   bool get hasPendingPlanQuestions => _pendingPlanQuestions.isNotEmpty;
+  List<PlanQuestion> get pendingPlanQuestions => UnmodifiableListView(
+        _pendingPlanQuestions.isNotEmpty
+            ? _pendingPlanQuestions
+            : (pendingInteraction?.planQuestions ?? const <PlanQuestion>[]),
+      );
+  PlanQuestion? get currentPendingPlanQuestion {
+    final questions = pendingPlanQuestions;
+    if (questions.isEmpty) {
+      return null;
+    }
+    final index = _pendingPlanQuestionIndex.clamp(0, questions.length - 1);
+    return questions[index];
+  }
+
   PlanQuestion? get pendingPlanQuestion {
     if (!hasPendingPlanQuestions) {
       return null;
@@ -2836,6 +2859,7 @@ class SessionController extends ChangeNotifier {
     _contextWindowUsage = const ContextWindowUsage();
     _runtimePermissionMode = '';
     _runtimeInfo = null;
+    _voiceApiConfigLoading = false;
     _agentState = null;
     _runtimePhase = null;
     _sessionState = null;
@@ -4624,6 +4648,24 @@ class SessionController extends ChangeNotifier {
     notifyListeners();
   }
 
+  void requestVoiceApiConfigCandidates({bool force = false}) {
+    if (!_connected) {
+      return;
+    }
+    if (_voiceApiConfigLoading && !force) {
+      return;
+    }
+    _voiceApiConfigLoading = true;
+    _voiceApiConfigMessage = '正在读取本机 Codex / Claude API 配置...';
+    _voiceApiConfigUnavailable = false;
+    _service.send({
+      'action': 'runtime_info',
+      'query': 'voice_api_configs',
+      'cwd': effectiveCwd,
+    });
+    notifyListeners();
+  }
+
   CodexModelCatalogEntry? codexModelCatalogEntry(String model) {
     return _findCodexModelCatalogEntry(model);
   }
@@ -4667,6 +4709,7 @@ class SessionController extends ChangeNotifier {
     _resumeRuntimeMeta = const RuntimeMeta();
     _contextWindowUsage = const ContextWindowUsage();
     _runtimeInfo = null;
+    _voiceApiConfigLoading = false;
     _pendingPrompt = null;
     _pendingInteraction = null;
     _runtimePhase = null;
@@ -5620,6 +5663,19 @@ class SessionController extends ChangeNotifier {
             runtimeInfo.runtimeMeta,
             runtimeInfo: runtimeInfo,
           );
+          break;
+        }
+        if (runtimeInfo.query.trim().toLowerCase() == 'voice_api_configs') {
+          _voiceApiConfigLoading = false;
+          _voiceApiConfigMessage = runtimeInfo.message.trim();
+          _voiceApiConfigUnavailable = runtimeInfo.unavailable;
+          final nextCandidates = runtimeInfo.items
+              .map(VoiceApiConfigCandidate.fromRuntimeInfoItem)
+              .where((item) => item.provider.trim().isNotEmpty)
+              .toList();
+          _voiceApiConfigCandidates
+            ..clear()
+            ..addAll(nextCandidates);
           break;
         }
         _runtimeInfo = runtimeInfo;

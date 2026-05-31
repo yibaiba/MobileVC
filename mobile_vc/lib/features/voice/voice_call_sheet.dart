@@ -8,6 +8,8 @@ import 'package:path_provider/path_provider.dart';
 import 'package:speech_to_text/speech_to_text.dart' as speech;
 
 import '../../core/config/app_config.dart';
+import '../../data/models/events.dart';
+import '../../data/models/session_models.dart';
 import '../session/session_controller.dart';
 import 'voice_api_client.dart';
 
@@ -48,10 +50,17 @@ class _VoiceCallSheetState extends State<VoiceCallSheet> {
   bool _speechReady = false;
   bool _listening = false;
   bool _autoSubmittingSpeech = false;
+  bool _autoListening = false;
+  bool _orchestrationActive = false;
+  bool _awaitingBackendConfirmation = false;
   String _status = '';
   String _elapsedLabel = '00:00';
+  String _lastBackendActionKey = '';
+  String _lastBackendReplyId = '';
+  String _pendingVoiceConfigProvider = '';
   late String _permissionMode;
   late final DateTime _callStartedAt;
+  DateTime? _orchestrationStartedAt;
   Timer? _durationTimer;
 
   SessionController get controller => widget.controller;
@@ -74,11 +83,14 @@ class _VoiceCallSheetState extends State<VoiceCallSheet> {
       const Duration(seconds: 1),
       (_) => _tickCallDuration(),
     );
+    controller.addListener(_handleControllerAutomationUpdate);
     _tickCallDuration();
+    WidgetsBinding.instance.addPostFrameCallback((_) => _scheduleAutoListen());
   }
 
   @override
   void dispose() {
+    controller.removeListener(_handleControllerAutomationUpdate);
     _durationTimer?.cancel();
     unawaited(_playbackSubscription?.cancel());
     unawaited(_speech.stop());
@@ -419,10 +431,16 @@ class _VoiceCallSheetState extends State<VoiceCallSheet> {
         _buildPrimaryVoiceButton(theme),
         _buildControlButton(
           theme: theme,
-          tooltip: '交给 AI',
-          icon: Icons.assistant_direction_outlined,
-          label: '交给 AI',
-          onPressed: _sending || _savingConfig ? null : _handoffToNativeAgent,
+          tooltip: _orchestrationActive ? '停止接管' : '交给 AI',
+          icon: _orchestrationActive
+              ? Icons.stop_circle_outlined
+              : Icons.assistant_direction_outlined,
+          label: _orchestrationActive ? '停止' : '交给 AI',
+          onPressed: _sending || _savingConfig
+              ? null
+              : _orchestrationActive
+                  ? _stopOrchestration
+                  : _handoffToNativeAgent,
         ),
         _buildControlButton(
           theme: theme,
@@ -450,7 +468,7 @@ class _VoiceCallSheetState extends State<VoiceCallSheet> {
             ? Icons.volume_off_outlined
             : Icons.mic_rounded;
     final label = _listening
-        ? '发送'
+        ? (_autoListening ? '在听' : '发送')
         : _speaking
             ? '打断'
             : '说话';
@@ -667,13 +685,13 @@ class _VoiceCallSheetState extends State<VoiceCallSheet> {
       case _VoiceCallStage.needsConfig:
         return '完成模型配置后开始';
       case _VoiceCallStage.listening:
-        return '说完后点发送';
+        return _autoListening ? '说完会自动发送' : '说完后点发送';
       case _VoiceCallStage.thinking:
         return '正在生成回应';
       case _VoiceCallStage.speaking:
         return '可随时打断';
       case _VoiceCallStage.idle:
-        return _turns.isEmpty ? '点麦克风开始' : '点麦克风继续';
+        return _turns.isEmpty ? '可以直接说话' : '可以继续说话';
     }
   }
 
@@ -705,6 +723,7 @@ class _VoiceCallSheetState extends State<VoiceCallSheet> {
       if (mounted) {
         setState(() => _speaking = false);
       }
+      await _startListening();
       return;
     }
     await _toggleListening();
@@ -771,6 +790,8 @@ class _VoiceCallSheetState extends State<VoiceCallSheet> {
               ),
             ],
           ),
+          const SizedBox(height: 10),
+          _buildVoiceApiConfigSync(theme),
           const SizedBox(height: 10),
           TextField(
             controller: _voiceApiUrlController,
@@ -869,6 +890,79 @@ class _VoiceCallSheetState extends State<VoiceCallSheet> {
           ),
         ],
       ),
+    );
+  }
+
+  Widget _buildVoiceApiConfigSync(ThemeData theme) {
+    final loading = controller.voiceApiConfigLoading;
+    final canSync = controller.connected && !_savingConfig && !loading;
+    final message = controller.voiceApiConfigMessage.trim();
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: [
+            OutlinedButton.icon(
+              onPressed: canSync ? () => _syncVoiceApiConfig('codex') : null,
+              icon: _pendingVoiceConfigProvider == 'codex' && loading
+                  ? const SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.terminal_outlined),
+              label: const Text('同步 Codex'),
+            ),
+            OutlinedButton.icon(
+              onPressed: canSync ? () => _syncVoiceApiConfig('claude') : null,
+              icon: _pendingVoiceConfigProvider == 'claude' && loading
+                  ? const SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.auto_awesome_outlined),
+              label: const Text('同步 Claude'),
+            ),
+            IconButton.outlined(
+              tooltip: '刷新本机配置',
+              onPressed: canSync
+                  ? () => controller.requestVoiceApiConfigCandidates(
+                        force: true,
+                      )
+                  : null,
+              icon: loading
+                  ? const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.sync_rounded),
+            ),
+          ],
+        ),
+        if (!controller.connected) ...[
+          const SizedBox(height: 6),
+          Text(
+            '连接后可同步电脑上的 Codex / Claude 配置',
+            style: theme.textTheme.bodySmall?.copyWith(
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
+          ),
+        ] else if (message.isNotEmpty) ...[
+          const SizedBox(height: 6),
+          Text(
+            message,
+            style: theme.textTheme.bodySmall?.copyWith(
+              color: controller.voiceApiConfigUnavailable
+                  ? theme.colorScheme.error
+                  : theme.colorScheme.onSurfaceVariant,
+            ),
+          ),
+        ],
+      ],
     );
   }
 
@@ -1010,9 +1104,117 @@ class _VoiceCallSheetState extends State<VoiceCallSheet> {
     }
   }
 
+  Future<void> _syncVoiceApiConfig(String provider) async {
+    final normalizedProvider = provider.trim().toLowerCase();
+    if (!controller.connected) {
+      setState(() => _status = '连接后才能同步电脑上的配置');
+      return;
+    }
+    setState(() {
+      _pendingVoiceConfigProvider = normalizedProvider;
+      _status = '正在读取${_voiceApiProviderLabel(normalizedProvider)}配置';
+    });
+    controller.requestVoiceApiConfigCandidates(force: true);
+  }
+
+  void _maybeApplyPendingVoiceApiConfigSync() {
+    final provider = _pendingVoiceConfigProvider.trim().toLowerCase();
+    if (provider.isEmpty || controller.voiceApiConfigLoading || !mounted) {
+      return;
+    }
+    _pendingVoiceConfigProvider = '';
+    final candidate = _voiceApiCandidate(provider);
+    if (candidate?.hasUsableConfig == true) {
+      unawaited(_applyVoiceApiConfigCandidate(candidate!));
+      return;
+    }
+    final detail = candidate?.detail.trim();
+    final message = detail?.isNotEmpty == true
+        ? detail!
+        : controller.voiceApiConfigMessage.trim();
+    setState(() {
+      _status = message.isEmpty
+          ? '没有找到可同步的${_voiceApiProviderLabel(provider)}配置'
+          : message;
+    });
+  }
+
+  Future<void> _applyVoiceApiConfigCandidate(
+    VoiceApiConfigCandidate candidate,
+  ) async {
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _savingConfig = true;
+      _voiceApiUrlController.text = candidate.apiUrl;
+      _voiceApiKeyController.text = candidate.apiKey;
+      _voiceModelController.text = candidate.modelName;
+      _status = '';
+    });
+    try {
+      await controller.saveConfig(_configFromFields());
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _status = '已同步${_voiceApiProviderLabel(candidate.provider)}配置';
+      });
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() => _status = '同步失败：$error');
+    } finally {
+      if (mounted) {
+        setState(() => _savingConfig = false);
+      }
+    }
+  }
+
+  VoiceApiConfigCandidate? _voiceApiCandidate(String provider) {
+    final normalizedProvider = provider.trim().toLowerCase();
+    for (final candidate in controller.voiceApiConfigCandidates) {
+      if (candidate.provider == normalizedProvider) {
+        return candidate;
+      }
+    }
+    return null;
+  }
+
+  String _voiceApiProviderLabel(String provider) {
+    switch (provider.trim().toLowerCase()) {
+      case 'codex':
+        return ' Codex';
+      case 'claude':
+        return ' Claude';
+      default:
+        return ' Voice API';
+    }
+  }
+
   Future<void> _toggleListening() async {
     if (_listening) {
       await _stopListening(submit: true);
+      return;
+    }
+    await _startListening();
+  }
+
+  Future<void> _startListening({bool automatic = false}) async {
+    if (_listening || _sending || _savingConfig || _speaking) {
+      return;
+    }
+    if (_configOpen || _keyboardOpen) {
+      return;
+    }
+    if (!_configFromFields().hasVoiceCallConfig) {
+      if (!automatic && mounted) {
+        setState(() {
+          _configOpen = true;
+          _status = '请先配置语音模型 URL 和模型名称';
+        });
+      }
       return;
     }
     try {
@@ -1024,7 +1226,10 @@ class _VoiceCallSheetState extends State<VoiceCallSheet> {
             }
             if (status == 'done' || status == 'notListening') {
               final shouldSubmit = _listening;
-              setState(() => _listening = false);
+              setState(() {
+                _listening = false;
+                _autoListening = false;
+              });
               if (shouldSubmit) {
                 unawaited(_submitRecognizedSpeech());
               }
@@ -1036,8 +1241,10 @@ class _VoiceCallSheetState extends State<VoiceCallSheet> {
             }
             setState(() {
               _listening = false;
+              _autoListening = false;
               _status = '录音失败：${error.errorMsg}';
             });
+            _scheduleAutoListen();
           },
         );
       }
@@ -1047,9 +1254,10 @@ class _VoiceCallSheetState extends State<VoiceCallSheet> {
       }
       setState(() {
         _listening = true;
+        _autoListening = automatic;
         _keyboardOpen = false;
         _configOpen = false;
-        _status = '';
+        _status = automatic ? '正在听你说话' : '';
       });
       await _speech.listen(
         listenOptions: speech.SpeechListenOptions(
@@ -1073,26 +1281,59 @@ class _VoiceCallSheetState extends State<VoiceCallSheet> {
       }
       setState(() {
         _listening = false;
+        _autoListening = false;
         _status = '录音失败：$error';
       });
+      _scheduleAutoListen();
     }
   }
 
   Future<void> _stopListening({required bool submit}) async {
     await _speech.stop();
     if (mounted) {
-      setState(() => _listening = false);
+      setState(() {
+        _listening = false;
+        _autoListening = false;
+      });
     }
     if (submit) {
       await _submitRecognizedSpeech();
     }
   }
 
+  void _scheduleAutoListen() {
+    if (!mounted ||
+        _listening ||
+        _sending ||
+        _savingConfig ||
+        _speaking ||
+        _configOpen ||
+        _keyboardOpen ||
+        !_configFromFields().hasVoiceCallConfig) {
+      return;
+    }
+    Future<void>.delayed(const Duration(milliseconds: 420), () async {
+      if (!mounted ||
+          _listening ||
+          _sending ||
+          _savingConfig ||
+          _speaking ||
+          _configOpen ||
+          _keyboardOpen ||
+          !_configFromFields().hasVoiceCallConfig) {
+        return;
+      }
+      await _startListening(automatic: true);
+    });
+  }
+
   Future<void> _submitRecognizedSpeech() async {
     if (_autoSubmittingSpeech || _sending) {
+      _scheduleAutoListen();
       return;
     }
     if (_userTextController.text.trim().isEmpty) {
+      _scheduleAutoListen();
       return;
     }
     _autoSubmittingSpeech = true;
@@ -1107,6 +1348,24 @@ class _VoiceCallSheetState extends State<VoiceCallSheet> {
     final userText = _userTextController.text.trim();
     if (userText.isEmpty) {
       setState(() => _status = '请输入或录入内容');
+      _scheduleAutoListen();
+      return;
+    }
+    if (_looksLikeStopOrchestrationCommand(userText)) {
+      _stopOrchestration();
+      _userTextController.clear();
+      _scheduleAutoListen();
+      return;
+    }
+    if (_orchestrationActive) {
+      await _sendToNativeAgentFromCall(userText);
+      return;
+    }
+    if (_looksLikeAutoHandoffTrigger(userText)) {
+      await _startNativeAgentHandoff(
+        pendingText: userText,
+        requireExistingContext: false,
+      );
       return;
     }
     final config = _configFromFields();
@@ -1149,6 +1408,7 @@ class _VoiceCallSheetState extends State<VoiceCallSheet> {
     } finally {
       if (mounted) {
         setState(() => _sending = false);
+        _scheduleAutoListen();
       }
     }
   }
@@ -1189,6 +1449,7 @@ class _VoiceCallSheetState extends State<VoiceCallSheet> {
       _playbackCompleter = null;
       if (mounted) {
         setState(() => _speaking = false);
+        _scheduleAutoListen();
       }
     }
   }
@@ -1228,24 +1489,481 @@ class _VoiceCallSheetState extends State<VoiceCallSheet> {
   }
 
   Future<void> _handoffToNativeAgent() async {
-    final pendingText = _userTextController.text.trim();
-    if (_turns.isEmpty && pendingText.isEmpty) {
+    await _startNativeAgentHandoff(
+      pendingText: _userTextController.text.trim(),
+      requireExistingContext: true,
+    );
+  }
+
+  Future<void> _startNativeAgentHandoff({
+    required String pendingText,
+    required bool requireExistingContext,
+  }) async {
+    final extraText = pendingText.trim();
+    if (requireExistingContext && _turns.isEmpty && extraText.isEmpty) {
       setState(() => _status = '请先通话或输入任务内容');
+      _scheduleAutoListen();
       return;
     }
     await controller.saveConfig(_configFromFields());
-    final prompt = _buildHandoffPrompt(extraUserText: pendingText);
+    final prompt = _buildHandoffPrompt(extraUserText: extraText);
+    final now = DateTime.now();
+    final latestReply = _latestBackendReply();
+    setState(() {
+      _orchestrationActive = true;
+      _awaitingBackendConfirmation = false;
+      _orchestrationStartedAt = now;
+      _lastBackendReplyId = latestReply?.id ?? '';
+      _lastBackendActionKey = _currentBackendActionKey();
+      _status = '已开始自动接管，正在把通话提示词发给 AI';
+      _keyboardOpen = false;
+      _configOpen = false;
+      if (extraText.isNotEmpty) {
+        _turns.add(_VoiceTurn(role: 'user', content: extraText));
+        _userTextController.clear();
+      }
+    });
     final submitted = controller.submitVoiceHandoff(
       prompt,
       permissionMode: _permissionMode,
     );
     if (!submitted) {
-      setState(() => _status = '交接失败，请检查连接或当前会话状态');
+      setState(() {
+        _orchestrationActive = false;
+        _awaitingBackendConfirmation = false;
+        _status = '交接失败，请检查连接或当前会话状态';
+      });
+      _scheduleAutoListen();
       return;
     }
-    if (mounted) {
-      Navigator.of(context).pop();
+    _handleControllerAutomationUpdate();
+    _scheduleAutoListen();
+  }
+
+  Future<void> _sendToNativeAgentFromCall(String userText) async {
+    if (_looksLikeStopOrchestrationCommand(userText) &&
+        !_awaitingBackendConfirmation) {
+      _stopOrchestration();
+      return;
     }
+    if (!controller.connected) {
+      setState(() => _status = '未连接 MobileVC 后端，暂时不能自动接管');
+      return;
+    }
+    setState(() {
+      _sending = true;
+      _status = '';
+      _keyboardOpen = false;
+      _turns.add(_VoiceTurn(role: 'user', content: userText));
+      _userTextController.clear();
+    });
+    try {
+      final config = _configFromFields();
+      await controller.saveConfig(config);
+      if (_permissionMode.trim().isNotEmpty &&
+          controller.displayPermissionMode != _permissionMode.trim()) {
+        controller.updatePermissionMode(_permissionMode);
+      }
+      if (_awaitingBackendConfirmation) {
+        final answer = _normalizeBackendConfirmation(userText);
+        if (controller.shouldShowReviewChoices) {
+          controller.sendReviewDecision(answer);
+        } else {
+          controller.submitPromptOption(answer);
+        }
+        _awaitingBackendConfirmation = false;
+        if (mounted) {
+          setState(() => _status = '已把你的确认提交给 AI，等待下一步结果');
+        }
+      } else {
+        final prompt = _buildBackendFollowUpPrompt(userText);
+        controller.sendInputText(prompt);
+        if (mounted) {
+          setState(() => _status = '已把你的补充提示词发给 AI');
+        }
+      }
+    } catch (error) {
+      if (mounted) {
+        setState(() => _status = '自动接管失败：$error');
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _sending = false);
+        _scheduleAutoListen();
+      }
+    }
+  }
+
+  void _stopOrchestration() {
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _orchestrationActive = false;
+      _awaitingBackendConfirmation = false;
+      _lastBackendActionKey = '';
+      _status = '自动接管已停止，可以继续普通语音沟通';
+    });
+    _scheduleAutoListen();
+  }
+
+  void _handleControllerAutomationUpdate() {
+    _maybeApplyPendingVoiceApiConfigSync();
+    if (!_orchestrationActive || !mounted) {
+      return;
+    }
+    final actionKey = _currentBackendActionKey();
+    if (actionKey.isNotEmpty && actionKey != _lastBackendActionKey) {
+      _lastBackendActionKey = actionKey;
+      _awaitingBackendConfirmation = true;
+      final message = _buildBackendConfirmationMessage();
+      unawaited(_announceAutomationMessage(
+        message,
+        status: 'AI 正在等待你的确认',
+      ));
+      return;
+    }
+    if (actionKey.isEmpty && _lastBackendActionKey.isNotEmpty) {
+      _lastBackendActionKey = '';
+    }
+    final reply = _latestBackendReply();
+    if (reply == null ||
+        reply.id == _lastBackendReplyId ||
+        !_replyBelongsToCurrentOrchestration(reply)) {
+      return;
+    }
+    _lastBackendReplyId = reply.id;
+    if (controller.isSessionBusy ||
+        controller.awaitInput ||
+        controller.hasPendingPermissionPrompt ||
+        controller.hasPendingPlanPrompt ||
+        controller.hasPendingPlanQuestions ||
+        controller.shouldShowReviewChoices) {
+      return;
+    }
+    unawaited(_announceAutomationMessage(
+      _buildBackendReplyMessage(reply),
+      status: 'AI 已回复，可以继续口头补充',
+    ));
+  }
+
+  Future<void> _announceAutomationMessage(
+    String message, {
+    required String status,
+  }) async {
+    final content = message.trim();
+    if (content.isEmpty || !mounted) {
+      return;
+    }
+    setState(() {
+      _turns.add(_VoiceTurn(role: 'assistant', content: content));
+      _status = status;
+    });
+    final config = _configFromFields();
+    if (config.hasVoiceTtsConfig) {
+      await _speakAssistantReply(config, content);
+    } else {
+      _scheduleAutoListen();
+    }
+  }
+
+  String _currentBackendActionKey() {
+    final prompt = controller.pendingPrompt;
+    final interaction = controller.pendingInteraction;
+    if (controller.hasPendingPermissionPrompt) {
+      final requestId =
+          prompt?.runtimeMeta.permissionRequestId.trim().isNotEmpty == true
+              ? prompt!.runtimeMeta.permissionRequestId.trim()
+              : interaction?.runtimeMeta.permissionRequestId.trim() ?? '';
+      return 'permission:${requestId.isEmpty ? _promptTextHash() : requestId}';
+    }
+    if (controller.shouldShowReviewChoices) {
+      final diff = controller.reviewActionTargetDiff;
+      return 'review:${diff?.id ?? diff?.path ?? 'current'}';
+    }
+    if (controller.hasPendingPlanQuestions || controller.hasPendingPlanPrompt) {
+      final question = controller.currentPendingPlanQuestion;
+      return 'plan:${controller.pendingPlanQuestionIndex}:${question?.id ?? _promptTextHash()}';
+    }
+    if (controller.awaitInput) {
+      return 'input:${_promptTextHash()}';
+    }
+    return '';
+  }
+
+  String _promptTextHash() {
+    final prompt = controller.pendingPrompt;
+    final interaction = controller.pendingInteraction;
+    final message = [
+      prompt?.message ?? '',
+      interaction?.message ?? '',
+      interaction?.title ?? '',
+    ].join('\n').trim();
+    return message.hashCode.toString();
+  }
+
+  String _buildBackendConfirmationMessage() {
+    if (controller.hasPendingPermissionPrompt) {
+      final message = _backendPromptMessage();
+      return [
+        'AI 需要权限确认。',
+        if (message.isNotEmpty) message,
+        '你可以说允许、拒绝，或者说仅本次允许。',
+      ].join('\n');
+    }
+    if (controller.shouldShowReviewChoices) {
+      final diff = controller.reviewActionTargetDiff;
+      return [
+        'AI 已产生需要审核的改动。',
+        if (diff?.path.trim().isNotEmpty == true) '文件：${diff!.path}',
+        '你可以说接受、继续修改，或者回退。',
+      ].join('\n');
+    }
+    if (controller.hasPendingPlanQuestions || controller.hasPendingPlanPrompt) {
+      final question = controller.currentPendingPlanQuestion;
+      final message = question?.displayLabel.trim().isNotEmpty == true
+          ? question!.displayLabel.trim()
+          : _backendPromptMessage();
+      final options = question?.options ?? _backendPromptOptions();
+      final optionText = _formatPromptOptions(options);
+      return [
+        'AI 需要你确认计划选项。',
+        if (message.isNotEmpty) message,
+        if (optionText.isNotEmpty) optionText,
+      ].join('\n');
+    }
+    final message = _backendPromptMessage();
+    return [
+      'AI 需要你补充信息。',
+      if (message.isNotEmpty) message,
+    ].join('\n');
+  }
+
+  String _backendPromptMessage() {
+    final prompt = controller.pendingPrompt;
+    final interaction = controller.pendingInteraction;
+    return [
+      interaction?.title ?? '',
+      interaction?.message ?? '',
+      prompt?.message ?? '',
+    ].where((value) => value.trim().isNotEmpty).join('\n').trim();
+  }
+
+  List<PromptOption> _backendPromptOptions() {
+    final promptOptions = controller.pendingPrompt?.options ?? const [];
+    if (promptOptions.isNotEmpty) {
+      return promptOptions;
+    }
+    return controller.pendingInteraction?.options ?? const [];
+  }
+
+  String _formatPromptOptions(List<PromptOption> options) {
+    if (options.isEmpty) {
+      return '';
+    }
+    final labels = <String>[];
+    for (var index = 0; index < options.length; index++) {
+      final option = options[index];
+      final label = option.displayText.trim().isNotEmpty
+          ? option.displayText.trim()
+          : option.value.trim();
+      if (label.isNotEmpty) {
+        labels.add('${index + 1}. $label');
+      }
+    }
+    return labels.isEmpty ? '' : '可选项：${labels.join('；')}';
+  }
+
+  TimelineItem? _latestBackendReply() {
+    for (final item in controller.timeline.reversed) {
+      final kind = item.kind.trim().toLowerCase();
+      if (kind == 'assistant_reply' || kind == 'markdown') {
+        final body = item.body.trim();
+        if (body.isNotEmpty) {
+          return item;
+        }
+      }
+    }
+    return null;
+  }
+
+  bool _replyBelongsToCurrentOrchestration(TimelineItem reply) {
+    final startedAt = _orchestrationStartedAt;
+    if (startedAt == null) {
+      return true;
+    }
+    return !reply.timestamp.isBefore(startedAt);
+  }
+
+  String _buildBackendReplyMessage(TimelineItem reply) {
+    final preview = _compactForVoice(reply.body);
+    return [
+      'AI 有新回复。',
+      if (preview.isNotEmpty) preview,
+      '要继续的话直接告诉我下一步要补充什么；如果已经好了，可以说结束接管。',
+    ].join('\n');
+  }
+
+  String _compactForVoice(String value) {
+    final normalized = value
+        .replaceAll(RegExp(r'```[\s\S]*?```'), '代码片段已省略。')
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .trim();
+    if (normalized.length <= 220) {
+      return normalized;
+    }
+    return '${normalized.substring(0, 220)}…';
+  }
+
+  String _normalizeBackendConfirmation(String userText) {
+    if (controller.shouldShowReviewChoices) {
+      return _normalizeReviewDecision(userText);
+    }
+    if (controller.hasPendingPermissionPrompt) {
+      return _normalizePermissionDecision(userText);
+    }
+    final matchedOption = _matchPromptOption(userText);
+    if (matchedOption.isNotEmpty) {
+      return matchedOption;
+    }
+    return userText.trim();
+  }
+
+  String _normalizePermissionDecision(String userText) {
+    final normalized = userText.trim().toLowerCase();
+    if (_containsAny(
+        normalized, const ['拒绝', '不同意', '不要', '不行', 'deny', 'no'])) {
+      return 'deny';
+    }
+    final persistent = _containsAny(
+      normalized,
+      const ['永久', '一直', '以后', 'persistent', 'always'],
+    );
+    if (_containsAny(
+      normalized,
+      const ['允许', '同意', '可以', '继续', '批准', 'approve', 'allow', 'ok', 'yes'],
+    )) {
+      return persistent ? 'approve:persistent' : 'approve:session';
+    }
+    return userText.trim();
+  }
+
+  String _normalizeReviewDecision(String userText) {
+    final normalized = userText.trim().toLowerCase();
+    if (_containsAny(normalized, const ['回退', '撤销', '不要', '拒绝', 'revert'])) {
+      return 'revert';
+    }
+    if (_containsAny(normalized, const ['修改', '继续改', '调整', 'revise'])) {
+      return 'revise';
+    }
+    if (_containsAny(normalized,
+        const ['接受', '同意', '可以', '通过', 'accept', 'approve', 'ok'])) {
+      return 'accept';
+    }
+    return userText.trim();
+  }
+
+  String _matchPromptOption(String userText) {
+    final normalized = userText.trim().toLowerCase();
+    final options = controller.currentPendingPlanQuestion?.options ??
+        _backendPromptOptions();
+    if (options.isEmpty) {
+      return '';
+    }
+    final numeric = RegExp(r'\d+').firstMatch(normalized);
+    if (numeric != null) {
+      final index = int.tryParse(numeric.group(0) ?? '') ?? 0;
+      if (index > 0 && index <= options.length) {
+        return _optionSubmissionValue(options[index - 1]);
+      }
+    }
+    const ordinalMap = {
+      '第一': 0,
+      '第一个': 0,
+      '第二': 1,
+      '第二个': 1,
+      '第三': 2,
+      '第三个': 2,
+      '第四': 3,
+      '第四个': 3,
+    };
+    for (final entry in ordinalMap.entries) {
+      if (normalized.contains(entry.key) && entry.value < options.length) {
+        return _optionSubmissionValue(options[entry.value]);
+      }
+    }
+    for (final option in options) {
+      final value = option.value.trim();
+      final label = option.displayText.trim();
+      if ((value.isNotEmpty && normalized.contains(value.toLowerCase())) ||
+          (label.isNotEmpty && normalized.contains(label.toLowerCase()))) {
+        return _optionSubmissionValue(option);
+      }
+    }
+    return '';
+  }
+
+  String _optionSubmissionValue(PromptOption option) {
+    if (option.value.trim().isNotEmpty) {
+      return option.value.trim();
+    }
+    return option.displayText.trim();
+  }
+
+  bool _containsAny(String value, List<String> needles) {
+    for (final needle in needles) {
+      if (value.contains(needle)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool _looksLikeAutoHandoffTrigger(String userText) {
+    final normalized = userText.trim().toLowerCase();
+    return _containsAny(normalized, const [
+      '开始执行',
+      '开始接管',
+      '自动接管',
+      '交给 ai',
+      '交给ai',
+      '交给 claude',
+      '交给 codex',
+      '帮我执行',
+      '帮我修改',
+      '开始修改',
+      '执行吧',
+      '修改吧',
+      'run it',
+      'start',
+    ]);
+  }
+
+  bool _looksLikeStopOrchestrationCommand(String userText) {
+    final normalized = userText.trim().toLowerCase();
+    return _containsAny(normalized, const [
+      '停止',
+      '停一下',
+      '结束接管',
+      '结束自动',
+      '退出接管',
+      '不用继续',
+      'stop',
+      'cancel takeover',
+    ]);
+  }
+
+  String _buildBackendFollowUpPrompt(String userText) {
+    final engine = controller.config.engine.trim().isEmpty
+        ? 'AI'
+        : controller.config.engine.trim();
+    return [
+      '来源：MobileVC 语音通话自动接管。',
+      '用户在听取 $engine 当前回复后追加了新的口头提示词。',
+      '请结合当前会话上下文继续推进，不要重复已经完成的工作。',
+      '',
+      '用户补充：${userText.trim()}',
+    ].join('\n');
   }
 
   AppConfig _configFromFields() {
