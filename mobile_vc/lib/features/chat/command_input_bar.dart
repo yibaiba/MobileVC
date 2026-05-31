@@ -1,5 +1,3 @@
-import 'dart:ui';
-
 import 'package:flutter/material.dart';
 
 import '../../app/theme.dart';
@@ -247,7 +245,6 @@ class _CommandInputBarState extends State<CommandInputBar> {
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
     final isLight = theme.brightness == Brightness.light;
-    final bottomInset = MediaQuery.of(context).viewInsets.bottom;
     final engineLabel =
         _engineLabel(widget.currentEngine, widget.showClaudeMode);
     final isCodex = widget.currentEngine.trim().toLowerCase() == 'codex';
@@ -297,328 +294,316 @@ class _CommandInputBarState extends State<CommandInputBar> {
       alpha: isLight ? 0.62 : 0.36,
     );
 
-    return Padding(
-      padding: EdgeInsets.only(bottom: bottomInset),
-      child: SafeArea(
-        top: false,
-        child: Padding(
-          padding: EdgeInsets.fromLTRB(10, 6, 10, bottomInset > 0 ? 8 : 10),
-          child: ClipRRect(
-            borderRadius: BorderRadius.circular(IOSTokens.radiusInput),
-            child: BackdropFilter(
-              filter: ImageFilter.blur(sigmaX: 24, sigmaY: 24),
-              child: Container(
-                padding: const EdgeInsets.fromLTRB(10, 10, 10, 10),
-                decoration: BoxDecoration(
-                  color:
-                      scheme.surface.withValues(alpha: isLight ? 0.94 : 0.72),
-                  borderRadius: BorderRadius.circular(IOSTokens.radiusInput),
-                  border: Border.all(color: dockBorderColor),
-                  boxShadow: [
-                    if (isLight)
-                      BoxShadow(
-                        color: Colors.black.withValues(alpha: 0.08),
-                        blurRadius: 24,
-                        offset: const Offset(0, 12),
-                      ),
-                  ],
-                ),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Container(
-                      padding: const EdgeInsets.fromLTRB(8, 8, 8, 8),
-                      decoration: BoxDecoration(
-                        color: railColor,
-                        borderRadius: BorderRadius.circular(24),
-                        border: Border.all(
-                          color: scheme.outlineVariant
-                              .withValues(alpha: isLight ? 0.46 : 0.26),
-                        ),
-                      ),
-                      child: Row(
-                        children: [
-                          Expanded(
-                            child: SingleChildScrollView(
-                              scrollDirection: Axis.horizontal,
-                              child: Row(
-                                children: [
-                                  _ToolChip(
-                                    icon: Icons.history,
-                                    label: '会话',
-                                    onPressed: widget.onOpenSessions,
-                                  ),
-                                  const SizedBox(width: 8),
-                                  if (widget.canCompact ||
-                                      widget.isCompacting) ...[
-                                    _ToolChip(
-                                      icon: widget.isCompacting
-                                          ? Icons.hourglass_top_rounded
-                                          : Icons.content_cut_rounded,
-                                      label: compactChipLabel,
-                                      onPressed: widget.isCompacting
-                                          ? null
-                                          : widget.onCompact,
-                                      highlighted: widget.isCompacting,
-                                      showSpinner: widget.isCompacting,
-                                    ),
-                                    const SizedBox(width: 8),
-                                  ],
-                                  _ToolChip(
-                                    icon: Icons.terminal,
-                                    label: '日志',
-                                    onPressed: widget.onOpenLogs,
-                                  ),
-                                  const SizedBox(width: 8),
-                                  _ToolChip(
-                                    icon: Icons.extension_outlined,
-                                    label: 'Skill',
-                                    onPressed: widget.onOpenSkills,
-                                  ),
-                                  const SizedBox(width: 8),
-                                  _ToolChip(
-                                    icon: Icons.psychology_alt_outlined,
-                                    label: 'Memory',
-                                    onPressed: widget.onOpenMemory,
-                                  ),
-                                  const SizedBox(width: 8),
-                                  _ToolChip(
-                                    icon: Icons.verified_user_outlined,
-                                    label:
-                                        '权限 · ${widget.permissionRuleSummary}',
-                                    onPressed: widget.onOpenPermissions,
-                                  ),
-                                  const SizedBox(width: 8),
-                                  _ToolChip(
-                                    key: const ValueKey(
-                                      'command-bar-model-button',
-                                    ),
-                                    icon: Icons.model_training_outlined,
-                                    label: '模型 · ${widget.modelSummary}',
-                                    onPressed: widget.onOpenModels,
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ),
-                          const SizedBox(width: 10),
-                          _ContextWindowUsageButton(
-                            usage: widget.contextWindowUsage,
-                            onPressed: widget.onOpenContextWindowUsage,
-                          ),
-                          const SizedBox(width: 8),
-                          DecoratedBox(
-                            decoration: BoxDecoration(
-                              color: inputColor,
-                              borderRadius: BorderRadius.circular(999),
-                              border: Border.all(
-                                color: scheme.outlineVariant
-                                    .withValues(alpha: 0.4),
-                              ),
-                            ),
-                            child: Padding(
-                              padding:
-                                  const EdgeInsets.symmetric(horizontal: 12),
-                              child: DropdownButtonHideUnderline(
-                                child: DropdownButton<String>(
-                                  value: permissionMode,
-                                  borderRadius: BorderRadius.circular(16),
-                                  style: theme.textTheme.bodySmall?.copyWith(
-                                    fontWeight: FontWeight.w600,
-                                  ),
-                                  items: permissionModeItems,
-                                  onChanged: (value) {
-                                    if (value != null) {
-                                      widget.onPermissionModeChanged(value);
-                                    }
-                                  },
-                                ),
-                              ),
-                            ),
-                          ),
-                          if (isCodex) ...[
-                            const SizedBox(width: 8),
-                            _TargetModeSwitch(
-                              enabled: widget.codexTargetMode,
-                              onChanged: widget.onCodexTargetModeChanged,
-                            ),
-                          ],
-                        ],
-                      ),
+    return SafeArea(
+      top: false,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(10, 6, 10, 10),
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(IOSTokens.radiusInput),
+          child: Container(
+            padding: const EdgeInsets.fromLTRB(10, 10, 10, 10),
+            decoration: BoxDecoration(
+              color: scheme.surface.withValues(alpha: isLight ? 0.94 : 0.72),
+              borderRadius: BorderRadius.circular(IOSTokens.radiusInput),
+              border: Border.all(color: dockBorderColor),
+              boxShadow: [
+                if (isLight)
+                  BoxShadow(
+                    color: Colors.black.withValues(alpha: 0.08),
+                    blurRadius: 24,
+                    offset: const Offset(0, 12),
+                  ),
+              ],
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Container(
+                  padding: const EdgeInsets.fromLTRB(8, 8, 8, 8),
+                  decoration: BoxDecoration(
+                    color: railColor,
+                    borderRadius: BorderRadius.circular(24),
+                    border: Border.all(
+                      color: scheme.outlineVariant
+                          .withValues(alpha: isLight ? 0.46 : 0.26),
                     ),
-                    const SizedBox(height: 10),
-                    Container(
-                      constraints: const BoxConstraints(minHeight: 56),
-                      decoration: BoxDecoration(
-                        gradient: LinearGradient(
-                          colors: [
-                            inputColor,
-                            isLight
-                                ? Color.alphaBlend(
-                                    scheme.secondary.withValues(alpha: 0.025),
-                                    scheme.surfaceContainerLowest,
-                                  )
-                                : scheme.surface.withValues(alpha: 0.94),
-                          ],
-                          begin: Alignment.topLeft,
-                          end: Alignment.bottomRight,
-                        ),
-                        borderRadius: BorderRadius.circular(28),
-                        border: Border.all(
-                          color: _inputLocked
-                              ? scheme.outlineVariant
-                                  .withValues(alpha: isLight ? 0.42 : 0.24)
-                              : scheme.primary
-                                  .withValues(alpha: isLight ? 0.20 : 0.12),
-                        ),
-                        boxShadow: [
-                          if (isLight)
-                            BoxShadow(
-                              color: scheme.primary.withValues(alpha: 0.06),
-                              blurRadius: 18,
-                              offset: const Offset(0, 8),
-                            ),
-                        ],
-                      ),
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          if (_imageAttachments.isNotEmpty)
-                            _AttachmentPreviewStrip(
-                              attachments: _imageAttachments,
-                              onRemove:
-                                  _inputLocked ? null : _removeImageAttachment,
-                            ),
-                          Row(
-                            crossAxisAlignment: CrossAxisAlignment.end,
+                  ),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: SingleChildScrollView(
+                          scrollDirection: Axis.horizontal,
+                          child: Row(
                             children: [
-                              Expanded(
-                                child: TextField(
-                                  controller: _controller,
-                                  focusNode: _focusNode,
-                                  enabled: !_inputLocked,
-                                  readOnly: _inputLocked,
-                                  canRequestFocus: !_inputLocked,
-                                  minLines: 1,
-                                  maxLines: 6,
-                                  keyboardType: TextInputType.multiline,
-                                  textInputAction: TextInputAction.send,
-                                  autocorrect: true,
-                                  enableSuggestions: true,
-                                  onTap: _inputLocked
-                                      ? () => _focusNode.unfocus()
-                                      : null,
-                                  onSubmitted:
-                                      _inputLocked ? null : (_) => _submit(),
-                                  textAlignVertical: TextAlignVertical.center,
-                                  style: Theme.of(context)
-                                      .textTheme
-                                      .bodyMedium
-                                      ?.copyWith(
-                                        height: 1.45,
-                                      ),
-                                  decoration: InputDecoration(
-                                    hintText: hintText,
-                                    hintStyle: Theme.of(context)
-                                        .textTheme
-                                        .bodyMedium
-                                        ?.copyWith(
-                                          color: scheme.onSurfaceVariant,
-                                        ),
-                                    filled: false,
-                                    isCollapsed: false,
-                                    contentPadding: const EdgeInsets.fromLTRB(
-                                      18,
-                                      14,
-                                      8,
-                                      14,
-                                    ),
-                                    border: InputBorder.none,
-                                    enabledBorder: InputBorder.none,
-                                    focusedBorder: InputBorder.none,
-                                    disabledBorder: InputBorder.none,
-                                  ),
-                                ),
+                              _ToolChip(
+                                icon: Icons.history,
+                                label: '会话',
+                                onPressed: widget.onOpenSessions,
                               ),
-                              Padding(
-                                padding: const EdgeInsets.fromLTRB(0, 0, 4, 7),
-                                child: SizedBox(
-                                  width: 42,
-                                  height: 42,
-                                  child: IconButton.filledTonal(
-                                    onPressed: _inputLocked || _pickingImage
-                                        ? null
-                                        : _attachImage,
-                                    tooltip: '添加图片',
-                                    icon: _pickingImage
-                                        ? SizedBox(
-                                            width: 18,
-                                            height: 18,
-                                            child: CircularProgressIndicator(
-                                              strokeWidth: 2,
-                                              color: scheme.primary,
-                                            ),
-                                          )
-                                        : const Icon(
-                                            Icons.image_outlined,
-                                            size: 20,
-                                          ),
-                                  ),
+                              const SizedBox(width: 8),
+                              if (widget.canCompact || widget.isCompacting) ...[
+                                _ToolChip(
+                                  icon: widget.isCompacting
+                                      ? Icons.hourglass_top_rounded
+                                      : Icons.content_cut_rounded,
+                                  label: compactChipLabel,
+                                  onPressed: widget.isCompacting
+                                      ? null
+                                      : widget.onCompact,
+                                  highlighted: widget.isCompacting,
+                                  showSpinner: widget.isCompacting,
                                 ),
+                                const SizedBox(width: 8),
+                              ],
+                              _ToolChip(
+                                icon: Icons.terminal,
+                                label: '日志',
+                                onPressed: widget.onOpenLogs,
                               ),
-                              Padding(
-                                padding: const EdgeInsets.fromLTRB(0, 0, 7, 7),
-                                child: SizedBox(
-                                  width: 42,
-                                  height: 42,
-                                  child:
-                                      ValueListenableBuilder<TextEditingValue>(
-                                    valueListenable: _controller,
-                                    builder: (context, value, _) {
-                                      final showStopAction =
-                                          _shouldShowStopAction(value.text);
-                                      return FilledButton(
-                                        onPressed: showStopAction
-                                            ? widget.onStop
-                                            : (_inputLocked ? null : _submit),
-                                        style: FilledButton.styleFrom(
-                                          elevation: 0,
-                                          backgroundColor: _inputLocked
-                                              ? scheme.surfaceContainerHighest
-                                              : showStopAction
-                                                  ? scheme.error
-                                                  : scheme.primary,
-                                          foregroundColor: _inputLocked
-                                              ? scheme.onSurfaceVariant
-                                              : showStopAction
-                                                  ? scheme.onError
-                                                  : scheme.onPrimary,
-                                          padding: EdgeInsets.zero,
-                                          minimumSize: const Size(42, 42),
-                                          shape: RoundedRectangleBorder(
-                                            borderRadius:
-                                                BorderRadius.circular(999),
-                                          ),
-                                        ),
-                                        child: Icon(
-                                          showStopAction
-                                              ? Icons.stop_rounded
-                                              : Icons.arrow_upward,
-                                          size: 18,
-                                        ),
-                                      );
-                                    },
-                                  ),
+                              const SizedBox(width: 8),
+                              _ToolChip(
+                                icon: Icons.extension_outlined,
+                                label: 'Skill',
+                                onPressed: widget.onOpenSkills,
+                              ),
+                              const SizedBox(width: 8),
+                              _ToolChip(
+                                icon: Icons.psychology_alt_outlined,
+                                label: 'Memory',
+                                onPressed: widget.onOpenMemory,
+                              ),
+                              const SizedBox(width: 8),
+                              _ToolChip(
+                                icon: Icons.verified_user_outlined,
+                                label: '权限 · ${widget.permissionRuleSummary}',
+                                onPressed: widget.onOpenPermissions,
+                              ),
+                              const SizedBox(width: 8),
+                              _ToolChip(
+                                key: const ValueKey(
+                                  'command-bar-model-button',
                                 ),
+                                icon: Icons.model_training_outlined,
+                                label: '模型 · ${widget.modelSummary}',
+                                onPressed: widget.onOpenModels,
                               ),
                             ],
                           ),
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      _ContextWindowUsageButton(
+                        usage: widget.contextWindowUsage,
+                        onPressed: widget.onOpenContextWindowUsage,
+                      ),
+                      const SizedBox(width: 8),
+                      DecoratedBox(
+                        decoration: BoxDecoration(
+                          color: inputColor,
+                          borderRadius: BorderRadius.circular(999),
+                          border: Border.all(
+                            color: scheme.outlineVariant.withValues(alpha: 0.4),
+                          ),
+                        ),
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 12),
+                          child: DropdownButtonHideUnderline(
+                            child: DropdownButton<String>(
+                              value: permissionMode,
+                              borderRadius: BorderRadius.circular(16),
+                              style: theme.textTheme.bodySmall?.copyWith(
+                                fontWeight: FontWeight.w600,
+                              ),
+                              items: permissionModeItems,
+                              onChanged: (value) {
+                                if (value != null) {
+                                  widget.onPermissionModeChanged(value);
+                                }
+                              },
+                            ),
+                          ),
+                        ),
+                      ),
+                      if (isCodex) ...[
+                        const SizedBox(width: 8),
+                        _TargetModeSwitch(
+                          enabled: widget.codexTargetMode,
+                          onChanged: widget.onCodexTargetModeChanged,
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 10),
+                Container(
+                  constraints: const BoxConstraints(minHeight: 56),
+                  decoration: BoxDecoration(
+                    gradient: LinearGradient(
+                      colors: [
+                        inputColor,
+                        isLight
+                            ? Color.alphaBlend(
+                                scheme.secondary.withValues(alpha: 0.025),
+                                scheme.surfaceContainerLowest,
+                              )
+                            : scheme.surface.withValues(alpha: 0.94),
+                      ],
+                      begin: Alignment.topLeft,
+                      end: Alignment.bottomRight,
+                    ),
+                    borderRadius: BorderRadius.circular(28),
+                    border: Border.all(
+                      color: _inputLocked
+                          ? scheme.outlineVariant
+                              .withValues(alpha: isLight ? 0.42 : 0.24)
+                          : scheme.primary
+                              .withValues(alpha: isLight ? 0.20 : 0.12),
+                    ),
+                    boxShadow: [
+                      if (isLight)
+                        BoxShadow(
+                          color: scheme.primary.withValues(alpha: 0.06),
+                          blurRadius: 18,
+                          offset: const Offset(0, 8),
+                        ),
+                    ],
+                  ),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      if (_imageAttachments.isNotEmpty)
+                        _AttachmentPreviewStrip(
+                          attachments: _imageAttachments,
+                          onRemove:
+                              _inputLocked ? null : _removeImageAttachment,
+                        ),
+                      Row(
+                        crossAxisAlignment: CrossAxisAlignment.end,
+                        children: [
+                          Expanded(
+                            child: TextField(
+                              controller: _controller,
+                              focusNode: _focusNode,
+                              enabled: !_inputLocked,
+                              readOnly: _inputLocked,
+                              canRequestFocus: !_inputLocked,
+                              minLines: 1,
+                              maxLines: 6,
+                              keyboardType: TextInputType.multiline,
+                              textInputAction: TextInputAction.send,
+                              autocorrect: true,
+                              enableSuggestions: true,
+                              onTap: _inputLocked
+                                  ? () => _focusNode.unfocus()
+                                  : null,
+                              onSubmitted:
+                                  _inputLocked ? null : (_) => _submit(),
+                              textAlignVertical: TextAlignVertical.center,
+                              style: Theme.of(context)
+                                  .textTheme
+                                  .bodyMedium
+                                  ?.copyWith(
+                                    height: 1.45,
+                                  ),
+                              decoration: InputDecoration(
+                                hintText: hintText,
+                                hintStyle: Theme.of(context)
+                                    .textTheme
+                                    .bodyMedium
+                                    ?.copyWith(
+                                      color: scheme.onSurfaceVariant,
+                                    ),
+                                filled: false,
+                                isCollapsed: false,
+                                contentPadding: const EdgeInsets.fromLTRB(
+                                  18,
+                                  14,
+                                  8,
+                                  14,
+                                ),
+                                border: InputBorder.none,
+                                enabledBorder: InputBorder.none,
+                                focusedBorder: InputBorder.none,
+                                disabledBorder: InputBorder.none,
+                              ),
+                            ),
+                          ),
+                          Padding(
+                            padding: const EdgeInsets.fromLTRB(0, 0, 4, 7),
+                            child: SizedBox(
+                              width: 42,
+                              height: 42,
+                              child: IconButton.filledTonal(
+                                onPressed: _inputLocked || _pickingImage
+                                    ? null
+                                    : _attachImage,
+                                tooltip: '添加图片',
+                                icon: _pickingImage
+                                    ? SizedBox(
+                                        width: 18,
+                                        height: 18,
+                                        child: CircularProgressIndicator(
+                                          strokeWidth: 2,
+                                          color: scheme.primary,
+                                        ),
+                                      )
+                                    : const Icon(
+                                        Icons.image_outlined,
+                                        size: 20,
+                                      ),
+                              ),
+                            ),
+                          ),
+                          Padding(
+                            padding: const EdgeInsets.fromLTRB(0, 0, 7, 7),
+                            child: SizedBox(
+                              width: 42,
+                              height: 42,
+                              child: ValueListenableBuilder<TextEditingValue>(
+                                valueListenable: _controller,
+                                builder: (context, value, _) {
+                                  final showStopAction =
+                                      _shouldShowStopAction(value.text);
+                                  return FilledButton(
+                                    onPressed: showStopAction
+                                        ? widget.onStop
+                                        : (_inputLocked ? null : _submit),
+                                    style: FilledButton.styleFrom(
+                                      elevation: 0,
+                                      backgroundColor: _inputLocked
+                                          ? scheme.surfaceContainerHighest
+                                          : showStopAction
+                                              ? scheme.error
+                                              : scheme.primary,
+                                      foregroundColor: _inputLocked
+                                          ? scheme.onSurfaceVariant
+                                          : showStopAction
+                                              ? scheme.onError
+                                              : scheme.onPrimary,
+                                      padding: EdgeInsets.zero,
+                                      minimumSize: const Size(42, 42),
+                                      shape: RoundedRectangleBorder(
+                                        borderRadius:
+                                            BorderRadius.circular(999),
+                                      ),
+                                    ),
+                                    child: Icon(
+                                      showStopAction
+                                          ? Icons.stop_rounded
+                                          : Icons.arrow_upward,
+                                      size: 18,
+                                    ),
+                                  );
+                                },
+                              ),
+                            ),
+                          ),
                         ],
                       ),
-                    ),
-                  ],
+                    ],
+                  ),
                 ),
-              ),
+              ],
             ),
           ),
         ),

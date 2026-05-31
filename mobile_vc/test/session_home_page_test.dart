@@ -55,14 +55,16 @@ void main() {
     await _pumpFrames(tester);
 
     final timelineSizeAfter = tester.getSize(find.byType(ChatTimeline));
+    final commandBarSizeAfter = tester.getSize(find.byType(CommandInputBar));
     final scaffold = tester.widget<Scaffold>(find.byType(Scaffold).first);
     expect(scaffold.resizeToAvoidBottomInset, isFalse);
     expect(scaffold.bottomNavigationBar, isNull);
     expect(timelineSizeAfter, timelineSizeBefore);
+    expect(commandBarSizeAfter, commandBarSizeBefore);
     final timelineAfter = tester.widget<ChatTimeline>(
       find.byType(ChatTimeline),
     );
-    expect(timelineAfter.bottomPadding, timelineBefore.bottomPadding);
+    expect(timelineAfter.bottomPadding, timelineBefore.bottomPadding + 320);
 
     final keyboardPadding = tester.widget<AnimatedPadding>(
       find.byKey(const ValueKey('command-bar-keyboard-padding')),

@@ -244,6 +244,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
     final isLight = theme.brightness == Brightness.light;
+    final keyboardInset = MediaQuery.viewInsetsOf(context).bottom;
     return Scaffold(
       key: _scaffoldKey,
       drawer: Drawer(
@@ -272,7 +273,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
           },
         ),
       ),
-      resizeToAvoidBottomInset: true,
+      resizeToAvoidBottomInset: false,
       extendBodyBehindAppBar: true,
       body: Stack(
         children: [
@@ -357,7 +358,8 @@ class _SessionHomePageState extends State<SessionHomePage> {
                                           controller.aiStatusIndicatorVisible,
                                       aiStatusLabel:
                                           controller.aiStatusIndicatorLabel,
-                                      bottomPadding: _timelineBottomPadding,
+                                      bottomPadding: _timelineBottomPadding +
+                                          keyboardInset,
                                       hasOlderItems:
                                           controller.hasOlderTimelineEntries,
                                       isLoadingOlderItems: controller
@@ -509,7 +511,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
               duration: const Duration(milliseconds: 180),
               curve: Curves.easeOutCubic,
               padding: EdgeInsets.only(
-                bottom: MediaQuery.viewInsetsOf(context).bottom,
+                bottom: keyboardInset,
               ),
               child: _MeasuredSize(
                 onChanged: _handleCommandBarSizeChanged,
