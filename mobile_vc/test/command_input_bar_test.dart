@@ -132,6 +132,14 @@ void main() {
       );
       expect(find.byKey(const ValueKey('permission-mode-icon-button')),
           findsOneWidget);
+      expect(
+        find.descendant(
+          of: find.byKey(const ValueKey('permission-mode-icon-button')),
+          matching: find.byIcon(Icons.rule_rounded),
+        ),
+        findsOneWidget,
+      );
+      expect(find.byIcon(Icons.lock_outline_rounded), findsNothing);
       await tester
           .tap(find.byKey(const ValueKey('permission-mode-icon-button')));
       await tester.pumpAndSettle();
@@ -141,6 +149,7 @@ void main() {
       expect(find.text('跳过审批'), findsOneWidget);
       expect(find.text('完全访问权限'), findsNothing);
       expect(find.text('自定义(config.toml)'), findsOneWidget);
+      expect(find.byIcon(Icons.bolt_rounded), findsOneWidget);
 
       await tester.tap(find.text('自动审查'));
       await tester.pumpAndSettle();

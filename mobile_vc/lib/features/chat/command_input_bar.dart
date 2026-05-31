@@ -820,14 +820,14 @@ class _PermissionModeIconButton extends StatelessWidget {
 IconData _permissionModeIcon(String value) {
   switch (value) {
     case 'bypassPermissions':
-      return Icons.lock_open_rounded;
+      return Icons.bolt_rounded;
     case 'auto':
       return Icons.rate_review_outlined;
     case 'config':
       return Icons.tune_rounded;
     case 'default':
     default:
-      return Icons.lock_outline_rounded;
+      return Icons.rule_rounded;
   }
 }
 
