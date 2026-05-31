@@ -2102,6 +2102,11 @@ class SessionController extends ChangeNotifier {
     } else {
       payload.remove('reasoningEffort');
     }
+    if (normalizedEngine == 'codex') {
+      payload['codexSandboxMode'] = _config.codexSandboxMode;
+    } else {
+      payload.remove('codexSandboxMode');
+    }
     if (data.trim().isNotEmpty) {
       payload['data'] = data;
     }

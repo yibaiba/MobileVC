@@ -54,3 +54,27 @@ func TestParseCodexConfigAssignmentIgnoresCommentsInQuotes(t *testing.T) {
 		t.Fatalf("unexpected assignment: key=%q value=%q", key, value)
 	}
 }
+
+func TestNormalizeCodexSandboxMode(t *testing.T) {
+	for _, mode := range []string{"", "workspace-write", "read-only", "danger-full-access"} {
+		got, err := normalizeCodexSandboxMode(mode)
+		if err != nil {
+			t.Fatalf("normalize sandbox %q: %v", mode, err)
+		}
+		if mode == "" {
+			if got != "workspace-write" {
+				t.Fatalf("expected empty sandbox to default to workspace-write, got %q", got)
+			}
+			continue
+		}
+		if got != mode {
+			t.Fatalf("expected sandbox %q, got %q", mode, got)
+		}
+	}
+}
+
+func TestNormalizeCodexSandboxModeRejectsInvalidValue(t *testing.T) {
+	if _, err := normalizeCodexSandboxMode("full"); err == nil {
+		t.Fatal("expected invalid sandbox mode to fail")
+	}
+}

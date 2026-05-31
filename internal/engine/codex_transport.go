@@ -292,11 +292,15 @@ func (s *codexAppSession) startOrResumeThread(ctx context.Context, resumeSession
 		params = map[string]any{"threadId": resumeSessionID}
 	} else {
 		method = "thread/start"
+		sandbox, err := normalizeCodexSandboxMode(s.req.RuntimeMeta.CodexSandboxMode)
+		if err != nil {
+			return err
+		}
 		params = map[string]any{
 			"cwd":                   s.cwd,
 			"approvalPolicy":        codexApprovalPolicy(s.runner.currentPermissionMode()),
 			"approvalsReviewer":     "user",
-			"sandbox":               "workspace-write",
+			"sandbox":               sandbox,
 			"serviceName":           "MobileVC",
 			"experimentalRawEvents": false,
 		}
@@ -1412,6 +1416,19 @@ func codexApprovalPolicy(permissionMode string) string {
 		return "never"
 	default:
 		return "on-request"
+	}
+}
+
+func normalizeCodexSandboxMode(value string) (string, error) {
+	switch strings.TrimSpace(value) {
+	case "", "workspace-write":
+		return "workspace-write", nil
+	case "read-only":
+		return "read-only", nil
+	case "danger-full-access":
+		return "danger-full-access", nil
+	default:
+		return "", fmt.Errorf("invalid Codex sandbox mode: %s", value)
 	}
 }
 

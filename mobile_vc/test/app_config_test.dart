@@ -639,6 +639,17 @@ void main() {
       expect(config.reasoningEffortForEngine('codex'), 'xhigh');
     });
 
+    test('codex sandbox mode is persisted', () {
+      const config = AppConfig(
+        engine: 'codex',
+        codexSandboxMode: 'danger-full-access',
+      );
+
+      final restored = AppConfig.fromJson(config.toJson());
+
+      expect(restored.codexSandboxMode, 'danger-full-access');
+    });
+
     test('launch uri overrides saved cwd token host and port', () {
       const fallback = AppConfig(
         host: '10.0.0.2',

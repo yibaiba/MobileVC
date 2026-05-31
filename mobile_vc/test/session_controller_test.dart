@@ -3716,6 +3716,30 @@ void main() {
       expect(controller.commandBarModelSummary, 'GPT-5.4 · XHIGH');
     });
 
+    test('Codex 沙箱配置会带入 ai_turn payload', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+      await controller.saveConfig(
+        controller.config.copyWith(
+          engine: 'codex',
+          codexSandboxMode: 'danger-full-access',
+        ),
+      );
+
+      await controller.connect();
+      service.sentPayloads.clear();
+      controller.sendInputText('codex');
+
+      expect(service.sentPayloads[0]['action'], 'ai_turn');
+      expect(service.sentPayloads[0]['engine'], 'codex');
+      expect(
+        service.sentPayloads[0]['codexSandboxMode'],
+        'danger-full-access',
+      );
+    });
+
     test('sendInputText 在 Claude 模式下继续普通文本时走 ai_turn', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);

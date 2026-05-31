@@ -78,6 +78,7 @@ type RuntimeMeta struct {
 	Engine              string `json:"engine,omitempty"`
 	Model               string `json:"model,omitempty"`
 	ReasoningEffort     string `json:"reasoningEffort,omitempty"`
+	CodexSandboxMode    string `json:"codexSandboxMode,omitempty"`
 	CWD                 string `json:"cwd,omitempty"`
 	PermissionMode      string `json:"permissionMode,omitempty"`
 	PermissionRequestID string `json:"permissionRequestId,omitempty"`
@@ -1667,6 +1668,9 @@ func MergeRuntimeMeta(base, overlay RuntimeMeta) RuntimeMeta {
 	}
 	if overlay.ReasoningEffort != "" {
 		merged.ReasoningEffort = overlay.ReasoningEffort
+	}
+	if overlay.CodexSandboxMode != "" {
+		merged.CodexSandboxMode = overlay.CodexSandboxMode
 	}
 	if overlay.CWD != "" {
 		merged.CWD = overlay.CWD

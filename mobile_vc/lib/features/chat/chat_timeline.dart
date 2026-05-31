@@ -271,7 +271,7 @@ class _ChatTimelineState extends State<ChatTimeline> {
         Positioned(
           left: 16,
           right: 16,
-          bottom: 8,
+          bottom: widget.bottomPadding + 8,
           child: IgnorePointer(
             child: AnimatedOpacity(
               duration: const Duration(milliseconds: 220),

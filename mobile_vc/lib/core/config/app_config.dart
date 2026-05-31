@@ -22,6 +22,7 @@ class AppConfig {
     this.claudeModel = '',
     this.codexModel = '',
     this.codexReasoningEffort = '',
+    this.codexSandboxMode = 'workspace-write',
     this.permissionMode = 'auto',
     this.fastMode = false,
     this.adbIceServersJson = '',
@@ -47,6 +48,7 @@ class AppConfig {
   final String claudeModel;
   final String codexModel;
   final String codexReasoningEffort;
+  final String codexSandboxMode;
   final String permissionMode;
   final bool fastMode;
   final String adbIceServersJson;
@@ -131,6 +133,7 @@ class AppConfig {
     String? claudeModel,
     String? codexModel,
     String? codexReasoningEffort,
+    String? codexSandboxMode,
     String? permissionMode,
     bool? fastMode,
     String? adbIceServersJson,
@@ -172,6 +175,8 @@ class AppConfig {
       claudeModel: nextModels.claudeModel,
       codexModel: nextModels.codexModel,
       codexReasoningEffort: nextModels.codexReasoningEffort,
+      codexSandboxMode:
+          normalizeCodexSandboxMode(codexSandboxMode ?? this.codexSandboxMode),
       permissionMode: _normalizePermissionMode(
         permissionMode ?? this.permissionMode,
       ),
@@ -245,6 +250,7 @@ class AppConfig {
         'claudeModel': claudeModel,
         'codexModel': codexModel,
         'codexReasoningEffort': codexReasoningEffort,
+        'codexSandboxMode': codexSandboxMode,
         'permissionMode': permissionMode,
         'fastMode': fastMode,
         'adbIceServersJson': adbIceServersJson,
@@ -288,6 +294,9 @@ class AppConfig {
                   ? legacyReasoningEffort
                   : ''))
           .toString(),
+      codexSandboxMode: normalizeCodexSandboxMode(
+        (json['codexSandboxMode'] ?? 'workspace-write').toString(),
+      ),
       permissionMode: _normalizePermissionMode(
         (json['permissionMode'] ?? 'auto').toString(),
       ),
@@ -321,6 +330,18 @@ class AppConfig {
         return 'default';
       default:
         return 'auto';
+    }
+  }
+
+  static String normalizeCodexSandboxMode(String value) {
+    switch (value.trim()) {
+      case 'read-only':
+        return 'read-only';
+      case 'danger-full-access':
+        return 'danger-full-access';
+      case 'workspace-write':
+      default:
+        return 'workspace-write';
     }
   }
 

@@ -667,6 +667,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
     var selectedEngine = controller.config.engine.trim().isEmpty
         ? 'claude'
         : controller.config.engine.trim();
+    var selectedCodexSandboxMode = controller.config.codexSandboxMode;
     var pendingConfig = controller.config;
     var connectingFromSheet = false;
 
@@ -711,6 +712,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
               selectedEngine = scanned.engine.trim().isEmpty
                   ? selectedEngine
                   : scanned.engine.trim();
+              selectedCodexSandboxMode = scanned.codexSandboxMode;
               scanHint = scanned.connectionMode != ConnectionMode.direct.name
                   ? '已导入 Relay 配对，点击连接完成配对'
                   : '已回填 ${scanned.displayHost}:${scanned.port}${scanned.token.isNotEmpty ? ' 与 token' : ''}';
@@ -732,6 +734,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
                     token: tokenController.text.trim(),
                     cwd: cwdController.text.trim(),
                     engine: selectedEngine,
+                    codexSandboxMode: selectedCodexSandboxMode,
                     permissionMode: permissionController.text.trim(),
                     fastMode: controller.fastMode,
                     adbIceServersJson: encodedIceConfig(),
@@ -840,6 +843,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
                     : tokenController.text.trim(),
                 cwd: cwdController.text.trim(),
                 engine: selectedEngine,
+                codexSandboxMode: selectedCodexSandboxMode,
                 permissionMode: permissionController.text.trim(),
                 fastMode: controller.fastMode,
                 adbIceServersJson: encodedIceConfig(),
@@ -1152,6 +1156,43 @@ class _SessionHomePageState extends State<SessionHomePage> {
                                     });
                                   },
                           ),
+                          if (selectedEngine.trim().toLowerCase() ==
+                              'codex') ...[
+                            const SizedBox(height: 10),
+                            DropdownButtonFormField<String>(
+                              initialValue: selectedCodexSandboxMode,
+                              decoration: const InputDecoration(
+                                labelText: 'Codex Sandbox',
+                              ),
+                              items: const [
+                                DropdownMenuItem(
+                                  value: 'workspace-write',
+                                  child: Text('Workspace Write'),
+                                ),
+                                DropdownMenuItem(
+                                  value: 'danger-full-access',
+                                  child: Text('Danger Full Access'),
+                                ),
+                                DropdownMenuItem(
+                                  value: 'read-only',
+                                  child: Text('Read Only'),
+                                ),
+                              ],
+                              onChanged: connectionBusy
+                                  ? null
+                                  : (value) {
+                                      if (value == null) {
+                                        return;
+                                      }
+                                      setSheetState(() {
+                                        selectedCodexSandboxMode =
+                                            AppConfig.normalizeCodexSandboxMode(
+                                          value,
+                                        );
+                                      });
+                                    },
+                            ),
+                          ],
                           const SizedBox(height: 10),
                           TextField(
                               controller: permissionController,
