@@ -1396,6 +1396,73 @@ func TestClaudeUsageHelpers(t *testing.T) {
 	if derived != 1900 {
 		t.Fatalf("unexpected derived usage: %d", derived)
 	}
+
+	effective := claudeEffectiveUsageTokens(json.RawMessage(`{
+		"total_tokens":0,
+		"input_tokens":1000,
+		"cache_creation_input_tokens":200,
+		"cache_read_input_tokens":300,
+		"output_tokens":400
+	}`), "result")
+	if effective != 1900 {
+		t.Fatalf("unexpected effective usage: %d", effective)
+	}
+}
+
+func TestPtyRunnerClaudeContextWindowUsageStabilizesLimitAndZero(t *testing.T) {
+	runner := NewPtyRunner()
+	events := []any{}
+	sink := func(event any) {
+		events = append(events, event)
+	}
+
+	runner.emitClaudeContextWindowUsage("s1", claudeStreamEnvelope{
+		Type:       "result",
+		SessionID:  "claude-session",
+		ModelUsage: json.RawMessage(`{"primary":{"contextWindow":200000}}`),
+		Usage: json.RawMessage(`{
+			"total_tokens":0,
+			"input_tokens":5000,
+			"cache_read_input_tokens":1000,
+			"output_tokens":500
+		}`),
+	}, sink)
+
+	if len(events) != 1 {
+		t.Fatalf("expected first usage event, got %d", len(events))
+	}
+	first, ok := events[0].(protocol.ContextWindowUsageEvent)
+	if !ok {
+		t.Fatalf("expected ContextWindowUsageEvent, got %T", events[0])
+	}
+	if first.Usage.TokenLimit != 200000 || first.Usage.TokensUsed != 6500 {
+		t.Fatalf("unexpected first usage: %+v", first.Usage)
+	}
+
+	runner.emitClaudeContextWindowUsage("s1", claudeStreamEnvelope{
+		Type:       "result",
+		SessionID:  "claude-session",
+		ModelUsage: json.RawMessage(`{"secondary":{"contextWindow":100000}}`),
+		Usage:      json.RawMessage(`{"total_tokens":7000}`),
+	}, sink)
+
+	if len(events) != 2 {
+		t.Fatalf("expected second usage event, got %d", len(events))
+	}
+	second := events[1].(protocol.ContextWindowUsageEvent)
+	if second.Usage.TokenLimit != 200000 || second.Usage.TokensUsed != 7000 {
+		t.Fatalf("unexpected second usage: %+v", second.Usage)
+	}
+
+	runner.emitClaudeContextWindowUsage("s1", claudeStreamEnvelope{
+		Type:      "result",
+		SessionID: "claude-session",
+		Usage:     json.RawMessage(`{"total_tokens":0}`),
+	}, sink)
+
+	if len(events) != 2 {
+		t.Fatalf("zero usage should not emit after a real value, got %d", len(events))
+	}
 }
 
 func TestNewClaudeStreamCommandPreservesResumeAndPermissionMode(t *testing.T) {

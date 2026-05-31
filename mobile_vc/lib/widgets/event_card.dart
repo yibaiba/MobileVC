@@ -81,6 +81,7 @@ class _EventCardState extends State<EventCard> {
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
+    final isDark = scheme.brightness == Brightness.dark;
     final style = _styleForKind(scheme, widget.item.kind);
     final compact = _isCompactKind(widget.item.kind);
     final isUser = widget.item.kind == 'user';
@@ -104,16 +105,24 @@ class _EventCardState extends State<EventCard> {
 
     if (isMarkdown) {
       final bubbleColor = Color.alphaBlend(
-        scheme.primary.withValues(alpha: 0.04),
-        scheme.surfaceContainerLowest,
+        scheme.primary.withValues(alpha: isDark ? 0.05 : 0.025),
+        isDark ? scheme.surfaceContainerLow : scheme.surface,
       );
       final markdownChild = DecoratedBox(
         decoration: BoxDecoration(
           color: bubbleColor,
           borderRadius: BorderRadius.circular(20),
           border: Border.all(
-            color: scheme.outlineVariant.withValues(alpha: 0.45),
+            color: scheme.outlineVariant.withValues(alpha: isDark ? 0.24 : 0.5),
           ),
+          boxShadow: [
+            if (!isDark)
+              BoxShadow(
+                color: Colors.black.withValues(alpha: 0.04),
+                blurRadius: 14,
+                offset: const Offset(0, 6),
+              ),
+          ],
         ),
         child: Padding(
           padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
@@ -513,30 +522,38 @@ class _EventCardState extends State<EventCard> {
   }
 
   bool _isCompactKind(String kind) {
-    return kind == 'session' || kind == 'system' || kind == 'compaction' || kind == 'thinking';
+    return kind == 'session' ||
+        kind == 'system' ||
+        kind == 'compaction' ||
+        kind == 'thinking';
   }
 
   _EventCardStyle _styleForKind(ColorScheme scheme, String kind) {
-    const iMessageBlue = Color(0xFF007AFF);
     final isDark = scheme.brightness == Brightness.dark;
+    final defaultLightBackground = Color.alphaBlend(
+      scheme.primary.withValues(alpha: 0.018),
+      scheme.surface,
+    );
+    final compactLightBackground = Color.alphaBlend(
+      scheme.secondary.withValues(alpha: 0.026),
+      scheme.surfaceContainerLow,
+    );
 
     return switch (kind) {
       'user' => _EventCardStyle(
-          background: iMessageBlue,
-          border: iMessageBlue,
+          background: scheme.primary,
+          border: scheme.primary,
           titleColor: Colors.white,
           bodyColor: Colors.white,
           subtitleColor: Colors.white.withValues(alpha: 0.76),
           iconBackground: Colors.white.withValues(alpha: 0.14),
           iconColor: Colors.white,
-          shadow: iMessageBlue.withValues(alpha: 0.12),
+          shadow: scheme.primary.withValues(alpha: isDark ? 0.12 : 0.18),
           radius: 20,
         ),
       'markdown' => _EventCardStyle(
-          background: isDark
-              ? const Color(0xFF1C1C1E)
-              : const Color(0xFFF2F2F7),
-          border: scheme.outlineVariant.withValues(alpha: isDark ? 0.18 : 0.36),
+          background: isDark ? const Color(0xFF1C1C1E) : defaultLightBackground,
+          border: scheme.outlineVariant.withValues(alpha: isDark ? 0.18 : 0.5),
           titleColor: scheme.onSurface,
           bodyColor: scheme.onSurface,
           subtitleColor: scheme.onSurfaceVariant,
@@ -557,10 +574,8 @@ class _EventCardState extends State<EventCard> {
           radius: 20,
         ),
       'terminal' || 'log' => _EventCardStyle(
-          background: isDark
-              ? const Color(0xFF1C1C1E)
-              : const Color(0xFFF2F2F7),
-          border: scheme.outlineVariant.withValues(alpha: isDark ? 0.18 : 0.36),
+          background: isDark ? const Color(0xFF1C1C1E) : defaultLightBackground,
+          border: scheme.outlineVariant.withValues(alpha: isDark ? 0.18 : 0.5),
           titleColor: scheme.onSurface,
           bodyColor: scheme.onSurface,
           subtitleColor: scheme.onSurfaceVariant,
@@ -581,8 +596,9 @@ class _EventCardState extends State<EventCard> {
           radius: 16,
         ),
       'session' || 'system' => _EventCardStyle(
-          background: scheme.surfaceContainerLow,
-          border: scheme.outlineVariant.withValues(alpha: isDark ? 0.18 : 0.36),
+          background:
+              isDark ? scheme.surfaceContainerLow : compactLightBackground,
+          border: scheme.outlineVariant.withValues(alpha: isDark ? 0.18 : 0.42),
           titleColor: scheme.onSurfaceVariant,
           bodyColor: scheme.onSurfaceVariant,
           subtitleColor: scheme.onSurfaceVariant.withValues(alpha: 0.84),
@@ -594,8 +610,11 @@ class _EventCardState extends State<EventCard> {
       'thinking' => _EventCardStyle(
           background: isDark
               ? const Color(0xFF2C2C2E)
-              : const Color(0xFFF5F5F7),
-          border: scheme.outlineVariant.withValues(alpha: isDark ? 0.12 : 0.24),
+              : Color.alphaBlend(
+                  scheme.tertiary.withValues(alpha: 0.035),
+                  scheme.surfaceContainerLow,
+                ),
+          border: scheme.outlineVariant.withValues(alpha: isDark ? 0.12 : 0.34),
           titleColor: scheme.onSurfaceVariant,
           bodyColor: scheme.onSurfaceVariant,
           subtitleColor: scheme.onSurfaceVariant.withValues(alpha: 0.6),
@@ -605,10 +624,8 @@ class _EventCardState extends State<EventCard> {
           radius: 14,
         ),
       _ => _EventCardStyle(
-          background: isDark
-              ? const Color(0xFF1C1C1E)
-              : const Color(0xFFF2F2F7),
-          border: scheme.outlineVariant.withValues(alpha: isDark ? 0.18 : 0.36),
+          background: isDark ? const Color(0xFF1C1C1E) : defaultLightBackground,
+          border: scheme.outlineVariant.withValues(alpha: isDark ? 0.18 : 0.5),
           titleColor: scheme.onSurface,
           bodyColor: scheme.onSurface,
           subtitleColor: scheme.onSurfaceVariant,

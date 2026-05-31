@@ -11,8 +11,10 @@ const {
   assertValidRelayURL,
   buildRelayAccessConfig,
   buildRelayPairingUri,
+  createRelayAgentSessionStatePath,
   parseInvocation,
   readRelayPairingEventFile,
+  removeRelayAgentSessionStateFile,
   removeRelayPairingEventFile,
   resolveBinaryInfo,
 } = require('../../bin/mobilevc.js');
@@ -116,6 +118,16 @@ test('relay pairing event file is read locally and removable', () => {
   assert.deepEqual(readRelayPairingEventFile(eventPath), event);
   removeRelayPairingEventFile(eventPath);
   assert.equal(fs.existsSync(eventPath), false);
+});
+
+test('relay agent session state path is per launch and removable', () => {
+  const sessionPath = createRelayAgentSessionStatePath();
+  assert.match(path.basename(sessionPath), /^mobilevc-relay-agent-session-.+\.json$/);
+
+  fs.mkdirSync(path.dirname(sessionPath), { recursive: true });
+  fs.writeFileSync(sessionPath, '{"version":1}\n', { mode: 0o600 });
+  removeRelayAgentSessionStateFile(sessionPath);
+  assert.equal(fs.existsSync(sessionPath), false);
 });
 
 test('isPortOccupied falls back from wildcard probe to IPv4 probe', async () => {

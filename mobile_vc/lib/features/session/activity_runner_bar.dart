@@ -74,14 +74,34 @@ class _ActivityRunnerBarState extends State<ActivityRunnerBar>
     if (!widget.visible) {
       return const SizedBox.shrink();
     }
-    final scheme = Theme.of(context).colorScheme;
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    final isLight = theme.brightness == Brightness.light;
     return Container(
       margin: const EdgeInsets.fromLTRB(16, 0, 16, 10),
       padding: const EdgeInsets.fromLTRB(6, 10, 14, 10),
       decoration: BoxDecoration(
-        color: scheme.surfaceContainerHighest,
+        gradient: LinearGradient(
+          colors: [
+            scheme.surface,
+            Color.alphaBlend(
+              scheme.primary.withValues(alpha: isLight ? 0.045 : 0.08),
+              scheme.surfaceContainerLow,
+            ),
+          ],
+        ),
         borderRadius: BorderRadius.circular(18),
-        border: Border.all(color: scheme.outlineVariant),
+        border: Border.all(
+          color: scheme.outlineVariant.withValues(alpha: isLight ? 0.58 : 0.36),
+        ),
+        boxShadow: [
+          if (isLight)
+            BoxShadow(
+              color: Colors.black.withValues(alpha: 0.05),
+              blurRadius: 16,
+              offset: const Offset(0, 6),
+            ),
+        ],
       ),
       child: Row(
         children: [

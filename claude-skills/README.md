@@ -6,7 +6,7 @@ Drop-in [Claude Code](https://docs.claude.com/en/docs/claude-code/) skills that 
 
 | Skill | Purpose |
 |---|---|
-| `mobilevc-installer` | One-shot: install `@justprove/mobilevc` from npm, run `mobilevc start`, guide the user through installing the iOS / Android client. |
+| `mobilevc-installer` | One-shot: install `@justprove/mobilevc` from npm, run `mobilevc start`, guide the user through installing the iOS / Android client from the MobileVC homepage. |
 
 ## Install
 
@@ -32,7 +32,14 @@ In any Claude Code session, ask one of:
 - "install mobilevc" / "set up mobilevc on this machine"
 - "把 Claude Code 装到我手机上"
 
-Claude will pick up the skill, install the npm package, run `mobilevc start`, and walk you through scanning the LAN QR code from the official phone client at <https://mobilevc.top/install>.
+Claude will pick up the skill, install the npm package, run `mobilevc start`, and walk you through installing the official phone client from <https://www.mobilevc.top>.
+
+Install notes:
+
+- iOS installs through the TestFlight link on the MobileVC homepage.
+- Android installs through the APK download link on the MobileVC homepage.
+- The homepage may require a domestic network environment. If it does not open, switch networks and try again.
+- During `mobilevc start` setup, token input is hidden. Type the token normally and press Enter.
 
 ## Uninstall
 

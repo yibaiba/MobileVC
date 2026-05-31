@@ -2781,6 +2781,7 @@ class SessionController extends ChangeNotifier {
       _observedSessionSyncInterval,
       (_) => _requestSessionDelta(reason: 'observe_active_session'),
     );
+    _requestSessionDelta(reason: 'observe_active_session_start', force: true);
   }
 
   void _stopObservedSessionSync() {
@@ -3027,6 +3028,7 @@ class SessionController extends ChangeNotifier {
     _clearPlanInteractionState();
     _runtimePhase = null;
     _runtimePermissionMode = '';
+    _contextWindowUsage = const ContextWindowUsage();
     _agentState = null;
     _sessionState = null;
     _currentStep = null;
@@ -3608,6 +3610,12 @@ class SessionController extends ChangeNotifier {
       'sessionId': _selectedSessionId.trim(),
       'cwd': effectiveCwd,
     });
+  }
+
+  void _applyContextWindowUsage(ContextWindowUsage usage) {
+    if (usage.isAvailable || !_contextWindowUsage.isAvailable) {
+      _contextWindowUsage = usage;
+    }
   }
 
   Future<void> prepareAdbDebug() async {
@@ -5030,7 +5038,7 @@ class SessionController extends ChangeNotifier {
         if (!_eventTargetsCurrentSession(usageEvent.sessionId)) {
           break;
         }
-        _contextWindowUsage = usageEvent.usage;
+        _applyContextWindowUsage(usageEvent.usage);
         break;
       case CompactResultEvent result:
         if (_eventTargetsCurrentSession(result.sessionId) ||
@@ -5123,7 +5131,7 @@ class SessionController extends ChangeNotifier {
             _isExternalNativeSession(resolvedHistorySummary);
         _executionActive = resolvedHistorySummary.executionActive;
         _sendCachedPushTokenIfPossible();
-        _contextWindowUsage = history.contextWindowUsage;
+        _applyContextWindowUsage(history.contextWindowUsage);
         _sessionContext = history.sessionContext;
         _skillCatalogMeta = history.skillCatalogMeta;
         _memoryCatalogMeta = history.memoryCatalogMeta;
@@ -5245,6 +5253,7 @@ class SessionController extends ChangeNotifier {
         _syncDerivedState();
         notifyListeners();
         needsDerivedSync = false;
+        _syncObservedSessionPolling();
         final restoredCwd = history.resumeRuntimeMeta.cwd.trim();
         final targetCwd = restoredCwd.isNotEmpty ? restoredCwd : _config.cwd;
         unawaited(_refreshContextAfterHistoryLoaded(
@@ -6347,7 +6356,7 @@ class SessionController extends ChangeNotifier {
       _upsertSession(resolvedSummary);
     }
     _sessionContext = delta.sessionContext;
-    _contextWindowUsage = delta.contextWindowUsage;
+    _applyContextWindowUsage(delta.contextWindowUsage);
     _skillCatalogMeta = delta.skillCatalogMeta;
     _memoryCatalogMeta = delta.memoryCatalogMeta;
     _runtimePermissionMode = delta.resumeRuntimeMeta.permissionMode.trim();
@@ -6425,6 +6434,7 @@ class SessionController extends ChangeNotifier {
     }
     _syncDerivedState();
     notifyListeners();
+    _syncObservedSessionPolling();
   }
 
   bool _isSessionRecoveryEventForActiveSession(String sessionId) {
@@ -7235,12 +7245,11 @@ class SessionController extends ChangeNotifier {
           : existing?.entryCount ?? 0,
       source:
           incoming.source.isNotEmpty ? incoming.source : existing?.source ?? '',
-      external: incoming.external || (existing?.external ?? false),
+      external: incoming.external,
       ownership: incoming.ownership.isNotEmpty
           ? incoming.ownership
           : existing?.ownership ?? '',
-      executionActive:
-          incoming.executionActive || (existing?.executionActive ?? false),
+      executionActive: incoming.executionActive,
       runtime: runtime,
     );
   }
@@ -9337,6 +9346,7 @@ class SessionController extends ChangeNotifier {
       if (!snapshot.syncing && _selectedSessionExternalNative) {
         return false;
       }
+      _executionActive = false;
       _sessionRuntimeAlive = false;
       _syncDerivedState();
       notifyListeners();
@@ -9364,6 +9374,7 @@ class SessionController extends ChangeNotifier {
     );
     if (_isIdleLikeState(state) || snapshot.awaitInput) {
       _clearStoppingState();
+      _executionActive = false;
     }
     if (snapshot.runtimeAlive) {
       _connectionStage = snapshot.syncing

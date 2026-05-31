@@ -241,6 +241,9 @@ class _SessionHomePageState extends State<SessionHomePage> {
 
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    final isLight = theme.brightness == Brightness.light;
     return Scaffold(
       key: _scaffoldKey,
       drawer: Drawer(
@@ -269,10 +272,32 @@ class _SessionHomePageState extends State<SessionHomePage> {
           },
         ),
       ),
-      resizeToAvoidBottomInset: false,
+      resizeToAvoidBottomInset: true,
       extendBodyBehindAppBar: true,
       body: Stack(
         children: [
+          Positioned.fill(
+            child: DecoratedBox(
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                  colors: [
+                    theme.scaffoldBackgroundColor,
+                    Color.alphaBlend(
+                      scheme.primary.withValues(alpha: isLight ? 0.035 : 0.08),
+                      theme.scaffoldBackgroundColor,
+                    ),
+                    Color.alphaBlend(
+                      scheme.secondary
+                          .withValues(alpha: isLight ? 0.025 : 0.045),
+                      theme.scaffoldBackgroundColor,
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
           controller.shouldShowSessionSurface
               ? GestureDetector(
                   behavior: HitTestBehavior.translucent,
@@ -373,9 +398,18 @@ class _SessionHomePageState extends State<SessionHomePage> {
               child: BackdropFilter(
                 filter: ImageFilter.blur(sigmaX: 20, sigmaY: 20),
                 child: Container(
-                  color: Theme.of(context)
-                      .scaffoldBackgroundColor
-                      .withValues(alpha: 0.72),
+                  decoration: BoxDecoration(
+                    color:
+                        scheme.surface.withValues(alpha: isLight ? 0.88 : 0.7),
+                    boxShadow: [
+                      if (isLight)
+                        BoxShadow(
+                          color: Colors.black.withValues(alpha: 0.05),
+                          blurRadius: 18,
+                          offset: const Offset(0, 8),
+                        ),
+                    ],
+                  ),
                   child: SafeArea(
                     bottom: false,
                     child: Container(
@@ -387,7 +421,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
                             color: Theme.of(context)
                                 .colorScheme
                                 .outlineVariant
-                                .withValues(alpha: 0.2),
+                                .withValues(alpha: isLight ? 0.56 : 0.2),
                             width: 0.5,
                           ),
                         ),
@@ -3015,7 +3049,7 @@ class _LandingBrand extends StatelessWidget {
             'MobileVC',
             style: Theme.of(context).textTheme.headlineMedium?.copyWith(
                   fontWeight: FontWeight.w900,
-                  letterSpacing: -0.5,
+                  letterSpacing: 0,
                 ),
           ),
           const SizedBox(height: 8),
@@ -3040,15 +3074,35 @@ class _SessionObservationBanner extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
     final scheme = Theme.of(context).colorScheme;
+    final isLight = theme.brightness == Brightness.light;
     return Container(
       width: double.infinity,
       margin: const EdgeInsets.fromLTRB(12, 8, 12, 0),
       padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
-        color: scheme.primaryContainer.withValues(alpha: 0.72),
+        gradient: LinearGradient(
+          colors: [
+            scheme.primaryContainer.withValues(alpha: isLight ? 0.82 : 0.72),
+            Color.alphaBlend(
+              scheme.secondary.withValues(alpha: isLight ? 0.08 : 0.12),
+              scheme.primaryContainer.withValues(alpha: isLight ? 0.74 : 0.64),
+            ),
+          ],
+        ),
         borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: scheme.primary.withValues(alpha: 0.18)),
+        border: Border.all(
+          color: scheme.primary.withValues(alpha: isLight ? 0.22 : 0.18),
+        ),
+        boxShadow: [
+          if (isLight)
+            BoxShadow(
+              color: scheme.primary.withValues(alpha: 0.08),
+              blurRadius: 16,
+              offset: const Offset(0, 6),
+            ),
+        ],
       ),
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.center,
@@ -3517,36 +3571,50 @@ class _ConnectionDot extends StatelessWidget {
     final color = connected ? const Color(0xFF22C55E) : scheme.outline;
     final normalizedLabel = label.trim();
     final compactLabel = _compactTransportLabel(normalizedLabel);
-    final indicator = Row(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Container(
-          width: 10,
-          height: 10,
-          decoration: BoxDecoration(
-            color: color,
-            shape: BoxShape.circle,
-            boxShadow: [
-              BoxShadow(
-                color: color.withValues(alpha: 0.35),
-                blurRadius: 8,
-                spreadRadius: 1,
-              ),
-            ],
-          ),
+    final indicator = Container(
+      padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 6),
+      decoration: BoxDecoration(
+        color: connected
+            ? color.withValues(alpha: 0.10)
+            : scheme.surfaceContainerHigh.withValues(alpha: 0.72),
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(
+          color: connected
+              ? color.withValues(alpha: 0.24)
+              : scheme.outlineVariant.withValues(alpha: 0.42),
         ),
-        if (connected && compactLabel.isNotEmpty) ...[
-          const SizedBox(width: 4),
-          Text(
-            compactLabel,
-            key: const ValueKey('connection-transport-label'),
-            style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                  color: scheme.onSurfaceVariant,
-                  fontWeight: FontWeight.w700,
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Container(
+            width: 9,
+            height: 9,
+            decoration: BoxDecoration(
+              color: color,
+              shape: BoxShape.circle,
+              boxShadow: [
+                BoxShadow(
+                  color: color.withValues(alpha: 0.35),
+                  blurRadius: 8,
+                  spreadRadius: 1,
                 ),
+              ],
+            ),
           ),
+          if (connected && compactLabel.isNotEmpty) ...[
+            const SizedBox(width: 5),
+            Text(
+              compactLabel,
+              key: const ValueKey('connection-transport-label'),
+              style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                    color: scheme.onSurfaceVariant,
+                    fontWeight: FontWeight.w800,
+                  ),
+            ),
+          ],
         ],
-      ],
+      ),
     );
     if (!connected || normalizedLabel.isEmpty) {
       return indicator;
