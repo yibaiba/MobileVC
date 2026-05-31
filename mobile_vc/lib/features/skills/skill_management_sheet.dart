@@ -199,32 +199,26 @@ class _SkillManagementSheetState extends State<SkillManagementSheet> {
                       builder: (context, constraints) {
                         final columns = constraints.maxWidth >= 720 ? 2 : 1;
                         final gap = 10.0;
-                        final itemWidth =
-                            (constraints.maxWidth - gap * (columns - 1)) /
-                                columns;
-                        return SingleChildScrollView(
-                          child: Align(
-                            alignment: Alignment.topLeft,
-                            child: Wrap(
-                              spacing: gap,
-                              runSpacing: gap,
-                              children: [
-                                for (final item in items)
-                                  SizedBox(
-                                    width: itemWidth,
-                                    child: _SkillCapsuleCard(
-                                      skill: item,
-                                      enabled: widget.enabledSkillNames
-                                          .contains(item.name),
-                                      onTap: () =>
-                                          _openDetailSheet(context, item),
-                                      onToggleEnabled: () =>
-                                          widget.onToggleEnabled(item.name),
-                                    ),
-                                  ),
-                              ],
-                            ),
+                        return GridView.builder(
+                          itemCount: items.length,
+                          gridDelegate:
+                              SliverGridDelegateWithFixedCrossAxisCount(
+                            crossAxisCount: columns,
+                            mainAxisSpacing: gap,
+                            crossAxisSpacing: gap,
+                            mainAxisExtent: 82,
                           ),
+                          itemBuilder: (context, index) {
+                            final item = items[index];
+                            return _SkillCapsuleCard(
+                              skill: item,
+                              enabled:
+                                  widget.enabledSkillNames.contains(item.name),
+                              onTap: () => _openDetailSheet(context, item),
+                              onToggleEnabled: () =>
+                                  widget.onToggleEnabled(item.name),
+                            );
+                          },
                         );
                       },
                     ),

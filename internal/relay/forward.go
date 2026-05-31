@@ -339,7 +339,8 @@ func (s *Server) agentTemporarilyDisconnected(sessionID string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	state := s.sessions[sessionID]
-	return state.agentDisconnectedWithinGrace(s.cfg.AgentGracePeriod)
+	return state.agentDisconnectedWithinGrace(s.cfg.AgentGracePeriod) ||
+		(state != nil && state.agent == nil && state.hasReconnectableDevices())
 }
 
 func (s *Server) markAgentDisconnected(sessionID string, peer *peerConn) {
@@ -371,6 +372,13 @@ func (s *Server) removeExpiredDisconnectedAgent(sessionID string, disconnectedAt
 	state := s.sessions[sessionID]
 	if state == nil || state.agent != nil || !state.agentDisconnectedAt.Equal(disconnectedAt) {
 		return nil
+	}
+	if state.hasReconnectableDevices() {
+		client := state.client
+		state.client = nil
+		state.clientID = ""
+		_ = s.saveStateLocked()
+		return client
 	}
 	delete(s.sessions, sessionID)
 	_ = s.saveStateLocked()

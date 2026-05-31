@@ -1,9 +1,8 @@
-import 'dart:ui';
-
 import 'package:flutter/material.dart';
 
 import '../../app/theme.dart';
 import '../../data/models/session_models.dart';
+import '../permissions/permission_mode_options.dart';
 
 class CommandInputBar extends StatefulWidget {
   const CommandInputBar({
@@ -31,8 +30,11 @@ class CommandInputBar extends StatefulWidget {
     required this.onOpenPermissions,
     required this.onOpenModels,
     required this.onPermissionModeChanged,
+    required this.codexTargetMode,
+    required this.onCodexTargetModeChanged,
     required this.showClaudeMode,
     required this.currentEngine,
+    required this.configuredEngine,
     required this.modelSummary,
     required this.permissionRuleSummary,
     required this.shouldShowPermissionChoices,
@@ -68,8 +70,11 @@ class CommandInputBar extends StatefulWidget {
   final VoidCallback onOpenPermissions;
   final VoidCallback onOpenModels;
   final ValueChanged<String> onPermissionModeChanged;
+  final bool codexTargetMode;
+  final ValueChanged<bool> onCodexTargetModeChanged;
   final bool showClaudeMode;
   final String currentEngine;
+  final String configuredEngine;
   final String modelSummary;
   final String permissionRuleSummary;
   final bool shouldShowPermissionChoices;
@@ -85,6 +90,9 @@ class CommandInputBar extends StatefulWidget {
 }
 
 class _CommandInputBarState extends State<CommandInputBar> {
+  static const double _inputActionButtonSize = 36;
+  static const double _inputActionIconSize = 18;
+
   final TextEditingController _controller = TextEditingController();
   final FocusNode _focusNode = FocusNode();
   final List<ChatImageAttachment> _imageAttachments = [];
@@ -102,16 +110,20 @@ class _CommandInputBarState extends State<CommandInputBar> {
       widget.isSessionLoading ||
       widget.shouldShowPermissionChoices ||
       widget.shouldShowReviewChoices ||
-      widget.shouldShowPlanChoices ||
-      (!widget.canSendToContinuedSameSession &&
-          !widget.awaitInput &&
-          !widget.canStop &&
-          widget.isBusy);
+      widget.shouldShowPlanChoices;
 
-  bool get _showStopAction =>
+  bool _canSubmitDraft(String text) =>
+      (text.trim().isNotEmpty || _imageAttachments.isNotEmpty) &&
+      !_inputLocked &&
+      (!widget.isBusy ||
+          widget.awaitInput ||
+          widget.canSendToContinuedSameSession);
+
+  bool _shouldShowStopAction(String text) =>
       !widget.isExternallyLocked &&
       !widget.isSessionLoading &&
-      _debouncedCanStop;
+      _debouncedCanStop &&
+      !_canSubmitDraft(text);
 
   String get _lockedHintText {
     if (widget.isExternallyLocked) {
@@ -130,9 +142,6 @@ class _CommandInputBarState extends State<CommandInputBar> {
     }
     if (widget.shouldShowPlanChoices) {
       return '请先在上方完成计划选择';
-    }
-    if (!widget.awaitInput && !widget.canStop && widget.isBusy) {
-      return '正在停止，请稍候...';
     }
     return '';
   }
@@ -185,12 +194,17 @@ class _CommandInputBarState extends State<CommandInputBar> {
       return;
     }
     final keepKeyboard = _shouldKeepKeyboard(normalized);
-    widget.onSubmit(text, List.unmodifiable(_imageAttachments));
+    final imageAttachments = List<ChatImageAttachment>.unmodifiable(
+      _imageAttachments,
+    );
     _controller.clear();
-    setState(() => _imageAttachments.clear());
+    if (_imageAttachments.isNotEmpty) {
+      setState(() => _imageAttachments.clear());
+    }
     if (!keepKeyboard) {
       _focusNode.unfocus();
     }
+    widget.onSubmit(text, imageAttachments);
   }
 
   Future<void> _attachImage() async {
@@ -234,9 +248,19 @@ class _CommandInputBarState extends State<CommandInputBar> {
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
     final isLight = theme.brightness == Brightness.light;
-    final bottomInset = MediaQuery.of(context).viewInsets.bottom;
     final engineLabel =
         _engineLabel(widget.currentEngine, widget.showClaudeMode);
+    final isCodex = widget.currentEngine.trim().toLowerCase() == 'codex';
+    final permissionEngine = widget.configuredEngine.trim().isEmpty
+        ? widget.currentEngine
+        : widget.configuredEngine;
+    final permissionMode = normalizePermissionModeForEngine(
+      widget.permissionMode,
+      permissionEngine,
+    );
+    final permissionModeOptions = permissionModeOptionsForEngine(
+      permissionEngine,
+    );
     final compactChipLabel = widget.isCompacting
         ? (widget.compactStatusLabel.trim().isEmpty
             ? '压缩中'
@@ -266,36 +290,34 @@ class _CommandInputBarState extends State<CommandInputBar> {
       alpha: isLight ? 0.62 : 0.36,
     );
 
-    return Padding(
-      padding: EdgeInsets.only(bottom: bottomInset),
-      child: SafeArea(
-        top: false,
-        child: Padding(
-          padding: EdgeInsets.fromLTRB(10, 6, 10, bottomInset > 0 ? 8 : 10),
-          child: ClipRRect(
-            borderRadius: BorderRadius.circular(IOSTokens.radiusInput),
-            child: BackdropFilter(
-              filter: ImageFilter.blur(sigmaX: 24, sigmaY: 24),
-              child: Container(
-                padding: const EdgeInsets.fromLTRB(10, 10, 10, 10),
-                decoration: BoxDecoration(
-                  color:
-                      scheme.surface.withValues(alpha: isLight ? 0.94 : 0.72),
-                  borderRadius: BorderRadius.circular(IOSTokens.radiusInput),
-                  border: Border.all(color: dockBorderColor),
-                  boxShadow: [
-                    if (isLight)
-                      BoxShadow(
-                        color: Colors.black.withValues(alpha: 0.08),
-                        blurRadius: 24,
-                        offset: const Offset(0, 12),
-                      ),
-                  ],
-                ),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Container(
+    return SafeArea(
+      top: false,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(10, 6, 10, 10),
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(IOSTokens.radiusInput),
+          child: Container(
+            padding: const EdgeInsets.fromLTRB(10, 10, 10, 10),
+            decoration: BoxDecoration(
+              color: scheme.surface.withValues(alpha: isLight ? 0.94 : 0.72),
+              borderRadius: BorderRadius.circular(IOSTokens.radiusInput),
+              border: Border.all(color: dockBorderColor),
+              boxShadow: [
+                if (isLight)
+                  BoxShadow(
+                    color: Colors.black.withValues(alpha: 0.08),
+                    blurRadius: 24,
+                    offset: const Offset(0, 12),
+                  ),
+              ],
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                LayoutBuilder(
+                  builder: (context, constraints) {
+                    final compactRail = constraints.maxWidth < 390;
+                    return Container(
                       padding: const EdgeInsets.fromLTRB(8, 8, 8, 8),
                       decoration: BoxDecoration(
                         color: railColor,
@@ -339,6 +361,21 @@ class _CommandInputBarState extends State<CommandInputBar> {
                                     onPressed: widget.onOpenLogs,
                                   ),
                                   const SizedBox(width: 8),
+                                  if (isCodex) ...[
+                                    _ToolChip(
+                                      key: const ValueKey(
+                                        'codex-target-tool-chip',
+                                      ),
+                                      icon: Icons.track_changes_outlined,
+                                      label: '目标',
+                                      onPressed: () =>
+                                          widget.onCodexTargetModeChanged(
+                                        !widget.codexTargetMode,
+                                      ),
+                                      highlighted: widget.codexTargetMode,
+                                    ),
+                                    const SizedBox(width: 8),
+                                  ],
                                   _ToolChip(
                                     icon: Icons.extension_outlined,
                                     label: 'Skill',
@@ -360,7 +397,8 @@ class _CommandInputBarState extends State<CommandInputBar> {
                                   const SizedBox(width: 8),
                                   _ToolChip(
                                     key: const ValueKey(
-                                        'command-bar-model-button'),
+                                      'command-bar-model-button',
+                                    ),
                                     icon: Icons.model_training_outlined,
                                     label: '模型 · ${widget.modelSummary}',
                                     onPressed: widget.onOpenModels,
@@ -369,219 +407,216 @@ class _CommandInputBarState extends State<CommandInputBar> {
                               ),
                             ),
                           ),
-                          const SizedBox(width: 10),
+                          SizedBox(width: compactRail ? 6 : 10),
                           _ContextWindowUsageButton(
                             usage: widget.contextWindowUsage,
                             onPressed: widget.onOpenContextWindowUsage,
                           ),
                           const SizedBox(width: 8),
-                          DecoratedBox(
-                            decoration: BoxDecoration(
-                              color: inputColor,
-                              borderRadius: BorderRadius.circular(999),
-                              border: Border.all(
-                                color: scheme.outlineVariant
-                                    .withValues(alpha: 0.4),
-                              ),
-                            ),
-                            child: Padding(
-                              padding:
-                                  const EdgeInsets.symmetric(horizontal: 12),
-                              child: DropdownButtonHideUnderline(
-                                child: DropdownButton<String>(
-                                  value: widget.permissionMode,
-                                  borderRadius: BorderRadius.circular(16),
-                                  style: theme.textTheme.bodySmall?.copyWith(
-                                    fontWeight: FontWeight.w600,
-                                  ),
-                                  items: const [
-                                    DropdownMenuItem(
-                                      value: 'auto',
-                                      child: Text('自动模式'),
-                                    ),
-                                    DropdownMenuItem(
-                                      value: 'default',
-                                      child: Text('手动审核'),
-                                    ),
-                                    DropdownMenuItem(
-                                      value: 'bypassPermissions',
-                                      child: Text('跳过权限确认'),
-                                    ),
-                                  ],
-                                  onChanged: (value) {
-                                    if (value != null) {
-                                      widget.onPermissionModeChanged(value);
-                                    }
-                                  },
-                                ),
-                              ),
-                            ),
+                          _PermissionModeIconButton(
+                            value: permissionMode,
+                            options: permissionModeOptions,
+                            inputColor: inputColor,
+                            onSelected: widget.onPermissionModeChanged,
                           ),
                         ],
                       ),
+                    );
+                  },
+                ),
+                const SizedBox(height: 10),
+                Container(
+                  constraints: const BoxConstraints(minHeight: 56),
+                  decoration: BoxDecoration(
+                    gradient: LinearGradient(
+                      colors: [
+                        inputColor,
+                        isLight
+                            ? Color.alphaBlend(
+                                scheme.secondary.withValues(alpha: 0.025),
+                                scheme.surfaceContainerLowest,
+                              )
+                            : scheme.surface.withValues(alpha: 0.94),
+                      ],
+                      begin: Alignment.topLeft,
+                      end: Alignment.bottomRight,
                     ),
-                    const SizedBox(height: 10),
-                    Container(
-                      constraints: const BoxConstraints(minHeight: 56),
-                      decoration: BoxDecoration(
-                        gradient: LinearGradient(
-                          colors: [
-                            inputColor,
-                            isLight
-                                ? Color.alphaBlend(
-                                    scheme.secondary.withValues(alpha: 0.025),
-                                    scheme.surfaceContainerLowest,
-                                  )
-                                : scheme.surface.withValues(alpha: 0.94),
-                          ],
-                          begin: Alignment.topLeft,
-                          end: Alignment.bottomRight,
+                    borderRadius: BorderRadius.circular(28),
+                    border: Border.all(
+                      color: _inputLocked
+                          ? scheme.outlineVariant
+                              .withValues(alpha: isLight ? 0.42 : 0.24)
+                          : scheme.primary
+                              .withValues(alpha: isLight ? 0.20 : 0.12),
+                    ),
+                    boxShadow: [
+                      if (isLight)
+                        BoxShadow(
+                          color: scheme.primary.withValues(alpha: 0.06),
+                          blurRadius: 18,
+                          offset: const Offset(0, 8),
                         ),
-                        borderRadius: BorderRadius.circular(28),
-                        border: Border.all(
-                          color: _inputLocked
-                              ? scheme.outlineVariant
-                                  .withValues(alpha: isLight ? 0.42 : 0.24)
-                              : scheme.primary
-                                  .withValues(alpha: isLight ? 0.20 : 0.12),
+                    ],
+                  ),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      if (_imageAttachments.isNotEmpty)
+                        _AttachmentPreviewStrip(
+                          attachments: _imageAttachments,
+                          onRemove:
+                              _inputLocked ? null : _removeImageAttachment,
                         ),
-                        boxShadow: [
-                          if (isLight)
-                            BoxShadow(
-                              color: scheme.primary.withValues(alpha: 0.06),
-                              blurRadius: 18,
-                              offset: const Offset(0, 8),
-                            ),
-                        ],
-                      ),
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
+                      Row(
+                        crossAxisAlignment: CrossAxisAlignment.end,
                         children: [
-                          if (_imageAttachments.isNotEmpty)
-                            _AttachmentPreviewStrip(
-                              attachments: _imageAttachments,
-                              onRemove:
-                                  _inputLocked ? null : _removeImageAttachment,
-                            ),
-                          Row(
-                            crossAxisAlignment: CrossAxisAlignment.end,
-                            children: [
-                              Expanded(
-                                child: TextField(
-                                  controller: _controller,
-                                  focusNode: _focusNode,
-                                  enabled: !_inputLocked,
-                                  readOnly: _inputLocked,
-                                  canRequestFocus: !_inputLocked,
-                                  minLines: 1,
-                                  maxLines: 6,
-                                  textInputAction: TextInputAction.send,
-                                  onTap: _inputLocked
-                                      ? () => _focusNode.unfocus()
-                                      : null,
-                                  onSubmitted:
-                                      _inputLocked ? null : (_) => _submit(),
-                                  textAlignVertical: TextAlignVertical.center,
-                                  style: Theme.of(context)
-                                      .textTheme
-                                      .bodyMedium
-                                      ?.copyWith(
-                                        height: 1.45,
-                                      ),
-                                  decoration: InputDecoration(
-                                    hintText: hintText,
-                                    hintStyle: Theme.of(context)
-                                        .textTheme
-                                        .bodyMedium
-                                        ?.copyWith(
-                                          color: scheme.onSurfaceVariant,
-                                        ),
-                                    filled: false,
-                                    isCollapsed: false,
-                                    contentPadding: const EdgeInsets.fromLTRB(
-                                      18,
-                                      14,
-                                      8,
-                                      14,
+                          Expanded(
+                            child: TextField(
+                              controller: _controller,
+                              focusNode: _focusNode,
+                              enabled: !_inputLocked,
+                              readOnly: _inputLocked,
+                              canRequestFocus: !_inputLocked,
+                              minLines: 1,
+                              maxLines: 6,
+                              keyboardType: TextInputType.multiline,
+                              textInputAction: TextInputAction.send,
+                              autocorrect: true,
+                              enableSuggestions: true,
+                              onTap: _inputLocked
+                                  ? () => _focusNode.unfocus()
+                                  : null,
+                              onSubmitted:
+                                  _inputLocked ? null : (_) => _submit(),
+                              textAlignVertical: TextAlignVertical.center,
+                              style: Theme.of(context)
+                                  .textTheme
+                                  .bodyMedium
+                                  ?.copyWith(
+                                    height: 1.45,
+                                  ),
+                              decoration: InputDecoration(
+                                hintText: hintText,
+                                hintStyle: Theme.of(context)
+                                    .textTheme
+                                    .bodyMedium
+                                    ?.copyWith(
+                                      color: scheme.onSurfaceVariant,
                                     ),
-                                    border: InputBorder.none,
-                                    enabledBorder: InputBorder.none,
-                                    focusedBorder: InputBorder.none,
-                                    disabledBorder: InputBorder.none,
-                                  ),
+                                filled: false,
+                                isCollapsed: false,
+                                contentPadding: const EdgeInsets.fromLTRB(
+                                  18,
+                                  14,
+                                  8,
+                                  14,
                                 ),
+                                border: InputBorder.none,
+                                enabledBorder: InputBorder.none,
+                                focusedBorder: InputBorder.none,
+                                disabledBorder: InputBorder.none,
                               ),
-                              Padding(
-                                padding: const EdgeInsets.fromLTRB(0, 0, 4, 7),
-                                child: SizedBox(
-                                  width: 42,
-                                  height: 42,
-                                  child: IconButton.filledTonal(
-                                    onPressed: _inputLocked || _pickingImage
-                                        ? null
-                                        : _attachImage,
-                                    tooltip: '添加图片',
-                                    icon: _pickingImage
-                                        ? SizedBox(
-                                            width: 18,
-                                            height: 18,
-                                            child: CircularProgressIndicator(
-                                              strokeWidth: 2,
-                                              color: scheme.primary,
-                                            ),
-                                          )
-                                        : const Icon(
-                                            Icons.image_outlined,
-                                            size: 20,
-                                          ),
+                            ),
+                          ),
+                          Padding(
+                            padding: const EdgeInsets.fromLTRB(0, 0, 2, 6),
+                            child: SizedBox(
+                              key:
+                                  const ValueKey('command-image-action-button'),
+                              width: _inputActionButtonSize,
+                              height: _inputActionButtonSize,
+                              child: IconButton.filledTonal(
+                                onPressed: _inputLocked || _pickingImage
+                                    ? null
+                                    : _attachImage,
+                                tooltip: '添加图片',
+                                style: IconButton.styleFrom(
+                                  fixedSize: const Size.square(
+                                    _inputActionButtonSize,
                                   ),
+                                  minimumSize: const Size.square(
+                                    _inputActionButtonSize,
+                                  ),
+                                  padding: EdgeInsets.zero,
+                                  tapTargetSize:
+                                      MaterialTapTargetSize.shrinkWrap,
+                                  visualDensity: VisualDensity.compact,
                                 ),
+                                icon: _pickingImage
+                                    ? SizedBox(
+                                        width: _inputActionIconSize,
+                                        height: _inputActionIconSize,
+                                        child: CircularProgressIndicator(
+                                          strokeWidth: 2,
+                                          color: scheme.primary,
+                                        ),
+                                      )
+                                    : const Icon(
+                                        Icons.image_outlined,
+                                        size: _inputActionIconSize,
+                                      ),
                               ),
-                              Padding(
-                                padding: const EdgeInsets.fromLTRB(0, 0, 7, 7),
-                                child: SizedBox(
-                                  width: 42,
-                                  height: 42,
-                                  child: FilledButton(
-                                    onPressed: _showStopAction
+                            ),
+                          ),
+                          Padding(
+                            padding: const EdgeInsets.fromLTRB(0, 0, 4, 6),
+                            child: SizedBox(
+                              key: const ValueKey('command-send-action-button'),
+                              width: _inputActionButtonSize,
+                              height: _inputActionButtonSize,
+                              child: ValueListenableBuilder<TextEditingValue>(
+                                valueListenable: _controller,
+                                builder: (context, value, _) {
+                                  final showStopAction =
+                                      _shouldShowStopAction(value.text);
+                                  return FilledButton(
+                                    onPressed: showStopAction
                                         ? widget.onStop
                                         : (_inputLocked ? null : _submit),
                                     style: FilledButton.styleFrom(
                                       elevation: 0,
                                       backgroundColor: _inputLocked
                                           ? scheme.surfaceContainerHighest
-                                          : _showStopAction
+                                          : showStopAction
                                               ? scheme.error
                                               : scheme.primary,
                                       foregroundColor: _inputLocked
                                           ? scheme.onSurfaceVariant
-                                          : _showStopAction
+                                          : showStopAction
                                               ? scheme.onError
                                               : scheme.onPrimary,
+                                      fixedSize: const Size.square(
+                                        _inputActionButtonSize,
+                                      ),
                                       padding: EdgeInsets.zero,
-                                      minimumSize: const Size(42, 42),
+                                      minimumSize: const Size.square(
+                                        _inputActionButtonSize,
+                                      ),
+                                      tapTargetSize:
+                                          MaterialTapTargetSize.shrinkWrap,
+                                      visualDensity: VisualDensity.compact,
                                       shape: RoundedRectangleBorder(
                                         borderRadius:
                                             BorderRadius.circular(999),
                                       ),
                                     ),
                                     child: Icon(
-                                      _showStopAction
+                                      showStopAction
                                           ? Icons.stop_rounded
                                           : Icons.arrow_upward,
-                                      size: 18,
+                                      size: _inputActionIconSize,
                                     ),
-                                  ),
-                                ),
+                                  );
+                                },
                               ),
-                            ],
+                            ),
                           ),
                         ],
                       ),
-                    ),
-                  ],
+                    ],
+                  ),
                 ),
-              ),
+              ],
             ),
           ),
         ),
@@ -694,6 +729,105 @@ class _ContextWindowUsageButton extends StatelessWidget {
         ),
       ),
     );
+  }
+}
+
+class _PermissionModeIconButton extends StatelessWidget {
+  const _PermissionModeIconButton({
+    required this.value,
+    required this.options,
+    required this.inputColor,
+    required this.onSelected,
+  });
+
+  final String value;
+  final List<PermissionModeOption> options;
+  final Color inputColor;
+  final ValueChanged<String> onSelected;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final selected = _selectedOption;
+    final tooltip = '权限：${selected.label}';
+
+    return Tooltip(
+      message: tooltip,
+      child: Semantics(
+        button: true,
+        label: tooltip,
+        child: PopupMenuButton<String>(
+          key: const ValueKey('permission-mode-icon-button'),
+          initialValue: value,
+          tooltip: tooltip,
+          onSelected: onSelected,
+          itemBuilder: (context) => [
+            for (final option in options)
+              PopupMenuItem<String>(
+                value: option.value,
+                child: Row(
+                  children: [
+                    Icon(
+                      option.value == value
+                          ? Icons.check_circle_rounded
+                          : _permissionModeIcon(option.value),
+                      size: 18,
+                      color: option.value == value
+                          ? scheme.primary
+                          : scheme.onSurfaceVariant,
+                    ),
+                    const SizedBox(width: 10),
+                    Text(option.label),
+                  ],
+                ),
+              ),
+          ],
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              color: inputColor,
+              borderRadius: BorderRadius.circular(999),
+              border: Border.all(
+                color: scheme.outlineVariant.withValues(alpha: 0.4),
+              ),
+            ),
+            child: SizedBox(
+              width: 44,
+              height: 40,
+              child: Center(
+                child: Icon(
+                  _permissionModeIcon(value),
+                  size: 20,
+                  color: scheme.onSurface,
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  PermissionModeOption get _selectedOption {
+    for (final option in options) {
+      if (option.value == value) {
+        return option;
+      }
+    }
+    return options.first;
+  }
+}
+
+IconData _permissionModeIcon(String value) {
+  switch (value) {
+    case 'bypassPermissions':
+      return Icons.bolt_rounded;
+    case 'auto':
+      return Icons.rate_review_outlined;
+    case 'config':
+      return Icons.tune_rounded;
+    case 'default':
+    default:
+      return Icons.rule_rounded;
   }
 }
 

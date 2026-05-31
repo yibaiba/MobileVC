@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -514,6 +515,158 @@ func TestHandlerFileAccessReadsAbsolutePath(t *testing.T) {
 	}
 }
 
+func TestHandlerFileAccessRejectsOversizedTextFile(t *testing.T) {
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "large.log")
+	largeContent := bytes.Repeat([]byte("x"), maxInlineFileReadBytes+1)
+	if err := os.WriteFile(filePath, largeContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h := newTestHandler()
+	conn := newTestConn(t, h)
+
+	if err := conn.WriteJSON(protocol.FSReadRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "fs_read"},
+		Path:        filePath,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	errorEvent := readUntilType(t, conn, protocol.EventTypeError)
+	if msg := fmt.Sprint(errorEvent["msg"]); !strings.Contains(msg, "file exceeds inline read limit") {
+		t.Fatalf("message: got %#v", errorEvent["msg"])
+	}
+}
+
+func TestHandlerFileAccessReadsImageAsBase64(t *testing.T) {
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "screen.png")
+	raw := []byte{0x89, 0x50, 0x4E, 0x47}
+	if err := os.WriteFile(filePath, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h := newTestHandler()
+	conn := newTestConn(t, h)
+
+	if err := conn.WriteJSON(protocol.FSReadRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "fs_read"},
+		Path:        filePath,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	readEvent := readUntilType(t, conn, protocol.EventTypeFSReadResult)
+	if readEvent["content"] != base64.StdEncoding.EncodeToString(raw) {
+		t.Fatalf("content: got %#v", readEvent["content"])
+	}
+	if readEvent["isText"] != false {
+		t.Fatalf("isText: got %#v", readEvent["isText"])
+	}
+}
+
+func TestHandlerFileAccessRejectsOversizedImage(t *testing.T) {
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "large.png")
+	largeContent := append([]byte{0x89, 0x50, 0x4E, 0x47}, bytes.Repeat([]byte("x"), maxInlineFileReadBytes+1)...)
+	if err := os.WriteFile(filePath, largeContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h := newTestHandler()
+	conn := newTestConn(t, h)
+
+	if err := conn.WriteJSON(protocol.FSReadRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "fs_read"},
+		Path:        filePath,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	errorEvent := readUntilType(t, conn, protocol.EventTypeError)
+	if msg := fmt.Sprint(errorEvent["msg"]); !strings.Contains(msg, "file exceeds inline read limit") {
+		t.Fatalf("message: got %#v", errorEvent["msg"])
+	}
+}
+
+func TestHandlerMediaPreviewReadsImageAsBase64(t *testing.T) {
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "preview.png")
+	raw := []byte{0x89, 0x50, 0x4E, 0x47}
+	if err := os.WriteFile(filePath, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h := newTestHandler()
+	conn := newTestConn(t, h)
+
+	if err := conn.WriteJSON(protocol.MediaPreviewRequestEvent{
+		ClientEvent:  protocol.ClientEvent{Action: "media_preview"},
+		AttachmentID: "att-1",
+		Path:         filePath,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	result := readUntilType(t, conn, protocol.EventTypeMediaPreviewResult)
+	if result["attachmentId"] != "att-1" {
+		t.Fatalf("attachmentId: got %#v", result["attachmentId"])
+	}
+	if result["status"] != "ok" {
+		t.Fatalf("status: got %#v", result["status"])
+	}
+	if result["content"] != base64.StdEncoding.EncodeToString(raw) {
+		t.Fatalf("content: got %#v", result["content"])
+	}
+}
+
+func TestHandlerMediaPreviewRejectsOversizedImage(t *testing.T) {
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "large.png")
+	largeContent := append([]byte{0x89, 0x50, 0x4E, 0x47}, bytes.Repeat([]byte("x"), maxImageAttachmentBytes+1)...)
+	if err := os.WriteFile(filePath, largeContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h := newTestHandler()
+	conn := newTestConn(t, h)
+
+	if err := conn.WriteJSON(protocol.MediaPreviewRequestEvent{
+		ClientEvent:  protocol.ClientEvent{Action: "media_preview"},
+		AttachmentID: "att-large",
+		Path:         filePath,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	result := readUntilType(t, conn, protocol.EventTypeMediaPreviewResult)
+	if result["status"] != "unsupported" {
+		t.Fatalf("status: got %#v", result["status"])
+	}
+	if msg := fmt.Sprint(result["message"]); !strings.Contains(msg, "image exceeds") {
+		t.Fatalf("message: got %#v", result["message"])
+	}
+	if content := fmt.Sprint(result["content"]); content != "" && content != "<nil>" {
+		t.Fatalf("content should be empty for oversized image, got %#v", result["content"])
+	}
+}
+
+func TestHandlerMediaPreviewRejectsNonImage(t *testing.T) {
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "notes.txt")
+	if err := os.WriteFile(filePath, []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h := newTestHandler()
+	conn := newTestConn(t, h)
+
+	if err := conn.WriteJSON(protocol.MediaPreviewRequestEvent{
+		ClientEvent:  protocol.ClientEvent{Action: "media_preview"},
+		AttachmentID: "att-text",
+		Path:         filePath,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	result := readUntilType(t, conn, protocol.EventTypeMediaPreviewResult)
+	if result["status"] != "unsupported" {
+		t.Fatalf("status: got %#v", result["status"])
+	}
+	if result["message"] != "file is not an image" {
+		t.Fatalf("message: got %#v", result["message"])
+	}
+}
+
 type switchableStubRunner struct {
 	mu       sync.Mutex
 	writeCh  chan []byte
@@ -675,6 +828,11 @@ func closeTestConnGracefully(t *testing.T, conn *websocket.Conn) {
 func readUntilSessionHistory(t *testing.T, conn *websocket.Conn) map[string]any {
 	t.Helper()
 	return readUntilType(t, conn, protocol.EventTypeSessionHistory)
+}
+
+func readUntilSessionHistoryPage(t *testing.T, conn *websocket.Conn) map[string]any {
+	t.Helper()
+	return readUntilType(t, conn, protocol.EventTypeSessionHistoryPage)
 }
 
 func readUntilSessionCreated(t *testing.T, conn *websocket.Conn) map[string]any {
@@ -1197,6 +1355,63 @@ func TestSessionResumeReplaysPendingEvents(t *testing.T) {
 	}
 	if resultEvent["runtimeAlive"] != false {
 		t.Fatalf("expected runtimeAlive false, got %#v", resultEvent)
+	}
+}
+
+func TestHandlerSessionResumeReturnsBoundedHistoryWindow(t *testing.T) {
+	h := newTestHandler()
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	h.SessionStore = tempStore
+	now := time.Date(2026, 5, 31, 17, 0, 0, 0, time.UTC)
+	entries := make([]data.SnapshotLogEntry, sessionResumeHistoryLimit+2)
+	for i := range entries {
+		entries[i] = data.SnapshotLogEntry{
+			Kind:      "markdown",
+			Message:   fmt.Sprintf("entry-%03d", i+1),
+			Timestamp: now.Add(time.Duration(i) * time.Second).Format(time.RFC3339),
+		}
+	}
+	record := data.SessionRecord{
+		Summary: data.SessionSummary{
+			ID:        "resume-window-session",
+			Title:     "Resume Window",
+			CreatedAt: now,
+			UpdatedAt: now,
+		},
+		Projection: data.ProjectionSnapshot{LogEntries: entries},
+	}
+	if _, err := h.SessionStore.UpsertSession(context.Background(), record); err != nil {
+		t.Fatalf("upsert session: %v", err)
+	}
+
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+	if err := conn.WriteJSON(protocol.SessionResumeRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_resume"},
+		SessionID:   record.Summary.ID,
+	}); err != nil {
+		t.Fatalf("write session_resume request: %v", err)
+	}
+
+	history := readUntilSessionHistory(t, conn)
+	if got := intFromJSONNumber(history["logEntryStart"]); got != 2 {
+		t.Fatalf("history start: got %d", got)
+	}
+	if got := intFromJSONNumber(history["logEntryTotal"]); got != sessionResumeHistoryLimit+2 {
+		t.Fatalf("history total: got %d", got)
+	}
+	if history["hasMoreBefore"] != true {
+		t.Fatalf("expected hasMoreBefore=true, got %#v", history)
+	}
+	gotEntries := history["logEntries"].([]any)
+	if len(gotEntries) != sessionResumeHistoryLimit {
+		t.Fatalf("expected %d entries, got %d", sessionResumeHistoryLimit, len(gotEntries))
+	}
+	if gotEntries[0].(map[string]any)["message"] != "entry-003" {
+		t.Fatalf("unexpected first bounded entry: %#v", gotEntries[0])
 	}
 }
 
@@ -6741,6 +6956,142 @@ func TestMergeSnapshotLogEntriesPreservesAppendOrder(t *testing.T) {
 	}
 }
 
+func TestHandlerSessionLoadReturnsLimitedHistoryWindowAndOlderPage(t *testing.T) {
+	h := newTestHandler()
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	h.SessionStore = tempStore
+	now := time.Date(2026, 5, 29, 12, 0, 0, 0, time.UTC)
+	record := data.SessionRecord{
+		Summary: data.SessionSummary{
+			ID:        "history-window-session",
+			Title:     "History Window",
+			CreatedAt: now,
+			UpdatedAt: now,
+		},
+		Projection: data.ProjectionSnapshot{
+			LogEntries: []data.SnapshotLogEntry{
+				{Kind: "markdown", Message: "one", Timestamp: now.Add(time.Second).Format(time.RFC3339)},
+				{Kind: "markdown", Message: "two", Timestamp: now.Add(2 * time.Second).Format(time.RFC3339)},
+				{Kind: "markdown", Message: "three", Timestamp: now.Add(3 * time.Second).Format(time.RFC3339)},
+				{Kind: "markdown", Message: "four", Timestamp: now.Add(4 * time.Second).Format(time.RFC3339)},
+			},
+		},
+	}
+	if _, err := h.SessionStore.UpsertSession(context.Background(), record); err != nil {
+		t.Fatalf("upsert session: %v", err)
+	}
+
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+	if err := conn.WriteJSON(protocol.SessionLoadRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_load"},
+		SessionID:   record.Summary.ID,
+		Limit:       2,
+	}); err != nil {
+		t.Fatalf("write session_load request: %v", err)
+	}
+	history := readUntilSessionHistory(t, conn)
+	if got := int(history["logEntryStart"].(float64)); got != 2 {
+		t.Fatalf("history start: got %d", got)
+	}
+	if got := int(history["logEntryTotal"].(float64)); got != 4 {
+		t.Fatalf("history total: got %d", got)
+	}
+	if history["hasMoreBefore"] != true {
+		t.Fatalf("expected hasMoreBefore=true, got %#v", history)
+	}
+	entries := history["logEntries"].([]any)
+	if len(entries) != 2 || entries[0].(map[string]any)["message"] != "three" || entries[1].(map[string]any)["message"] != "four" {
+		t.Fatalf("unexpected limited history entries: %#v", entries)
+	}
+
+	if err := conn.WriteJSON(protocol.SessionHistoryPageRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_history_page"},
+		SessionID:   record.Summary.ID,
+		Before:      2,
+		Limit:       2,
+	}); err != nil {
+		t.Fatalf("write session_history_page request: %v", err)
+	}
+	page := readUntilSessionHistoryPage(t, conn)
+	if got := intFromJSONNumber(page["logEntryStart"]); got != 0 {
+		t.Fatalf("page start: got %d", got)
+	}
+	if page["hasMoreBefore"] == true {
+		t.Fatalf("expected page hasMoreBefore=false, got %#v", page)
+	}
+	pageEntries := page["logEntries"].([]any)
+	if len(pageEntries) != 2 || pageEntries[0].(map[string]any)["message"] != "one" || pageEntries[1].(map[string]any)["message"] != "two" {
+		t.Fatalf("unexpected page entries: %#v", pageEntries)
+	}
+}
+
+func TestHandlerSessionLoadDefaultsToBoundedHistoryWindow(t *testing.T) {
+	h := newTestHandler()
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	h.SessionStore = tempStore
+	now := time.Date(2026, 5, 31, 19, 0, 0, 0, time.UTC)
+	entries := make([]data.SnapshotLogEntry, sessionResumeHistoryLimit+4)
+	for i := range entries {
+		entries[i] = data.SnapshotLogEntry{
+			Kind:      "markdown",
+			Message:   fmt.Sprintf("load-entry-%03d", i+1),
+			Timestamp: now.Add(time.Duration(i) * time.Second).Format(time.RFC3339),
+		}
+	}
+	record := data.SessionRecord{
+		Summary: data.SessionSummary{
+			ID:        "load-default-window-session",
+			Title:     "Load Default Window",
+			CreatedAt: now,
+			UpdatedAt: now,
+		},
+		Projection: data.ProjectionSnapshot{LogEntries: entries},
+	}
+	if _, err := h.SessionStore.UpsertSession(context.Background(), record); err != nil {
+		t.Fatalf("upsert session: %v", err)
+	}
+
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+	if err := conn.WriteJSON(protocol.SessionLoadRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_load"},
+		SessionID:   record.Summary.ID,
+	}); err != nil {
+		t.Fatalf("write session_load request: %v", err)
+	}
+	history := readUntilSessionHistory(t, conn)
+	if got := intFromJSONNumber(history["logEntryStart"]); got != 4 {
+		t.Fatalf("history start: got %d", got)
+	}
+	if got := intFromJSONNumber(history["logEntryTotal"]); got != sessionResumeHistoryLimit+4 {
+		t.Fatalf("history total: got %d", got)
+	}
+	if history["hasMoreBefore"] != true {
+		t.Fatalf("expected hasMoreBefore=true, got %#v", history)
+	}
+	gotEntries := history["logEntries"].([]any)
+	if len(gotEntries) != sessionResumeHistoryLimit {
+		t.Fatalf("expected %d entries, got %d", sessionResumeHistoryLimit, len(gotEntries))
+	}
+	if gotEntries[0].(map[string]any)["message"] != "load-entry-005" {
+		t.Fatalf("unexpected first bounded entry: %#v", gotEntries[0])
+	}
+}
+
+func intFromJSONNumber(value any) int {
+	if value == nil {
+		return 0
+	}
+	return int(value.(float64))
+}
+
 func TestHandlerSessionLoadPreservesCodexMirrorOverlayButDropsStaleCachedLogs(t *testing.T) {
 	homeDir := t.TempDir()
 	projectDir := filepath.Join(homeDir, "workspace", "MobileVC")
@@ -7212,6 +7563,92 @@ func TestHandlerSessionDeleteCurrentSessionCleansRuntimeAndFallsBack(t *testing.
 	}
 }
 
+func TestHandlerSessionDeleteFallbackReturnsBoundedHistoryWindow(t *testing.T) {
+	runnerA := newSwitchableStubRunner()
+	runnerB := newSwitchableStubRunner()
+	h := newTestHandler()
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	h.SessionStore = tempStore
+	h.NewPtyRunner = func() engine.Runner {
+		if runnerA != nil {
+			r := runnerA
+			runnerA = nil
+			return r
+		}
+		return runnerB
+	}
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+
+	if err := conn.WriteJSON(protocol.SessionCreateRequestEvent{ClientEvent: protocol.ClientEvent{Action: "session_create"}, Title: "session-a"}); err != nil {
+		t.Fatalf("write initial session create request: %v", err)
+	}
+	createdA := readUntilSessionCreated(t, conn)
+	_ = readUntilType(t, conn, protocol.EventTypeSessionListResult)
+	summaryA, ok := createdA["summary"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected summary payload, got %#v", createdA)
+	}
+	sessionA, _ := summaryA["id"].(string)
+	if sessionA == "" {
+		t.Fatalf("expected session A id, got %#v", createdA)
+	}
+	now := time.Date(2026, 5, 31, 18, 0, 0, 0, time.UTC)
+	entries := make([]data.SnapshotLogEntry, sessionResumeHistoryLimit+3)
+	for i := range entries {
+		entries[i] = data.SnapshotLogEntry{
+			Kind:      "markdown",
+			Message:   fmt.Sprintf("fallback-entry-%03d", i+1),
+			Timestamp: now.Add(time.Duration(i) * time.Second).Format(time.RFC3339),
+		}
+	}
+	if _, err := h.SessionStore.SaveProjection(context.Background(), sessionA, data.ProjectionSnapshot{LogEntries: entries}); err != nil {
+		t.Fatalf("save fallback projection: %v", err)
+	}
+
+	if err := conn.WriteJSON(protocol.SessionCreateRequestEvent{ClientEvent: protocol.ClientEvent{Action: "session_create"}, Title: "session-b"}); err != nil {
+		t.Fatalf("write session create request: %v", err)
+	}
+	createdB := readUntilSessionCreated(t, conn)
+	_ = readUntilType(t, conn, protocol.EventTypeSessionListResult)
+	summaryB, ok := createdB["summary"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected summary payload, got %#v", createdB)
+	}
+	sessionB, _ := summaryB["id"].(string)
+	if sessionB == "" || sessionB == sessionA {
+		t.Fatalf("expected distinct session B id, got %q", sessionB)
+	}
+
+	if err := conn.WriteJSON(protocol.SessionDeleteRequestEvent{ClientEvent: protocol.ClientEvent{Action: "session_delete"}, SessionID: sessionB}); err != nil {
+		t.Fatalf("write session delete request: %v", err)
+	}
+	_ = readUntilType(t, conn, protocol.EventTypeSessionListResult)
+	history := readUntilSessionHistory(t, conn)
+	if history["sessionId"] != sessionA {
+		t.Fatalf("expected fallback history for session A, got %#v", history)
+	}
+	if got := intFromJSONNumber(history["logEntryStart"]); got != 3 {
+		t.Fatalf("history start: got %d", got)
+	}
+	if got := intFromJSONNumber(history["logEntryTotal"]); got != sessionResumeHistoryLimit+3 {
+		t.Fatalf("history total: got %d", got)
+	}
+	if history["hasMoreBefore"] != true {
+		t.Fatalf("expected hasMoreBefore=true, got %#v", history)
+	}
+	gotEntries := history["logEntries"].([]any)
+	if len(gotEntries) != sessionResumeHistoryLimit {
+		t.Fatalf("expected %d entries, got %d", sessionResumeHistoryLimit, len(gotEntries))
+	}
+	if gotEntries[0].(map[string]any)["message"] != "fallback-entry-004" {
+		t.Fatalf("unexpected first fallback entry: %#v", gotEntries[0])
+	}
+}
+
 func TestHandlerSessionDeleteCurrentSessionSkipsNativeCodexFallback(t *testing.T) {
 	homeDir := t.TempDir()
 	projectDir := filepath.Join(homeDir, "workspace", "MobileVC")
@@ -7350,6 +7787,105 @@ func TestHandlerSessionDeltaRefreshesNativeCodexMirror(t *testing.T) {
 	}
 	if !foundFresh {
 		t.Fatalf("expected fresh native mirror log entry in delta, got %#v", entries)
+	}
+}
+
+func TestHandlerSessionDeltaMergesClaudeJSONLForMobileVCSession(t *testing.T) {
+	homeDir := t.TempDir()
+	projectDir := filepath.Join(homeDir, "workspace", "ClaudeProject")
+	if err := os.MkdirAll(projectDir, 0o755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
+	}
+	t.Setenv("HOME", homeDir)
+	t.Setenv("USERPROFILE", homeDir)
+	t.Setenv("HOMEDRIVE", "")
+	t.Setenv("HOMEPATH", "")
+
+	h := newTestHandler()
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	h.SessionStore = tempStore
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+
+	sessionID := createHistorySessionForHandlerTest(t, h, conn, "mobilevc-claude")
+	record, err := h.SessionStore.GetSession(context.Background(), sessionID)
+	if err != nil {
+		t.Fatalf("get created session: %v", err)
+	}
+	record.Summary.Runtime.CWD = projectDir
+	record.Projection.Runtime = data.SessionRuntime{
+		ResumeSessionID: record.Summary.ClaudeSessionUUID,
+		Command:         "claude --resume " + record.Summary.ClaudeSessionUUID,
+		Engine:          "claude",
+		CWD:             projectDir,
+		Source:          "mobilevc",
+	}
+	record.Projection.Controller.SessionID = sessionID
+	record.Projection.LogEntries = []data.SnapshotLogEntry{{
+		Kind:      "user",
+		Label:     "历史输入",
+		Message:   "mobile existing prompt",
+		Timestamp: "2026-05-28T01:00:00Z",
+	}}
+	summary, err := h.SessionStore.UpsertSession(context.Background(), record)
+	if err != nil {
+		t.Fatalf("upsert mobilevc claude session: %v", err)
+	}
+	record.Summary = summary
+
+	if err := conn.WriteJSON(protocol.SessionLoadRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_load"},
+		SessionID:   sessionID,
+		CWD:         projectDir,
+	}); err != nil {
+		t.Fatalf("write session_load request: %v", err)
+	}
+	_ = readUntilSessionHistory(t, conn)
+
+	if err := claudesync.WriteSessionToJSONL(projectDir, record.Summary.ClaudeSessionUUID, []claudesync.JSONLEvent{
+		{Type: "assistant", Text: "Fresh desktop Claude answer", Timestamp: "2026-05-28T01:01:00Z"},
+	}); err != nil {
+		t.Fatalf("append claude jsonl: %v", err)
+	}
+
+	if err := conn.WriteJSON(protocol.SessionDeltaRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_delta_get"},
+		SessionID:   sessionID,
+		Known: protocol.SessionDeltaKnown{
+			LogEntryCount: len(record.Projection.LogEntries),
+		},
+	}); err != nil {
+		t.Fatalf("write session_delta_get request: %v", err)
+	}
+	delta := readUntilType(t, conn, protocol.EventTypeSessionDelta)
+	if delta["requiresFullSync"] == true {
+		t.Fatalf("expected incremental delta, got full sync request: %#v", delta)
+	}
+	entries, ok := delta["appendLogEntries"].([]any)
+	if !ok || len(entries) == 0 {
+		t.Fatalf("expected claude jsonl entry in delta, got %#v", delta)
+	}
+	foundFresh := false
+	for _, raw := range entries {
+		entry, _ := raw.(map[string]any)
+		if entry["message"] == "Fresh desktop Claude answer" {
+			foundFresh = true
+			break
+		}
+	}
+	if !foundFresh {
+		t.Fatalf("expected fresh desktop Claude entry in delta, got %#v", entries)
+	}
+
+	updated, err := h.SessionStore.GetSession(context.Background(), sessionID)
+	if err != nil {
+		t.Fatalf("get updated session: %v", err)
+	}
+	if updated.Summary.Ownership != "mobilevc" || updated.Summary.External {
+		t.Fatalf("mobilevc-owned session should not become external: %#v", updated.Summary)
 	}
 }
 

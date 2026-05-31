@@ -7,6 +7,7 @@ import '../relay_e2ee/relay_e2ee_capability.dart';
 import 'relay_config.dart';
 
 const Object _unchanged = Object();
+const int defaultHistoryWindowLimit = 120;
 
 class AppConfig {
   static const String adbIcePort = AdbIceConfig.port;
@@ -22,6 +23,9 @@ class AppConfig {
     this.claudeModel = '',
     this.codexModel = '',
     this.codexReasoningEffort = '',
+    this.codexSandboxMode = 'workspace-write',
+    this.codexTargetMode = false,
+    this.historyWindowLimit = defaultHistoryWindowLimit,
     this.permissionMode = 'auto',
     this.fastMode = false,
     this.adbIceServersJson = '',
@@ -47,6 +51,9 @@ class AppConfig {
   final String claudeModel;
   final String codexModel;
   final String codexReasoningEffort;
+  final String codexSandboxMode;
+  final bool codexTargetMode;
+  final int historyWindowLimit;
   final String permissionMode;
   final bool fastMode;
   final String adbIceServersJson;
@@ -131,6 +138,9 @@ class AppConfig {
     String? claudeModel,
     String? codexModel,
     String? codexReasoningEffort,
+    String? codexSandboxMode,
+    bool? codexTargetMode,
+    int? historyWindowLimit,
     String? permissionMode,
     bool? fastMode,
     String? adbIceServersJson,
@@ -172,6 +182,11 @@ class AppConfig {
       claudeModel: nextModels.claudeModel,
       codexModel: nextModels.codexModel,
       codexReasoningEffort: nextModels.codexReasoningEffort,
+      codexSandboxMode:
+          normalizeCodexSandboxMode(codexSandboxMode ?? this.codexSandboxMode),
+      codexTargetMode: codexTargetMode ?? this.codexTargetMode,
+      historyWindowLimit: parseHistoryWindowLimit(
+          historyWindowLimit ?? this.historyWindowLimit),
       permissionMode: _normalizePermissionMode(
         permissionMode ?? this.permissionMode,
       ),
@@ -245,6 +260,9 @@ class AppConfig {
         'claudeModel': claudeModel,
         'codexModel': codexModel,
         'codexReasoningEffort': codexReasoningEffort,
+        'codexSandboxMode': codexSandboxMode,
+        'codexTargetMode': codexTargetMode,
+        'historyWindowLimit': historyWindowLimit,
         'permissionMode': permissionMode,
         'fastMode': fastMode,
         'adbIceServersJson': adbIceServersJson,
@@ -288,6 +306,14 @@ class AppConfig {
                   ? legacyReasoningEffort
                   : ''))
           .toString(),
+      codexSandboxMode: normalizeCodexSandboxMode(
+        (json['codexSandboxMode'] ?? 'workspace-write').toString(),
+      ),
+      codexTargetMode: json['codexTargetMode'] == true,
+      historyWindowLimit: parseHistoryWindowLimit(
+        json['historyWindowLimit'],
+        defaultWhenMissing: true,
+      ),
       permissionMode: _normalizePermissionMode(
         (json['permissionMode'] ?? 'auto').toString(),
       ),
@@ -314,14 +340,62 @@ class AppConfig {
   }
 
   static String _normalizePermissionMode(String value) {
+    return normalizePermissionModeForDisplay(value);
+  }
+
+  static String normalizePermissionModeForDisplay(String value) {
     switch (value.trim()) {
       case 'bypassPermissions':
         return 'bypassPermissions';
+      case 'config':
+        return 'config';
       case 'default':
         return 'default';
       default:
         return 'auto';
     }
+  }
+
+  static String normalizeCodexSandboxMode(String value) {
+    switch (value.trim()) {
+      case 'read-only':
+        return 'read-only';
+      case 'danger-full-access':
+        return 'danger-full-access';
+      case 'config':
+        return 'config';
+      case 'workspace-write':
+      default:
+        return 'workspace-write';
+    }
+  }
+
+  static int parseHistoryWindowLimit(
+    Object? value, {
+    bool defaultWhenMissing = false,
+  }) {
+    if (value == null) {
+      if (defaultWhenMissing) {
+        return defaultHistoryWindowLimit;
+      }
+      throw const FormatException('historyWindowLimit is required');
+    }
+    final parsed = value is num
+        ? _parseNumericHistoryWindowLimit(value)
+        : int.tryParse(value.toString().trim());
+    if (parsed == null || parsed <= 0) {
+      throw const FormatException(
+        'historyWindowLimit must be a positive integer',
+      );
+    }
+    return parsed;
+  }
+
+  static int? _parseNumericHistoryWindowLimit(num value) {
+    if (!value.isFinite || value % 1 != 0) {
+      return null;
+    }
+    return value.toInt();
   }
 
   static AppConfig? fromLaunchUri(
@@ -341,6 +415,13 @@ class AppConfig {
       final hasReconnectCredentials =
           fallback.relayClientId.trim().isNotEmpty &&
               fallback.relayClientReconnectSecret.trim().isNotEmpty;
+      final canReconnectSameRelaySession =
+          sameRelaySession && hasReconnectCredentials;
+      if (!canReconnectSameRelaySession && _relayPairingExpired(relayPairing)) {
+        throw const FormatException(
+          'Relay 配对链接已过期，请在电脑端生成新的 Relay 链接后重新导入',
+        );
+      }
       return fallback.copyWith(
         connectionMode: relayPairing.hasLanEndpoint
             ? ConnectionMode.auto.name
@@ -359,16 +440,13 @@ class AppConfig {
             (relayPairing.hasLanEndpoint ? fallback.secureTransport : null),
         relayUrl: relayPairing.relayUrl,
         relaySessionId: relayPairing.sessionId,
-        relayPairingSecret: sameRelaySession && hasReconnectCredentials
-            ? ''
-            : relayPairing.pairingSecret,
-        relayPairingExpiresAt: sameRelaySession && hasReconnectCredentials
-            ? 0
-            : relayPairing.expiresAt,
-        relayClientId: sameRelaySession && hasReconnectCredentials
-            ? fallback.relayClientId
-            : '',
-        relayClientReconnectSecret: sameRelaySession && hasReconnectCredentials
+        relayPairingSecret:
+            canReconnectSameRelaySession ? '' : relayPairing.pairingSecret,
+        relayPairingExpiresAt:
+            canReconnectSameRelaySession ? 0 : relayPairing.expiresAt,
+        relayClientId:
+            canReconnectSameRelaySession ? fallback.relayClientId : '',
+        relayClientReconnectSecret: canReconnectSameRelaySession
             ? fallback.relayClientReconnectSecret
             : '',
         relayNodeFingerprintHex: relayPairing.nodeFingerprintHex,
@@ -392,6 +470,14 @@ class AppConfig {
       adbIceServersJson: ice,
       secureTransport: secureTransportFromScheme(uri.scheme),
     );
+  }
+
+  static bool _relayPairingExpired(RelayPairing pairing) {
+    if (pairing.expiresAt <= 0) {
+      return false;
+    }
+    final nowSeconds = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    return nowSeconds > pairing.expiresAt;
   }
 
   AppConnectionUrls _connectionUrls(bool? secureTransport) {

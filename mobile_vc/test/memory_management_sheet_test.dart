@@ -91,7 +91,7 @@ void main() {
       find.byKey(const ValueKey('memoryDetail.modifyInput:mem-9')),
       '改成偏好浅色、但保留 iOS 风格',
     );
-    await tester.tap(find.text('让 Claude 修改这个 memory'));
+    await tester.tap(find.text('让 AI 助手修改这个 memory'));
     await tester.pumpAndSettle();
     expect(revised, 'mem-9:改成偏好浅色、但保留 iOS 风格');
   });
@@ -118,12 +118,59 @@ void main() {
     await tester.pumpAndSettle();
 
     await tester.enterText(find.widgetWithText(TextField, 'id'), 'mem-2');
-    await tester.enterText(find.widgetWithText(TextField, 'title'), 'New Memory');
-    await tester.enterText(find.widgetWithText(TextField, 'content'), 'remember this');
+    await tester.enterText(
+        find.widgetWithText(TextField, 'title'), 'New Memory');
+    await tester.enterText(
+        find.widgetWithText(TextField, 'content'), 'remember this');
 
     expect(find.text('mem-2'), findsOneWidget);
     expect(find.text('New Memory'), findsOneWidget);
     expect(find.text('remember this'), findsOneWidget);
     expect(find.widgetWithText(FilledButton, '保存 memory'), findsOneWidget);
+  });
+
+  testWidgets('大量 memory 按可见网格项懒加载', (tester) async {
+    final items = List<MemoryItem>.generate(
+      120,
+      (index) => MemoryItem(
+        id: 'mem-$index',
+        title: 'Memory item $index',
+        content: 'content $index',
+      ),
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SizedBox(
+            height: 560,
+            child: MemoryManagementSheet(
+              items: items,
+              syncStatus: '',
+              catalogMeta: const CatalogMetadata(domain: 'memory'),
+              enabledMemoryIds: const [],
+              onToggleEnabled: (_) {},
+              onSave: (_) {},
+              onSync: () {},
+              onReviseMemory: (_, __) {},
+            ),
+          ),
+        ),
+      ),
+    );
+
+    expect(find.text('Memory item 0'), findsOneWidget);
+    expect(find.text('Memory item 119'), findsNothing);
+
+    await tester.scrollUntilVisible(
+      find.text('Memory item 119'),
+      500,
+      scrollable: find.descendant(
+        of: find.byType(CustomScrollView),
+        matching: find.byType(Scrollable),
+      ),
+    );
+
+    expect(find.text('Memory item 119'), findsOneWidget);
   });
 }

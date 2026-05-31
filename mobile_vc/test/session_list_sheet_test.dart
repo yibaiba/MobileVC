@@ -223,6 +223,47 @@ void main() {
     expect(find.widgetWithText(ChoiceChip, 'Project23'), findsNothing);
   });
 
+  testWidgets('单项目大量会话按可见行懒加载', (tester) async {
+    final sessions = List<SessionSummary>.generate(120, (index) {
+      return SessionSummary(
+        id: 'session-$index',
+        title: 'Work item $index',
+        updatedAt:
+            DateTime(2026, 5, 24, 12, 0).subtract(Duration(minutes: index)),
+        runtime: const RuntimeMeta(cwd: '/workspace/MobileVC'),
+      );
+    });
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SizedBox(
+            height: 520,
+            child: SessionListSheet(
+              sessions: sessions,
+              selectedSessionId: '',
+              cwd: '/workspace/MobileVC',
+              onCreate: () {},
+              onLoad: (_) {},
+              onDelete: (_) {},
+            ),
+          ),
+        ),
+      ),
+    );
+
+    expect(find.text('Work item 0'), findsOneWidget);
+    expect(find.text('Work item 119'), findsNothing);
+
+    await tester.scrollUntilVisible(
+      find.text('Work item 119'),
+      500,
+      scrollable: find.byType(Scrollable),
+    );
+
+    expect(find.text('Work item 119'), findsOneWidget);
+  });
+
   testWidgets('Codex Claude 和 Gemini 筛选只显示对应来源', (tester) async {
     await tester.pumpWidget(
       MaterialApp(

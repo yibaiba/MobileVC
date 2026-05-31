@@ -303,6 +303,51 @@ func TestSessionHistoryEventFromRecord(t *testing.T) {
 	}
 }
 
+func TestSessionHistoryWindowEventFromRecordReturnsTailWindow(t *testing.T) {
+	record := data.SessionRecord{
+		Summary: data.SessionSummary{ID: "s1"},
+		Projection: data.ProjectionSnapshot{
+			LogEntries: []data.SnapshotLogEntry{
+				{Kind: "markdown", Message: "a"},
+				{Kind: "markdown", Message: "b"},
+				{Kind: "markdown", Message: "c"},
+			},
+		},
+	}
+
+	got := SessionHistoryWindowEventFromRecord(record, false, 2)
+
+	if got.LogEntryStart != 1 || got.LogEntryTotal != 3 || !got.HasMoreBefore {
+		t.Fatalf("unexpected window metadata: start=%d total=%d hasMore=%v", got.LogEntryStart, got.LogEntryTotal, got.HasMoreBefore)
+	}
+	if len(got.LogEntries) != 2 || got.LogEntries[0].Message != "b" || got.LogEntries[1].Message != "c" {
+		t.Fatalf("unexpected window entries: %+v", got.LogEntries)
+	}
+}
+
+func TestSessionHistoryPageEventFromRecordReturnsEarlierWindow(t *testing.T) {
+	record := data.SessionRecord{
+		Summary: data.SessionSummary{ID: "s1"},
+		Projection: data.ProjectionSnapshot{
+			LogEntries: []data.SnapshotLogEntry{
+				{Kind: "markdown", Message: "a"},
+				{Kind: "markdown", Message: "b"},
+				{Kind: "markdown", Message: "c"},
+				{Kind: "markdown", Message: "d"},
+			},
+		},
+	}
+
+	got := SessionHistoryPageEventFromRecord(record, 2, 2)
+
+	if got.LogEntryStart != 0 || got.LogEntryTotal != 4 || got.HasMoreBefore {
+		t.Fatalf("unexpected page metadata: start=%d total=%d hasMore=%v", got.LogEntryStart, got.LogEntryTotal, got.HasMoreBefore)
+	}
+	if len(got.LogEntries) != 2 || got.LogEntries[0].Message != "a" || got.LogEntries[1].Message != "b" {
+		t.Fatalf("unexpected page entries: %+v", got.LogEntries)
+	}
+}
+
 func TestSessionDeltaEventFromRecord_FullDeliveryWhenKnownEmpty(t *testing.T) {
 	record := data.SessionRecord{
 		Summary: data.SessionSummary{ID: "s1"},
@@ -354,6 +399,44 @@ func TestSessionDeltaEventFromRecord_RespectsKnownLog(t *testing.T) {
 	got := SessionDeltaEventFromRecord(record, known, DeltaCursorSnapshot{}, false)
 	if len(got.AppendLogEntries) != 1 {
 		t.Errorf("expected 1 new entry, got %d", len(got.AppendLogEntries))
+	}
+}
+
+func TestSessionDeltaEventFromRecord_PreservesLogEntryAttachments(t *testing.T) {
+	attachment := protocol.TimelineAttachment{
+		ID:            "att-1",
+		Kind:          "image",
+		Name:          "screen.png",
+		MIMEType:      "image/png",
+		Size:          9,
+		Path:          "/tmp/screen.png",
+		PreviewStatus: "available",
+		Source:        "user_upload",
+	}
+	record := data.SessionRecord{
+		Summary: data.SessionSummary{ID: "s1"},
+		Projection: data.ProjectionSnapshot{
+			LogEntries: []data.SnapshotLogEntry{
+				{
+					Kind:        "user",
+					Message:     "看图",
+					Attachments: []protocol.TimelineAttachment{attachment},
+				},
+			},
+			Runtime: data.SessionRuntime{Command: "claude"},
+		},
+	}
+
+	got := SessionDeltaEventFromRecord(record, protocol.SessionDeltaKnown{}, DeltaCursorSnapshot{}, false)
+	if len(got.AppendLogEntries) != 1 {
+		t.Fatalf("expected 1 log entry, got %d", len(got.AppendLogEntries))
+	}
+	attachments := got.AppendLogEntries[0].Attachments
+	if len(attachments) != 1 {
+		t.Fatalf("expected attachment metadata, got %+v", got.AppendLogEntries[0])
+	}
+	if attachments[0].ID != attachment.ID || attachments[0].Path != attachment.Path {
+		t.Fatalf("attachment metadata not preserved: %+v", attachments[0])
 	}
 }
 

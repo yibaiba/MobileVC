@@ -107,7 +107,7 @@ Common relay settings:
 | `RELAY_MAX_CLIENT_CONNS` | `2000` | Client websocket cap |
 | `RELAY_MAX_CONNS_PER_IP` | `20` | Per-IP websocket cap |
 | `RELAY_FORWARD_QUEUE_SIZE` | `64` | Bounded forward queue per peer |
-| `RELAY_MAX_PAYLOAD_BYTES` | `8388608` | Max decoded relay payload size |
+| `RELAY_MAX_PAYLOAD_BYTES` | `33554432` | Max decoded relay payload size |
 | `CADDY_DOCKERFILE` | `Caddy.DNS.Dockerfile` | Caddy build template; use `Caddy.DNSPod.Dockerfile` for DNSPod |
 | `CADDYFILE_PATH` | `./Caddyfile.cloudflare` | DNS-01 provider template: Cloudflare, AliDNS, or DNSPod |
 | `CF_API_TOKEN` | empty | Cloudflare scoped token when using `Caddyfile.cloudflare` |
@@ -173,7 +173,7 @@ The phone app, local backend, and relay may be built from incompatible code, or 
 
 `payload_too_large`
 
-The encrypted relay payload exceeded `RELAY_MAX_PAYLOAD_BYTES`. The default is `8 MiB`. File downloads should use the encrypted chunked download stream instead of sending a whole file in one frame.
+The encrypted relay payload exceeded `RELAY_MAX_PAYLOAD_BYTES`. The default is `32 MiB`. File downloads should use the encrypted chunked download stream instead of sending a whole file in one frame.
 
 Public `ws://` is rejected
 

@@ -35,6 +35,18 @@ func TestLoadConfigFromEnvRejectsInvalidByteLimit(t *testing.T) {
 	}
 }
 
+func TestLoadConfigFromEnvUsesDefaultPayloadByteLimit(t *testing.T) {
+	withRelayEnv(t, map[string]string{})
+
+	cfg, err := LoadConfigFromEnv()
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.MaxPayloadBytes != 32*1024*1024 {
+		t.Fatalf("payload bytes: got %d", cfg.MaxPayloadBytes)
+	}
+}
+
 func TestLoadConfigFromEnvReadsPayloadByteLimit(t *testing.T) {
 	withRelayEnv(t, map[string]string{
 		"RELAY_MAX_PAYLOAD_BYTES": "12KiB",

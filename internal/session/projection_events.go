@@ -278,8 +278,12 @@ func snapshotDiffMatches(item DiffContext, contextID, targetPath string) bool {
 }
 
 func SessionHistoryEventFromRecord(record data.SessionRecord, runtimeAlive bool) protocol.SessionHistoryEvent {
+	return SessionHistoryWindowEventFromRecord(record, runtimeAlive, 0)
+}
+
+func SessionHistoryWindowEventFromRecord(record data.SessionRecord, runtimeAlive bool, limit int) protocol.SessionHistoryEvent {
 	projection := NormalizeProjectionSnapshot(record.Projection)
-	entries := protocolLogEntries(projection.LogEntries)
+	window := snapshotLogEntryWindow(projection.LogEntries, len(projection.LogEntries), limit)
 	executions := protocolTerminalExecutions(projection.TerminalExecutions)
 	resumeMeta := protocol.RuntimeMeta{
 		ResumeSessionID: projection.Runtime.ResumeSessionID,
@@ -289,10 +293,12 @@ func SessionHistoryEventFromRecord(record data.SessionRecord, runtimeAlive bool)
 		PermissionMode:  projection.Runtime.PermissionMode,
 		ClaudeLifecycle: NormalizeProjectionLifecycle(projection.Runtime.ClaudeLifecycle, projection.Runtime.ResumeSessionID),
 	}
-	return protocol.NewSessionHistoryEvent(
+	return protocol.NewSessionHistoryWindowEvent(
 		record.Summary.ID,
 		ToProtocolSummary(record.Summary),
-		entries,
+		protocolLogEntries(window.entries),
+		window.start,
+		len(projection.LogEntries),
 		ProtocolDiffContexts(projection.Diffs),
 		ProtocolDiffContext(projection.CurrentDiff),
 		ProtocolReviewGroups(projection.ReviewGroups),
@@ -309,6 +315,49 @@ func SessionHistoryEventFromRecord(record data.SessionRecord, runtimeAlive bool)
 		runtimeAlive,
 		resumeMeta,
 	)
+}
+
+func SessionHistoryPageEventFromRecord(record data.SessionRecord, before, limit int) protocol.SessionHistoryPageEvent {
+	projection := NormalizeProjectionSnapshot(record.Projection)
+	window := snapshotLogEntryWindow(projection.LogEntries, before, limit)
+	resumeMeta := protocol.RuntimeMeta{
+		ResumeSessionID: projection.Runtime.ResumeSessionID,
+		Command:         projection.Runtime.Command,
+		Engine:          projection.Runtime.Engine,
+		CWD:             projection.Runtime.CWD,
+		PermissionMode:  projection.Runtime.PermissionMode,
+		ClaudeLifecycle: NormalizeProjectionLifecycle(projection.Runtime.ClaudeLifecycle, projection.Runtime.ResumeSessionID),
+	}
+	return protocol.NewSessionHistoryPageEvent(
+		record.Summary.ID,
+		protocolLogEntries(window.entries),
+		window.start,
+		len(projection.LogEntries),
+		resumeMeta,
+	)
+}
+
+type snapshotLogWindow struct {
+	entries []data.SnapshotLogEntry
+	start   int
+}
+
+func snapshotLogEntryWindow(entries []data.SnapshotLogEntry, before, limit int) snapshotLogWindow {
+	total := len(entries)
+	if before <= 0 || before > total {
+		before = total
+	}
+	if limit <= 0 || limit >= before {
+		return snapshotLogWindow{
+			entries: append([]data.SnapshotLogEntry(nil), entries[:before]...),
+			start:   0,
+		}
+	}
+	start := before - limit
+	return snapshotLogWindow{
+		entries: append([]data.SnapshotLogEntry(nil), entries[start:before]...),
+		start:   start,
+	}
 }
 
 func SessionDeltaEventFromRecord(record data.SessionRecord, known protocol.SessionDeltaKnown, cursor DeltaCursorSnapshot, runtimeAlive bool) protocol.SessionDeltaEvent {
@@ -606,6 +655,7 @@ func protocolLogEntries(items []data.SnapshotLogEntry) []protocol.HistoryLogEntr
 			Phase:       entry.Phase,
 			ExitCode:    entry.ExitCode,
 			Context:     HistoryContextFromSnapshot(entry.Context),
+			Attachments: append([]protocol.TimelineAttachment(nil), entry.Attachments...),
 		})
 	}
 	return entries

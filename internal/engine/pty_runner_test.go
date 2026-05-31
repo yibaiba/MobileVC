@@ -1725,6 +1725,87 @@ func TestCodexAppSessionTurnStartPassesReasoningEffort(t *testing.T) {
 	}
 }
 
+func TestCodexAppSessionTurnStartUsesCodexConfigDefaults(t *testing.T) {
+	buf := &nopWriteCloser{}
+	app := &codexAppSession{
+		runner: NewPtyRunner(),
+		req: ExecRequest{
+			Command: "codex",
+		},
+		defaults: codexConfigDefaults{
+			model:           "gpt-5.5",
+			reasoningEffort: "xhigh",
+		},
+		stdin: buf,
+	}
+	app.setThreadID("thread-123")
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- app.SendUserInput(context.Background(), []byte("hello\n"))
+	}()
+
+	resolveNextPendingRPC(t, app, map[string]any{
+		"turn": map[string]any{
+			"id": "turn-1",
+		},
+	})
+
+	if err := <-errCh; err != nil {
+		t.Fatalf("send user input: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, `"model":"gpt-5.5"`) {
+		t.Fatalf("expected model default in turn/start payload, got %q", output)
+	}
+	if !strings.Contains(output, `"effort":"xhigh"`) {
+		t.Fatalf("expected reasoning effort default in turn/start payload, got %q", output)
+	}
+}
+
+func TestCodexAppSessionTurnStartCommandOverridesCodexConfigDefaults(t *testing.T) {
+	buf := &nopWriteCloser{}
+	app := &codexAppSession{
+		runner: NewPtyRunner(),
+		req: ExecRequest{
+			Command: "codex -m gpt-5.4 --config model_reasoning_effort=high",
+		},
+		defaults: codexConfigDefaults{
+			model:           "gpt-5.5",
+			reasoningEffort: "xhigh",
+		},
+		stdin: buf,
+	}
+	app.setThreadID("thread-123")
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- app.SendUserInput(context.Background(), []byte("hello\n"))
+	}()
+
+	resolveNextPendingRPC(t, app, map[string]any{
+		"turn": map[string]any{
+			"id": "turn-1",
+		},
+	})
+
+	if err := <-errCh; err != nil {
+		t.Fatalf("send user input: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, `"model":"gpt-5.4"`) {
+		t.Fatalf("expected command model override in turn/start payload, got %q", output)
+	}
+	if !strings.Contains(output, `"effort":"high"`) {
+		t.Fatalf("expected command reasoning effort override in turn/start payload, got %q", output)
+	}
+	if strings.Contains(output, `"gpt-5.5"`) || strings.Contains(output, `"xhigh"`) {
+		t.Fatalf("did not expect config defaults to override command flags, got %q", output)
+	}
+}
+
 func TestCodexAppSessionCompactUsesThreadCompactStart(t *testing.T) {
 	buf := &nopWriteCloser{}
 	var compactionEvents []protocol.CompactionEvent

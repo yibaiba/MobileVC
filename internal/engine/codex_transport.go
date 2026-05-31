@@ -54,9 +54,11 @@ type codexAppSession struct {
 	req       ExecRequest
 	cwd       string
 	sink      EventSink
+	defaults  codexConfigDefaults
 
 	cmd    *exec.Cmd
 	stdin  io.WriteCloser
+	stdout io.ReadCloser
 	stderr io.ReadCloser
 
 	writeMu sync.Mutex
@@ -229,6 +231,12 @@ func newCodexAppSession(processCtx context.Context, rpcCtx context.Context, runn
 		_ = stdin.Close()
 		return nil, fmt.Errorf("start codex app-server: %w", err)
 	}
+	defaults, err := loadCodexConfigDefaults()
+	if err != nil {
+		_ = stdin.Close()
+		_ = cmd.Process.Kill()
+		return nil, err
+	}
 
 	app := &codexAppSession{
 		runner:    runner,
@@ -236,8 +244,10 @@ func newCodexAppSession(processCtx context.Context, rpcCtx context.Context, runn
 		req:       req,
 		cwd:       cwd,
 		sink:      sink,
+		defaults:  defaults,
 		cmd:       cmd,
 		stdin:     stdin,
+		stdout:    stdout,
 		stderr:    stderr,
 		pending:   make(map[string]chan codexRPCResponse),
 	}
@@ -282,15 +292,21 @@ func (s *codexAppSession) startOrResumeThread(ctx context.Context, resumeSession
 		params = map[string]any{"threadId": resumeSessionID}
 	} else {
 		method = "thread/start"
+		sandbox, err := normalizeCodexSandboxMode(s.req.RuntimeMeta.CodexSandboxMode, s.defaults)
+		if err != nil {
+			return err
+		}
 		params = map[string]any{
 			"cwd":                   s.cwd,
-			"approvalPolicy":        codexApprovalPolicy(s.runner.currentPermissionMode()),
+			"approvalPolicy":        codexApprovalPolicy(s.runner.currentPermissionMode(), s.defaults),
 			"approvalsReviewer":     "user",
-			"sandbox":               "workspace-write",
+			"sandbox":               sandbox,
 			"serviceName":           "MobileVC",
 			"experimentalRawEvents": false,
 		}
 		if model := extractCodexModelFlag(s.req.Command); model != "" {
+			params["model"] = model
+		} else if model := s.defaults.model; model != "" {
 			params["model"] = model
 		}
 	}
@@ -339,12 +355,16 @@ func (s *codexAppSession) SendUserInput(ctx context.Context, data []byte) error 
 	params := map[string]any{
 		"threadId":       threadID,
 		"input":          input,
-		"approvalPolicy": codexApprovalPolicy(s.runner.currentPermissionMode()),
+		"approvalPolicy": codexApprovalPolicy(s.runner.currentPermissionMode(), s.defaults),
 	}
 	if model := extractCodexModelFlag(s.req.Command); model != "" {
 		params["model"] = model
+	} else if model := s.defaults.model; model != "" {
+		params["model"] = model
 	}
 	if effort := extractCodexReasoningEffortFlag(s.req.Command); effort != "" {
+		params["effort"] = effort
+	} else if effort := s.defaults.reasoningEffort; effort != "" {
 		params["effort"] = effort
 	}
 	var resp codexTurnStartResponse
@@ -1386,7 +1406,7 @@ func codexDrainAssistantChunks(buffer *strings.Builder, flushAll bool) []string 
 	return emitted
 }
 
-func codexApprovalPolicy(permissionMode string) string {
+func codexApprovalPolicy(permissionMode string, defaults codexConfigDefaults) string {
 	// Codex 默认必须走 on-request，避免文件修改或命令执行在未显式授权时直接放行。
 	// 只有用户显式配置 bypassPermissions 时，才允许完全跳过审批。
 	// 如果线上看起来“Codex 文件修改不需要授权”，更可能是该改动没有走
@@ -1394,8 +1414,31 @@ func codexApprovalPolicy(permissionMode string) string {
 	switch strings.TrimSpace(permissionMode) {
 	case "bypassPermissions":
 		return "never"
+	case "config":
+		if policy := strings.TrimSpace(defaults.approvalPolicy); policy != "" {
+			return policy
+		}
+		return "on-request"
 	default:
 		return "on-request"
+	}
+}
+
+func normalizeCodexSandboxMode(value string, defaults codexConfigDefaults) (string, error) {
+	switch strings.TrimSpace(value) {
+	case "", "workspace-write":
+		return "workspace-write", nil
+	case "read-only":
+		return "read-only", nil
+	case "danger-full-access":
+		return "danger-full-access", nil
+	case "config":
+		if mode := strings.TrimSpace(defaults.sandboxMode); mode != "" {
+			return normalizeCodexSandboxMode(mode, codexConfigDefaults{})
+		}
+		return "workspace-write", nil
+	default:
+		return "", fmt.Errorf("invalid Codex sandbox mode: %s", value)
 	}
 }
 

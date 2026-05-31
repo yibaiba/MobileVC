@@ -1002,6 +1002,47 @@ class FSReadResultEvent extends AppEvent {
       );
 }
 
+class MediaPreviewResultEvent extends AppEvent {
+  const MediaPreviewResultEvent({
+    required super.timestamp,
+    required super.sessionId,
+    required super.runtimeMeta,
+    required super.raw,
+    this.attachmentId = '',
+    this.path = '',
+    this.content = '',
+    this.size = 0,
+    this.mimeType = '',
+    this.status = '',
+    this.message = '',
+  }) : super(type: 'media_preview_result');
+
+  final String attachmentId;
+  final String path;
+  final String content;
+  final int size;
+  final String mimeType;
+  final String status;
+  final String message;
+
+  bool get ok => status.trim().toLowerCase() == 'ok';
+
+  factory MediaPreviewResultEvent.fromJson(Map<String, dynamic> json) =>
+      MediaPreviewResultEvent(
+        timestamp: _readTimestamp(json),
+        sessionId: (json['sessionId'] ?? '').toString(),
+        runtimeMeta: RuntimeMeta.fromJson(json),
+        raw: json,
+        attachmentId: (json['attachmentId'] ?? '').toString(),
+        path: (json['path'] ?? '').toString(),
+        content: (json['content'] ?? '').toString(),
+        size: (json['size'] as num?)?.toInt() ?? 0,
+        mimeType: (json['mimeType'] ?? '').toString(),
+        status: (json['status'] ?? '').toString(),
+        message: (json['message'] ?? '').toString(),
+      );
+}
+
 class StepUpdateEvent extends AppEvent {
   const StepUpdateEvent({
     required super.timestamp,
@@ -1241,10 +1282,16 @@ class SessionHistoryEvent extends AppEvent {
     this.canResume = false,
     this.runtimeAlive = false,
     this.resumeRuntimeMeta = const RuntimeMeta(),
+    this.logEntryStart = 0,
+    this.logEntryTotal = 0,
+    this.hasMoreBefore = false,
   }) : super(type: 'session_history');
 
   final SessionSummary summary;
   final List<HistoryLogEntry> logEntries;
+  final int logEntryStart;
+  final int logEntryTotal;
+  final bool hasMoreBefore;
   final List<HistoryContext> diffs;
   final HistoryContext? currentDiff;
   final List<ReviewGroup> reviewGroups;
@@ -1273,6 +1320,9 @@ class SessionHistoryEvent extends AppEvent {
             .whereType<Map<String, dynamic>>()
             .map(HistoryLogEntry.fromJson)
             .toList(),
+        logEntryStart: (json['logEntryStart'] as num?)?.toInt() ?? 0,
+        logEntryTotal: (json['logEntryTotal'] as num?)?.toInt() ?? 0,
+        hasMoreBefore: json['hasMoreBefore'] == true,
         diffs: ((json['diffs'] as List?) ?? const [])
             .whereType<Map<String, dynamic>>()
             .map(HistoryContext.fromJson)
@@ -1322,6 +1372,45 @@ class SessionHistoryEvent extends AppEvent {
             : const ContextWindowUsage(),
         canResume: json['canResume'] == true,
         runtimeAlive: json['runtimeAlive'] == true,
+        resumeRuntimeMeta: json['resumeRuntimeMeta'] is Map<String, dynamic>
+            ? RuntimeMeta.fromJson(
+                json['resumeRuntimeMeta'] as Map<String, dynamic>)
+            : const RuntimeMeta(),
+      );
+}
+
+class SessionHistoryPageEvent extends AppEvent {
+  const SessionHistoryPageEvent({
+    required super.timestamp,
+    required super.sessionId,
+    required super.runtimeMeta,
+    required super.raw,
+    this.logEntries = const [],
+    this.logEntryStart = 0,
+    this.logEntryTotal = 0,
+    this.hasMoreBefore = false,
+    this.resumeRuntimeMeta = const RuntimeMeta(),
+  }) : super(type: 'session_history_page');
+
+  final List<HistoryLogEntry> logEntries;
+  final int logEntryStart;
+  final int logEntryTotal;
+  final bool hasMoreBefore;
+  final RuntimeMeta resumeRuntimeMeta;
+
+  factory SessionHistoryPageEvent.fromJson(Map<String, dynamic> json) =>
+      SessionHistoryPageEvent(
+        timestamp: _readTimestamp(json),
+        sessionId: (json['sessionId'] ?? '').toString(),
+        runtimeMeta: RuntimeMeta.fromJson(json),
+        raw: json,
+        logEntries: ((json['logEntries'] as List?) ?? const [])
+            .whereType<Map<String, dynamic>>()
+            .map(HistoryLogEntry.fromJson)
+            .toList(),
+        logEntryStart: (json['logEntryStart'] as num?)?.toInt() ?? 0,
+        logEntryTotal: (json['logEntryTotal'] as num?)?.toInt() ?? 0,
+        hasMoreBefore: json['hasMoreBefore'] == true,
         resumeRuntimeMeta: json['resumeRuntimeMeta'] is Map<String, dynamic>
             ? RuntimeMeta.fromJson(
                 json['resumeRuntimeMeta'] as Map<String, dynamic>)
@@ -2070,6 +2159,8 @@ class TimelineItem {
     this.trigger = '',
     this.meta = const RuntimeMeta(),
     this.context,
+    this.attachments = const [],
+    this.codexSteps = const [],
     this.animateBody = true,
   });
 
@@ -2083,6 +2174,8 @@ class TimelineItem {
   final String trigger;
   final RuntimeMeta meta;
   final HistoryContext? context;
+  final List<TimelineAttachment> attachments;
+  final List<String> codexSteps;
   final bool animateBody;
 
   TimelineItem copyWith({
@@ -2096,6 +2189,8 @@ class TimelineItem {
     String? trigger,
     RuntimeMeta? meta,
     HistoryContext? context,
+    List<TimelineAttachment>? attachments,
+    List<String>? codexSteps,
     bool? animateBody,
   }) {
     return TimelineItem(
@@ -2109,6 +2204,8 @@ class TimelineItem {
       trigger: trigger ?? this.trigger,
       meta: meta ?? this.meta,
       context: context ?? this.context,
+      attachments: attachments ?? this.attachments,
+      codexSteps: codexSteps ?? this.codexSteps,
       animateBody: animateBody ?? this.animateBody,
     );
   }

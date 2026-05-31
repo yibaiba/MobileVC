@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -34,6 +35,14 @@ const wsDebugPreviewLimit = 240
 const sessionListCacheTTL = 1500 * time.Millisecond
 const clientActionDedupeTTL = 24 * time.Hour
 const clientActionDedupeLimit = 500
+const sessionResumeHistoryLimit = 120
+
+func sessionHistoryWindowLimit(requested int) int {
+	if requested <= 0 {
+		return sessionResumeHistoryLimit
+	}
+	return requested
+}
 
 type sessionLoadTraceStage struct {
 	name     string
@@ -954,7 +963,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				if err != nil {
 					logx.Warn("ws", "initial session history restore skipped: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
 				} else {
-					emit(session.SessionHistoryEventFromRecord(record, sessionRecordRuntimeAlive(record, runtimeSvc)))
+					emit(session.SessionHistoryWindowEventFromRecord(record, sessionRecordRuntimeAlive(record, runtimeSvc), sessionResumeHistoryLimit))
 					emitReviewStateFromProjection(emit, selectedSessionID, record.Projection)
 				}
 			}
@@ -1126,7 +1135,8 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid session_load request: %v", err), ""))
 				continue
 			}
-			logx.Info("ws", "incoming session_load: connectionID=%s sessionID=%s remoteAddr=%s requestedSessionID=%s cwd=%q reason=%q", connectionID, selectedSessionID, remoteAddr, req.SessionID, req.CWD, req.Reason)
+			loadHistoryLimit := sessionHistoryWindowLimit(req.Limit)
+			logx.Info("ws", "incoming session_load: connectionID=%s sessionID=%s remoteAddr=%s requestedSessionID=%s cwd=%q reason=%q limit=%d", connectionID, selectedSessionID, remoteAddr, req.SessionID, req.CWD, req.Reason, loadHistoryLimit)
 			if strings.TrimSpace(req.Reason) == "auto_bind" && strings.TrimSpace(selectedSessionID) != "" {
 				logx.Info("ws", "ignore auto_bind session_load because session already selected: connectionID=%s sessionID=%s requestedSessionID=%s remoteAddr=%s", connectionID, selectedSessionID, req.SessionID, remoteAddr)
 				emitSessionList(sessionListFilterCWD)
@@ -1179,7 +1189,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			})
 			loadRuntimeAlive := sessionRecordRuntimeAlive(record, runtimeSvc)
 			trace.Step("merge_projection")
-			emit(session.SessionHistoryEventFromRecord(record, loadRuntimeAlive))
+			emit(session.SessionHistoryWindowEventFromRecord(record, loadRuntimeAlive, loadHistoryLimit))
 			trace.Step("emit_history")
 			emitContextWindowUsageIfAvailable(record.Summary.ID, runtimeSvc)
 			emitReviewStateFromProjection(emit, selectedSessionID, record.Projection)
@@ -1193,6 +1203,50 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			emit(protocol.NewSessionStateEvent(selectedSessionID, string(session.StateActive), "history loaded"))
 			trace.Step("emit_session_state")
 			trace.Finish(record.Summary.ID, activeRuntimeLoad, projectionMetrics(record.Projection))
+		case "session_history_page":
+			var req protocol.SessionHistoryPageRequestEvent
+			if err := json.Unmarshal(payloadBytes, &req); err != nil {
+				logx.Warn("ws", "invalid session_history_page request: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
+				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid session_history_page request: %v", err), ""))
+				continue
+			}
+			targetSessionID := strings.TrimSpace(req.SessionID)
+			if targetSessionID == "" {
+				targetSessionID = strings.TrimSpace(selectedSessionID)
+			}
+			if targetSessionID == "" {
+				emit(protocol.NewErrorEvent(selectedSessionID, "session ID is required", ""))
+				continue
+			}
+			if targetSessionID != strings.TrimSpace(selectedSessionID) {
+				logx.Info("ws", "ignore session_history_page for non-selected session: connectionID=%s sessionID=%s requestedSessionID=%s remoteAddr=%s", connectionID, selectedSessionID, targetSessionID, remoteAddr)
+				continue
+			}
+			if h.SessionStore == nil {
+				emit(protocol.NewErrorEvent(selectedSessionID, "session store unavailable", ""))
+				continue
+			}
+			record, err := loadSessionDeltaRecord(targetSessionID)
+			if err != nil {
+				emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
+				continue
+			}
+			_, pageRuntimeSvc := runtimeForSession(record.Summary.ID)
+			if !isNativeMirrorSessionID(record.Summary.ID) {
+				record = mergeClaudeJSONLToRecord(ctx, h.SessionStore, record, pageRuntimeSvc)
+			}
+			freshProjection := session.NormalizeProjectionSnapshot(record.Projection)
+			runtimeProjection := finalizeProjectionSnapshotForService(record.Summary.ID, pageRuntimeSvc, freshProjection)
+			if isNativeMirrorSessionID(record.Summary.ID) {
+				record.Projection = mergeProjectionWithOptionalRuntime(freshProjection, runtimeProjection, pageRuntimeSvc, record.Summary.ID)
+			} else {
+				record.Projection = runtimeProjection
+			}
+			record.Summary.Runtime = record.Projection.Runtime
+			pageHistoryLimit := sessionHistoryWindowLimit(req.Limit)
+			pageEvent := session.SessionHistoryPageEventFromRecord(record, req.Before, pageHistoryLimit)
+			logx.Info("ws", "session history page response: connectionID=%s sessionID=%s remoteAddr=%s before=%d limit=%d start=%d total=%d entries=%d", connectionID, record.Summary.ID, remoteAddr, req.Before, pageHistoryLimit, pageEvent.LogEntryStart, pageEvent.LogEntryTotal, len(pageEvent.LogEntries))
+			emit(pageEvent)
 		case "register_push_token":
 			var req protocol.RegisterPushTokenRequestEvent
 			if err := json.Unmarshal(payloadBytes, &req); err != nil {
@@ -1260,6 +1314,9 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				continue
 			}
 			sessionRuntime, sessionRuntimeSvc := runtimeForSession(record.Summary.ID)
+			if !isNativeMirrorSessionID(record.Summary.ID) {
+				record = mergeClaudeJSONLToRecord(ctx, h.SessionStore, record, sessionRuntimeSvc)
+			}
 			freshProjection := session.NormalizeProjectionSnapshot(record.Projection)
 			runtimeProjection := finalizeProjectionSnapshotForService(record.Summary.ID, sessionRuntimeSvc, freshProjection)
 			if isNativeMirrorSessionID(record.Summary.ID) {
@@ -1287,7 +1344,8 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid session_resume request: %v", err), ""))
 				continue
 			}
-			logx.Info("ws", "incoming session_resume: connectionID=%s sessionID=%s remoteAddr=%s requestedSessionID=%s cwd=%q reason=%q lastSeenEventCursor=%d lastKnownRuntimeState=%q", connectionID, selectedSessionID, remoteAddr, req.SessionID, req.CWD, req.Reason, req.LastSeenEventCursor, req.LastKnownRuntimeState)
+			resumeHistoryLimit := sessionHistoryWindowLimit(req.Limit)
+			logx.Info("ws", "incoming session_resume: connectionID=%s sessionID=%s remoteAddr=%s requestedSessionID=%s cwd=%q reason=%q lastSeenEventCursor=%d lastKnownRuntimeState=%q limit=%d", connectionID, selectedSessionID, remoteAddr, req.SessionID, req.CWD, req.Reason, req.LastSeenEventCursor, req.LastKnownRuntimeState, resumeHistoryLimit)
 			if h.SessionStore == nil {
 				logx.Error("ws", "session store unavailable for session_resume: connectionID=%s sessionID=%s remoteAddr=%s requestedSessionID=%s", connectionID, selectedSessionID, remoteAddr, req.SessionID)
 				emit(protocol.NewErrorEvent(selectedSessionID, "session store unavailable", ""))
@@ -1336,9 +1394,9 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 					emit(status)
 				}
 			}
-			emit(session.SessionHistoryEventFromRecord(record, runtimeAlive))
+			emit(session.SessionHistoryWindowEventFromRecord(record, runtimeAlive, resumeHistoryLimit))
 			emitContextWindowUsageIfAvailable(record.Summary.ID, runtimeSvc)
-			logx.Info("ws", "session history emitted: sessionID=%s runtimeAlive=%v ownership=%s", record.Summary.ID, runtimeAlive, record.Summary.Ownership)
+			logx.Info("ws", "session history emitted: sessionID=%s runtimeAlive=%v ownership=%s limit=%d", record.Summary.ID, runtimeAlive, record.Summary.Ownership, resumeHistoryLimit)
 			emitReviewStateFromProjection(emit, selectedSessionID, record.Projection)
 			restoredState := ""
 			var restoredAgentEvent *protocol.AgentStateEvent
@@ -1470,7 +1528,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			}
 			record.Projection = buildProjectionSnapshotForService(record.Summary.ID, runtimeSvc)
 			record.Summary.Runtime = record.Projection.Runtime
-			emit(session.SessionHistoryEventFromRecord(record, sessionRecordRuntimeAlive(record, runtimeSvc)))
+			emit(session.SessionHistoryWindowEventFromRecord(record, sessionRecordRuntimeAlive(record, runtimeSvc), sessionResumeHistoryLimit))
 			emitReviewStateFromProjection(emit, selectedSessionID, record.Projection)
 			if restored := restoredAgentStateEventFromRecord(record, sessionRecordRuntimeAlive(record, runtimeSvc)); restored != nil {
 				emit(*restored)
@@ -1791,14 +1849,15 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				controller.ActiveMeta.PermissionMode,
 				projection.Runtime.PermissionMode,
 			))
+			visibleUserText := strings.TrimRight(aiReq.Data, "\n")
 			inputData := aiReq.Data
-			attachmentPaths, err := persistImageAttachments(ctx, sessionID, aiReq.ImageAttachments)
+			attachments, err := persistImageAttachments(ctx, sessionID, aiReq.ImageAttachments)
 			if err != nil {
 				logx.Warn("ws", "persist ai_turn image attachments failed: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, sessionID, remoteAddr, err)
 				emit(protocol.NewErrorEvent(sessionID, err.Error(), ""))
 				continue
 			}
-			inputData = appendAttachmentPathPrompt(inputData, attachmentPaths)
+			inputData = appendAttachmentPathPrompt(inputData, attachmentPaths(attachments))
 			if strings.TrimSpace(inputData) != "" {
 				service.RecordUserInput(inputData)
 				skillPrefix, err := skills.BuildEnabledSkillsPrefix(h.SessionStore, projection.SessionContext)
@@ -1826,9 +1885,9 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				PermissionMode: permissionMode,
 				RuntimeMeta:    reqMeta,
 			}
-			rawUserText := strings.TrimRight(inputData, "\n")
-			if rawUserText == "" {
-				appendUserProjectionEntry(h.SessionStore, ctx, sessionID, command, "命令", connectionID, remoteAddr)
+			runnerInputText := strings.TrimRight(inputData, "\n")
+			if runnerInputText == "" {
+				appendUserProjectionEntry(h.SessionStore, ctx, sessionID, command, "命令", connectionID, remoteAddr, attachments)
 				logx.Info("ws", "dispatch ai_turn execute: connectionID=%s sessionID=%s remoteAddr=%s command=%q cwd=%q permissionMode=%q", connectionID, sessionID, remoteAddr, command, cwd, permissionMode)
 				if err := service.Execute(ctx, sessionID, execReq, emitAndPersist); err != nil {
 					logx.Error("ws", "ai_turn execute failed: connectionID=%s sessionID=%s remoteAddr=%s command=%q err=%v", connectionID, sessionID, remoteAddr, command, err)
@@ -1893,7 +1952,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				emit(protocol.NewErrorEvent(sessionID, message, ""))
 				continue
 			}
-			appendUserProjectionEntry(h.SessionStore, ctx, sessionID, rawUserText, "回复", connectionID, remoteAddr)
+			appendUserProjectionEntry(h.SessionStore, ctx, sessionID, visibleUserText, "回复", connectionID, remoteAddr, attachments)
 		case "exec":
 			var reqEvent protocol.ExecRequestEvent
 			if err := json.Unmarshal(payloadBytes, &reqEvent); err != nil {
@@ -1921,7 +1980,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			}
 			sessionRuntime, service := runtimeForSession(sessionID)
 			emitAndPersist := emitAndPersistFor(sessionID)
-			appendUserProjectionEntry(h.SessionStore, ctx, sessionID, reqEvent.Command, "命令", connectionID, remoteAddr)
+			appendUserProjectionEntry(h.SessionStore, ctx, sessionID, reqEvent.Command, "命令", connectionID, remoteAddr, nil)
 			mode, err := session.ParseMode(reqEvent.Mode)
 			if err != nil {
 				logx.Warn("ws", "parse exec mode failed: connectionID=%s sessionID=%s remoteAddr=%s mode=%q err=%v", connectionID, sessionID, remoteAddr, reqEvent.Mode, err)
@@ -2011,7 +2070,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				command := strings.TrimSpace(inputEvent.Data)
 				permissionMode := normalizePermissionModeForClaude(inputEvent.PermissionMode)
 				logx.Info("ws", "promote input to exec: connectionID=%s sessionID=%s remoteAddr=%s action=input command=%q", connectionID, sessionID, remoteAddr, command)
-				appendUserProjectionEntry(h.SessionStore, ctx, sessionID, command, "命令", connectionID, remoteAddr)
+				appendUserProjectionEntry(h.SessionStore, ctx, sessionID, command, "命令", connectionID, remoteAddr, nil)
 				if sessionRuntime != nil {
 					service.SetSink(sessionRuntime.EnsureBufferedSinkWithProcessor(emitAndPersist))
 				}
@@ -2037,13 +2096,13 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			projection := buildProjectionSnapshotFor(sessionID)
 			snapshot := service.RuntimeSnapshot()
 			inputData := inputEvent.Data
-			attachmentPaths, err := persistImageAttachments(ctx, sessionID, inputEvent.ImageAttachments)
+			attachments, err := persistImageAttachments(ctx, sessionID, inputEvent.ImageAttachments)
 			if err != nil {
 				logx.Warn("ws", "persist input image attachments failed: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, sessionID, remoteAddr, err)
 				emit(protocol.NewErrorEvent(sessionID, err.Error(), ""))
 				continue
 			}
-			inputData = appendAttachmentPathPrompt(inputData, attachmentPaths)
+			inputData = appendAttachmentPathPrompt(inputData, attachmentPaths(attachments))
 			service.RecordUserInput(inputData)
 			if shouldInjectEnabledSkillsForInput(
 				firstNonEmptyString(snapshot.ActiveMeta.Command, controller.CurrentCommand, projection.Runtime.Command),
@@ -2168,7 +2227,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				logx.Warn("ws", "service send input failed: connectionID=%s sessionID=%s remoteAddr=%s action=input err=%v", connectionID, sessionID, remoteAddr, err)
 				emit(protocol.NewErrorEvent(sessionID, message, ""))
 			} else {
-				appendUserProjectionEntry(h.SessionStore, ctx, sessionID, strings.TrimRight(inputEvent.Data, "\n"), "回复", connectionID, remoteAddr)
+				appendUserProjectionEntry(h.SessionStore, ctx, sessionID, strings.TrimRight(inputEvent.Data, "\n"), "回复", connectionID, remoteAddr, attachments)
 			}
 		case "stop":
 			if strings.TrimSpace(selectedSessionID) == "" || selectedSessionID == connectionID {
@@ -2227,7 +2286,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 					}
 				}
 			}
-			appendUserProjectionEntry(h.SessionStore, ctx, sessionID, strings.TrimSpace(permissionEvent.PromptMessage), "权限决策", connectionID, remoteAddr)
+			appendUserProjectionEntry(h.SessionStore, ctx, sessionID, strings.TrimSpace(permissionEvent.PromptMessage), "权限决策", connectionID, remoteAddr, nil)
 			scope := strings.TrimSpace(permissionEvent.Scope)
 			if decision == "approve" && (scope == string(data.PermissionScopeSession) || scope == string(data.PermissionScopePersistent)) {
 				rule := buildPermissionRule(permissionEvent, scope, projection, controller)
@@ -2786,7 +2845,12 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			if sessionRuntime != nil {
 				service.SetSink(sessionRuntime.EnsureBufferedSinkWithProcessor(emitAndPersist))
 			}
-			if err := service.Compact(ctx, targetSessionID, emitAndPersist); err != nil {
+			compactMeta := protocol.MergeRuntimeMeta(compactReq.RuntimeMeta, protocol.RuntimeMeta{
+				CWD:            compactReq.CWD,
+				Engine:         compactReq.Engine,
+				PermissionMode: compactReq.PermissionMode,
+			})
+			if err := service.Compact(ctx, targetSessionID, compactMeta, emitAndPersist); err != nil {
 				logx.Error("ws", "handle compact failed: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, targetSessionID, remoteAddr, err)
 				emit(protocol.NewCompactResultEvent(targetSessionID, false, err.Error()))
 				continue
@@ -2820,6 +2884,18 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				continue
 			}
 			emit(result)
+		case "media_preview":
+			var previewReq protocol.MediaPreviewRequestEvent
+			if err := json.Unmarshal(payloadBytes, &previewReq); err != nil {
+				logx.Warn("ws", "invalid media_preview request: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
+				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid media_preview request: %v", err), ""))
+				continue
+			}
+			result := readMediaPreview(selectedSessionID, previewReq.AttachmentID, previewReq.Path)
+			if result.Status != "ok" {
+				logx.Warn("ws", "media preview failed: connectionID=%s sessionID=%s remoteAddr=%s attachmentID=%q path=%q status=%q message=%q", connectionID, selectedSessionID, remoteAddr, previewReq.AttachmentID, previewReq.Path, result.Status, result.Message)
+			}
+			emit(result)
 		default:
 			logx.Warn("ws", "unknown action: connectionID=%s sessionID=%s remoteAddr=%s action=%s", connectionID, selectedSessionID, remoteAddr, clientEvent.Action)
 			emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("unknown action: %s", clientEvent.Action), ""))
@@ -2828,8 +2904,8 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 
 }
 
-func appendUserProjectionEntry(sessionStore data.Store, ctx context.Context, sessionID, text, label, connectionID, remoteAddr string) {
-	if sessionStore == nil || strings.TrimSpace(sessionID) == "" || strings.TrimSpace(text) == "" {
+func appendUserProjectionEntry(sessionStore data.Store, ctx context.Context, sessionID, text, label, connectionID, remoteAddr string, attachments []protocol.TimelineAttachment) {
+	if sessionStore == nil || strings.TrimSpace(sessionID) == "" || (strings.TrimSpace(text) == "" && len(attachments) == 0) {
 		if sessionStore == nil {
 			logx.Warn("ws", "skip append user projection entry because session store unavailable: connectionID=%s sessionID=%s remoteAddr=%s", connectionID, sessionID, remoteAddr)
 		}
@@ -2842,10 +2918,11 @@ func appendUserProjectionEntry(sessionStore data.Store, ctx context.Context, ses
 	}
 	projection := session.NormalizeProjectionSnapshot(record.Projection)
 	projection.LogEntries = append(projection.LogEntries, data.SnapshotLogEntry{
-		Kind:      "user",
-		Message:   text,
-		Label:     label,
-		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Kind:        "user",
+		Message:     text,
+		Label:       label,
+		Timestamp:   time.Now().UTC().Format(time.RFC3339),
+		Attachments: append([]protocol.TimelineAttachment(nil), attachments...),
 	})
 	if _, err := sessionStore.SaveProjection(ctx, sessionID, projection); err != nil {
 		logx.Error("ws", "save projection after append user entry failed: connectionID=%s sessionID=%s remoteAddr=%s label=%s err=%v", connectionID, sessionID, remoteAddr, label, err)
@@ -4205,18 +4282,71 @@ func readFile(sessionID, rawPath string) (protocol.FSReadResultEvent, error) {
 	if info.IsDir() {
 		return protocol.FSReadResultEvent{}, fmt.Errorf("path is a directory")
 	}
+	if info.Size() > maxInlineFileReadBytes {
+		return protocol.FSReadResultEvent{}, fmt.Errorf("file exceeds inline read limit of %d bytes; use file download", maxInlineFileReadBytes)
+	}
 
 	content, err := os.ReadFile(absPath)
 	if err != nil {
 		return protocol.FSReadResultEvent{}, err
 	}
 
-	isText := !hasBinaryContent(content)
+	isImage := isPreviewableImagePath(absPath)
+	isText := !hasBinaryContent(content) && !isImage
 	textContent := string(content)
-	if !isText {
+	if isImage {
+		if info.Size() > maxImageAttachmentBytes {
+			return protocol.FSReadResultEvent{}, fmt.Errorf("image exceeds %d bytes", maxImageAttachmentBytes)
+		}
+		textContent = base64.StdEncoding.EncodeToString(content)
+	} else if !isText {
 		textContent = ""
 	}
 	return protocol.NewFSReadResultEvent(sessionID, absPath, textContent, info.Size(), detectLangFromPath(absPath), "utf-8", isText), nil
+}
+
+func readMediaPreview(sessionID, attachmentID, rawPath string) protocol.MediaPreviewResultEvent {
+	target := strings.TrimSpace(rawPath)
+	if target == "" {
+		return protocol.NewMediaPreviewResultEvent(sessionID, attachmentID, "", "", 0, "", "error", "path is required")
+	}
+	absPath, err := filepath.Abs(filepath.Clean(target))
+	if err != nil {
+		return protocol.NewMediaPreviewResultEvent(sessionID, attachmentID, target, "", 0, "", "error", err.Error())
+	}
+	info, err := os.Stat(absPath)
+	if err != nil {
+		return protocol.NewMediaPreviewResultEvent(sessionID, attachmentID, absPath, "", 0, "", "error", err.Error())
+	}
+	if info.IsDir() {
+		return protocol.NewMediaPreviewResultEvent(sessionID, attachmentID, absPath, "", 0, "", "unsupported", "path is a directory")
+	}
+	mimeType := mime.TypeByExtension(strings.ToLower(filepath.Ext(absPath)))
+	if !strings.HasPrefix(strings.ToLower(mimeType), "image/") {
+		return protocol.NewMediaPreviewResultEvent(sessionID, attachmentID, absPath, "", info.Size(), mimeType, "unsupported", "file is not an image")
+	}
+	if info.Size() > maxImageAttachmentBytes {
+		return protocol.NewMediaPreviewResultEvent(sessionID, attachmentID, absPath, "", info.Size(), mimeType, "unsupported", fmt.Sprintf("image exceeds %d bytes", maxImageAttachmentBytes))
+	}
+	content, err := os.ReadFile(absPath)
+	if err != nil {
+		return protocol.NewMediaPreviewResultEvent(sessionID, attachmentID, absPath, "", info.Size(), mimeType, "error", err.Error())
+	}
+	return protocol.NewMediaPreviewResultEvent(
+		sessionID,
+		attachmentID,
+		absPath,
+		base64.StdEncoding.EncodeToString(content),
+		info.Size(),
+		mimeType,
+		"ok",
+		"",
+	)
+}
+
+func isPreviewableImagePath(path string) bool {
+	mimeType := mime.TypeByExtension(strings.ToLower(filepath.Ext(path)))
+	return strings.HasPrefix(strings.ToLower(mimeType), "image/")
 }
 
 func detectLangFromPath(path string) string {
