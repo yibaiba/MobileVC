@@ -1780,7 +1780,8 @@ void main() {
         service.sentPayloads.where((payload) =>
             payload['action'] == 'session_resume' &&
             payload['sessionId'] == 'session-relay' &&
-            payload['reason'] == 'reconnect'),
+            payload['reason'] == 'reconnect' &&
+            payload['limit'] == 120),
         hasLength(1),
       );
     });

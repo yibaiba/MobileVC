@@ -1358,6 +1358,63 @@ func TestSessionResumeReplaysPendingEvents(t *testing.T) {
 	}
 }
 
+func TestHandlerSessionResumeReturnsBoundedHistoryWindow(t *testing.T) {
+	h := newTestHandler()
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	h.SessionStore = tempStore
+	now := time.Date(2026, 5, 31, 17, 0, 0, 0, time.UTC)
+	entries := make([]data.SnapshotLogEntry, sessionResumeHistoryLimit+2)
+	for i := range entries {
+		entries[i] = data.SnapshotLogEntry{
+			Kind:      "markdown",
+			Message:   fmt.Sprintf("entry-%03d", i+1),
+			Timestamp: now.Add(time.Duration(i) * time.Second).Format(time.RFC3339),
+		}
+	}
+	record := data.SessionRecord{
+		Summary: data.SessionSummary{
+			ID:        "resume-window-session",
+			Title:     "Resume Window",
+			CreatedAt: now,
+			UpdatedAt: now,
+		},
+		Projection: data.ProjectionSnapshot{LogEntries: entries},
+	}
+	if _, err := h.SessionStore.UpsertSession(context.Background(), record); err != nil {
+		t.Fatalf("upsert session: %v", err)
+	}
+
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+	if err := conn.WriteJSON(protocol.SessionResumeRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_resume"},
+		SessionID:   record.Summary.ID,
+	}); err != nil {
+		t.Fatalf("write session_resume request: %v", err)
+	}
+
+	history := readUntilSessionHistory(t, conn)
+	if got := intFromJSONNumber(history["logEntryStart"]); got != 2 {
+		t.Fatalf("history start: got %d", got)
+	}
+	if got := intFromJSONNumber(history["logEntryTotal"]); got != sessionResumeHistoryLimit+2 {
+		t.Fatalf("history total: got %d", got)
+	}
+	if history["hasMoreBefore"] != true {
+		t.Fatalf("expected hasMoreBefore=true, got %#v", history)
+	}
+	gotEntries := history["logEntries"].([]any)
+	if len(gotEntries) != sessionResumeHistoryLimit {
+		t.Fatalf("expected %d entries, got %d", sessionResumeHistoryLimit, len(gotEntries))
+	}
+	if gotEntries[0].(map[string]any)["message"] != "entry-003" {
+		t.Fatalf("unexpected first bounded entry: %#v", gotEntries[0])
+	}
+}
+
 func TestHandlerSkillCatalogLifecycle(t *testing.T) {
 	homeDir := t.TempDir()
 	t.Setenv("HOME", homeDir)

@@ -251,6 +251,7 @@ class SessionController extends ChangeNotifier {
   static const Duration _observedSessionSyncInterval = Duration(seconds: 3);
   static const Duration _sessionDeltaRequestCoalesceWindow =
       Duration(seconds: 2);
+  static const int _historyWindowLimit = 120;
   static const Duration _defaultLanReturnProbeInterval = Duration(seconds: 20);
   static const Duration _lanReturnCooldown = Duration(seconds: 30);
   final MobileVcWsService _service;
@@ -359,6 +360,7 @@ class SessionController extends ChangeNotifier {
   final List<PermissionRule> _persistentPermissionRules = [];
   final List<String> _debugLogs = [];
   final List<TimelineItem> _timeline = [];
+  final Set<String> _timelineItemIds = <String>{};
   final Map<String, MediaPreviewState> _mediaPreviewStates =
       <String, MediaPreviewState>{};
   final Set<String> _requestedMediaPreviewKeys = <String>{};
@@ -2777,6 +2779,7 @@ class SessionController extends ChangeNotifier {
       'action': 'session_resume',
       'sessionId': sessionId,
       'cwd': effectiveCwd,
+      'limit': _historyWindowLimit,
       if (reason.trim().isNotEmpty) 'reason': reason.trim(),
       if (lastSeenCursor > 0) 'lastSeenEventCursor': lastSeenCursor,
       if (runtimeState.isNotEmpty) 'lastKnownRuntimeState': runtimeState,
@@ -3000,7 +3003,7 @@ class SessionController extends ChangeNotifier {
       'action': 'session_load',
       'sessionId': targetId,
       'cwd': effectiveCwd,
-      'limit': 120,
+      'limit': _historyWindowLimit,
     });
   }
 
@@ -3019,7 +3022,7 @@ class SessionController extends ChangeNotifier {
       'sessionId': sessionId,
       'cwd': effectiveCwd,
       'before': before,
-      'limit': 120,
+      'limit': _historyWindowLimit,
     });
     notifyListeners();
   }
@@ -3142,7 +3145,7 @@ class SessionController extends ChangeNotifier {
     _reviewGroups.clear();
     _activeReviewGroupId = '';
     _activeReviewDiffId = '';
-    _timeline.clear();
+    _clearTimelineItems();
     _visibleHistoryLogEntryKeys.clear();
     _terminalStdout = '';
     _terminalStderr = '';
@@ -5007,7 +5010,7 @@ class SessionController extends ChangeNotifier {
   }
 
   void clearTimeline() {
-    _timeline.clear();
+    _clearTimelineItems();
     final sessionId = _selectedSessionId.trim();
     if (sessionId.isNotEmpty) {
       _visibleHistoryLogEntryKeys.remove(sessionId);
@@ -6510,7 +6513,7 @@ class SessionController extends ChangeNotifier {
     List<HistoryLogEntry> entries,
     RuntimeMeta resumeMeta,
   ) {
-    _timeline.clear();
+    _clearTimelineItems();
     _isCompacting = false;
     final normalizedSessionId = sessionId.trim();
     if (normalizedSessionId.isNotEmpty) {
@@ -6561,13 +6564,13 @@ class SessionController extends ChangeNotifier {
       return;
     }
     final existing = List<TimelineItem>.from(_timeline);
-    _timeline.clear();
+    _clearTimelineItems();
     _appendHistoryTimelineEntries(sessionId, entries, resumeMeta);
     final olderItems = List<TimelineItem>.from(_timeline);
-    _timeline
-      ..clear()
-      ..addAll(olderItems)
-      ..addAll(existing);
+    _replaceTimelineItems(<TimelineItem>[
+      ...olderItems,
+      ...existing,
+    ]);
   }
 
   List<HistoryLogEntry> _sortedHistoryLogEntries(
@@ -7157,7 +7160,7 @@ class SessionController extends ChangeNotifier {
         !looksLikeSessionPlaceholderTitle(explicitPreview);
     final fallbackMessage =
         preview.isNotEmpty ? preview : '会话已恢复，可以继续对话（历史记录暂时不可用）';
-    _timeline.add(
+    _appendTimelineItem(
       TimelineItem(
         id: 'history-fallback-${summary.id}',
         kind: hasExplicitPreview &&
@@ -7169,6 +7172,7 @@ class SessionController extends ChangeNotifier {
         meta: history.resumeRuntimeMeta,
         animateBody: false,
       ),
+      emitNotifications: false,
     );
   }
 
@@ -7379,6 +7383,26 @@ class SessionController extends ChangeNotifier {
     _appendTimelineItem(item);
   }
 
+  void _clearTimelineItems() {
+    _timeline.clear();
+    _timelineItemIds.clear();
+  }
+
+  void _replaceTimelineItems(List<TimelineItem> items) {
+    _clearTimelineItems();
+    for (final item in items) {
+      _timeline.add(item);
+      _timelineItemIds.add(item.id);
+    }
+  }
+
+  void _replaceTimelineItemAt(int index, TimelineItem item) {
+    final previous = _timeline[index];
+    _timelineItemIds.remove(previous.id);
+    _timeline[index] = item;
+    _timelineItemIds.add(item.id);
+  }
+
   void _appendTimelineItem(
     TimelineItem item, {
     bool emitNotifications = true,
@@ -7386,7 +7410,7 @@ class SessionController extends ChangeNotifier {
     if (!_shouldKeepTimelineItem(item)) {
       return;
     }
-    if (_timeline.any((previous) => previous.id == item.id)) {
+    if (_timelineItemIds.contains(item.id)) {
       return;
     }
     if (_isDuplicateUserTimelineItem(item)) {
@@ -7397,6 +7421,7 @@ class SessionController extends ChangeNotifier {
     }
     if (_shouldMergeIntoPreviousTimelineItem(item)) {
       final previous = _timeline.removeLast();
+      _timelineItemIds.remove(previous.id);
       final mergedItem = TimelineItem(
         id: previous.id,
         kind: _mergedTimelineKind(previous, item),
@@ -7415,6 +7440,7 @@ class SessionController extends ChangeNotifier {
         animateBody: previous.animateBody || item.animateBody,
       );
       _timeline.add(mergedItem);
+      _timelineItemIds.add(mergedItem.id);
       if (emitNotifications) {
         _emitTimelineNotification(
           mergedItem,
@@ -7424,6 +7450,7 @@ class SessionController extends ChangeNotifier {
       return;
     }
     _timeline.add(item);
+    _timelineItemIds.add(item.id);
     if (emitNotifications) {
       _emitTimelineNotification(item);
     }
@@ -9662,33 +9689,39 @@ class SessionController extends ChangeNotifier {
         contextId.trim().isNotEmpty ? contextId.trim() : meta.contextId.trim();
     final loadingIndex = _findLatestCompactionLoadingIndex(effectiveContextId);
     if (normalizedStatus == 'loading' && loadingIndex != -1) {
-      _timeline[loadingIndex] = _timeline[loadingIndex].copyWith(
-        timestamp: timestamp,
-        status: 'loading',
-        trigger: effectiveTrigger,
-        body: '',
-        meta: _timeline[loadingIndex].meta.merge(
-              effectiveContextId.isNotEmpty
-                  ? meta.merge(RuntimeMeta(contextId: effectiveContextId))
-                  : meta,
-            ),
+      _replaceTimelineItemAt(
+        loadingIndex,
+        _timeline[loadingIndex].copyWith(
+          timestamp: timestamp,
+          status: 'loading',
+          trigger: effectiveTrigger,
+          body: '',
+          meta: _timeline[loadingIndex].meta.merge(
+                effectiveContextId.isNotEmpty
+                    ? meta.merge(RuntimeMeta(contextId: effectiveContextId))
+                    : meta,
+              ),
+        ),
       );
       return;
     }
     if ((normalizedStatus == 'completed' || normalizedStatus == 'failed') &&
         loadingIndex != -1) {
       final previous = _timeline[loadingIndex];
-      _timeline[loadingIndex] = previous.copyWith(
-        timestamp: timestamp,
-        status: normalizedStatus,
-        trigger: previous.trigger.trim().isNotEmpty
-            ? previous.trigger
-            : effectiveTrigger,
-        body: normalizedStatus == 'failed' ? message.trim() : '',
-        meta: previous.meta.merge(
-          effectiveContextId.isNotEmpty
-              ? meta.merge(RuntimeMeta(contextId: effectiveContextId))
-              : meta,
+      _replaceTimelineItemAt(
+        loadingIndex,
+        previous.copyWith(
+          timestamp: timestamp,
+          status: normalizedStatus,
+          trigger: previous.trigger.trim().isNotEmpty
+              ? previous.trigger
+              : effectiveTrigger,
+          body: normalizedStatus == 'failed' ? message.trim() : '',
+          meta: previous.meta.merge(
+            effectiveContextId.isNotEmpty
+                ? meta.merge(RuntimeMeta(contextId: effectiveContextId))
+                : meta,
+          ),
         ),
       );
       return;

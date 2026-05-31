@@ -35,6 +35,7 @@ const wsDebugPreviewLimit = 240
 const sessionListCacheTTL = 1500 * time.Millisecond
 const clientActionDedupeTTL = 24 * time.Hour
 const clientActionDedupeLimit = 500
+const sessionResumeHistoryLimit = 120
 
 type sessionLoadTraceStage struct {
 	name     string
@@ -1334,7 +1335,11 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid session_resume request: %v", err), ""))
 				continue
 			}
-			logx.Info("ws", "incoming session_resume: connectionID=%s sessionID=%s remoteAddr=%s requestedSessionID=%s cwd=%q reason=%q lastSeenEventCursor=%d lastKnownRuntimeState=%q", connectionID, selectedSessionID, remoteAddr, req.SessionID, req.CWD, req.Reason, req.LastSeenEventCursor, req.LastKnownRuntimeState)
+			resumeHistoryLimit := req.Limit
+			if resumeHistoryLimit <= 0 {
+				resumeHistoryLimit = sessionResumeHistoryLimit
+			}
+			logx.Info("ws", "incoming session_resume: connectionID=%s sessionID=%s remoteAddr=%s requestedSessionID=%s cwd=%q reason=%q lastSeenEventCursor=%d lastKnownRuntimeState=%q limit=%d", connectionID, selectedSessionID, remoteAddr, req.SessionID, req.CWD, req.Reason, req.LastSeenEventCursor, req.LastKnownRuntimeState, resumeHistoryLimit)
 			if h.SessionStore == nil {
 				logx.Error("ws", "session store unavailable for session_resume: connectionID=%s sessionID=%s remoteAddr=%s requestedSessionID=%s", connectionID, selectedSessionID, remoteAddr, req.SessionID)
 				emit(protocol.NewErrorEvent(selectedSessionID, "session store unavailable", ""))
@@ -1383,9 +1388,9 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 					emit(status)
 				}
 			}
-			emit(session.SessionHistoryEventFromRecord(record, runtimeAlive))
+			emit(session.SessionHistoryWindowEventFromRecord(record, runtimeAlive, resumeHistoryLimit))
 			emitContextWindowUsageIfAvailable(record.Summary.ID, runtimeSvc)
-			logx.Info("ws", "session history emitted: sessionID=%s runtimeAlive=%v ownership=%s", record.Summary.ID, runtimeAlive, record.Summary.Ownership)
+			logx.Info("ws", "session history emitted: sessionID=%s runtimeAlive=%v ownership=%s limit=%d", record.Summary.ID, runtimeAlive, record.Summary.Ownership, resumeHistoryLimit)
 			emitReviewStateFromProjection(emit, selectedSessionID, record.Projection)
 			restoredState := ""
 			var restoredAgentEvent *protocol.AgentStateEvent

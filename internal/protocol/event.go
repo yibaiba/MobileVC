@@ -528,6 +528,7 @@ type SessionResumeRequestEvent struct {
 	Reason                string `json:"reason,omitempty"`
 	LastSeenEventCursor   int64  `json:"lastSeenEventCursor,omitempty"`
 	LastKnownRuntimeState string `json:"lastKnownRuntimeState,omitempty"`
+	Limit                 int    `json:"limit,omitempty"`
 }
 
 type SessionDeltaKnown struct {
