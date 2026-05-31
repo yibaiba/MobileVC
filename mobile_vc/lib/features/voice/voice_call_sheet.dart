@@ -1270,7 +1270,7 @@ class _VoiceCallSheetState extends State<VoiceCallSheet> {
           listenMode: speech.ListenMode.dictation,
           partialResults: true,
           listenFor: const Duration(seconds: 45),
-          pauseFor: const Duration(milliseconds: 900),
+          pauseFor: const Duration(milliseconds: 2800),
           localeId: 'zh_CN',
         ),
         onResult: (result) {
@@ -1282,9 +1282,6 @@ class _VoiceCallSheetState extends State<VoiceCallSheet> {
             offset: _userTextController.text.length,
           );
           _scheduleSpeechSilenceSubmit();
-          if (result.finalResult) {
-            unawaited(_stopListening(submit: true));
-          }
         },
       );
     } catch (error) {
@@ -1322,7 +1319,7 @@ class _VoiceCallSheetState extends State<VoiceCallSheet> {
       return;
     }
     _speechSilenceTimer?.cancel();
-    _speechSilenceTimer = Timer(const Duration(milliseconds: 1200), () {
+    _speechSilenceTimer = Timer(const Duration(milliseconds: 2800), () {
       if (!mounted ||
           !_listening ||
           _sending ||
