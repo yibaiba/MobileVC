@@ -303,6 +303,40 @@ void main() {
       expect(restored.relayNodeFingerprintHex, testNodeFingerprint);
     });
 
+    test('voice call config persists model and tts endpoints', () {
+      const config = AppConfig(
+        voiceApiUrl: 'https://api.example.test/v1/chat/completions',
+        voiceApiKey: 'voice-key',
+        voiceModelName: 'voice-chat',
+        voiceTtsUrl: 'https://api.example.test/v1/audio/speech',
+        voiceTtsApiKey: 'tts-key',
+        voiceTtsModelName: 'voice-tts',
+        voiceTtsVoice: 'verse',
+      );
+
+      expect(config.hasVoiceCallConfig, isTrue);
+      expect(config.hasVoiceTtsConfig, isTrue);
+
+      final json = config.toJson();
+      expect(
+          json['voiceApiUrl'], 'https://api.example.test/v1/chat/completions');
+      expect(json['voiceApiKey'], 'voice-key');
+      expect(json['voiceModelName'], 'voice-chat');
+      expect(json['voiceTtsUrl'], 'https://api.example.test/v1/audio/speech');
+      expect(json['voiceTtsApiKey'], 'tts-key');
+      expect(json['voiceTtsModelName'], 'voice-tts');
+      expect(json['voiceTtsVoice'], 'verse');
+
+      final restored = AppConfig.fromJson(json);
+      expect(restored.voiceApiUrl, config.voiceApiUrl);
+      expect(restored.voiceApiKey, config.voiceApiKey);
+      expect(restored.voiceModelName, config.voiceModelName);
+      expect(restored.voiceTtsUrl, config.voiceTtsUrl);
+      expect(restored.voiceTtsApiKey, config.voiceTtsApiKey);
+      expect(restored.voiceTtsModelName, config.voiceTtsModelName);
+      expect(restored.voiceTtsVoice, config.voiceTtsVoice);
+    });
+
     test('invalid persisted relay capabilities keep reconnect credentials', () {
       final config = AppConfig.fromJson(const {
         'connectionMode': 'relay',

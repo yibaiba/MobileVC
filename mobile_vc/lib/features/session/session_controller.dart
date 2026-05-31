@@ -3928,6 +3928,45 @@ class SessionController extends ChangeNotifier {
     sendInputTextWithImages(text, const []);
   }
 
+  bool submitVoiceHandoff(
+    String text, {
+    String permissionMode = '',
+  }) {
+    final value = text.trim();
+    if (value.isEmpty) {
+      _pushSystem('session', '语音通话没有可交接的任务内容');
+      return false;
+    }
+    if (!_connected) {
+      _pushSystem('session', '请先连接 MobileVC 后端，再把语音通话交给 AI');
+      return false;
+    }
+    if (_isLoadingSession) {
+      _pushSystem('session', '会话切换中，请等待加载完成');
+      return false;
+    }
+    if (hasPendingPermissionPrompt && !shouldShowReviewChoices) {
+      _pushSystem('session', '请先完成当前授权请求，再交接语音通话');
+      return false;
+    }
+    if (hasPendingPlanQuestions || hasPendingPlanPrompt) {
+      _pushSystem('session', '请先完成当前计划选择，再交接语音通话');
+      return false;
+    }
+    if (isSessionBusy && !awaitInput && !canSendToContinuedSameSession) {
+      _pushSystem('session', '当前 AI 助手会话仍在处理中，请稍后再交接语音通话');
+      return false;
+    }
+    final normalizedMode = permissionMode.trim();
+    if (normalizedMode.isNotEmpty &&
+        _normalizeDisplayPermissionMode(normalizedMode) !=
+            _config.permissionMode) {
+      updatePermissionMode(normalizedMode);
+    }
+    sendInputText(value);
+    return true;
+  }
+
   void sendInputTextWithImages(
     String text,
     List<ChatImageAttachment> imageAttachments,

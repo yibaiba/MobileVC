@@ -35,6 +35,13 @@ class AppConfig {
     this.relayClientReconnectSecret = '',
     this.relayNodeFingerprintHex = '',
     this.relayCapabilities,
+    this.voiceApiUrl = '',
+    this.voiceApiKey = '',
+    this.voiceModelName = '',
+    this.voiceTtsUrl = '',
+    this.voiceTtsApiKey = '',
+    this.voiceTtsModelName = '',
+    this.voiceTtsVoice = 'alloy',
   });
 
   final String host;
@@ -60,6 +67,13 @@ class AppConfig {
   final String relayClientReconnectSecret;
   final String relayNodeFingerprintHex;
   final RelayE2eeCapabilitySet? relayCapabilities;
+  final String voiceApiUrl;
+  final String voiceApiKey;
+  final String voiceModelName;
+  final String voiceTtsUrl;
+  final String voiceTtsApiKey;
+  final String voiceTtsModelName;
+  final String voiceTtsVoice;
 
   bool get isRelayMode => connectionMode == ConnectionMode.relay.name;
 
@@ -76,6 +90,12 @@ class AppConfig {
       host.trim().isNotEmpty &&
       port.trim().isNotEmpty &&
       token.trim().isNotEmpty;
+
+  bool get hasVoiceCallConfig =>
+      voiceApiUrl.trim().isNotEmpty && voiceModelName.trim().isNotEmpty;
+
+  bool get hasVoiceTtsConfig =>
+      voiceTtsUrl.trim().isNotEmpty && voiceTtsModelName.trim().isNotEmpty;
 
   String get baseHttpUrl => baseHttpUrlFor();
 
@@ -144,6 +164,13 @@ class AppConfig {
     String? relayClientReconnectSecret,
     String? relayNodeFingerprintHex,
     Object? relayCapabilities = _unchanged,
+    String? voiceApiUrl,
+    String? voiceApiKey,
+    String? voiceModelName,
+    String? voiceTtsUrl,
+    String? voiceTtsApiKey,
+    String? voiceTtsModelName,
+    String? voiceTtsVoice,
   }) {
     final nextEngine = engine ?? this.engine;
     final nextModels = AppConfigEngineModels.resolve(
@@ -195,6 +222,13 @@ class AppConfig {
       relayCapabilities: identical(relayCapabilities, _unchanged)
           ? this.relayCapabilities
           : relayCapabilities as RelayE2eeCapabilitySet?,
+      voiceApiUrl: voiceApiUrl ?? this.voiceApiUrl,
+      voiceApiKey: voiceApiKey ?? this.voiceApiKey,
+      voiceModelName: voiceModelName ?? this.voiceModelName,
+      voiceTtsUrl: voiceTtsUrl ?? this.voiceTtsUrl,
+      voiceTtsApiKey: voiceTtsApiKey ?? this.voiceTtsApiKey,
+      voiceTtsModelName: voiceTtsModelName ?? this.voiceTtsModelName,
+      voiceTtsVoice: voiceTtsVoice ?? this.voiceTtsVoice,
     );
   }
 
@@ -259,6 +293,14 @@ class AppConfig {
         if (relayCapabilities != null)
           'relayCapabilities': relayCapabilities!.toJson(),
         if (secureTransport != null) 'secureTransport': secureTransport!,
+        if (voiceApiUrl.trim().isNotEmpty) 'voiceApiUrl': voiceApiUrl,
+        if (voiceApiKey.trim().isNotEmpty) 'voiceApiKey': voiceApiKey,
+        if (voiceModelName.trim().isNotEmpty) 'voiceModelName': voiceModelName,
+        if (voiceTtsUrl.trim().isNotEmpty) 'voiceTtsUrl': voiceTtsUrl,
+        if (voiceTtsApiKey.trim().isNotEmpty) 'voiceTtsApiKey': voiceTtsApiKey,
+        if (voiceTtsModelName.trim().isNotEmpty)
+          'voiceTtsModelName': voiceTtsModelName,
+        if (voiceTtsVoice.trim().isNotEmpty) 'voiceTtsVoice': voiceTtsVoice,
       };
 
   factory AppConfig.fromJson(Map<String, Object?> json) {
@@ -310,6 +352,13 @@ class AppConfig {
             .trim()
             .isNotEmpty,
       ),
+      voiceApiUrl: (json['voiceApiUrl'] ?? '').toString(),
+      voiceApiKey: (json['voiceApiKey'] ?? '').toString(),
+      voiceModelName: (json['voiceModelName'] ?? '').toString(),
+      voiceTtsUrl: (json['voiceTtsUrl'] ?? '').toString(),
+      voiceTtsApiKey: (json['voiceTtsApiKey'] ?? '').toString(),
+      voiceTtsModelName: (json['voiceTtsModelName'] ?? '').toString(),
+      voiceTtsVoice: (json['voiceTtsVoice'] ?? 'alloy').toString(),
     );
   }
 

@@ -259,7 +259,7 @@ cat > "$EXPORT_OPTIONS_PLIST" <<EOF
   <key>destination</key>
   <string>export</string>
   <key>method</key>
-  <string>ad-hoc</string>
+  <string>release-testing</string>
   <key>signingStyle</key>
   <string>automatic</string>
   <key>signingCertificate</key>

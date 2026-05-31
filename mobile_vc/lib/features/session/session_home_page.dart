@@ -29,6 +29,7 @@ import '../../features/runtime_info/runtime_info_sheet.dart';
 import '../../features/skills/skill_management_sheet.dart';
 import '../../features/status/status_detail_sheet.dart';
 import '../../features/status/terminal_log_sheet.dart';
+import '../../features/voice/voice_call_sheet.dart';
 import 'context_window_usage_sheet.dart';
 import 'claude_model_utils.dart';
 import 'connection_scan_sheet.dart';
@@ -457,6 +458,11 @@ class _SessionHomePageState extends State<SessionHomePage> {
                             ),
                           ),
                           IconButton(
+                            onPressed: () => _openVoiceCall(context),
+                            tooltip: '语音通话',
+                            icon: const Icon(Icons.call_outlined),
+                          ),
+                          IconButton(
                             onPressed: () => _openStatusDetails(context),
                             icon: const Icon(Icons.dashboard_outlined),
                           ),
@@ -542,6 +548,16 @@ class _SessionHomePageState extends State<SessionHomePage> {
           );
         },
       ),
+    );
+  }
+
+  Future<void> _openVoiceCall(BuildContext context) async {
+    await showModalBottomSheet<void>(
+      context: context,
+      useSafeArea: true,
+      showDragHandle: false,
+      isScrollControlled: true,
+      builder: (context) => VoiceCallSheet(controller: controller),
     );
   }
 

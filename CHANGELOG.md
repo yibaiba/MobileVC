@@ -4,7 +4,9 @@ This changelog tracks repository-facing npm package changes. Current package ver
 
 ## Unreleased
 
-_No package-facing changes yet._
+### Added
+
+- **移动端语音通话预沟通**：新增可配置 Voice API / TTS API 的通话入口，支持先语音澄清任务、权限模式和约束，再交接给本机 Claude Code / Codex 执行。
 
 ## [0.2.9] - 2026-05-31
 
