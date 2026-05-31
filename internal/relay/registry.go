@@ -99,28 +99,26 @@ func (s *Server) reconnectAgent(peer *peerConn, raw []byte) (string, error) {
 		return "", errors.New("agent reconnect rejected")
 	}
 	disconnectedAt := state.agentDisconnectedAt
-	clientID := ""
-	if state.client != nil {
-		clientID = state.clientID
-	}
+	staleClient := state.client
+	staleClientID := state.clientID
 	state.agent = peer
 	state.agentDisconnectedAt = time.Time{}
+	state.client = nil
+	state.clientID = ""
 	sessionID := state.id
 	if err := s.saveStateLocked(); err != nil {
 		state.agent = nil
 		state.agentDisconnectedAt = disconnectedAt
+		state.client = staleClient
+		state.clientID = staleClientID
 		s.mu.Unlock()
 		return "", err
 	}
 	s.mu.Unlock()
+	if staleClient != nil {
+		_ = staleClient.Close()
+	}
 	if err := writeRegistered(peer, sessionID); err != nil {
-		s.rollbackAgentReconnect(sessionID, peer, disconnectedAt)
-		return "", err
-	}
-	if strings.TrimSpace(clientID) == "" {
-		return sessionID, nil
-	}
-	if err := notifyClientAttached(peer, sessionID, clientID); err != nil {
 		s.rollbackAgentReconnect(sessionID, peer, disconnectedAt)
 		return "", err
 	}
