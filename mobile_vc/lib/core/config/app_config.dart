@@ -7,6 +7,7 @@ import '../relay_e2ee/relay_e2ee_capability.dart';
 import 'relay_config.dart';
 
 const Object _unchanged = Object();
+const int defaultHistoryWindowLimit = 120;
 
 class AppConfig {
   static const String adbIcePort = AdbIceConfig.port;
@@ -24,6 +25,7 @@ class AppConfig {
     this.codexReasoningEffort = '',
     this.codexSandboxMode = 'workspace-write',
     this.codexTargetMode = false,
+    this.historyWindowLimit = defaultHistoryWindowLimit,
     this.permissionMode = 'auto',
     this.fastMode = false,
     this.adbIceServersJson = '',
@@ -51,6 +53,7 @@ class AppConfig {
   final String codexReasoningEffort;
   final String codexSandboxMode;
   final bool codexTargetMode;
+  final int historyWindowLimit;
   final String permissionMode;
   final bool fastMode;
   final String adbIceServersJson;
@@ -137,6 +140,7 @@ class AppConfig {
     String? codexReasoningEffort,
     String? codexSandboxMode,
     bool? codexTargetMode,
+    int? historyWindowLimit,
     String? permissionMode,
     bool? fastMode,
     String? adbIceServersJson,
@@ -181,6 +185,8 @@ class AppConfig {
       codexSandboxMode:
           normalizeCodexSandboxMode(codexSandboxMode ?? this.codexSandboxMode),
       codexTargetMode: codexTargetMode ?? this.codexTargetMode,
+      historyWindowLimit: parseHistoryWindowLimit(
+          historyWindowLimit ?? this.historyWindowLimit),
       permissionMode: _normalizePermissionMode(
         permissionMode ?? this.permissionMode,
       ),
@@ -256,6 +262,7 @@ class AppConfig {
         'codexReasoningEffort': codexReasoningEffort,
         'codexSandboxMode': codexSandboxMode,
         'codexTargetMode': codexTargetMode,
+        'historyWindowLimit': historyWindowLimit,
         'permissionMode': permissionMode,
         'fastMode': fastMode,
         'adbIceServersJson': adbIceServersJson,
@@ -303,6 +310,10 @@ class AppConfig {
         (json['codexSandboxMode'] ?? 'workspace-write').toString(),
       ),
       codexTargetMode: json['codexTargetMode'] == true,
+      historyWindowLimit: parseHistoryWindowLimit(
+        json['historyWindowLimit'],
+        defaultWhenMissing: true,
+      ),
       permissionMode: _normalizePermissionMode(
         (json['permissionMode'] ?? 'auto').toString(),
       ),
@@ -357,6 +368,34 @@ class AppConfig {
       default:
         return 'workspace-write';
     }
+  }
+
+  static int parseHistoryWindowLimit(
+    Object? value, {
+    bool defaultWhenMissing = false,
+  }) {
+    if (value == null) {
+      if (defaultWhenMissing) {
+        return defaultHistoryWindowLimit;
+      }
+      throw const FormatException('historyWindowLimit is required');
+    }
+    final parsed = value is num
+        ? _parseNumericHistoryWindowLimit(value)
+        : int.tryParse(value.toString().trim());
+    if (parsed == null || parsed <= 0) {
+      throw const FormatException(
+        'historyWindowLimit must be a positive integer',
+      );
+    }
+    return parsed;
+  }
+
+  static int? _parseNumericHistoryWindowLimit(num value) {
+    if (!value.isFinite || value % 1 != 0) {
+      return null;
+    }
+    return value.toInt();
   }
 
   static AppConfig? fromLaunchUri(

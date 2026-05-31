@@ -679,6 +679,32 @@ void main() {
       expect(restored.permissionMode, 'config');
     });
 
+    test('history window limit defaults and persists', () {
+      expect(const AppConfig().historyWindowLimit, defaultHistoryWindowLimit);
+
+      const config = AppConfig(historyWindowLimit: 240);
+      final restored = AppConfig.fromJson(config.toJson());
+
+      expect(restored.historyWindowLimit, 240);
+      expect(
+        AppConfig.fromJson(const {'historyWindowLimit': '360'})
+            .historyWindowLimit,
+        360,
+      );
+      expect(
+        AppConfig.fromJson(const <String, Object?>{}).historyWindowLimit,
+        defaultHistoryWindowLimit,
+      );
+      expect(
+        () => AppConfig.fromJson(const {'historyWindowLimit': 0}),
+        throwsA(isA<FormatException>()),
+      );
+      expect(
+        () => const AppConfig().copyWith(historyWindowLimit: -1),
+        throwsA(isA<FormatException>()),
+      );
+    });
+
     test('launch uri overrides saved cwd token host and port', () {
       const fallback = AppConfig(
         host: '10.0.0.2',

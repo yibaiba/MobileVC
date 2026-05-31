@@ -688,6 +688,9 @@ class _SessionHomePageState extends State<SessionHomePage> {
     final tokenController =
         TextEditingController(text: controller.config.token);
     final cwdController = TextEditingController(text: controller.config.cwd);
+    final historyWindowLimitController = TextEditingController(
+      text: controller.config.historyWindowLimit.toString(),
+    );
     final linkController = TextEditingController();
     final permissionController =
         TextEditingController(text: controller.config.permissionMode);
@@ -760,6 +763,8 @@ class _SessionHomePageState extends State<SessionHomePage> {
               portController.text = scanned.port;
               tokenController.text = scanned.token;
               cwdController.text = scanned.cwd;
+              historyWindowLimitController.text =
+                  scanned.historyWindowLimit.toString();
               iceHostController.text = scanned.adbIceHostOverride;
               iceUsernameController.text = scanned.adbIceUsername;
               iceCredentialController.text = scanned.adbIceCredential;
@@ -779,6 +784,13 @@ class _SessionHomePageState extends State<SessionHomePage> {
             }
 
             AppConfig? parseConnectionLink(String raw) {
+              final historyWindowLimit = int.tryParse(
+                historyWindowLimitController.text.trim(),
+              );
+              if (historyWindowLimit == null || historyWindowLimit <= 0) {
+                scanHint = '历史加载条数必须是正整数';
+                return null;
+              }
               try {
                 return AppConfig.fromLaunchUri(
                   raw,
@@ -789,6 +801,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
                     cwd: cwdController.text.trim(),
                     engine: selectedEngine,
                     codexSandboxMode: selectedCodexSandboxMode,
+                    historyWindowLimit: historyWindowLimit,
                     permissionMode: permissionController.text.trim(),
                     fastMode: controller.fastMode,
                     adbIceServersJson: encodedIceConfig(),
@@ -885,6 +898,15 @@ class _SessionHomePageState extends State<SessionHomePage> {
 
             Future<bool> persistConfig({bool connect = false}) async {
               final hostText = hostController.text.trim();
+              final historyWindowLimit = int.tryParse(
+                historyWindowLimitController.text.trim(),
+              );
+              if (historyWindowLimit == null || historyWindowLimit <= 0) {
+                setSheetState(() {
+                  scanHint = '历史加载条数必须是正整数';
+                });
+                return false;
+              }
               final nextConfig = pendingConfig.copyWith(
                 host: pendingConfig.connectionMode == ConnectionMode.relay.name
                     ? pendingConfig.host
@@ -898,6 +920,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
                 cwd: cwdController.text.trim(),
                 engine: selectedEngine,
                 codexSandboxMode: selectedCodexSandboxMode,
+                historyWindowLimit: historyWindowLimit,
                 permissionMode: permissionController.text.trim(),
                 fastMode: controller.fastMode,
                 adbIceServersJson: encodedIceConfig(),
@@ -1180,6 +1203,16 @@ class _SessionHomePageState extends State<SessionHomePage> {
                               enabled: !connectionBusy,
                               decoration:
                                   const InputDecoration(labelText: 'CWD')),
+                          const SizedBox(height: 10),
+                          TextField(
+                            controller: historyWindowLimitController,
+                            enabled: !connectionBusy,
+                            keyboardType: TextInputType.number,
+                            decoration: const InputDecoration(
+                              labelText: '历史加载条数',
+                              hintText: '120',
+                            ),
+                          ),
                           const SizedBox(height: 10),
                           DropdownButtonFormField<String>(
                             initialValue: selectedEngine,

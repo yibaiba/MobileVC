@@ -11507,6 +11507,48 @@ void main() {
       expect(service.sentPayloads.single['limit'], 120);
     });
 
+    test('会话历史窗口使用配置里的条数', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.saveConfig(const AppConfig(historyWindowLimit: 240));
+      await controller.connect();
+      service.sentPayloads.clear();
+      controller.loadSession('session-window');
+
+      expect(service.sentPayloads.single['action'], 'session_load');
+      expect(service.sentPayloads.single['limit'], 240);
+
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-window',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-window', title: '当前会话'),
+        logEntryStart: 20,
+        logEntryTotal: 260,
+        hasMoreBefore: true,
+        resumeRuntimeMeta: const RuntimeMeta(cwd: '/workspace'),
+      ));
+      await _flushEvents();
+
+      service.sentPayloads.clear();
+      controller.loadOlderTimelineEntries();
+      expect(service.sentPayloads.single['action'], 'session_history_page');
+      expect(service.sentPayloads.single['limit'], 240);
+
+      service.sentPayloads.clear();
+      controller.resumeConnectionIfNeeded();
+      await _flushEvents();
+      expect(
+        service.sentPayloads.any((payload) =>
+            payload['action'] == 'session_resume' && payload['limit'] == 240),
+        isTrue,
+      );
+    });
+
     test('session_history_page 会把更早历史插入 timeline 前面', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);
@@ -12174,7 +12216,7 @@ void main() {
       );
     });
 
-    test('history_loaded delta 不会被同会话 delta coalesce 吞掉', () async {
+    test('前台恢复只发 session_resume，history_loaded delta 仍会补齐', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);
       await controller.initialize();
@@ -12196,13 +12238,21 @@ void main() {
       await _flushEvents();
       expect(
         service.sentPayloads.any((payload) =>
+            payload['action'] == 'session_resume' &&
+            payload['reason'] == 'foreground' &&
+            payload['limit'] == 120),
+        isTrue,
+      );
+      expect(
+        service.sentPayloads.any((payload) =>
             payload['action'] == 'session_delta_get' &&
             payload['reason'] == 'foreground'),
-        isTrue,
+        isFalse,
+        reason: 'foreground resume should not also request a potentially large '
+            'delta before the bounded history event resets known counters',
       );
 
       service.sentPayloads.clear();
-      controller.loadSession('session-target');
       service.emit(SessionHistoryEvent(
         timestamp: _timestamp.add(const Duration(seconds: 1)),
         sessionId: 'session-target',

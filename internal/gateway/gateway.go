@@ -37,6 +37,13 @@ const clientActionDedupeTTL = 24 * time.Hour
 const clientActionDedupeLimit = 500
 const sessionResumeHistoryLimit = 120
 
+func sessionHistoryWindowLimit(requested int) int {
+	if requested <= 0 {
+		return sessionResumeHistoryLimit
+	}
+	return requested
+}
+
 type sessionLoadTraceStage struct {
 	name     string
 	duration time.Duration
@@ -956,7 +963,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				if err != nil {
 					logx.Warn("ws", "initial session history restore skipped: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
 				} else {
-					emit(session.SessionHistoryEventFromRecord(record, sessionRecordRuntimeAlive(record, runtimeSvc)))
+					emit(session.SessionHistoryWindowEventFromRecord(record, sessionRecordRuntimeAlive(record, runtimeSvc), sessionResumeHistoryLimit))
 					emitReviewStateFromProjection(emit, selectedSessionID, record.Projection)
 				}
 			}
@@ -1128,7 +1135,8 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid session_load request: %v", err), ""))
 				continue
 			}
-			logx.Info("ws", "incoming session_load: connectionID=%s sessionID=%s remoteAddr=%s requestedSessionID=%s cwd=%q reason=%q", connectionID, selectedSessionID, remoteAddr, req.SessionID, req.CWD, req.Reason)
+			loadHistoryLimit := sessionHistoryWindowLimit(req.Limit)
+			logx.Info("ws", "incoming session_load: connectionID=%s sessionID=%s remoteAddr=%s requestedSessionID=%s cwd=%q reason=%q limit=%d", connectionID, selectedSessionID, remoteAddr, req.SessionID, req.CWD, req.Reason, loadHistoryLimit)
 			if strings.TrimSpace(req.Reason) == "auto_bind" && strings.TrimSpace(selectedSessionID) != "" {
 				logx.Info("ws", "ignore auto_bind session_load because session already selected: connectionID=%s sessionID=%s requestedSessionID=%s remoteAddr=%s", connectionID, selectedSessionID, req.SessionID, remoteAddr)
 				emitSessionList(sessionListFilterCWD)
@@ -1181,7 +1189,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			})
 			loadRuntimeAlive := sessionRecordRuntimeAlive(record, runtimeSvc)
 			trace.Step("merge_projection")
-			emit(session.SessionHistoryWindowEventFromRecord(record, loadRuntimeAlive, req.Limit))
+			emit(session.SessionHistoryWindowEventFromRecord(record, loadRuntimeAlive, loadHistoryLimit))
 			trace.Step("emit_history")
 			emitContextWindowUsageIfAvailable(record.Summary.ID, runtimeSvc)
 			emitReviewStateFromProjection(emit, selectedSessionID, record.Projection)
@@ -1235,8 +1243,9 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				record.Projection = runtimeProjection
 			}
 			record.Summary.Runtime = record.Projection.Runtime
-			pageEvent := session.SessionHistoryPageEventFromRecord(record, req.Before, req.Limit)
-			logx.Info("ws", "session history page response: connectionID=%s sessionID=%s remoteAddr=%s before=%d limit=%d start=%d total=%d entries=%d", connectionID, record.Summary.ID, remoteAddr, req.Before, req.Limit, pageEvent.LogEntryStart, pageEvent.LogEntryTotal, len(pageEvent.LogEntries))
+			pageHistoryLimit := sessionHistoryWindowLimit(req.Limit)
+			pageEvent := session.SessionHistoryPageEventFromRecord(record, req.Before, pageHistoryLimit)
+			logx.Info("ws", "session history page response: connectionID=%s sessionID=%s remoteAddr=%s before=%d limit=%d start=%d total=%d entries=%d", connectionID, record.Summary.ID, remoteAddr, req.Before, pageHistoryLimit, pageEvent.LogEntryStart, pageEvent.LogEntryTotal, len(pageEvent.LogEntries))
 			emit(pageEvent)
 		case "register_push_token":
 			var req protocol.RegisterPushTokenRequestEvent
@@ -1335,10 +1344,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid session_resume request: %v", err), ""))
 				continue
 			}
-			resumeHistoryLimit := req.Limit
-			if resumeHistoryLimit <= 0 {
-				resumeHistoryLimit = sessionResumeHistoryLimit
-			}
+			resumeHistoryLimit := sessionHistoryWindowLimit(req.Limit)
 			logx.Info("ws", "incoming session_resume: connectionID=%s sessionID=%s remoteAddr=%s requestedSessionID=%s cwd=%q reason=%q lastSeenEventCursor=%d lastKnownRuntimeState=%q limit=%d", connectionID, selectedSessionID, remoteAddr, req.SessionID, req.CWD, req.Reason, req.LastSeenEventCursor, req.LastKnownRuntimeState, resumeHistoryLimit)
 			if h.SessionStore == nil {
 				logx.Error("ws", "session store unavailable for session_resume: connectionID=%s sessionID=%s remoteAddr=%s requestedSessionID=%s", connectionID, selectedSessionID, remoteAddr, req.SessionID)
@@ -1522,7 +1528,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			}
 			record.Projection = buildProjectionSnapshotForService(record.Summary.ID, runtimeSvc)
 			record.Summary.Runtime = record.Projection.Runtime
-			emit(session.SessionHistoryEventFromRecord(record, sessionRecordRuntimeAlive(record, runtimeSvc)))
+			emit(session.SessionHistoryWindowEventFromRecord(record, sessionRecordRuntimeAlive(record, runtimeSvc), sessionResumeHistoryLimit))
 			emitReviewStateFromProjection(emit, selectedSessionID, record.Projection)
 			if restored := restoredAgentStateEventFromRecord(record, sessionRecordRuntimeAlive(record, runtimeSvc)); restored != nil {
 				emit(*restored)

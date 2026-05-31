@@ -7029,6 +7029,62 @@ func TestHandlerSessionLoadReturnsLimitedHistoryWindowAndOlderPage(t *testing.T)
 	}
 }
 
+func TestHandlerSessionLoadDefaultsToBoundedHistoryWindow(t *testing.T) {
+	h := newTestHandler()
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	h.SessionStore = tempStore
+	now := time.Date(2026, 5, 31, 19, 0, 0, 0, time.UTC)
+	entries := make([]data.SnapshotLogEntry, sessionResumeHistoryLimit+4)
+	for i := range entries {
+		entries[i] = data.SnapshotLogEntry{
+			Kind:      "markdown",
+			Message:   fmt.Sprintf("load-entry-%03d", i+1),
+			Timestamp: now.Add(time.Duration(i) * time.Second).Format(time.RFC3339),
+		}
+	}
+	record := data.SessionRecord{
+		Summary: data.SessionSummary{
+			ID:        "load-default-window-session",
+			Title:     "Load Default Window",
+			CreatedAt: now,
+			UpdatedAt: now,
+		},
+		Projection: data.ProjectionSnapshot{LogEntries: entries},
+	}
+	if _, err := h.SessionStore.UpsertSession(context.Background(), record); err != nil {
+		t.Fatalf("upsert session: %v", err)
+	}
+
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+	if err := conn.WriteJSON(protocol.SessionLoadRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_load"},
+		SessionID:   record.Summary.ID,
+	}); err != nil {
+		t.Fatalf("write session_load request: %v", err)
+	}
+	history := readUntilSessionHistory(t, conn)
+	if got := intFromJSONNumber(history["logEntryStart"]); got != 4 {
+		t.Fatalf("history start: got %d", got)
+	}
+	if got := intFromJSONNumber(history["logEntryTotal"]); got != sessionResumeHistoryLimit+4 {
+		t.Fatalf("history total: got %d", got)
+	}
+	if history["hasMoreBefore"] != true {
+		t.Fatalf("expected hasMoreBefore=true, got %#v", history)
+	}
+	gotEntries := history["logEntries"].([]any)
+	if len(gotEntries) != sessionResumeHistoryLimit {
+		t.Fatalf("expected %d entries, got %d", sessionResumeHistoryLimit, len(gotEntries))
+	}
+	if gotEntries[0].(map[string]any)["message"] != "load-entry-005" {
+		t.Fatalf("unexpected first bounded entry: %#v", gotEntries[0])
+	}
+}
+
 func intFromJSONNumber(value any) int {
 	if value == nil {
 		return 0
@@ -7504,6 +7560,92 @@ func TestHandlerSessionDeleteCurrentSessionCleansRuntimeAndFallsBack(t *testing.
 	textsA := sessionLogTexts(recordA)
 	if containsText(textsA, "late output from deleted session B") || containsText(textsA, "late step from deleted session B") {
 		t.Fatalf("did not expect deleted session events to leak into fallback session, got %#v", textsA)
+	}
+}
+
+func TestHandlerSessionDeleteFallbackReturnsBoundedHistoryWindow(t *testing.T) {
+	runnerA := newSwitchableStubRunner()
+	runnerB := newSwitchableStubRunner()
+	h := newTestHandler()
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	h.SessionStore = tempStore
+	h.NewPtyRunner = func() engine.Runner {
+		if runnerA != nil {
+			r := runnerA
+			runnerA = nil
+			return r
+		}
+		return runnerB
+	}
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+
+	if err := conn.WriteJSON(protocol.SessionCreateRequestEvent{ClientEvent: protocol.ClientEvent{Action: "session_create"}, Title: "session-a"}); err != nil {
+		t.Fatalf("write initial session create request: %v", err)
+	}
+	createdA := readUntilSessionCreated(t, conn)
+	_ = readUntilType(t, conn, protocol.EventTypeSessionListResult)
+	summaryA, ok := createdA["summary"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected summary payload, got %#v", createdA)
+	}
+	sessionA, _ := summaryA["id"].(string)
+	if sessionA == "" {
+		t.Fatalf("expected session A id, got %#v", createdA)
+	}
+	now := time.Date(2026, 5, 31, 18, 0, 0, 0, time.UTC)
+	entries := make([]data.SnapshotLogEntry, sessionResumeHistoryLimit+3)
+	for i := range entries {
+		entries[i] = data.SnapshotLogEntry{
+			Kind:      "markdown",
+			Message:   fmt.Sprintf("fallback-entry-%03d", i+1),
+			Timestamp: now.Add(time.Duration(i) * time.Second).Format(time.RFC3339),
+		}
+	}
+	if _, err := h.SessionStore.SaveProjection(context.Background(), sessionA, data.ProjectionSnapshot{LogEntries: entries}); err != nil {
+		t.Fatalf("save fallback projection: %v", err)
+	}
+
+	if err := conn.WriteJSON(protocol.SessionCreateRequestEvent{ClientEvent: protocol.ClientEvent{Action: "session_create"}, Title: "session-b"}); err != nil {
+		t.Fatalf("write session create request: %v", err)
+	}
+	createdB := readUntilSessionCreated(t, conn)
+	_ = readUntilType(t, conn, protocol.EventTypeSessionListResult)
+	summaryB, ok := createdB["summary"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected summary payload, got %#v", createdB)
+	}
+	sessionB, _ := summaryB["id"].(string)
+	if sessionB == "" || sessionB == sessionA {
+		t.Fatalf("expected distinct session B id, got %q", sessionB)
+	}
+
+	if err := conn.WriteJSON(protocol.SessionDeleteRequestEvent{ClientEvent: protocol.ClientEvent{Action: "session_delete"}, SessionID: sessionB}); err != nil {
+		t.Fatalf("write session delete request: %v", err)
+	}
+	_ = readUntilType(t, conn, protocol.EventTypeSessionListResult)
+	history := readUntilSessionHistory(t, conn)
+	if history["sessionId"] != sessionA {
+		t.Fatalf("expected fallback history for session A, got %#v", history)
+	}
+	if got := intFromJSONNumber(history["logEntryStart"]); got != 3 {
+		t.Fatalf("history start: got %d", got)
+	}
+	if got := intFromJSONNumber(history["logEntryTotal"]); got != sessionResumeHistoryLimit+3 {
+		t.Fatalf("history total: got %d", got)
+	}
+	if history["hasMoreBefore"] != true {
+		t.Fatalf("expected hasMoreBefore=true, got %#v", history)
+	}
+	gotEntries := history["logEntries"].([]any)
+	if len(gotEntries) != sessionResumeHistoryLimit {
+		t.Fatalf("expected %d entries, got %d", sessionResumeHistoryLimit, len(gotEntries))
+	}
+	if gotEntries[0].(map[string]any)["message"] != "fallback-entry-004" {
+		t.Fatalf("unexpected first fallback entry: %#v", gotEntries[0])
 	}
 }
 

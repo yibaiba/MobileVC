@@ -251,7 +251,6 @@ class SessionController extends ChangeNotifier {
   static const Duration _observedSessionSyncInterval = Duration(seconds: 3);
   static const Duration _sessionDeltaRequestCoalesceWindow =
       Duration(seconds: 2);
-  static const int _historyWindowLimit = 120;
   static const Duration _defaultLanReturnProbeInterval = Duration(seconds: 20);
   static const Duration _lanReturnCooldown = Duration(seconds: 30);
   final MobileVcWsService _service;
@@ -259,6 +258,8 @@ class SessionController extends ChangeNotifier {
   final Duration _outboundAckRetryDelay;
   final Duration _outboundAckStaleTimeout;
   final Duration _lanReturnProbeInterval;
+  int get _historyWindowLimit =>
+      AppConfig.parseHistoryWindowLimit(_config.historyWindowLimit);
 
   StreamSubscription<AppEvent>? _subscription;
   AppConfig _config = const AppConfig();
@@ -2747,7 +2748,6 @@ class SessionController extends ChangeNotifier {
       }
       requestTaskSnapshot();
       _requestSessionResume(reason: 'foreground');
-      _requestSessionDelta(reason: 'foreground', force: true);
       _flushPendingOutboundActions();
       _syncObservedSessionPolling();
       return;

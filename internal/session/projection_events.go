@@ -283,8 +283,7 @@ func SessionHistoryEventFromRecord(record data.SessionRecord, runtimeAlive bool)
 
 func SessionHistoryWindowEventFromRecord(record data.SessionRecord, runtimeAlive bool, limit int) protocol.SessionHistoryEvent {
 	projection := NormalizeProjectionSnapshot(record.Projection)
-	entries := protocolLogEntries(projection.LogEntries)
-	window := historyLogEntryWindow(entries, len(entries), limit)
+	window := snapshotLogEntryWindow(projection.LogEntries, len(projection.LogEntries), limit)
 	executions := protocolTerminalExecutions(projection.TerminalExecutions)
 	resumeMeta := protocol.RuntimeMeta{
 		ResumeSessionID: projection.Runtime.ResumeSessionID,
@@ -297,9 +296,9 @@ func SessionHistoryWindowEventFromRecord(record data.SessionRecord, runtimeAlive
 	return protocol.NewSessionHistoryWindowEvent(
 		record.Summary.ID,
 		ToProtocolSummary(record.Summary),
-		window.entries,
+		protocolLogEntries(window.entries),
 		window.start,
-		len(entries),
+		len(projection.LogEntries),
 		ProtocolDiffContexts(projection.Diffs),
 		ProtocolDiffContext(projection.CurrentDiff),
 		ProtocolReviewGroups(projection.ReviewGroups),
@@ -320,8 +319,7 @@ func SessionHistoryWindowEventFromRecord(record data.SessionRecord, runtimeAlive
 
 func SessionHistoryPageEventFromRecord(record data.SessionRecord, before, limit int) protocol.SessionHistoryPageEvent {
 	projection := NormalizeProjectionSnapshot(record.Projection)
-	entries := protocolLogEntries(projection.LogEntries)
-	window := historyLogEntryWindow(entries, before, limit)
+	window := snapshotLogEntryWindow(projection.LogEntries, before, limit)
 	resumeMeta := protocol.RuntimeMeta{
 		ResumeSessionID: projection.Runtime.ResumeSessionID,
 		Command:         projection.Runtime.Command,
@@ -332,32 +330,32 @@ func SessionHistoryPageEventFromRecord(record data.SessionRecord, before, limit 
 	}
 	return protocol.NewSessionHistoryPageEvent(
 		record.Summary.ID,
-		window.entries,
+		protocolLogEntries(window.entries),
 		window.start,
-		len(entries),
+		len(projection.LogEntries),
 		resumeMeta,
 	)
 }
 
-type historyLogWindow struct {
-	entries []protocol.HistoryLogEntry
+type snapshotLogWindow struct {
+	entries []data.SnapshotLogEntry
 	start   int
 }
 
-func historyLogEntryWindow(entries []protocol.HistoryLogEntry, before, limit int) historyLogWindow {
+func snapshotLogEntryWindow(entries []data.SnapshotLogEntry, before, limit int) snapshotLogWindow {
 	total := len(entries)
 	if before <= 0 || before > total {
 		before = total
 	}
 	if limit <= 0 || limit >= before {
-		return historyLogWindow{
-			entries: append([]protocol.HistoryLogEntry(nil), entries[:before]...),
+		return snapshotLogWindow{
+			entries: append([]data.SnapshotLogEntry(nil), entries[:before]...),
 			start:   0,
 		}
 	}
 	start := before - limit
-	return historyLogWindow{
-		entries: append([]protocol.HistoryLogEntry(nil), entries[start:before]...),
+	return snapshotLogWindow{
+		entries: append([]data.SnapshotLogEntry(nil), entries[start:before]...),
 		start:   start,
 	}
 }
