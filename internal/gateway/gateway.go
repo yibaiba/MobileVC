@@ -1378,14 +1378,15 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			}
 			record.Projection = projection
 			record.Summary.Runtime = projection.Runtime
-			runtimeSvc.SyncRuntimeMeta(protocol.RuntimeMeta{
+			resumeMeta := protocol.MergeRuntimeMeta(protocol.RuntimeMeta{
 				Command:         projection.Runtime.Command,
 				Engine:          projection.Runtime.Engine,
 				CWD:             projection.Runtime.CWD,
 				PermissionMode:  projection.Runtime.PermissionMode,
 				ResumeSessionID: projection.Runtime.ResumeSessionID,
 				ClaudeLifecycle: projection.Runtime.ClaudeLifecycle,
-			})
+			}, req.RuntimeMeta)
+			runtimeSvc.SyncRuntimeMeta(resumeMeta)
 			runtimeAlive := sessionRecordRuntimeAlive(record, runtimeSvc)
 			if runtimeAlive && session.ShouldEmitResumeRecoveryStateEvent(runtimeSvc, projection, req.LastKnownRuntimeState) {
 				recovery := session.BuildResumeRecoveryStateEvent(record.Summary.ID, runtimeSvc, projection, req.LastKnownRuntimeState)
@@ -1898,8 +1899,9 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			inputReq := session.InputRequest{
 				Data: inputData,
 				RuntimeMeta: protocol.RuntimeMeta{
-					Source:         "ai_turn",
-					PermissionMode: permissionMode,
+					Source:           "ai_turn",
+					PermissionMode:   permissionMode,
+					CodexSandboxMode: aiReq.RuntimeMeta.CodexSandboxMode,
 				},
 			}
 			logx.Info("ws", "dispatch ai_turn input/resume: connectionID=%s sessionID=%s remoteAddr=%s command=%q cwd=%q permissionMode=%q preview=%q", connectionID, sessionID, remoteAddr, command, cwd, permissionMode, wsDebugPreview(inputData))

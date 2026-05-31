@@ -4731,6 +4731,91 @@ void main() {
       );
     });
 
+    test('观察模式继续 Codex 会话时带入当前沙箱配置', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+      await controller.saveConfig(
+        controller.config.copyWith(
+          engine: 'codex',
+          codexSandboxMode: 'danger-full-access',
+        ),
+      );
+
+      await controller.connect();
+      service.emit(
+        SessionHistoryEvent(
+          timestamp: _timestamp,
+          sessionId: 'codex-thread:observe',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_history'},
+          summary: const SessionSummary(
+            id: 'codex-thread:observe',
+            title: 'Native Codex',
+            source: 'codex-native',
+            external: true,
+            executionActive: true,
+            runtime: RuntimeMeta(command: 'codex', engine: 'codex'),
+          ),
+          runtimeAlive: true,
+          resumeRuntimeMeta:
+              const RuntimeMeta(command: 'codex', engine: 'codex'),
+        ),
+      );
+      await _flushEvents();
+
+      service.sentPayloads.clear();
+      controller.continueSameSessionFromPhone();
+
+      final resumes = service.sentPayloads
+          .where((payload) => payload['action'] == 'session_resume')
+          .toList();
+      expect(resumes, hasLength(1));
+      expect(resumes.single['reason'], 'continue_same_session');
+      expect(resumes.single['engine'], 'codex');
+      expect(resumes.single['codexSandboxMode'], 'danger-full-access');
+    });
+
+    test('前台恢复空 runtime 元信息时不会按当前配置误带 Codex 沙箱', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+      await controller.saveConfig(
+        controller.config.copyWith(
+          engine: 'codex',
+          codexSandboxMode: 'danger-full-access',
+        ),
+      );
+
+      await controller.connect();
+      service.emit(
+        SessionHistoryEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-unknown-runtime',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_history'},
+          summary: const SessionSummary(
+            id: 'session-unknown-runtime',
+            title: 'Unknown runtime',
+          ),
+          resumeRuntimeMeta: const RuntimeMeta(),
+        ),
+      );
+      await _flushEvents();
+
+      service.sentPayloads.clear();
+      controller.resumeConnectionIfNeeded();
+
+      final resumes = service.sentPayloads
+          .where((payload) => payload['action'] == 'session_resume')
+          .toList();
+      expect(resumes, hasLength(1));
+      expect(resumes.single.containsKey('codexSandboxMode'), isFalse);
+      expect(resumes.single.containsKey('engine'), isFalse);
+    });
+
     test('summary executionActive=false 会清掉陈旧 stop 锁存', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);
@@ -6052,6 +6137,114 @@ void main() {
         'session-b',
       ]);
       expect(controller.selectedSessionId, isEmpty);
+    });
+
+    test('连接后自动恢复配置里的上次会话', () async {
+      SharedPreferences.setMockInitialValues({
+        'mobilevc.app_config': jsonEncode(const AppConfig(
+          lastSessionId: 'session-target',
+          lastSessionCwd: '/workspace/Saved',
+          historyWindowLimit: 240,
+        ).toJson()),
+      });
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.sentPayloads.clear();
+
+      service.emit(
+        SessionListResultEvent(
+          timestamp: _timestamp,
+          sessionId: 'conn-1',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_list_result'},
+          items: const [
+            SessionSummary(
+              id: 'session-target',
+              title: '上次会话',
+              runtime: RuntimeMeta(cwd: '/workspace/Target'),
+            ),
+            SessionSummary(id: 'session-other', title: 'Other'),
+          ],
+        ),
+      );
+      await _flushEvents();
+
+      final loads = service.sentPayloads
+          .where((payload) => payload['action'] == 'session_load')
+          .toList();
+      expect(loads, hasLength(1));
+      expect(loads.single['sessionId'], 'session-target');
+      expect(loads.single['cwd'], '/workspace/Target');
+      expect(loads.single['limit'], 240);
+    });
+
+    test('通知目标优先于配置里的上次会话恢复', () async {
+      SharedPreferences.setMockInitialValues({
+        'mobilevc.app_config': jsonEncode(const AppConfig(
+          lastSessionId: 'session-old',
+        ).toJson()),
+      });
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.sentPayloads.clear();
+
+      await controller.restoreSessionFromNotification('session-notify');
+      service.emit(
+        SessionListResultEvent(
+          timestamp: _timestamp,
+          sessionId: 'conn-1',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_list_result'},
+          items: const [
+            SessionSummary(id: 'session-old', title: 'Old'),
+          ],
+        ),
+      );
+      await _flushEvents();
+
+      final loads = service.sentPayloads
+          .where((payload) => payload['action'] == 'session_load')
+          .toList();
+      expect(loads, hasLength(1));
+      expect(loads.single['sessionId'], 'session-notify');
+    });
+
+    test('成功恢复历史后保存上次会话', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(
+        SessionHistoryEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-history',
+          runtimeMeta: const RuntimeMeta(command: 'claude'),
+          raw: const {'type': 'session_history'},
+          summary: const SessionSummary(
+            id: 'session-history',
+            title: '历史会话',
+          ),
+          resumeRuntimeMeta: const RuntimeMeta(cwd: '/workspace/History'),
+        ),
+      );
+      await _flushEvents();
+
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString('mobilevc.app_config');
+      final restored =
+          AppConfig.fromJson(jsonDecode(raw!) as Map<String, dynamic>);
+      expect(restored.lastSessionId, 'session-history');
+      expect(restored.lastSessionCwd, '/workspace/History');
     });
 
     test('连接后收到空 session 列表时，不自动 create session', () async {

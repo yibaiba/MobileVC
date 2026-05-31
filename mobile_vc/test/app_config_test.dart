@@ -705,6 +705,21 @@ void main() {
       );
     });
 
+    test('last selected session metadata is persisted', () {
+      const config = AppConfig(
+        lastSessionId: 'session-last',
+        lastSessionCwd: '/workspace/mobilevc',
+      );
+
+      final json = config.toJson();
+      final restored = AppConfig.fromJson(json);
+
+      expect(json['lastSessionId'], 'session-last');
+      expect(json['lastSessionCwd'], '/workspace/mobilevc');
+      expect(restored.lastSessionId, 'session-last');
+      expect(restored.lastSessionCwd, '/workspace/mobilevc');
+    });
+
     test('launch uri overrides saved cwd token host and port', () {
       const fallback = AppConfig(
         host: '10.0.0.2',

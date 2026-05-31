@@ -26,6 +26,8 @@ class AppConfig {
     this.codexSandboxMode = 'workspace-write',
     this.codexTargetMode = false,
     this.historyWindowLimit = defaultHistoryWindowLimit,
+    this.lastSessionId = '',
+    this.lastSessionCwd = '',
     this.permissionMode = 'auto',
     this.fastMode = false,
     this.adbIceServersJson = '',
@@ -54,6 +56,8 @@ class AppConfig {
   final String codexSandboxMode;
   final bool codexTargetMode;
   final int historyWindowLimit;
+  final String lastSessionId;
+  final String lastSessionCwd;
   final String permissionMode;
   final bool fastMode;
   final String adbIceServersJson;
@@ -141,6 +145,8 @@ class AppConfig {
     String? codexSandboxMode,
     bool? codexTargetMode,
     int? historyWindowLimit,
+    String? lastSessionId,
+    String? lastSessionCwd,
     String? permissionMode,
     bool? fastMode,
     String? adbIceServersJson,
@@ -187,6 +193,8 @@ class AppConfig {
       codexTargetMode: codexTargetMode ?? this.codexTargetMode,
       historyWindowLimit: parseHistoryWindowLimit(
           historyWindowLimit ?? this.historyWindowLimit),
+      lastSessionId: lastSessionId ?? this.lastSessionId,
+      lastSessionCwd: lastSessionCwd ?? this.lastSessionCwd,
       permissionMode: _normalizePermissionMode(
         permissionMode ?? this.permissionMode,
       ),
@@ -263,6 +271,10 @@ class AppConfig {
         'codexSandboxMode': codexSandboxMode,
         'codexTargetMode': codexTargetMode,
         'historyWindowLimit': historyWindowLimit,
+        if (lastSessionId.trim().isNotEmpty)
+          'lastSessionId': lastSessionId.trim(),
+        if (lastSessionCwd.trim().isNotEmpty)
+          'lastSessionCwd': lastSessionCwd.trim(),
         'permissionMode': permissionMode,
         'fastMode': fastMode,
         'adbIceServersJson': adbIceServersJson,
@@ -314,6 +326,8 @@ class AppConfig {
         json['historyWindowLimit'],
         defaultWhenMissing: true,
       ),
+      lastSessionId: (json['lastSessionId'] ?? '').toString(),
+      lastSessionCwd: (json['lastSessionCwd'] ?? '').toString(),
       permissionMode: _normalizePermissionMode(
         (json['permissionMode'] ?? 'auto').toString(),
       ),

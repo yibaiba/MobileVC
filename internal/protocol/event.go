@@ -523,6 +523,7 @@ type RegisterPushTokenRequestEvent struct {
 
 type SessionResumeRequestEvent struct {
 	ClientEvent
+	RuntimeMeta
 	SessionID             string `json:"sessionId"`
 	CWD                   string `json:"cwd,omitempty"`
 	Reason                string `json:"reason,omitempty"`

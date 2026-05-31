@@ -460,7 +460,7 @@ func (s *Service) SendInput(ctx context.Context, sessionID string, req InputRequ
 		req.RuntimeMeta.PermissionMode = normalizeClaudePermissionMode(req.RuntimeMeta.PermissionMode)
 	}
 	effectiveMeta := meta
-	if req.RuntimeMeta.Source != "" || req.RuntimeMeta.SkillName != "" || req.RuntimeMeta.ResumeSessionID != "" || req.RuntimeMeta.ExecutionID != "" || req.RuntimeMeta.GroupID != "" || req.RuntimeMeta.GroupTitle != "" || req.RuntimeMeta.ContextID != "" || req.RuntimeMeta.ContextTitle != "" || req.RuntimeMeta.TargetText != "" || req.RuntimeMeta.TargetPath != "" || req.RuntimeMeta.PermissionMode != "" {
+	if req.RuntimeMeta.Source != "" || req.RuntimeMeta.SkillName != "" || req.RuntimeMeta.ResumeSessionID != "" || req.RuntimeMeta.ExecutionID != "" || req.RuntimeMeta.GroupID != "" || req.RuntimeMeta.GroupTitle != "" || req.RuntimeMeta.ContextID != "" || req.RuntimeMeta.ContextTitle != "" || req.RuntimeMeta.TargetText != "" || req.RuntimeMeta.TargetPath != "" || req.RuntimeMeta.PermissionMode != "" || req.RuntimeMeta.CodexSandboxMode != "" {
 		effectiveMeta = protocol.MergeRuntimeMeta(effectiveMeta, req.RuntimeMeta)
 		s.manager.updateMeta(func(m *protocol.RuntimeMeta) {
 			*m = effectiveMeta
@@ -551,7 +551,7 @@ func (s *Service) SendPermissionDecision(ctx context.Context, sessionID string, 
 		}
 	}
 	effectiveMeta := activeMeta
-	if meta.Source != "" || meta.SkillName != "" || meta.ResumeSessionID != "" || meta.ExecutionID != "" || meta.GroupID != "" || meta.GroupTitle != "" || meta.ContextID != "" || meta.ContextTitle != "" || meta.TargetText != "" || meta.TargetPath != "" || meta.PermissionMode != "" {
+	if meta.Source != "" || meta.SkillName != "" || meta.ResumeSessionID != "" || meta.ExecutionID != "" || meta.GroupID != "" || meta.GroupTitle != "" || meta.ContextID != "" || meta.ContextTitle != "" || meta.TargetText != "" || meta.TargetPath != "" || meta.PermissionMode != "" || meta.CodexSandboxMode != "" {
 		effectiveMeta = protocol.MergeRuntimeMeta(effectiveMeta, meta)
 		s.manager.updateMeta(func(m *protocol.RuntimeMeta) {
 			*m = effectiveMeta

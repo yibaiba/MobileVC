@@ -361,6 +361,27 @@ func TestService_SendPermissionDecision_HappyPathWritesDecision(t *testing.T) {
 	}
 }
 
+func TestService_SendInputMergesCodexSandboxMode(t *testing.T) {
+	runner := newPermissionStubRunner()
+	runner.interactive = true
+	svc := makeServiceWithPermissionRunner(t, runner)
+	startPermissionRunner(t, svc, "s1", runner)
+
+	if err := svc.SendInput(context.Background(), "s1", InputRequest{
+		Data: "continue\n",
+		RuntimeMeta: protocol.RuntimeMeta{
+			Source:           "ai_turn",
+			CodexSandboxMode: "danger-full-access",
+		},
+	}, func(any) {}); err != nil {
+		t.Fatalf("SendInput: %v", err)
+	}
+
+	if got := svc.RuntimeSnapshot().ActiveMeta.CodexSandboxMode; got != "danger-full-access" {
+		t.Fatalf("active meta codexSandboxMode: %q", got)
+	}
+}
+
 func TestService_SendPermissionDecision_WriteErrPropagates(t *testing.T) {
 	runner := newPermissionStubRunner()
 	runner.hasPending = true
