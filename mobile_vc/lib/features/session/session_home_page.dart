@@ -4,6 +4,7 @@ import 'dart:ui';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -24,6 +25,7 @@ import '../../features/diff/diff_viewer_sheet.dart';
 import '../../features/files/file_browser_sheet.dart';
 import '../../features/files/file_viewer_sheet.dart';
 import '../../features/memory/memory_management_sheet.dart';
+import '../../features/permissions/permission_mode_options.dart';
 import '../../features/permissions/permission_rule_management_sheet.dart';
 import '../../features/runtime_info/runtime_info_sheet.dart';
 import '../../features/skills/skill_management_sheet.dart';
@@ -54,12 +56,15 @@ class SessionHomePage extends StatefulWidget {
 
 class _SessionHomePageState extends State<SessionHomePage> {
   static const int _maxImageAttachmentBytes = 4 * 1024 * 1024;
+  static const double _defaultTimelineBottomPadding = 128;
+  static const double _commandBarGap = 12;
 
   final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
   int _lastCompactFeedbackId = 0;
   static const String _tipCommandModePrefsKey = 'tip_command_mode_shown_v2';
   bool _lastConnected = false;
   bool _checkingTipShown = false;
+  double _timelineBottomPadding = _defaultTimelineBottomPadding;
 
   SessionController get controller => widget.controller;
 
@@ -240,6 +245,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
     final isLight = theme.brightness == Brightness.light;
+    final keyboardInset = MediaQuery.viewInsetsOf(context).bottom;
     return Scaffold(
       key: _scaffoldKey,
       drawer: Drawer(
@@ -268,7 +274,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
           },
         ),
       ),
-      resizeToAvoidBottomInset: true,
+      resizeToAvoidBottomInset: false,
       extendBodyBehindAppBar: true,
       body: Stack(
         children: [
@@ -324,6 +330,8 @@ class _SessionHomePageState extends State<SessionHomePage> {
                                     child: ChatTimeline(
                                       items: controller.timeline,
                                       sessionId: controller.selectedSessionId,
+                                      mediaPreviewStates:
+                                          controller.mediaPreviewStates,
                                       activeReviewDiff:
                                           controller.currentReviewDiff,
                                       activeReviewGroup:
@@ -351,11 +359,23 @@ class _SessionHomePageState extends State<SessionHomePage> {
                                           controller.aiStatusIndicatorVisible,
                                       aiStatusLabel:
                                           controller.aiStatusIndicatorLabel,
+                                      bottomPadding: _timelineBottomPadding +
+                                          keyboardInset,
+                                      hasOlderItems:
+                                          controller.hasOlderTimelineEntries,
+                                      isLoadingOlderItems: controller
+                                          .isLoadingOlderTimelineEntries,
                                       onOpenDiff: () => _openDiff(context),
                                       onOpenRuntimeInfo: () =>
                                           _openRuntimeInfo(context),
                                       onOpenFile: () =>
                                           _openFileViewer(context),
+                                      onOpenAttachment: (attachment) =>
+                                          _openAttachment(context, attachment),
+                                      onRequestMediaPreview:
+                                          controller.requestMediaPreview,
+                                      onLoadOlderItems:
+                                          controller.loadOlderTimelineEntries,
                                       onReviewDecision:
                                           controller.sendReviewDecision,
                                       onAcceptAll:
@@ -488,44 +508,80 @@ class _SessionHomePageState extends State<SessionHomePage> {
               ),
             ),
           ),
+          Positioned(
+            left: 0,
+            right: 0,
+            bottom: 0,
+            child: AnimatedPadding(
+              key: const ValueKey('command-bar-keyboard-padding'),
+              duration: const Duration(milliseconds: 180),
+              curve: Curves.easeOutCubic,
+              padding: EdgeInsets.only(
+                bottom: keyboardInset,
+              ),
+              child: _MeasuredSize(
+                onChanged: _handleCommandBarSizeChanged,
+                child: _buildCommandInputBar(context),
+              ),
+            ),
+          ),
         ],
       ),
-      bottomNavigationBar: CommandInputBar(
-        awaitInput: controller.awaitInput,
-        isBusy: controller.isSessionBusy,
-        canStop: controller.canStopCurrentRun,
-        canCompact: controller.shouldShowCompactButton,
-        isCompacting: controller.isCompacting,
-        compactStatusLabel: controller.compactStatusLabel,
-        contextWindowUsage: controller.contextWindowUsage,
-        onOpenContextWindowUsage: () => _openContextWindowUsage(context),
-        hasPendingReview: controller.hasPendingReview,
-        fastMode: controller.fastMode,
-        permissionMode: controller.displayPermissionMode,
-        shouldShowPermissionChoices: controller.shouldShowPermissionChoices,
-        shouldShowReviewChoices: controller.shouldShowReviewChoices,
-        shouldShowPlanChoices: controller.shouldShowPlanChoices,
-        onSubmit: controller.sendInputTextWithImages,
-        onAttachImage: () => _pickImageAttachment(context),
-        onStop: controller.stopCurrentRun,
-        onCompact: controller.compactCurrentSession,
-        onOpenSessions: () => _openSessions(context),
-        onOpenRuntimeInfo: () => _openRuntimeInfo(context),
-        onOpenLogs: () => _openLogs(context),
-        onOpenSkills: () => _openSkills(context),
-        onOpenMemory: () => _openMemory(context),
-        onOpenPermissions: () => _openPermissions(context),
-        onOpenModels: () => _openModelSwitcher(context),
-        onPermissionModeChanged: controller.updatePermissionMode,
-        showClaudeMode: controller.shouldShowClaudeMode,
-        currentEngine: controller.commandBarEngine,
-        modelSummary: controller.commandBarModelSummary,
-        permissionRuleSummary: controller.permissionRuleSummary,
-        isSessionLoading: controller.isLoadingSession,
-        canSendToContinuedSameSession: controller.canSendToContinuedSameSession,
-        isExternallyLocked: controller.isSessionReadOnly,
-        externalLockedHint: controller.sessionReadOnlyHint,
-      ),
+    );
+  }
+
+  void _handleCommandBarSizeChanged(Size size) {
+    if (!mounted) {
+      return;
+    }
+    final nextPadding = size.height + _commandBarGap;
+    if ((nextPadding - _timelineBottomPadding).abs() < 0.5) {
+      return;
+    }
+    setState(() {
+      _timelineBottomPadding = nextPadding;
+    });
+  }
+
+  Widget _buildCommandInputBar(BuildContext context) {
+    return CommandInputBar(
+      awaitInput: controller.awaitInput,
+      isBusy: controller.isSessionBusy,
+      canStop: controller.canStopCurrentRun,
+      canCompact: controller.shouldShowCompactButton,
+      isCompacting: controller.isCompacting,
+      compactStatusLabel: controller.compactStatusLabel,
+      contextWindowUsage: controller.contextWindowUsage,
+      onOpenContextWindowUsage: () => _openContextWindowUsage(context),
+      hasPendingReview: controller.hasPendingReview,
+      fastMode: controller.fastMode,
+      permissionMode: controller.displayPermissionMode,
+      shouldShowPermissionChoices: controller.shouldShowPermissionChoices,
+      shouldShowReviewChoices: controller.shouldShowReviewChoices,
+      shouldShowPlanChoices: controller.shouldShowPlanChoices,
+      onSubmit: controller.sendInputTextWithImages,
+      onAttachImage: () => _pickImageAttachment(context),
+      onStop: controller.stopCurrentRun,
+      onCompact: controller.compactCurrentSession,
+      onOpenSessions: () => _openSessions(context),
+      onOpenRuntimeInfo: () => _openRuntimeInfo(context),
+      onOpenLogs: () => _openLogs(context),
+      onOpenSkills: () => _openSkills(context),
+      onOpenMemory: () => _openMemory(context),
+      onOpenPermissions: () => _openPermissions(context),
+      onOpenModels: () => _openModelSwitcher(context),
+      onPermissionModeChanged: controller.updatePermissionMode,
+      codexTargetMode: controller.codexTargetMode,
+      onCodexTargetModeChanged: controller.updateCodexTargetMode,
+      showClaudeMode: controller.shouldShowClaudeMode,
+      currentEngine: controller.commandBarEngine,
+      configuredEngine: controller.configuredAiEngine,
+      modelSummary: controller.commandBarModelSummary,
+      permissionRuleSummary: controller.permissionRuleSummary,
+      isSessionLoading: controller.isLoadingSession,
+      canSendToContinuedSameSession: controller.canSendToContinuedSameSession,
+      isExternallyLocked: controller.isSessionReadOnly,
+      externalLockedHint: controller.sessionReadOnlyHint,
     );
   }
 
@@ -648,6 +704,9 @@ class _SessionHomePageState extends State<SessionHomePage> {
     final tokenController =
         TextEditingController(text: controller.config.token);
     final cwdController = TextEditingController(text: controller.config.cwd);
+    final historyWindowLimitController = TextEditingController(
+      text: controller.config.historyWindowLimit.toString(),
+    );
     final linkController = TextEditingController();
     final permissionController =
         TextEditingController(text: controller.config.permissionMode);
@@ -667,6 +726,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
     var selectedEngine = controller.config.engine.trim().isEmpty
         ? 'claude'
         : controller.config.engine.trim();
+    var selectedCodexSandboxMode = controller.config.codexSandboxMode;
     var pendingConfig = controller.config;
     var connectingFromSheet = false;
 
@@ -698,6 +758,20 @@ class _SessionHomePageState extends State<SessionHomePage> {
                 pendingConfig.relayPairingSecret.trim().isNotEmpty ||
                 (pendingConfig.relayClientId.trim().isNotEmpty &&
                     pendingConfig.relayClientReconnectSecret.trim().isNotEmpty);
+            final permissionModeEngine = selectedEngine.trim().toLowerCase();
+            final selectedPermissionMode = normalizePermissionModeForEngine(
+              permissionController.text,
+              permissionModeEngine,
+            );
+            final permissionModeItems =
+                permissionModeOptionsForEngine(permissionModeEngine)
+                    .map(
+                      (option) => DropdownMenuItem<String>(
+                        value: option.value,
+                        child: Text(option.label),
+                      ),
+                    )
+                    .toList(growable: false);
 
             void applyScannedConfig(AppConfig scanned) {
               pendingConfig = scanned;
@@ -705,12 +779,15 @@ class _SessionHomePageState extends State<SessionHomePage> {
               portController.text = scanned.port;
               tokenController.text = scanned.token;
               cwdController.text = scanned.cwd;
+              historyWindowLimitController.text =
+                  scanned.historyWindowLimit.toString();
               iceHostController.text = scanned.adbIceHostOverride;
               iceUsernameController.text = scanned.adbIceUsername;
               iceCredentialController.text = scanned.adbIceCredential;
               selectedEngine = scanned.engine.trim().isEmpty
                   ? selectedEngine
                   : scanned.engine.trim();
+              selectedCodexSandboxMode = scanned.codexSandboxMode;
               scanHint = scanned.connectionMode != ConnectionMode.direct.name
                   ? '已导入 Relay 配对，点击连接完成配对'
                   : '已回填 ${scanned.displayHost}:${scanned.port}${scanned.token.isNotEmpty ? ' 与 token' : ''}';
@@ -723,6 +800,13 @@ class _SessionHomePageState extends State<SessionHomePage> {
             }
 
             AppConfig? parseConnectionLink(String raw) {
+              final historyWindowLimit = int.tryParse(
+                historyWindowLimitController.text.trim(),
+              );
+              if (historyWindowLimit == null || historyWindowLimit <= 0) {
+                scanHint = '历史加载条数必须是正整数';
+                return null;
+              }
               try {
                 return AppConfig.fromLaunchUri(
                   raw,
@@ -732,6 +816,8 @@ class _SessionHomePageState extends State<SessionHomePage> {
                     token: tokenController.text.trim(),
                     cwd: cwdController.text.trim(),
                     engine: selectedEngine,
+                    codexSandboxMode: selectedCodexSandboxMode,
+                    historyWindowLimit: historyWindowLimit,
                     permissionMode: permissionController.text.trim(),
                     fastMode: controller.fastMode,
                     adbIceServersJson: encodedIceConfig(),
@@ -828,6 +914,15 @@ class _SessionHomePageState extends State<SessionHomePage> {
 
             Future<bool> persistConfig({bool connect = false}) async {
               final hostText = hostController.text.trim();
+              final historyWindowLimit = int.tryParse(
+                historyWindowLimitController.text.trim(),
+              );
+              if (historyWindowLimit == null || historyWindowLimit <= 0) {
+                setSheetState(() {
+                  scanHint = '历史加载条数必须是正整数';
+                });
+                return false;
+              }
               final nextConfig = pendingConfig.copyWith(
                 host: pendingConfig.connectionMode == ConnectionMode.relay.name
                     ? pendingConfig.host
@@ -840,6 +935,8 @@ class _SessionHomePageState extends State<SessionHomePage> {
                     : tokenController.text.trim(),
                 cwd: cwdController.text.trim(),
                 engine: selectedEngine,
+                codexSandboxMode: selectedCodexSandboxMode,
+                historyWindowLimit: historyWindowLimit,
                 permissionMode: permissionController.text.trim(),
                 fastMode: controller.fastMode,
                 adbIceServersJson: encodedIceConfig(),
@@ -1123,6 +1220,16 @@ class _SessionHomePageState extends State<SessionHomePage> {
                               decoration:
                                   const InputDecoration(labelText: 'CWD')),
                           const SizedBox(height: 10),
+                          TextField(
+                            controller: historyWindowLimitController,
+                            enabled: !connectionBusy,
+                            keyboardType: TextInputType.number,
+                            decoration: const InputDecoration(
+                              labelText: '历史加载条数',
+                              hintText: '120',
+                            ),
+                          ),
+                          const SizedBox(height: 10),
                           DropdownButtonFormField<String>(
                             initialValue: selectedEngine,
                             decoration:
@@ -1149,15 +1256,103 @@ class _SessionHomePageState extends State<SessionHomePage> {
                                     }
                                     setSheetState(() {
                                       selectedEngine = value;
+                                      permissionController.text =
+                                          normalizePermissionModeForEngine(
+                                        permissionController.text,
+                                        selectedEngine,
+                                      );
                                     });
                                   },
                           ),
+                          if (selectedEngine.trim().toLowerCase() ==
+                              'codex') ...[
+                            const SizedBox(height: 10),
+                            DropdownButtonFormField<String>(
+                              initialValue: selectedCodexSandboxMode,
+                              decoration: const InputDecoration(
+                                labelText: 'Codex 沙箱范围',
+                              ),
+                              items: const [
+                                DropdownMenuItem(
+                                  value: 'workspace-write',
+                                  child: Text('工作区写入'),
+                                ),
+                                DropdownMenuItem(
+                                  value: 'danger-full-access',
+                                  child: Text('关闭沙箱'),
+                                ),
+                                DropdownMenuItem(
+                                  value: 'read-only',
+                                  child: Text('只读'),
+                                ),
+                                DropdownMenuItem(
+                                  value: 'config',
+                                  child: Text('自定义(config.toml)'),
+                                ),
+                              ],
+                              onChanged: connectionBusy
+                                  ? null
+                                  : (value) {
+                                      if (value == null) {
+                                        return;
+                                      }
+                                      setSheetState(() {
+                                        selectedCodexSandboxMode =
+                                            AppConfig.normalizeCodexSandboxMode(
+                                          value,
+                                        );
+                                      });
+                                    },
+                            ),
+                          ],
                           const SizedBox(height: 10),
-                          TextField(
+                          if (selectedEngine.trim().toLowerCase() == 'codex')
+                            DropdownButtonFormField<String>(
+                              key: const ValueKey(
+                                'connection-config-codex-permission-mode',
+                              ),
+                              initialValue: selectedPermissionMode,
+                              decoration: const InputDecoration(
+                                labelText: 'Codex 审批策略',
+                              ),
+                              items: permissionModeItems,
+                              onChanged: connectionBusy
+                                  ? null
+                                  : (value) {
+                                      if (value == null) {
+                                        return;
+                                      }
+                                      permissionController.text = value;
+                                    },
+                            )
+                          else if (selectedEngine.trim().toLowerCase() ==
+                              'claude')
+                            DropdownButtonFormField<String>(
+                              key: const ValueKey(
+                                'connection-config-claude-permission-mode',
+                              ),
+                              initialValue: selectedPermissionMode,
+                              decoration: const InputDecoration(
+                                labelText: 'Claude 权限',
+                              ),
+                              items: permissionModeItems,
+                              onChanged: connectionBusy
+                                  ? null
+                                  : (value) {
+                                      if (value == null) {
+                                        return;
+                                      }
+                                      permissionController.text = value;
+                                    },
+                            )
+                          else
+                            TextField(
                               controller: permissionController,
                               enabled: !connectionBusy,
                               decoration: const InputDecoration(
-                                  labelText: 'Permission Mode')),
+                                labelText: 'Permission Mode',
+                              ),
+                            ),
                         ],
                       ),
                     ),
@@ -1542,6 +1737,21 @@ class _SessionHomePageState extends State<SessionHomePage> {
         );
       },
     );
+  }
+
+  Future<void> _openAttachment(
+    BuildContext context,
+    TimelineAttachment attachment,
+  ) async {
+    final path = attachment.path.trim();
+    if (path.isEmpty) {
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(const SnackBar(content: Text('附件缺少可打开的文件路径')));
+      return;
+    }
+    controller.openFile(path);
+    await _openFileViewer(context);
   }
 
   Future<void> _openRuntimeInfo(BuildContext context) async {
@@ -2086,6 +2296,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
                     connected: controller.connected,
                     awaitInput: controller.awaitInput,
                     permissionMode: controller.config.permissionMode,
+                    engine: controller.configuredAiEngine,
                     currentPath: controller.currentDirectoryPath,
                     runtimeMeta: controller.currentMeta,
                     currentStep: controller.currentStep,
@@ -2191,6 +2402,10 @@ class _ModelSwitcherSheetState extends State<_ModelSwitcherSheet> {
         final isCodex = engine == 'codex';
         final isClaude = engine == 'claude';
         final supportsModels = isClaude || isCodex;
+        final selectedCodexDefault = isCodex && selectedModel.trim().isEmpty;
+        final selectedCodexModelLabel = selectedCodexDefault
+            ? 'Default'
+            : controller.codexModelDisplayLabel(selectedModel);
 
         // 判断是否加载失败
         final modelOptions = isCodex
@@ -2348,10 +2563,7 @@ class _ModelSwitcherSheetState extends State<_ModelSwitcherSheet> {
                                                   CrossAxisAlignment.start,
                                               children: [
                                                 Text(
-                                                  controller
-                                                      .codexModelDisplayLabel(
-                                                    selectedModel,
-                                                  ),
+                                                  selectedCodexModelLabel,
                                                   style: theme
                                                       .textTheme.titleMedium
                                                       ?.copyWith(
@@ -2369,7 +2581,9 @@ class _ModelSwitcherSheetState extends State<_ModelSwitcherSheet> {
                                                           true
                                                       ? selectedCatalogEntry!
                                                           .description
-                                                      : '当前选择的 Codex 模型',
+                                                      : selectedCodexDefault
+                                                          ? '模型和推理强度将跟随 Codex config.toml'
+                                                          : '当前选择的 Codex 模型',
                                                   style: theme
                                                       .textTheme.bodySmall
                                                       ?.copyWith(
@@ -2415,8 +2629,8 @@ class _ModelSwitcherSheetState extends State<_ModelSwitcherSheet> {
                                             )
                                           else ...[
                                             Text(
-                                              selectedModel.trim().isEmpty
-                                                  ? '先选择一个 Codex 模型。'
+                                              selectedCodexDefault
+                                                  ? '模型和推理强度将跟随 Codex config.toml；MobileVC 不会下发 model_reasoning_effort 覆盖。'
                                                   : '当前保存的模型不在 Codex 原生目录中，因此这里只保留已保存强度，不展示额外原生选项。',
                                               style: theme.textTheme.bodySmall
                                                   ?.copyWith(
@@ -2424,7 +2638,14 @@ class _ModelSwitcherSheetState extends State<_ModelSwitcherSheet> {
                                                     .onSurfaceVariant,
                                               ),
                                             ),
-                                            if (selectedEffort
+                                            if (selectedCodexDefault) ...[
+                                              const SizedBox(height: 8),
+                                              const ChoiceChip(
+                                                label: Text('跟随 config.toml'),
+                                                selected: true,
+                                                onSelected: null,
+                                              ),
+                                            ] else if (selectedEffort
                                                 .trim()
                                                 .isNotEmpty) ...[
                                               const SizedBox(height: 8),
@@ -2573,18 +2794,24 @@ class _ModelSwitcherSheetState extends State<_ModelSwitcherSheet> {
                                                                   .isEmpty),
                                                   onTap: () {
                                                     setState(() {
-                                                      selectedModel =
+                                                      final isDefaultOption =
                                                           option.value ==
-                                                                  'default'
+                                                              'default';
+                                                      selectedModel =
+                                                          isDefaultOption
                                                               ? ''
                                                               : option.value;
                                                       if (isCodex) {
-                                                        selectedEffort = controller
-                                                            .preferredCodexReasoningEffortForModel(
-                                                          option.value,
-                                                          fallback:
-                                                              selectedEffort,
-                                                        );
+                                                        selectedEffort =
+                                                            isDefaultOption
+                                                                ? ''
+                                                                : controller
+                                                                    .preferredCodexReasoningEffortForModel(
+                                                                    option
+                                                                        .value,
+                                                                    fallback:
+                                                                        selectedEffort,
+                                                                  );
                                                         sheetStep =
                                                             _ModelSwitcherStep
                                                                 .effort;
@@ -3457,6 +3684,48 @@ String _portForHostInput(String rawHost, String rawPort) {
     return uri.port.toString();
   }
   return rawPort.trim();
+}
+
+class _MeasuredSize extends SingleChildRenderObjectWidget {
+  const _MeasuredSize({
+    required super.child,
+    required this.onChanged,
+  });
+
+  final ValueChanged<Size> onChanged;
+
+  @override
+  RenderObject createRenderObject(BuildContext context) {
+    return _MeasuredSizeRenderObject(onChanged);
+  }
+
+  @override
+  void updateRenderObject(
+    BuildContext context,
+    covariant _MeasuredSizeRenderObject renderObject,
+  ) {
+    renderObject.onChanged = onChanged;
+  }
+}
+
+class _MeasuredSizeRenderObject extends RenderProxyBox {
+  _MeasuredSizeRenderObject(this.onChanged);
+
+  ValueChanged<Size> onChanged;
+  Size? _lastSize;
+
+  @override
+  void performLayout() {
+    super.performLayout();
+    final currentSize = size;
+    if (currentSize == _lastSize) {
+      return;
+    }
+    _lastSize = currentSize;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      onChanged(currentSize);
+    });
+  }
 }
 
 class _TipSection extends StatelessWidget {

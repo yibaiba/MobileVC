@@ -1118,6 +1118,65 @@ void main() {
     });
   });
 
+  group('SessionController compact', () {
+    test('手动 Compact 会携带当前 Codex resume 元信息', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.saveConfig(const AppConfig(
+        cwd: '/workspace/MobileVC',
+        engine: 'codex',
+        permissionMode: 'bypassPermissions',
+      ));
+      await controller.connect();
+      service.emit(
+        SessionHistoryEvent(
+          timestamp: _timestamp,
+          sessionId: 'codex-thread:thread-current',
+          runtimeMeta: const RuntimeMeta(engine: 'codex'),
+          raw: const {'type': 'session_history'},
+          summary: const SessionSummary(
+            id: 'codex-thread:thread-current',
+            title: 'Codex thread',
+            runtime: RuntimeMeta(
+              engine: 'codex',
+              command: 'codex -m gpt-5.5',
+              cwd: '/workspace/MobileVC',
+              resumeSessionId: 'thread-current',
+            ),
+          ),
+          canResume: true,
+          runtimeAlive: true,
+          resumeRuntimeMeta: const RuntimeMeta(
+            engine: 'codex',
+            command: 'codex -m gpt-5.5',
+            cwd: '/workspace/MobileVC',
+            resumeSessionId: 'thread-current',
+            claudeLifecycle: 'waiting_input',
+          ),
+        ),
+      );
+      await _flushEvents();
+      service.sentPayloads.clear();
+
+      controller.compactCurrentSession();
+
+      expect(service.sentPayloads, hasLength(1));
+      final payload = service.sentPayloads.single;
+      expect(payload['action'], 'compact');
+      expect(payload['sessionId'], 'codex-thread:thread-current');
+      expect(payload['resumeSessionId'], 'thread-current');
+      expect(payload['command'], 'codex -m gpt-5.5');
+      expect(payload['engine'], 'codex');
+      expect(payload['cwd'], '/workspace/MobileVC');
+      expect(payload['permissionMode'], 'bypassPermissions');
+      expect(payload['source'], 'compact');
+      expect(payload['targetType'], 'compact');
+    });
+  });
+
   group('SessionController action needed signal', () {
     test(
         'initialize reconnects when previous page had active connection intent',
@@ -1187,7 +1246,7 @@ void main() {
 
       final imported = await controller.importConnectionLink(
         'mobilevc://relay/v1?relay=wss%3A%2F%2Frelay.example.test'
-        '&session=rs_import&secret=pair_secret&exp=1760000000'
+        '&session=rs_import&secret=pair_secret&exp=4102444800'
         '&nodeFingerprint=1111111111111111111111111111111111111111111111111111111111111111'
         '&relayProtocolVersion=1&e2eeProtocolVersion=1'
         '&cryptoSuite=p256-ecdsa%2Bp256-ecdh%2Bhkdf-sha256%2Baes-256-gcm'
@@ -1221,7 +1280,7 @@ void main() {
 
       final imported = await controller.importConnectionLink(
         'mobilevc://relay/v1?relay=wss%3A%2F%2Frelay.example.test'
-        '&session=rs_import&secret=pair_secret&exp=1760000000'
+        '&session=rs_import&secret=pair_secret&exp=4102444800'
         '&nodeFingerprint=1111111111111111111111111111111111111111111111111111111111111111'
         '&lanHost=192.168.1.2&lanPort=8001&lanToken=direct-token'
         '&lanCwd=%2Fworkspace'
@@ -1248,7 +1307,7 @@ void main() {
           relayUrl: 'wss://relay.example.test',
           relaySessionId: 'rs_test',
           relayPairingSecret: 'pair_secret',
-          relayPairingExpiresAt: 1760000000,
+          relayPairingExpiresAt: 4102444800,
         ).toJson()),
       });
       final service = _FakeMobileVcWsService();
@@ -1261,7 +1320,7 @@ void main() {
         relayUrl: 'wss://relay.example.test',
         relaySessionId: 'rs_test',
         relayPairingSecret: 'pair_secret',
-        relayPairingExpiresAt: 1760000000,
+        relayPairingExpiresAt: 4102444800,
       ));
       await controller.connect();
 
@@ -1282,6 +1341,44 @@ void main() {
       expect(persisted['relayClientReconnectSecret'], 'reconnect_secret');
     });
 
+    test('expired new relay link is rejected without changing current config',
+        () async {
+      SharedPreferences.setMockInitialValues({
+        'mobilevc.app_config': jsonEncode(const AppConfig(
+          connectionMode: 'relay',
+          relayUrl: 'wss://relay.example.test',
+          relaySessionId: 'rs_existing',
+          relayClientId: 'rc_existing',
+          relayClientReconnectSecret: 'reconnect_existing',
+        ).toJson()),
+      });
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      final imported = await controller.importConnectionLink(
+        'mobilevc://relay/v1?relay=wss%3A%2F%2Frelay.example.test'
+        '&session=rs_expired&secret=stale_pair_secret&exp=1'
+        '&nodeFingerprint=1111111111111111111111111111111111111111111111111111111111111111'
+        '&relayProtocolVersion=1&e2eeProtocolVersion=1'
+        '&cryptoSuite=p256-ecdsa%2Bp256-ecdh%2Bhkdf-sha256%2Baes-256-gcm'
+        '&tunnelProtocolVersion=1&supportsMultiplexStreams=true'
+        '&supportsFileDownloadStream=true&supportsDeviceManagement=true'
+        '&requiresE2EE=true&plaintextTestMode=false',
+      );
+
+      expect(imported, isFalse);
+      expect(controller.connectionMessage, contains('Relay 配对链接已过期'));
+      expect(controller.config.relaySessionId, 'rs_existing');
+      expect(controller.config.relayClientId, 'rc_existing');
+      expect(
+        controller.config.relayClientReconnectSecret,
+        'reconnect_existing',
+      );
+      expect(service.disconnectCalls, 0);
+    });
+
     test('relay pairing failure keeps one-time secret for explicit retry',
         () async {
       final service = _FakeMobileVcWsService()
@@ -1298,7 +1395,7 @@ void main() {
         relayUrl: 'wss://relay.example.test',
         relaySessionId: 'rs_test',
         relayPairingSecret: 'pair_secret',
-        relayPairingExpiresAt: 1760000000,
+        relayPairingExpiresAt: 4102444800,
       ));
 
       await controller.connect();
@@ -1307,7 +1404,7 @@ void main() {
       expect(controller.connectionStage, SessionConnectionStage.failed);
       expect(controller.connectionMessage, contains('Relay E2EE 握手失败'));
       expect(controller.config.relayPairingSecret, 'pair_secret');
-      expect(controller.config.relayPairingExpiresAt, 1760000000);
+      expect(controller.config.relayPairingExpiresAt, 4102444800);
 
       final prefs = await SharedPreferences.getInstance();
       final persisted = jsonDecode(prefs.getString('mobilevc.app_config')!)
@@ -1521,7 +1618,7 @@ void main() {
         relayUrl: 'wss://relay.example.test',
         relaySessionId: 'rs_test',
         relayPairingSecret: 'pair_secret',
-        relayPairingExpiresAt: 1760000000,
+        relayPairingExpiresAt: 4102444800,
       ));
 
       await controller.connect();
@@ -1529,7 +1626,7 @@ void main() {
       expect(controller.connected, isFalse);
       expect(controller.connectionStage, SessionConnectionStage.reconnecting);
       expect(controller.config.relayPairingSecret, 'pair_secret');
-      expect(controller.config.relayPairingExpiresAt, 1760000000);
+      expect(controller.config.relayPairingExpiresAt, 4102444800);
     });
 
     test('relay agent disconnect auto reconnects and resends unacked action',
@@ -1683,7 +1780,8 @@ void main() {
         service.sentPayloads.where((payload) =>
             payload['action'] == 'session_resume' &&
             payload['sessionId'] == 'session-relay' &&
-            payload['reason'] == 'reconnect'),
+            payload['reason'] == 'reconnect' &&
+            payload['limit'] == 120),
         hasLength(1),
       );
     });
@@ -1950,7 +2048,7 @@ void main() {
 
       final imported = await controller.importConnectionLink(
         'mobilevc://relay/v1?relay=wss%3A%2F%2Frelay.example.test'
-        '&session=rs_new&secret=new_pair_secret&exp=1760000000'
+        '&session=rs_new&secret=new_pair_secret&exp=4102444800'
         '&nodeFingerprint=1111111111111111111111111111111111111111111111111111111111111111'
         '&relayProtocolVersion=1&e2eeProtocolVersion=1'
         '&cryptoSuite=p256-ecdsa%2Bp256-ecdh%2Bhkdf-sha256%2Baes-256-gcm'
@@ -1989,7 +2087,7 @@ void main() {
 
       final imported = await controller.importConnectionLink(
         'mobilevc://relay/v1?relay=wss%3A%2F%2Frelay.example.test'
-        '&session=rs_test&secret=stale_pair_secret&exp=1760000000'
+        '&session=rs_test&secret=stale_pair_secret&exp=4102444800'
         '&nodeFingerprint=1111111111111111111111111111111111111111111111111111111111111111'
         '&relayProtocolVersion=1&e2eeProtocolVersion=1'
         '&cryptoSuite=p256-ecdsa%2Bp256-ecdh%2Bhkdf-sha256%2Baes-256-gcm'
@@ -2012,6 +2110,48 @@ void main() {
       expect(call.clientReconnectSecret, 'reconnect_existing');
     });
 
+    test('reimporting same connected relay link does not disconnect', () async {
+      SharedPreferences.setMockInitialValues({
+        'mobilevc.app_config': jsonEncode(const AppConfig(
+          connectionMode: 'relay',
+          relayUrl: 'wss://relay.example.test',
+          relaySessionId: 'rs_test',
+          relayClientId: 'rc_existing',
+          relayClientReconnectSecret: 'reconnect_existing',
+        ).toJson()),
+      });
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      expect(controller.connected, isTrue);
+
+      final imported = await controller.importConnectionLink(
+        'mobilevc://relay/v1?relay=wss%3A%2F%2Frelay.example.test'
+        '&session=rs_test&secret=stale_pair_secret&exp=1'
+        '&nodeFingerprint=1111111111111111111111111111111111111111111111111111111111111111'
+        '&relayProtocolVersion=1&e2eeProtocolVersion=1'
+        '&cryptoSuite=p256-ecdsa%2Bp256-ecdh%2Bhkdf-sha256%2Baes-256-gcm'
+        '&tunnelProtocolVersion=1&supportsMultiplexStreams=true'
+        '&supportsFileDownloadStream=true&supportsDeviceManagement=true'
+        '&requiresE2EE=true&plaintextTestMode=false',
+      );
+
+      expect(imported, isTrue);
+      expect(controller.connected, isTrue);
+      expect(controller.connectionStage, SessionConnectionStage.connected);
+      expect(controller.connectionMessage, '已恢复 Relay 连接配置');
+      expect(service.disconnectCalls, 0);
+      expect(controller.config.relayPairingSecret, isEmpty);
+      expect(controller.config.relayClientId, 'rc_existing');
+      expect(
+        controller.config.relayClientReconnectSecret,
+        'reconnect_existing',
+      );
+    });
+
     test('imported relay pairing link disconnects active stale relay session',
         () async {
       SharedPreferences.setMockInitialValues({});
@@ -2032,7 +2172,7 @@ void main() {
 
       final imported = await controller.importConnectionLink(
         'mobilevc://relay/v1?relay=wss%3A%2F%2Frelay.example.test'
-        '&session=rs_new&secret=new_pair_secret&exp=1760000000'
+        '&session=rs_new&secret=new_pair_secret&exp=4102444800'
         '&nodeFingerprint=1111111111111111111111111111111111111111111111111111111111111111'
         '&relayProtocolVersion=1&e2eeProtocolVersion=1'
         '&cryptoSuite=p256-ecdsa%2Bp256-ecdh%2Bhkdf-sha256%2Baes-256-gcm'
@@ -3330,6 +3470,43 @@ void main() {
       expect(controller.commandBarModelSummary, 'gpt-5.5 · HIGH');
     });
 
+    test('Codex Default 模型跟随 config.toml 且不下发推理强度覆盖', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.saveConfig(
+        const AppConfig(
+          engine: 'codex',
+          codexModel: 'gpt-5.5',
+          codexReasoningEffort: 'high',
+        ),
+      );
+      await controller.connect();
+
+      await controller.updateAiModelSelection(
+        model: '',
+        reasoningEffort: '',
+        engine: 'codex',
+      );
+
+      expect(controller.config.codexModel, isEmpty);
+      expect(controller.config.codexReasoningEffort, isEmpty);
+      expect(controller.commandBarModelSummary, 'Default · config.toml');
+
+      service.sentPayloads.clear();
+      controller.sendInputText('codex');
+
+      expect(service.sentPayloads.single['action'], 'ai_turn');
+      expect(service.sentPayloads.single['engine'], 'codex');
+      expect(service.sentPayloads.single['model'], 'default');
+      expect(
+        service.sentPayloads.single.containsKey('reasoningEffort'),
+        isFalse,
+      );
+    });
+
     test('Codex 启动时不会把残留的 Claude 模型配置发给后端', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);
@@ -3609,14 +3786,14 @@ void main() {
           '',
           fallback: '',
         ),
-        'high',
+        '',
       );
       await controller.saveConfig(
         controller.config.copyWith(engine: 'codex'),
       );
       expect(controller.configuredAiModel, isEmpty);
-      expect(controller.configuredAiReasoningEffort, 'high');
-      expect(controller.commandBarModelSummary, 'Default · HIGH');
+      expect(controller.configuredAiReasoningEffort, isEmpty);
+      expect(controller.commandBarModelSummary, 'Default · config.toml');
     });
 
     test('voice_api_configs 结果会填充候选项且不覆盖普通 runtime info', () async {
@@ -3796,6 +3973,104 @@ void main() {
       expect(service.sentPayloads[0]['model'], 'gpt-5.4');
       expect(service.sentPayloads[0]['reasoningEffort'], 'xhigh');
       expect(controller.commandBarModelSummary, 'GPT-5.4 · XHIGH');
+    });
+
+    test('Codex 沙箱配置会带入 ai_turn payload', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+      await controller.saveConfig(
+        controller.config.copyWith(
+          engine: 'codex',
+          codexSandboxMode: 'danger-full-access',
+        ),
+      );
+
+      await controller.connect();
+      service.sentPayloads.clear();
+      controller.sendInputText('codex');
+
+      expect(service.sentPayloads[0]['action'], 'ai_turn');
+      expect(service.sentPayloads[0]['engine'], 'codex');
+      expect(
+        service.sentPayloads[0]['codexSandboxMode'],
+        'danger-full-access',
+      );
+    });
+
+    test('Codex 目标模式关闭时不带目标上下文', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+      await controller.saveConfig(
+        controller.config.copyWith(
+          engine: 'codex',
+          codexTargetMode: false,
+        ),
+      );
+
+      await controller.connect();
+      service.emit(
+        FileDiffEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-1',
+          runtimeMeta: const RuntimeMeta(
+            command: 'codex',
+            engine: 'codex',
+            targetPath: '/workspace/lib/main.dart',
+          ),
+          raw: const {'type': 'file_diff'},
+          path: '/workspace/lib/main.dart',
+          title: 'main.dart',
+          diff: '@@ -1 +1 @@\n-old\n+new',
+          lang: 'dart',
+        ),
+      );
+      await _flushEvents();
+
+      service.sentPayloads.clear();
+      controller.sendInputText('codex fix it');
+
+      expect(service.sentPayloads[0]['action'], 'ai_turn');
+      expect(service.sentPayloads[0]['engine'], 'codex');
+      expect(service.sentPayloads[0].containsKey('targetPath'), isFalse);
+      expect(service.sentPayloads[0].containsKey('targetDiff'), isFalse);
+    });
+
+    test('Codex 目标模式开启时带目标上下文', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+      await controller.saveConfig(
+        controller.config.copyWith(
+          engine: 'codex',
+          codexTargetMode: true,
+        ),
+      );
+
+      await controller.connect();
+      service.emit(
+        FileDiffEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-1',
+          runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+          raw: const {'type': 'file_diff'},
+          path: '/workspace/lib/main.dart',
+          title: 'main.dart',
+          diff: '@@ -1 +1 @@\n-old\n+new',
+          lang: 'dart',
+        ),
+      );
+      await _flushEvents();
+
+      service.sentPayloads.clear();
+      controller.sendInputText('codex fix it');
+
+      expect(service.sentPayloads[0]['targetPath'], '/workspace/lib/main.dart');
+      expect(service.sentPayloads[0]['targetDiff'], contains('-old'));
     });
 
     test('sendInputText 在 Claude 模式下继续普通文本时走 ai_turn', () async {
@@ -4426,6 +4701,78 @@ void main() {
 
       expect(controller.isSessionReadOnly, isTrue);
       expect(controller.canStopCurrentRun, isFalse);
+    });
+
+    test('Codex 等待输入且只有 runtimeAlive 时选图会发送 input 而不是显示停止', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(
+        SessionHistoryEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-codex-idle',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_history'},
+          summary: const SessionSummary(
+            id: 'session-codex-idle',
+            title: 'Codex idle',
+            ownership: 'mobilevc',
+            runtime: RuntimeMeta(command: 'codex', engine: 'codex'),
+          ),
+          runtimeAlive: true,
+          resumeRuntimeMeta: const RuntimeMeta(
+            command: 'codex',
+            engine: 'codex',
+            claudeLifecycle: 'waiting_input',
+          ),
+        ),
+      );
+      service.emit(
+        AgentStateEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-codex-idle',
+          runtimeMeta: const RuntimeMeta(
+            command: 'codex',
+            engine: 'codex',
+            claudeLifecycle: 'waiting_input',
+          ),
+          raw: const {'type': 'agent_state'},
+          state: 'WAIT_INPUT',
+          message: '等待输入',
+          awaitInput: true,
+          command: 'codex',
+        ),
+      );
+      await _flushEvents();
+
+      expect(controller.awaitInput, isTrue);
+      expect(controller.isSessionBusy, isFalse);
+      expect(controller.canStopCurrentRun, isFalse);
+
+      service.sentPayloads.clear();
+      controller.stopCurrentRun();
+      expect(service.sentPayloads, isEmpty);
+
+      controller.sendInputTextWithImages(
+        '看下这张图',
+        [
+          ChatImageAttachment(
+            name: 'screen.png',
+            mimeType: 'image/png',
+            bytes: utf8.encode('png-bytes'),
+          ),
+        ],
+      );
+
+      expect(service.sentPayloads, hasLength(1));
+      final payload = service.sentPayloads.single;
+      expect(payload['action'], 'input');
+      expect(payload['data'], '看下这张图\n');
+      expect(payload.containsKey('imageAttachments'), isTrue);
+      expect(controller.canStopCurrentRun, isTrue);
     });
 
     test('外部原生 history 落地后立即启动观察增量同步', () async {
@@ -6389,6 +6736,63 @@ void main() {
         ['session-current', 'session-other'],
       );
       expect(controller.selectedSessionId, 'session-current');
+    });
+
+    test('session_list_result 大列表合并会保留已有可见摘要', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      service.emit(
+        SessionListResultEvent(
+          timestamp: _timestamp,
+          sessionId: '',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_list_result'},
+          items: [
+            const SessionSummary(
+              id: 'session-keep',
+              title: 'session',
+              lastPreview: '用户刚才的问题',
+            ),
+            ...List<SessionSummary>.generate(
+              240,
+              (index) => SessionSummary(
+                id: 'session-$index',
+                title: 'Old $index',
+              ),
+            ),
+          ],
+        ),
+      );
+      await _flushEvents();
+
+      service.emit(
+        SessionListResultEvent(
+          timestamp: _timestamp.add(const Duration(seconds: 1)),
+          sessionId: '',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_list_result'},
+          items: [
+            const SessionSummary(id: 'session-keep', title: 'session'),
+            ...List<SessionSummary>.generate(
+              240,
+              (index) => SessionSummary(
+                id: 'session-$index',
+                title: 'New $index',
+              ),
+            ),
+          ],
+        ),
+      );
+      await _flushEvents();
+
+      expect(controller.sessions, hasLength(241));
+      expect(controller.sessions.first.id, 'session-keep');
+      expect(controller.sessions.first.lastPreview, '用户刚才的问题');
+      expect(controller.sessions.last.id, 'session-239');
+      expect(controller.sessions.last.title, 'New 239');
     });
 
     test('deleteSession 立即移除本地会话并发送删除请求', () async {
@@ -11269,6 +11673,538 @@ void main() {
       );
     });
 
+    test('loadSession 请求首屏历史窗口，避免一次加载完整长会话', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.sentPayloads.clear();
+      controller.loadSession('session-window');
+
+      expect(service.sentPayloads, hasLength(1));
+      expect(service.sentPayloads.single['action'], 'session_load');
+      expect(service.sentPayloads.single['sessionId'], 'session-window');
+      expect(service.sentPayloads.single['limit'], 120);
+    });
+
+    test('会话历史窗口使用配置里的条数', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.saveConfig(const AppConfig(historyWindowLimit: 240));
+      await controller.connect();
+      service.sentPayloads.clear();
+      controller.loadSession('session-window');
+
+      expect(service.sentPayloads.single['action'], 'session_load');
+      expect(service.sentPayloads.single['limit'], 240);
+
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-window',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-window', title: '当前会话'),
+        logEntryStart: 20,
+        logEntryTotal: 260,
+        hasMoreBefore: true,
+        resumeRuntimeMeta: const RuntimeMeta(cwd: '/workspace'),
+      ));
+      await _flushEvents();
+
+      service.sentPayloads.clear();
+      controller.loadOlderTimelineEntries();
+      expect(service.sentPayloads.single['action'], 'session_history_page');
+      expect(service.sentPayloads.single['limit'], 240);
+
+      service.sentPayloads.clear();
+      controller.resumeConnectionIfNeeded();
+      await _flushEvents();
+      expect(
+        service.sentPayloads.any((payload) =>
+            payload['action'] == 'session_resume' && payload['limit'] == 240),
+        isTrue,
+      );
+    });
+
+    test('session_history_page 会把更早历史插入 timeline 前面', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        logEntryStart: 2,
+        logEntryTotal: 4,
+        hasMoreBefore: true,
+        logEntries: const [
+          HistoryLogEntry(
+            kind: 'markdown',
+            message: '第三条',
+            timestamp: '2026-05-27T05:20:03Z',
+          ),
+          HistoryLogEntry(
+            kind: 'markdown',
+            message: '第四条',
+            timestamp: '2026-05-27T05:20:04Z',
+          ),
+        ],
+        resumeRuntimeMeta: RuntimeMeta(command: 'claude'),
+      ));
+      await _flushEvents();
+
+      expect(controller.hasOlderTimelineEntries, isTrue);
+      service.sentPayloads.clear();
+      controller.loadOlderTimelineEntries();
+      expect(service.sentPayloads.single['action'], 'session_history_page');
+      expect(service.sentPayloads.single['before'], 2);
+      expect(service.sentPayloads.single['limit'], 120);
+
+      service.emit(SessionHistoryPageEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_history_page'},
+        logEntryStart: 0,
+        logEntryTotal: 4,
+        hasMoreBefore: false,
+        logEntries: const [
+          HistoryLogEntry(
+            kind: 'markdown',
+            message: '第一条',
+            timestamp: '2026-05-27T05:20:01Z',
+          ),
+          HistoryLogEntry(
+            kind: 'markdown',
+            message: '第二条',
+            timestamp: '2026-05-27T05:20:02Z',
+          ),
+        ],
+        resumeRuntimeMeta: RuntimeMeta(command: 'claude'),
+      ));
+      await _flushEvents();
+
+      expect(
+        controller.timeline.map((item) => item.body).toList(),
+        ['第一条第二条', '第三条第四条'],
+      );
+      expect(controller.hasOlderTimelineEntries, isFalse);
+      expect(controller.isLoadingOlderTimelineEntries, isFalse);
+    });
+
+    test('session_history 会折叠 Codex 原生工具事件', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        logEntries: const [
+          HistoryLogEntry(
+            kind: 'user',
+            message: '看一下项目',
+            timestamp: '2026-05-27T05:20:00Z',
+          ),
+          HistoryLogEntry(
+            kind: 'system',
+            message: '调用 shell',
+            timestamp: '2026-05-27T05:20:01Z',
+            context: HistoryContext(
+              source: 'codex-native',
+              type: 'codex_tool_call',
+              tool: 'functions.exec_command',
+              command:
+                  '{"cmd":"sed -n \'1,80p\' internal/engine/codex_transport.go"}',
+            ),
+          ),
+          HistoryLogEntry(
+            kind: 'system',
+            message: 'exit 0',
+            timestamp: '2026-05-27T05:20:02Z',
+            context: HistoryContext(
+              source: 'codex-native',
+              type: 'codex_tool_output',
+              tool: 'functions.exec_command',
+            ),
+          ),
+          HistoryLogEntry(
+            kind: 'system',
+            message: 'apply_patch success',
+            timestamp: '2026-05-27T05:20:03Z',
+            context: HistoryContext(
+              source: 'codex-native',
+              type: 'codex_patch',
+              status: 'success',
+            ),
+          ),
+          HistoryLogEntry(
+            kind: 'markdown',
+            message: '已经看完了',
+            timestamp: '2026-05-27T05:20:04Z',
+          ),
+        ],
+        resumeRuntimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+      ));
+      await _flushEvents();
+
+      expect(controller.timeline.map((item) => item.kind), [
+        'user',
+        'codex_tool_group',
+        'markdown',
+      ]);
+      final group = controller.timeline.singleWhere(
+        (item) => item.kind == 'codex_tool_group',
+      );
+      expect(group.status, contains('工具调用 1'));
+      expect(group.status, contains('输出 1'));
+      expect(group.status, contains('Patch 1'));
+      expect(
+          group.codexSteps,
+          containsAll([
+            '正在读取 codex_transport.go',
+            '补丁结果：success',
+          ]));
+      expect(group.body, contains('## 工具调用 (1)'));
+      expect(group.body, contains('## 工具输出 (1)'));
+      expect(group.body, contains('## Patch (1)'));
+      expect(group.body, contains('- **functions.exec_command**'));
+      expect(
+          controller.timeline.where((item) => item.kind == 'system'), isEmpty);
+    });
+
+    test('session_delta 会折叠 Codex 原生工具事件', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionDeltaEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'session_delta'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        appendLogEntries: const [
+          HistoryLogEntry(
+            kind: 'system',
+            message: 'task started',
+            timestamp: '2026-05-27T05:21:01Z',
+            context: HistoryContext(
+              source: 'codex-native',
+              type: 'codex_task',
+              status: 'started',
+            ),
+          ),
+          HistoryLogEntry(
+            kind: 'system',
+            message: '调用 shell',
+            timestamp: '2026-05-27T05:21:02Z',
+            context: HistoryContext(
+              source: 'codex-native',
+              type: 'codex_tool_call',
+              tool: 'functions.exec_command',
+            ),
+          ),
+          HistoryLogEntry(
+            kind: 'system',
+            message: 'exit 0',
+            timestamp: '2026-05-27T05:21:03Z',
+            context: HistoryContext(
+              source: 'codex-native',
+              type: 'codex_tool_output',
+              tool: 'functions.exec_command',
+            ),
+          ),
+        ],
+        resumeRuntimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+      ));
+      await _flushEvents();
+
+      expect(controller.timeline, hasLength(1));
+      final group = controller.timeline.single;
+      expect(group.kind, 'codex_tool_group');
+      expect(group.status, contains('工具调用 1'));
+      expect(group.status, contains('输出 1'));
+      expect(group.status, contains('任务状态 1'));
+      expect(group.body, contains('## 任务状态 (1)'));
+      expect(group.body, contains('## 工具调用 (1)'));
+      expect(group.body, contains('## 工具输出 (1)'));
+      expect(group.body, contains('- **started**'));
+      expect(group.body, contains('- **functions.exec_command**'));
+    });
+
+    test('session_history 会把 Codex 子智能体事件整理成可见状态', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        logEntries: const [
+          HistoryLogEntry(
+            kind: 'system',
+            message: 'spawn subagent',
+            timestamp: '2026-05-27T05:22:01Z',
+            context: HistoryContext(
+              source: 'codex-native',
+              type: 'codex_tool_call',
+              tool: 'functions.spawn_agent',
+              command: '{"task_name":"agent-019e7126","message":"分析通信层"}',
+            ),
+          ),
+          HistoryLogEntry(
+            kind: 'system',
+            message: 'read source',
+            timestamp: '2026-05-27T05:22:02Z',
+            context: HistoryContext(
+              source: 'codex-native',
+              type: 'codex_tool_call',
+              tool: 'functions.exec_command',
+              command:
+                  '{"cmd":"sed -n \'1,120p\' internal/engine/codex_transport.go"}',
+            ),
+          ),
+        ],
+        resumeRuntimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+      ));
+      await _flushEvents();
+
+      final group = controller.timeline.single;
+      expect(group.kind, 'codex_tool_group');
+      expect(group.codexSteps, [
+        '正在创建智能体：agent-019e7126',
+        '正在读取 codex_transport.go',
+      ]);
+    });
+
+    test('Codex 可见状态优先保留后续关键智能体和补丁状态', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        logEntries: const [
+          HistoryLogEntry(
+            kind: 'system',
+            message: 'read 1',
+            timestamp: '2026-05-27T05:23:01Z',
+            context: HistoryContext(
+              source: 'codex-native',
+              type: 'codex_tool_call',
+              tool: 'functions.exec_command',
+              command: '{"cmd":"sed -n \'1,40p\' lib/a.dart"}',
+            ),
+          ),
+          HistoryLogEntry(
+            kind: 'system',
+            message: 'read 2',
+            timestamp: '2026-05-27T05:23:02Z',
+            context: HistoryContext(
+              source: 'codex-native',
+              type: 'codex_tool_call',
+              tool: 'functions.exec_command',
+              command: '{"cmd":"cat lib/b.dart"}',
+            ),
+          ),
+          HistoryLogEntry(
+            kind: 'system',
+            message: 'read 3',
+            timestamp: '2026-05-27T05:23:03Z',
+            context: HistoryContext(
+              source: 'codex-native',
+              type: 'codex_tool_call',
+              tool: 'functions.exec_command',
+              command: '{"cmd":"rg SessionController lib/c.dart"}',
+            ),
+          ),
+          HistoryLogEntry(
+            kind: 'system',
+            message: 'read 4',
+            timestamp: '2026-05-27T05:23:04Z',
+            context: HistoryContext(
+              source: 'codex-native',
+              type: 'codex_tool_call',
+              tool: 'functions.exec_command',
+              command: '{"cmd":"find lib -name d.dart"}',
+            ),
+          ),
+          HistoryLogEntry(
+            kind: 'system',
+            message: 'read 5',
+            timestamp: '2026-05-27T05:23:05Z',
+            context: HistoryContext(
+              source: 'codex-native',
+              type: 'codex_tool_call',
+              tool: 'functions.exec_command',
+              command: '{"cmd":"head -20 lib/e.dart"}',
+            ),
+          ),
+          HistoryLogEntry(
+            kind: 'system',
+            message: 'spawn subagent',
+            timestamp: '2026-05-27T05:23:06Z',
+            context: HistoryContext(
+              source: 'codex-native',
+              type: 'codex_tool_call',
+              tool: 'functions.spawn_agent',
+              command: '{"task_name":"agent-review","message":"审查"}',
+            ),
+          ),
+          HistoryLogEntry(
+            kind: 'system',
+            message: 'patch success',
+            timestamp: '2026-05-27T05:23:07Z',
+            context: HistoryContext(
+              source: 'codex-native',
+              type: 'codex_patch',
+              status: 'success',
+            ),
+          ),
+        ],
+        resumeRuntimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+      ));
+      await _flushEvents();
+
+      final steps = controller.timeline.single.codexSteps;
+      expect(steps, hasLength(6));
+      expect(steps, contains('正在创建智能体：agent-review'));
+      expect(steps, contains('补丁结果：success'));
+      expect(steps, contains('正在读取 e.dart'));
+      expect(steps, isNot(contains('正在读取 a.dart')));
+    });
+
+    test('session_history 会恢复用户消息附件并处理媒体预览结果', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        logEntries: const [
+          HistoryLogEntry(
+            kind: 'user',
+            message: '看图',
+            timestamp: '2026-05-27T05:20:00Z',
+            attachments: [
+              TimelineAttachment(
+                id: 'att-1',
+                kind: 'image',
+                name: 'screen.png',
+                mimeType: 'image/png',
+                size: 9,
+                path: '/tmp/screen.png',
+                previewStatus: 'available',
+                source: 'user_upload',
+              ),
+            ],
+          ),
+        ],
+        resumeRuntimeMeta: RuntimeMeta(command: 'claude'),
+      ));
+      await _flushEvents();
+
+      expect(controller.timeline, hasLength(1));
+      final attachment = controller.timeline.single.attachments.single;
+      expect(attachment.name, 'screen.png');
+
+      controller.requestMediaPreview(attachment);
+      expect(service.sentPayloads.last['action'], 'media_preview');
+      expect(service.sentPayloads.last['attachmentId'], 'att-1');
+      expect(service.sentPayloads.last['path'], '/tmp/screen.png');
+
+      service.emit(MediaPreviewResultEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(),
+        raw: const {'type': 'media_preview_result'},
+        attachmentId: 'att-1',
+        path: '/tmp/screen.png',
+        content: base64Encode(utf8.encode('png-bytes')),
+        status: 'ok',
+      ));
+      await _flushEvents();
+
+      final preview = controller.mediaPreviewStates['att-1'];
+      expect(preview?.ok, isTrue);
+      expect(utf8.decode(preview!.bytes!), 'png-bytes');
+    });
+
+    test('Codex 原生历史会从本地图片路径恢复附件卡片', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'codex-thread:local-image',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(
+          id: 'codex-thread:local-image',
+          title: 'Codex 图片会话',
+          source: 'codex-native',
+        ),
+        logEntries: const [
+          HistoryLogEntry(
+            kind: 'markdown',
+            message: '已生成图片：![preview](/tmp/codex-output/screen.png)',
+            timestamp: '2026-05-27T05:20:00Z',
+          ),
+        ],
+        resumeRuntimeMeta: RuntimeMeta(command: 'codex', engine: 'codex'),
+      ));
+      await _flushEvents();
+
+      expect(controller.timeline, hasLength(1));
+      final item = controller.timeline.single;
+      expect(item.kind, 'markdown');
+      expect(item.attachments, hasLength(1));
+      final attachment = item.attachments.single;
+      expect(attachment.kind, 'image');
+      expect(attachment.name, 'screen.png');
+      expect(attachment.mimeType, 'image/png');
+      expect(attachment.path, '/tmp/codex-output/screen.png');
+      expect(attachment.source, 'assistant_path');
+    });
+
     test('loadSession 匹配 history 后先显示 timeline 再异步刷新目录和 delta', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);
@@ -11462,7 +12398,7 @@ void main() {
       );
     });
 
-    test('history_loaded delta 不会被同会话 delta coalesce 吞掉', () async {
+    test('前台恢复只发 session_resume，history_loaded delta 仍会补齐', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);
       await controller.initialize();
@@ -11484,13 +12420,21 @@ void main() {
       await _flushEvents();
       expect(
         service.sentPayloads.any((payload) =>
+            payload['action'] == 'session_resume' &&
+            payload['reason'] == 'foreground' &&
+            payload['limit'] == 120),
+        isTrue,
+      );
+      expect(
+        service.sentPayloads.any((payload) =>
             payload['action'] == 'session_delta_get' &&
             payload['reason'] == 'foreground'),
-        isTrue,
+        isFalse,
+        reason: 'foreground resume should not also request a potentially large '
+            'delta before the bounded history event resets known counters',
       );
 
       service.sentPayloads.clear();
-      controller.loadSession('session-target');
       service.emit(SessionHistoryEvent(
         timestamp: _timestamp.add(const Duration(seconds: 1)),
         sessionId: 'session-target',

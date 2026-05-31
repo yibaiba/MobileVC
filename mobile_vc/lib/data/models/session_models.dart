@@ -282,6 +282,7 @@ class HistoryLogEntry {
     this.phase = '',
     this.exitCode,
     this.context,
+    this.attachments = const [],
   });
 
   final String kind;
@@ -294,6 +295,7 @@ class HistoryLogEntry {
   final String phase;
   final int? exitCode;
   final HistoryContext? context;
+  final List<TimelineAttachment> attachments;
 
   factory HistoryLogEntry.fromJson(Map<String, dynamic> json) {
     return HistoryLogEntry(
@@ -309,8 +311,106 @@ class HistoryLogEntry {
       context: json['context'] is Map<String, dynamic>
           ? HistoryContext.fromJson(json['context'] as Map<String, dynamic>)
           : null,
+      attachments: ((json['attachments'] as List?) ?? const [])
+          .whereType<Map<String, dynamic>>()
+          .map(TimelineAttachment.fromJson)
+          .toList(),
     );
   }
+}
+
+class TimelineAttachment {
+  const TimelineAttachment({
+    this.id = '',
+    this.kind = '',
+    this.name = '',
+    this.mimeType = '',
+    this.size = 0,
+    this.path = '',
+    this.previewStatus = '',
+    this.source = '',
+  });
+
+  final String id;
+  final String kind;
+  final String name;
+  final String mimeType;
+  final int size;
+  final String path;
+  final String previewStatus;
+  final String source;
+
+  bool get isImage {
+    final normalizedKind = kind.trim().toLowerCase();
+    if (normalizedKind == 'image') {
+      return true;
+    }
+    return mimeType.trim().toLowerCase().startsWith('image/');
+  }
+
+  String get displayName {
+    if (name.trim().isNotEmpty) {
+      return name.trim();
+    }
+    final normalized = path.replaceAll('\\', '/');
+    final index = normalized.lastIndexOf('/');
+    final value = index == -1 ? normalized : normalized.substring(index + 1);
+    return value.trim().isEmpty ? '文件' : value;
+  }
+
+  factory TimelineAttachment.fromJson(Map<String, dynamic> json) {
+    return TimelineAttachment(
+      id: (json['id'] ?? '').toString(),
+      kind: (json['kind'] ?? '').toString(),
+      name: (json['name'] ?? '').toString(),
+      mimeType: (json['mimeType'] ?? '').toString(),
+      size: (json['size'] as num?)?.toInt() ?? 0,
+      path: (json['path'] ?? '').toString(),
+      previewStatus: (json['previewStatus'] ?? '').toString(),
+      source: (json['source'] ?? '').toString(),
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'kind': kind,
+        'name': name,
+        'mimeType': mimeType,
+        'size': size,
+        'path': path,
+        'previewStatus': previewStatus,
+        'source': source,
+      };
+}
+
+class MediaPreviewState {
+  const MediaPreviewState({
+    required this.key,
+    this.status = 'idle',
+    this.bytes,
+    this.message = '',
+  });
+
+  final String key;
+  final String status;
+  final Uint8List? bytes;
+  final String message;
+
+  bool get loading => status == 'loading';
+  bool get ok => status == 'ok' && bytes != null;
+  bool get failed => status == 'error' || status == 'unsupported';
+
+  MediaPreviewState copyWith({
+    String? status,
+    Uint8List? bytes,
+    String? message,
+  }) =>
+      MediaPreviewState(
+        key: key,
+        status: status ?? this.status,
+        bytes: bytes ?? this.bytes,
+        message: message ?? this.message,
+      );
 }
 
 class TerminalExecution {

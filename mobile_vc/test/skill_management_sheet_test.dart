@@ -50,13 +50,14 @@ void main() {
     await tester.pump();
     expect(synced, true);
 
-    await tester.tap(find.byKey(const ValueKey('skillManagement.generateButton')));
+    await tester
+        .tap(find.byKey(const ValueKey('skillManagement.generateButton')));
     await tester.pumpAndSettle();
     await tester.enterText(
       find.byKey(const ValueKey('skillManagement.generateInput')),
       '生成一个新的 skill',
     );
-    await tester.tap(find.text('交给 Claude 生成'));
+    await tester.tap(find.text('交给 AI 助手生成'));
     await tester.pumpAndSettle();
     expect(generated, true);
   });
@@ -90,21 +91,26 @@ void main() {
             onSync: () {},
             onExecuteSkill: (name) => executed = name,
             onGenerateSkill: (_) {},
-            onReviseSkill: (skill, request) => revised = '${skill.name}:$request',
+            onReviseSkill: (skill, request) =>
+                revised = '${skill.name}:$request',
           ),
         ),
       ),
     );
 
     await tester.tap(find.byKey(const ValueKey('skillCapsule:review-pr')));
-    await tester.pump();
+    await tester.pumpAndSettle();
+    expect(find.text('Prompt'), findsOneWidget);
+
+    await tester.tap(find.text('立即执行'));
+    await tester.pumpAndSettle();
     expect(executed, 'review-pr');
 
     await tester.tap(find.byType(Switch));
     await tester.pump();
     expect(toggled, 'review-pr');
 
-    await tester.longPress(find.byKey(const ValueKey('skillCapsule:review-pr')));
+    await tester.tap(find.byKey(const ValueKey('skillCapsule:review-pr')));
     await tester.pumpAndSettle();
     expect(find.text('Prompt'), findsOneWidget);
 
@@ -112,8 +118,54 @@ void main() {
       find.byKey(const ValueKey('skillDetail.modifyInput:review-pr')),
       '把它改成更适合移动端审阅',
     );
-    await tester.tap(find.text('让 Claude 修改'));
+    await tester.tap(find.text('让 AI 助手修改'));
     await tester.pumpAndSettle();
     expect(revised, 'review-pr:把它改成更适合移动端审阅');
+  });
+
+  testWidgets('大量 skill 按可见网格项懒加载', (tester) async {
+    final skills = List<SkillDefinition>.generate(
+      120,
+      (index) => SkillDefinition(
+        name: 'skill-$index',
+        description: 'Skill item $index',
+      ),
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SizedBox(
+            height: 560,
+            child: SkillManagementSheet(
+              skills: skills,
+              enabledSkillNames: const [],
+              syncStatus: '',
+              catalogMeta: const CatalogMetadata(domain: 'skill'),
+              onToggleEnabled: (_) {},
+              onSave: (_) {},
+              onSync: () {},
+              onExecuteSkill: (_) {},
+              onGenerateSkill: (_) {},
+              onReviseSkill: (_, __) {},
+            ),
+          ),
+        ),
+      ),
+    );
+
+    expect(find.text('skill-0'), findsOneWidget);
+    expect(find.text('skill-119'), findsNothing);
+
+    await tester.scrollUntilVisible(
+      find.text('skill-119'),
+      500,
+      scrollable: find.descendant(
+        of: find.byType(GridView),
+        matching: find.byType(Scrollable),
+      ),
+    );
+
+    expect(find.text('skill-119'), findsOneWidget);
   });
 }

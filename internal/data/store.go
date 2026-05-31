@@ -253,16 +253,17 @@ type ControllerSnapshot struct {
 }
 
 type SnapshotLogEntry struct {
-	Kind        string           `json:"kind"`
-	Message     string           `json:"message,omitempty"`
-	Label       string           `json:"label,omitempty"`
-	Timestamp   string           `json:"timestamp,omitempty"`
-	Stream      string           `json:"stream,omitempty"`
-	Text        string           `json:"text,omitempty"`
-	ExecutionID string           `json:"executionId,omitempty"`
-	Phase       string           `json:"phase,omitempty"`
-	ExitCode    *int             `json:"exitCode,omitempty"`
-	Context     *SnapshotContext `json:"context,omitempty"`
+	Kind        string                        `json:"kind"`
+	Message     string                        `json:"message,omitempty"`
+	Label       string                        `json:"label,omitempty"`
+	Timestamp   string                        `json:"timestamp,omitempty"`
+	Stream      string                        `json:"stream,omitempty"`
+	Text        string                        `json:"text,omitempty"`
+	ExecutionID string                        `json:"executionId,omitempty"`
+	Phase       string                        `json:"phase,omitempty"`
+	ExitCode    *int                          `json:"exitCode,omitempty"`
+	Context     *SnapshotContext              `json:"context,omitempty"`
+	Attachments []protocol.TimelineAttachment `json:"attachments,omitempty"`
 }
 
 type TerminalExecution struct {

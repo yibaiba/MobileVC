@@ -17,6 +17,7 @@ class RuntimeMeta {
     this.engine = '',
     this.model = '',
     this.reasoningEffort = '',
+    this.codexSandboxMode = '',
     this.cwd = '',
     this.permissionMode = '',
     this.permissionRequestId = '',
@@ -46,6 +47,7 @@ class RuntimeMeta {
   final String engine;
   final String model;
   final String reasoningEffort;
+  final String codexSandboxMode;
   final String cwd;
   final String permissionMode;
   final String permissionRequestId;
@@ -88,6 +90,9 @@ class RuntimeMeta {
       reasoningEffort: other.reasoningEffort.isNotEmpty
           ? other.reasoningEffort
           : reasoningEffort,
+      codexSandboxMode: other.codexSandboxMode.isNotEmpty
+          ? other.codexSandboxMode
+          : codexSandboxMode,
       cwd: other.cwd.isNotEmpty ? other.cwd : cwd,
       permissionMode: other.permissionMode.isNotEmpty
           ? other.permissionMode
@@ -130,6 +135,7 @@ class RuntimeMeta {
         if (engine.isNotEmpty) 'engine': engine,
         if (model.isNotEmpty) 'model': model,
         if (reasoningEffort.isNotEmpty) 'reasoningEffort': reasoningEffort,
+        if (codexSandboxMode.isNotEmpty) 'codexSandboxMode': codexSandboxMode,
         if (cwd.isNotEmpty) 'cwd': cwd,
         if (permissionMode.isNotEmpty) 'permissionMode': permissionMode,
         if (permissionRequestId.isNotEmpty)
@@ -164,6 +170,7 @@ class RuntimeMeta {
       engine: read('engine'),
       model: read('model'),
       reasoningEffort: read('reasoningEffort'),
+      codexSandboxMode: read('codexSandboxMode'),
       cwd: read('cwd'),
       permissionMode: read('permissionMode'),
       permissionRequestId: read('permissionRequestId'),

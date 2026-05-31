@@ -49,6 +49,18 @@ type deviceState struct {
 	Revoked       bool
 }
 
+func (s *sessionState) hasReconnectableDevices() bool {
+	if s == nil {
+		return false
+	}
+	for _, device := range s.devices {
+		if device != nil && !device.Revoked {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *sessionState) agentDisconnectedWithinGrace(grace time.Duration) bool {
 	if s == nil || s.agent != nil || s.agentDisconnectedAt.IsZero() {
 		return false

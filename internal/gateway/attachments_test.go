@@ -6,6 +6,7 @@ import (
 	"os"
 	"testing"
 
+	"mobilevc/internal/data"
 	"mobilevc/internal/protocol"
 )
 
@@ -13,7 +14,7 @@ func TestPersistImageAttachmentsWritesOwnerOnlyFile(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 
-	paths, err := persistImageAttachments(context.Background(), "session/test", []protocol.ImageAttachment{
+	attachments, err := persistImageAttachments(context.Background(), "session/test", []protocol.ImageAttachment{
 		{
 			Name:     "screen.png",
 			MIMEType: "image/png",
@@ -23,17 +24,24 @@ func TestPersistImageAttachmentsWritesOwnerOnlyFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("persist image attachments: %v", err)
 	}
-	if len(paths) != 1 {
-		t.Fatalf("paths count: got %d want 1", len(paths))
+	if len(attachments) != 1 {
+		t.Fatalf("attachments count: got %d want 1", len(attachments))
 	}
-	raw, err := os.ReadFile(paths[0])
+	attachment := attachments[0]
+	if attachment.Kind != "image" || attachment.MIMEType != "image/png" || attachment.Source != "user_upload" {
+		t.Fatalf("unexpected metadata: %+v", attachment)
+	}
+	if attachment.Path == "" || attachment.Size != int64(len("png-bytes")) {
+		t.Fatalf("missing path/size metadata: %+v", attachment)
+	}
+	raw, err := os.ReadFile(attachment.Path)
 	if err != nil {
 		t.Fatalf("read persisted image: %v", err)
 	}
 	if string(raw) != "png-bytes" {
 		t.Fatalf("persisted bytes: got %q", string(raw))
 	}
-	info, err := os.Stat(paths[0])
+	info, err := os.Stat(attachment.Path)
 	if err != nil {
 		t.Fatalf("stat persisted image: %v", err)
 	}
@@ -62,5 +70,52 @@ func TestAppendAttachmentPathPrompt(t *testing.T) {
 	want := "请分析\n\nAttached local image files:\n- /tmp/a.png\n- /tmp/b.jpg\n"
 	if got != want {
 		t.Fatalf("prompt:\ngot  %q\nwant %q", got, want)
+	}
+}
+
+func TestAppendUserProjectionEntryAllowsAttachmentOnlyMessage(t *testing.T) {
+	store, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new file store: %v", err)
+	}
+	summary, err := store.CreateSession(context.Background(), "attachment only")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	attachment := protocol.TimelineAttachment{
+		ID:            "att-1",
+		Kind:          "image",
+		Name:          "screen.png",
+		MIMEType:      "image/png",
+		Size:          9,
+		Path:          "/tmp/screen.png",
+		PreviewStatus: "available",
+		Source:        "user_upload",
+	}
+
+	appendUserProjectionEntry(
+		store,
+		context.Background(),
+		summary.ID,
+		"",
+		"回复",
+		"conn-test",
+		"remote-test",
+		[]protocol.TimelineAttachment{attachment},
+	)
+
+	record, err := store.GetSession(context.Background(), summary.ID)
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	if len(record.Projection.LogEntries) != 1 {
+		t.Fatalf("log entries: got %d want 1", len(record.Projection.LogEntries))
+	}
+	entry := record.Projection.LogEntries[0]
+	if entry.Message != "" || len(entry.Attachments) != 1 {
+		t.Fatalf("unexpected attachment-only entry: %+v", entry)
+	}
+	if entry.Attachments[0].ID != attachment.ID || entry.Attachments[0].Path != attachment.Path {
+		t.Fatalf("attachment metadata not preserved: %+v", entry.Attachments[0])
 	}
 }

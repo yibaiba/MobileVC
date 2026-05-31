@@ -49,6 +49,8 @@ class MobileVcMapper {
         return FSListResultEvent.fromJson(json);
       case 'fs_read_result':
         return FSReadResultEvent.fromJson(json);
+      case 'media_preview_result':
+        return MediaPreviewResultEvent.fromJson(json);
       case 'step_update':
         return StepUpdateEvent.fromJson(json);
       case 'file_diff':
@@ -65,6 +67,8 @@ class MobileVcMapper {
         return SessionListResultEvent.fromJson(json);
       case 'session_history':
         return SessionHistoryEvent.fromJson(json);
+      case 'session_history_page':
+        return SessionHistoryPageEvent.fromJson(json);
       case 'session_delta':
         return SessionDeltaEvent.fromJson(json);
       case 'session_resume_result':

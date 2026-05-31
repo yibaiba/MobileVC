@@ -181,6 +181,42 @@ void main() {
     expect(find.text('执行中'), findsNothing);
   });
 
+  testWidgets('运行状态避开悬浮输入栏底部占位', (tester) async {
+    const height = 600.0;
+    const bottomPadding = 180.0;
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SizedBox(
+            height: height,
+            child: ChatTimeline(
+              sessionId: 'test-session',
+              bottomPadding: bottomPadding,
+              items: [
+                TimelineItem(
+                  id: 'item-1',
+                  kind: 'markdown',
+                  timestamp: DateTime(2026, 1, 1),
+                  title: '',
+                  body: '第一条消息',
+                ),
+              ],
+              isAiRunning: true,
+              aiStatusLabel: 'Running command',
+            ),
+          ),
+        ),
+      ),
+    );
+
+    final statusBottom = tester
+        .getBottomLeft(find.byKey(const ValueKey('ai-status-indicator')))
+        .dy;
+
+    expect(statusBottom, lessThan(height - bottomPadding));
+  });
+
   testWidgets('review summary 仍插入到匹配 diff 后且不复制完整列表', (tester) async {
     final diff = HistoryContext(
       id: 'diff-1',

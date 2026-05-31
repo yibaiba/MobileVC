@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../../data/models/runtime_meta.dart';
 import '../../data/models/session_models.dart';
+import '../permissions/permission_mode_options.dart';
 
 class StatusDetailSheet extends StatelessWidget {
   const StatusDetailSheet({
@@ -11,6 +12,7 @@ class StatusDetailSheet extends StatelessWidget {
     required this.connected,
     required this.awaitInput,
     required this.permissionMode,
+    required this.engine,
     required this.currentPath,
     required this.runtimeMeta,
     required this.currentStep,
@@ -28,6 +30,7 @@ class StatusDetailSheet extends StatelessWidget {
   final bool connected;
   final bool awaitInput;
   final String permissionMode;
+  final String engine;
   final String currentPath;
   final RuntimeMeta runtimeMeta;
   final HistoryContext? currentStep;
@@ -47,7 +50,10 @@ class StatusDetailSheet extends StatelessWidget {
       MapEntry('sessionId', sessionId),
       MapEntry('resumeSessionId', runtimeMeta.resumeSessionId),
       MapEntry('canResume', canResumeCurrentSession ? 'true' : 'false'),
-      MapEntry('permissionMode', _permissionModeLabel(permissionMode)),
+      MapEntry(
+        'permissionMode',
+        permissionModeLabelForEngine(permissionMode, engine),
+      ),
       MapEntry('agentState', agentPhaseLabel),
       MapEntry('recentStep', currentStepSummary),
       MapEntry('recentDiff', recentDiff?.path ?? ''),
@@ -115,18 +121,6 @@ class StatusDetailSheet extends StatelessWidget {
         ),
       ),
     );
-  }
-}
-
-String _permissionModeLabel(String permissionMode) {
-  switch (permissionMode.trim()) {
-    case 'bypassPermissions':
-      return '跳过权限确认';
-    case 'auto':
-    case 'acceptEdits':
-    case 'default':
-    default:
-      return '自动模式';
   }
 }
 

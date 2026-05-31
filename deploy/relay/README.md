@@ -187,4 +187,4 @@ RELAY_PLAINTEXT_TEST_MODE=false
 
 `payload_too_large`
 
-单个中继 payload 超过 `RELAY_MAX_PAYLOAD_BYTES`。文件下载应该走 E2EE chunk/backpressure 流，不要一次性塞进一个 relay frame。
+单个中继 payload 超过 `RELAY_MAX_PAYLOAD_BYTES`。默认上限是 32 MiB；文件下载应该走 E2EE chunk/backpressure 流，不要一次性塞进一个 relay frame。

@@ -9,6 +9,8 @@ import 'package:mobile_vc/data/models/events.dart';
 import 'package:mobile_vc/data/models/runtime_meta.dart';
 import 'package:mobile_vc/data/models/session_models.dart';
 import 'package:mobile_vc/data/services/mobilevc_ws_service.dart';
+import 'package:mobile_vc/features/chat/chat_timeline.dart';
+import 'package:mobile_vc/features/chat/command_input_bar.dart';
 import 'package:mobile_vc/features/session/session_controller.dart';
 import 'package:mobile_vc/features/session/session_home_page.dart';
 
@@ -17,6 +19,94 @@ void main() {
 
   setUp(() {
     SharedPreferences.setMockInitialValues({});
+  });
+
+  testWidgets('键盘弹出只移动输入栏，不整体 resize 时间线', (tester) async {
+    await _useTallSurface(tester);
+    final service = _FakeMobileVcWsService();
+    final controller = SessionController(service: service);
+
+    await controller.connect();
+    for (var i = 0; i < 40; i++) {
+      controller.pushSystemMessage('markdown', '历史消息 $i');
+    }
+
+    await tester.pumpWidget(
+      _buildHomeWithInsets(controller, EdgeInsets.zero),
+    );
+    await _pumpFrames(tester);
+
+    final timelineSizeBefore = tester.getSize(find.byType(ChatTimeline));
+    final commandBarSizeBefore = tester.getSize(find.byType(CommandInputBar));
+    final timelineBefore = tester.widget<ChatTimeline>(
+      find.byType(ChatTimeline),
+    );
+    expect(
+      timelineBefore.bottomPadding,
+      greaterThanOrEqualTo(commandBarSizeBefore.height),
+    );
+
+    await tester.pumpWidget(
+      _buildHomeWithInsets(
+        controller,
+        const EdgeInsets.only(bottom: 320),
+      ),
+    );
+    await _pumpFrames(tester);
+
+    final timelineSizeAfter = tester.getSize(find.byType(ChatTimeline));
+    final commandBarSizeAfter = tester.getSize(find.byType(CommandInputBar));
+    final scaffold = tester.widget<Scaffold>(find.byType(Scaffold).first);
+    expect(scaffold.resizeToAvoidBottomInset, isFalse);
+    expect(scaffold.bottomNavigationBar, isNull);
+    expect(timelineSizeAfter, timelineSizeBefore);
+    expect(commandBarSizeAfter, commandBarSizeBefore);
+    final timelineAfter = tester.widget<ChatTimeline>(
+      find.byType(ChatTimeline),
+    );
+    expect(timelineAfter.bottomPadding, timelineBefore.bottomPadding + 320);
+
+    final keyboardPadding = tester.widget<AnimatedPadding>(
+      find.byKey(const ValueKey('command-bar-keyboard-padding')),
+    );
+    expect(keyboardPadding.padding, const EdgeInsets.only(bottom: 320));
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    await controller.disposeController();
+  });
+
+  testWidgets('输入栏重建后仍用实际高度作为时间线底部留白', (tester) async {
+    await _useTallSurface(tester);
+    final service = _FakeMobileVcWsService();
+    final controller = SessionController(service: service);
+
+    await controller.connect();
+    for (var i = 0; i < 40; i++) {
+      controller.pushSystemMessage('markdown', '历史消息 $i');
+    }
+
+    await tester.pumpWidget(
+      _buildHomeWithInsets(controller, EdgeInsets.zero),
+    );
+    await _pumpFrames(tester);
+
+    await tester.enterText(
+      find.byType(TextField),
+      List<String>.filled(6, '长输入内容').join('\n'),
+    );
+    await _pumpFrames(tester);
+
+    final commandBarSize = tester.getSize(find.byType(CommandInputBar));
+    final expandedTimeline = tester.widget<ChatTimeline>(
+      find.byType(ChatTimeline),
+    );
+    expect(
+      expandedTimeline.bottomPadding,
+      greaterThanOrEqualTo(commandBarSize.height),
+    );
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    await controller.disposeController();
   });
 
   test('主界面顶部上下文胶囊已完全移除', () async {
@@ -145,7 +235,7 @@ void main() {
     );
     await _pumpFrames(tester);
 
-    await _tapCommandBarModel(tester, '模型 · Default · HIGH');
+    await _tapCommandBarModel(tester, '模型 · Default · config.toml');
     await _pumpFrames(tester);
 
     expect(controller.catalogRequestCount, 1);
@@ -172,6 +262,98 @@ void main() {
     await controller.disposeController();
   });
 
+  testWidgets('连接设置里 Claude 使用官方权限模式下拉', (tester) async {
+    await _useTallSurface(tester);
+    final service = _FakeMobileVcWsService();
+    final controller = SessionController(service: service);
+    await controller.saveConfig(
+      const AppConfig(
+        cwd: '/workspace',
+        engine: 'claude',
+        permissionMode: 'default',
+      ),
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SessionHomePage(controller: controller),
+      ),
+    );
+    await _pumpFrames(tester);
+
+    await tester.tap(find.byIcon(Icons.settings_outlined));
+    await _pumpFrames(tester);
+    await tester.ensureVisible(find.text('Claude 权限'));
+    await tester.pump();
+
+    final dropdown = find.byKey(
+      const ValueKey('connection-config-claude-permission-mode'),
+    );
+    expect(dropdown, findsOneWidget);
+    await tester.tap(dropdown);
+    await tester.pumpAndSettle();
+
+    expect(find.text('默认权限'), findsAtLeastNWidgets(1));
+    expect(find.text('自动模式'), findsOneWidget);
+    expect(find.text('完全访问权限'), findsOneWidget);
+    expect(find.text('跳过审批'), findsNothing);
+    expect(find.text('自动审查'), findsNothing);
+    expect(find.text('自定义(config.toml)'), findsNothing);
+
+    await controller.disposeController();
+  });
+
+  testWidgets('连接设置里 Codex 沙箱范围和审批策略分开显示', (tester) async {
+    await _useTallSurface(tester);
+    final service = _FakeMobileVcWsService();
+    final controller = SessionController(service: service);
+    await controller.saveConfig(
+      const AppConfig(
+        cwd: '/workspace',
+        engine: 'codex',
+        codexSandboxMode: 'workspace-write',
+        permissionMode: 'default',
+      ),
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SessionHomePage(controller: controller),
+      ),
+    );
+    await _pumpFrames(tester);
+
+    await tester.tap(find.byIcon(Icons.settings_outlined));
+    await _pumpFrames(tester);
+    await tester.ensureVisible(find.text('Codex 沙箱范围'));
+    await tester.pump();
+
+    expect(find.text('Codex 沙箱范围'), findsOneWidget);
+    expect(find.text('Codex 审批策略'), findsOneWidget);
+    expect(find.text('Codex Sandbox'), findsNothing);
+    expect(find.text('Codex 权限'), findsNothing);
+    expect(find.text('请求目标'), findsNothing);
+
+    await tester.tap(find.text('工作区写入'));
+    await tester.pumpAndSettle();
+    expect(find.text('关闭沙箱'), findsOneWidget);
+    await tester.tap(find.text('关闭沙箱').last);
+    await tester.pumpAndSettle();
+
+    final approvalDropdown = find.byKey(
+      const ValueKey('connection-config-codex-permission-mode'),
+    );
+    await tester.tap(approvalDropdown);
+    await tester.pumpAndSettle();
+
+    expect(find.text('跳过审批'), findsOneWidget);
+    expect(find.text('完全访问权限'), findsNothing);
+    expect(find.text('自动审查'), findsOneWidget);
+    expect(find.text('自定义(config.toml)'), findsOneWidget);
+
+    await controller.disposeController();
+  });
+
   testWidgets('Relay 连接中禁用重复点击并显示进度', (tester) async {
     await _useTallSurface(tester);
     final service = _BlockingRelayWsService();
@@ -181,7 +363,7 @@ void main() {
       relayUrl: 'wss://relay.example.test',
       relaySessionId: 'rs_test',
       relayPairingSecret: 'pair_secret',
-      relayPairingExpiresAt: 1760000000,
+      relayPairingExpiresAt: 4102444800,
     ));
 
     await tester.pumpWidget(
@@ -193,7 +375,11 @@ void main() {
 
     await tester.tap(find.byIcon(Icons.settings_outlined));
     await _pumpFrames(tester);
+    await tester.ensureVisible(find.text('连接'));
+    await tester.pump();
     await tester.tap(find.text('连接'));
+    await tester.pump();
+    await tester.ensureVisible(find.text('连接中'));
     await tester.pump();
     await tester.tap(find.text('连接中'));
     await tester.pump();
@@ -224,7 +410,7 @@ void main() {
       relayUrl: 'wss://relay.example.test',
       relaySessionId: 'rs_test',
       relayPairingSecret: 'pair_secret',
-      relayPairingExpiresAt: 1760000000,
+      relayPairingExpiresAt: 4102444800,
     ));
     await controller.connect();
 
@@ -273,6 +459,21 @@ Future<void> _pumpFrames(
   for (var i = 0; i < count; i++) {
     await tester.pump(step);
   }
+}
+
+Widget _buildHomeWithInsets(
+  SessionController controller,
+  EdgeInsets viewInsets,
+) {
+  return MaterialApp(
+    home: MediaQuery(
+      data: MediaQueryData(
+        size: const Size(900, 1100),
+        viewInsets: viewInsets,
+      ),
+      child: SessionHomePage(controller: controller),
+    ),
+  );
 }
 
 class _FakeMobileVcWsService extends MobileVcWsService {

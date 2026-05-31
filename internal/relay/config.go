@@ -25,7 +25,7 @@ const (
 	defaultPingInterval            = 30 * time.Second
 	defaultPongTimeout             = 10 * time.Second
 	defaultMaxControlFrameBytes    = 16 * 1024
-	defaultMaxPayloadBytes         = 8 * 1024 * 1024
+	defaultMaxPayloadBytes         = 32 * 1024 * 1024
 	defaultForwardQueueSize        = 64
 	defaultHTTPAllowedRoutes       = "GET:/healthz,GET:/version,GET:/download"
 	defaultWSAllowedRoutes         = "GET:/ws"

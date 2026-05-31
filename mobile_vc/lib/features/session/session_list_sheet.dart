@@ -63,17 +63,16 @@ class _SessionListSheetBodyState extends State<_SessionListSheetBody> {
   Widget build(BuildContext context) {
     final filteredByProvider =
         widget.sessions.where((item) => _matchesFilter(item, _filter)).toList();
-    final projectOptions = _projectOptions(filteredByProvider, widget.cwd);
+    final grouped = _groupSessions(filteredByProvider, widget.cwd);
+    final projectOptions = _projectOptionsFromGroups(grouped);
     if (_projectFilterKey.isNotEmpty &&
         !projectOptions.any((item) => item.key == _projectFilterKey)) {
       _projectFilterKey = '';
     }
-    final projectFiltered = _projectFilterKey.isEmpty
-        ? filteredByProvider
-        : filteredByProvider
-            .where((item) => _projectKey(item.runtime.cwd) == _projectFilterKey)
-            .toList();
-    final groups = _groupSessions(projectFiltered, widget.cwd);
+    final visibleGroups = _projectFilterKey.isEmpty
+        ? grouped
+        : grouped.where((group) => group.key == _projectFilterKey).toList();
+    final rows = _sessionListRows(visibleGroups);
     final currentProjectLabel =
         widget.cwd.trim().isEmpty ? '' : _projectLabel(widget.cwd);
     return SafeArea(
@@ -100,18 +99,26 @@ class _SessionListSheetBodyState extends State<_SessionListSheetBody> {
             ),
             const SizedBox(height: 10),
             Flexible(
-              child: groups.isEmpty
+              child: rows.isEmpty
                   ? const _EmptySessionList()
-                  : ListView.separated(
-                      shrinkWrap: true,
-                      itemCount: groups.length,
-                      separatorBuilder: (_, __) => const SizedBox(height: 14),
+                  : ListView.builder(
+                      itemCount: rows.length,
                       itemBuilder: (context, index) {
-                        return _ProjectSessionGroup(
-                          group: groups[index],
-                          selectedSessionId: widget.selectedSessionId,
-                          onLoad: widget.onLoad,
-                          onDelete: widget.onDelete,
+                        final row = rows[index];
+                        if (row.group != null) {
+                          return _ProjectSessionHeader(group: row.group!);
+                        }
+                        final item = row.session!;
+                        return Padding(
+                          padding: EdgeInsets.only(
+                            bottom: row.lastInGroup ? 14 : 10,
+                          ),
+                          child: _SessionListTile(
+                            item: item,
+                            selected: item.id == widget.selectedSessionId,
+                            onLoad: widget.onLoad,
+                            onDelete: widget.onDelete,
+                          ),
                         );
                       },
                     ),
@@ -214,64 +221,44 @@ class _ProjectFilterChips extends StatelessWidget {
   }
 }
 
-class _ProjectSessionGroup extends StatelessWidget {
-  const _ProjectSessionGroup({
-    required this.group,
-    required this.selectedSessionId,
-    required this.onLoad,
-    required this.onDelete,
-  });
+class _ProjectSessionHeader extends StatelessWidget {
+  const _ProjectSessionHeader({required this.group});
 
   final _ProjectSessionGroupData group;
-  final String selectedSessionId;
-  final ValueChanged<SessionSummary> onLoad;
-  final ValueChanged<String> onDelete;
 
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Row(
-          children: [
-            Expanded(
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: Row(
+        children: [
+          Expanded(
+            child: Text(
+              group.title,
+              style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                    fontWeight: FontWeight.w800,
+                  ),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+          if (group.current)
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+              decoration: BoxDecoration(
+                color: scheme.primaryContainer,
+                borderRadius: BorderRadius.circular(999),
+              ),
               child: Text(
-                group.title,
-                style: Theme.of(context).textTheme.titleSmall?.copyWith(
-                      fontWeight: FontWeight.w800,
+                '当前',
+                style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                      color: scheme.onPrimaryContainer,
                     ),
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
               ),
             ),
-            if (group.current)
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                decoration: BoxDecoration(
-                  color: scheme.primaryContainer,
-                  borderRadius: BorderRadius.circular(999),
-                ),
-                child: Text(
-                  '当前',
-                  style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                        color: scheme.onPrimaryContainer,
-                      ),
-                ),
-              ),
-          ],
-        ),
-        const SizedBox(height: 8),
-        for (final item in group.sessions) ...[
-          _SessionListTile(
-            item: item,
-            selected: item.id == selectedSessionId,
-            onLoad: onLoad,
-            onDelete: onDelete,
-          ),
-          if (item != group.sessions.last) const SizedBox(height: 10),
         ],
-      ],
+      ),
     );
   }
 }
@@ -408,12 +395,14 @@ enum _SessionProviderFilter {
 
 class _ProjectSessionGroupData {
   const _ProjectSessionGroupData({
+    required this.key,
     required this.cwd,
     required this.title,
     required this.current,
     required this.sessions,
   });
 
+  final String key;
   final String cwd;
   final String title;
   final bool current;
@@ -434,35 +423,46 @@ class _ProjectFilterOption {
   final DateTime updatedAt;
 }
 
-List<_ProjectFilterOption> _projectOptions(
-  List<SessionSummary> sessions,
-  String currentCwd,
-) {
-  final byKey = <String, List<SessionSummary>>{};
-  for (final item in sessions) {
-    final key = _projectKey(item.runtime.cwd);
-    byKey.putIfAbsent(key, () => <SessionSummary>[]).add(item);
+class _SessionListRow {
+  const _SessionListRow.header(this.group)
+      : session = null,
+        lastInGroup = false;
+
+  const _SessionListRow.session(this.session, {required this.lastInGroup})
+      : group = null;
+
+  final _ProjectSessionGroupData? group;
+  final SessionSummary? session;
+  final bool lastInGroup;
+}
+
+List<_SessionListRow> _sessionListRows(List<_ProjectSessionGroupData> groups) {
+  final rows = <_SessionListRow>[];
+  for (final group in groups) {
+    rows.add(_SessionListRow.header(group));
+    for (var index = 0; index < group.sessions.length; index++) {
+      rows.add(
+        _SessionListRow.session(
+          group.sessions[index],
+          lastInGroup: index == group.sessions.length - 1,
+        ),
+      );
+    }
   }
-  final currentKey = _projectKey(currentCwd);
-  final options = byKey.entries.map((entry) {
-    final items = [...entry.value]..sort(_compareSessionsByUpdatedAt);
-    final actualCwd = entry.value
-        .map((item) => item.runtime.cwd.trim())
-        .firstWhere((value) => value.isNotEmpty, orElse: () => '');
+  return rows;
+}
+
+List<_ProjectFilterOption> _projectOptionsFromGroups(
+  List<_ProjectSessionGroupData> groups,
+) {
+  return groups.map((group) {
     return _ProjectFilterOption(
-      key: entry.key,
-      title: actualCwd.isEmpty ? '未记录目录' : _projectLabel(actualCwd),
-      current: currentKey.isNotEmpty && entry.key == currentKey,
-      updatedAt: items.first.updatedAt ?? items.first.createdAt ?? DateTime(0),
+      key: group.key,
+      title: group.title,
+      current: group.current,
+      updatedAt: _latestUpdatedAt(group),
     );
   }).toList();
-  options.sort((left, right) {
-    if (left.current != right.current) {
-      return left.current ? -1 : 1;
-    }
-    return right.updatedAt.compareTo(left.updatedAt);
-  });
-  return options;
 }
 
 List<_ProjectSessionGroupData> _groupSessions(
@@ -483,6 +483,7 @@ List<_ProjectSessionGroupData> _groupSessions(
         .firstWhere((value) => value.isNotEmpty, orElse: () => '');
     final current = currentKey.isNotEmpty && entry.key == currentKey;
     return _ProjectSessionGroupData(
+      key: entry.key,
       cwd: actualCwd,
       title: actualCwd.isEmpty ? '未记录目录' : _projectLabel(actualCwd),
       current: current,

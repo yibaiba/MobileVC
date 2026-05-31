@@ -181,7 +181,7 @@ func ApplyEventToProjection(snapshot data.ProjectionSnapshot, event any) (data.P
 				snapshot.LogEntries,
 				e,
 			)
-			snapshot.LogEntries = append(snapshot.LogEntries, data.SnapshotLogEntry{Kind: "markdown", Message: e.Message, Timestamp: e.Timestamp.Format(time.RFC3339), Stream: e.Stream, ExecutionID: e.ExecutionID, Phase: phase, ExitCode: e.ExitCode, Context: context})
+			snapshot.LogEntries = append(snapshot.LogEntries, data.SnapshotLogEntry{Kind: "markdown", Message: e.Message, Timestamp: e.Timestamp.Format(time.RFC3339), Stream: e.Stream, ExecutionID: e.ExecutionID, Phase: phase, ExitCode: e.ExitCode, Context: context, Attachments: TimelineAttachmentsFromText(e.Message, "assistant_path")})
 		} else {
 			previousIndex := len(snapshot.LogEntries) - 1
 			if previousIndex >= 0 && snapshot.LogEntries[previousIndex].Kind == "terminal" && snapshot.LogEntries[previousIndex].Stream == e.Stream && snapshot.LogEntries[previousIndex].ExecutionID == e.ExecutionID && snapshot.LogEntries[previousIndex].Phase == phase {

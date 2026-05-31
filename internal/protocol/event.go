@@ -27,6 +27,7 @@ const (
 	EventTypeTaskSnapshot              = "task_snapshot"
 	EventTypeFSListResult              = "fs_list_result"
 	EventTypeFSReadResult              = "fs_read_result"
+	EventTypeMediaPreviewResult        = "media_preview_result"
 	EventTypeStepUpdate                = "step_update"
 	EventTypeFileDiff                  = "file_diff"
 	EventTypeRuntimeInfoResult         = "runtime_info_result"
@@ -35,6 +36,7 @@ const (
 	EventTypeSessionCreated            = "session_created"
 	EventTypeSessionListResult         = "session_list_result"
 	EventTypeSessionHistory            = "session_history"
+	EventTypeSessionHistoryPage        = "session_history_page"
 	EventTypeSessionDelta              = "session_delta"
 	EventTypeReviewState               = "review_state"
 	EventTypeSkillCatalogResult        = "skill_catalog_result"
@@ -76,6 +78,7 @@ type RuntimeMeta struct {
 	Engine              string `json:"engine,omitempty"`
 	Model               string `json:"model,omitempty"`
 	ReasoningEffort     string `json:"reasoningEffort,omitempty"`
+	CodexSandboxMode    string `json:"codexSandboxMode,omitempty"`
 	CWD                 string `json:"cwd,omitempty"`
 	PermissionMode      string `json:"permissionMode,omitempty"`
 	PermissionRequestID string `json:"permissionRequestId,omitempty"`
@@ -190,6 +193,17 @@ type ImageAttachment struct {
 	Data     string `json:"data"`
 }
 
+type TimelineAttachment struct {
+	ID            string `json:"id,omitempty"`
+	Kind          string `json:"kind,omitempty"`
+	Name          string `json:"name,omitempty"`
+	MIMEType      string `json:"mimeType,omitempty"`
+	Size          int64  `json:"size,omitempty"`
+	Path          string `json:"path,omitempty"`
+	PreviewStatus string `json:"previewStatus,omitempty"`
+	Source        string `json:"source,omitempty"`
+}
+
 type ReviewDecisionRequestEvent struct {
 	ClientEvent
 	Decision       string `json:"decision"`
@@ -290,6 +304,7 @@ type CompactRequestEvent struct {
 	CWD            string `json:"cwd,omitempty"`
 	Engine         string `json:"engine,omitempty"`
 	PermissionMode string `json:"permissionMode,omitempty"`
+	RuntimeMeta
 }
 
 type SkillCatalogRequestEvent struct {
@@ -380,6 +395,12 @@ type FSListRequestEvent struct {
 type FSReadRequestEvent struct {
 	ClientEvent
 	Path string `json:"path,omitempty"`
+}
+
+type MediaPreviewRequestEvent struct {
+	ClientEvent
+	AttachmentID string `json:"attachmentId,omitempty"`
+	Path         string `json:"path,omitempty"`
 }
 
 type ADBDevicesRequestEvent struct {
@@ -490,6 +511,7 @@ type SessionLoadRequestEvent struct {
 	SessionID string `json:"sessionId"`
 	CWD       string `json:"cwd,omitempty"`
 	Reason    string `json:"reason,omitempty"`
+	Limit     int    `json:"limit,omitempty"`
 }
 
 type RegisterPushTokenRequestEvent struct {
@@ -506,6 +528,7 @@ type SessionResumeRequestEvent struct {
 	Reason                string `json:"reason,omitempty"`
 	LastSeenEventCursor   int64  `json:"lastSeenEventCursor,omitempty"`
 	LastKnownRuntimeState string `json:"lastKnownRuntimeState,omitempty"`
+	Limit                 int    `json:"limit,omitempty"`
 }
 
 type SessionDeltaKnown struct {
@@ -523,6 +546,14 @@ type SessionDeltaRequestEvent struct {
 	CWD       string            `json:"cwd,omitempty"`
 	Reason    string            `json:"reason,omitempty"`
 	Known     SessionDeltaKnown `json:"known,omitempty"`
+}
+
+type SessionHistoryPageRequestEvent struct {
+	ClientEvent
+	SessionID string `json:"sessionId"`
+	CWD       string `json:"cwd,omitempty"`
+	Before    int    `json:"before,omitempty"`
+	Limit     int    `json:"limit,omitempty"`
 }
 
 type SessionDeleteRequestEvent struct {
@@ -598,16 +629,17 @@ type ReviewGroup struct {
 }
 
 type HistoryLogEntry struct {
-	Kind        string          `json:"kind"`
-	Message     string          `json:"message,omitempty"`
-	Label       string          `json:"label,omitempty"`
-	Timestamp   string          `json:"timestamp,omitempty"`
-	Stream      string          `json:"stream,omitempty"`
-	Text        string          `json:"text,omitempty"`
-	ExecutionID string          `json:"executionId,omitempty"`
-	Phase       string          `json:"phase,omitempty"`
-	ExitCode    *int            `json:"exitCode,omitempty"`
-	Context     *HistoryContext `json:"context,omitempty"`
+	Kind        string               `json:"kind"`
+	Message     string               `json:"message,omitempty"`
+	Label       string               `json:"label,omitempty"`
+	Timestamp   string               `json:"timestamp,omitempty"`
+	Stream      string               `json:"stream,omitempty"`
+	Text        string               `json:"text,omitempty"`
+	ExecutionID string               `json:"executionId,omitempty"`
+	Phase       string               `json:"phase,omitempty"`
+	ExitCode    *int                 `json:"exitCode,omitempty"`
+	Context     *HistoryContext      `json:"context,omitempty"`
+	Attachments []TimelineAttachment `json:"attachments,omitempty"`
 }
 
 type TerminalExecution struct {
@@ -635,6 +667,9 @@ type SessionHistoryEvent struct {
 	Event
 	Summary             SessionSummary      `json:"summary"`
 	LogEntries          []HistoryLogEntry   `json:"logEntries,omitempty"`
+	LogEntryStart       int                 `json:"logEntryStart,omitempty"`
+	LogEntryTotal       int                 `json:"logEntryTotal,omitempty"`
+	HasMoreBefore       bool                `json:"hasMoreBefore,omitempty"`
 	Diffs               []HistoryContext    `json:"diffs,omitempty"`
 	CurrentDiff         *HistoryContext     `json:"currentDiff,omitempty"`
 	ReviewGroups        []ReviewGroup       `json:"reviewGroups,omitempty"`
@@ -674,6 +709,15 @@ type SessionDeltaEvent struct {
 	RuntimeAlive        bool                `json:"runtimeAlive,omitempty"`
 	ResumeRuntimeMeta   RuntimeMeta         `json:"resumeRuntimeMeta,omitempty"`
 	RequiresFullSync    bool                `json:"requiresFullSync,omitempty"`
+}
+
+type SessionHistoryPageEvent struct {
+	Event
+	LogEntries        []HistoryLogEntry `json:"logEntries,omitempty"`
+	LogEntryStart     int               `json:"logEntryStart,omitempty"`
+	LogEntryTotal     int               `json:"logEntryTotal,omitempty"`
+	HasMoreBefore     bool              `json:"hasMoreBefore,omitempty"`
+	ResumeRuntimeMeta RuntimeMeta       `json:"resumeRuntimeMeta,omitempty"`
 }
 
 type SessionResumeResultEvent struct {
@@ -972,6 +1016,17 @@ type FSReadResultEvent struct {
 	Lang     string `json:"lang,omitempty"`
 	Encoding string `json:"encoding,omitempty"`
 	IsText   bool   `json:"isText"`
+}
+
+type MediaPreviewResultEvent struct {
+	Event
+	AttachmentID string `json:"attachmentId,omitempty"`
+	Path         string `json:"path"`
+	Content      string `json:"content,omitempty"`
+	Size         int64  `json:"size,omitempty"`
+	MIMEType     string `json:"mimeType,omitempty"`
+	Status       string `json:"status"`
+	Message      string `json:"message,omitempty"`
 }
 
 type RuntimeInfoResultEvent struct {
@@ -1290,6 +1345,19 @@ func NewFSReadResultEvent(sessionID, path, content string, size int64, lang, enc
 	}
 }
 
+func NewMediaPreviewResultEvent(sessionID, attachmentID, path, content string, size int64, mimeType, status, message string) MediaPreviewResultEvent {
+	return MediaPreviewResultEvent{
+		Event:        NewBaseEvent(EventTypeMediaPreviewResult, sessionID),
+		AttachmentID: attachmentID,
+		Path:         path,
+		Content:      content,
+		Size:         size,
+		MIMEType:     mimeType,
+		Status:       status,
+		Message:      message,
+	}
+}
+
 func NewSessionCreatedEvent(sessionID string, summary SessionSummary) SessionCreatedEvent {
 	return SessionCreatedEvent{
 		Event:   NewBaseEvent(EventTypeSessionCreated, sessionID),
@@ -1327,6 +1395,14 @@ func NewSessionHistoryEvent(sessionID string, summary SessionSummary, logEntries
 	}
 }
 
+func NewSessionHistoryWindowEvent(sessionID string, summary SessionSummary, logEntries []HistoryLogEntry, logEntryStart, logEntryTotal int, diffs []HistoryContext, currentDiff *HistoryContext, reviewGroups []ReviewGroup, activeReviewGroup *ReviewGroup, currentStep, latestError *HistoryContext, rawTerminalByStream map[string]string, terminalExecutions []TerminalExecution, contextWindowUsage ContextWindowUsage, sessionContext SessionContext, skillCatalogMeta, memoryCatalogMeta CatalogMetadata, canResume, runtimeAlive bool, resumeRuntimeMeta RuntimeMeta) SessionHistoryEvent {
+	event := NewSessionHistoryEvent(sessionID, summary, logEntries, diffs, currentDiff, reviewGroups, activeReviewGroup, currentStep, latestError, rawTerminalByStream, terminalExecutions, contextWindowUsage, sessionContext, skillCatalogMeta, memoryCatalogMeta, canResume, runtimeAlive, resumeRuntimeMeta)
+	event.LogEntryStart = logEntryStart
+	event.LogEntryTotal = logEntryTotal
+	event.HasMoreBefore = logEntryStart > 0
+	return event
+}
+
 func NewSessionDeltaEvent(sessionID string, summary SessionSummary, base, latest SessionDeltaKnown, appendLogEntries []HistoryLogEntry, upsertDiffs []HistoryContext, currentDiff *HistoryContext, reviewGroups []ReviewGroup, activeReviewGroup *ReviewGroup, currentStep, latestError *HistoryContext, rawTerminalByStream map[string]string, terminalExecutions []TerminalExecution, contextWindowUsage ContextWindowUsage, sessionContext SessionContext, skillCatalogMeta, memoryCatalogMeta CatalogMetadata, canResume, runtimeAlive bool, resumeRuntimeMeta RuntimeMeta, requiresFullSync bool) SessionDeltaEvent {
 	return SessionDeltaEvent{
 		Event:               NewBaseEvent(EventTypeSessionDelta, sessionID),
@@ -1350,6 +1426,17 @@ func NewSessionDeltaEvent(sessionID string, summary SessionSummary, base, latest
 		RuntimeAlive:        runtimeAlive,
 		ResumeRuntimeMeta:   resumeRuntimeMeta,
 		RequiresFullSync:    requiresFullSync,
+	}
+}
+
+func NewSessionHistoryPageEvent(sessionID string, logEntries []HistoryLogEntry, logEntryStart, logEntryTotal int, resumeRuntimeMeta RuntimeMeta) SessionHistoryPageEvent {
+	return SessionHistoryPageEvent{
+		Event:             NewBaseEvent(EventTypeSessionHistoryPage, sessionID),
+		LogEntries:        logEntries,
+		LogEntryStart:     logEntryStart,
+		LogEntryTotal:     logEntryTotal,
+		HasMoreBefore:     logEntryStart > 0,
+		ResumeRuntimeMeta: resumeRuntimeMeta,
 	}
 }
 
@@ -1584,6 +1671,9 @@ func MergeRuntimeMeta(base, overlay RuntimeMeta) RuntimeMeta {
 	if overlay.ReasoningEffort != "" {
 		merged.ReasoningEffort = overlay.ReasoningEffort
 	}
+	if overlay.CodexSandboxMode != "" {
+		merged.CodexSandboxMode = overlay.CodexSandboxMode
+	}
 	if overlay.CWD != "" {
 		merged.CWD = overlay.CWD
 	}
@@ -1716,6 +1806,9 @@ func ApplyRuntimeMeta(event any, meta RuntimeMeta) any {
 	case SessionHistoryEvent:
 		e.RuntimeMeta = MergeRuntimeMeta(e.RuntimeMeta, meta)
 		return e
+	case SessionHistoryPageEvent:
+		e.RuntimeMeta = MergeRuntimeMeta(e.RuntimeMeta, meta)
+		return e
 	case SessionDeltaEvent:
 		e.RuntimeMeta = MergeRuntimeMeta(e.RuntimeMeta, meta)
 		return e
@@ -1835,6 +1928,9 @@ func ApplyEventCursor(event any, cursor int64) any {
 		e.EventCursor = cursor
 		return e
 	case SessionHistoryEvent:
+		e.EventCursor = cursor
+		return e
+	case SessionHistoryPageEvent:
 		e.EventCursor = cursor
 		return e
 	case SessionDeltaEvent:

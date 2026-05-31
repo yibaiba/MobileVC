@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"mobilevc/internal/protocol"
 )
 
 type FileStore struct {
@@ -657,9 +659,30 @@ func snapshotLogEntryDedupeKey(entry SnapshotLogEntry) string {
 		entry.ExecutionID,
 		entry.Phase,
 		exitCode,
+		snapshotLogEntryAttachmentDedupeKey(entry.Attachments),
 	}
 	fields = append(fields, contextFields...)
 	return strings.Join(fields, "\x1f")
+}
+
+func snapshotLogEntryAttachmentDedupeKey(attachments []protocol.TimelineAttachment) string {
+	if len(attachments) == 0 {
+		return ""
+	}
+	fields := make([]string, 0, len(attachments))
+	for _, attachment := range attachments {
+		fields = append(fields, strings.Join([]string{
+			attachment.ID,
+			attachment.Kind,
+			attachment.Name,
+			attachment.MIMEType,
+			fmt.Sprintf("%d", attachment.Size),
+			attachment.Path,
+			attachment.PreviewStatus,
+			attachment.Source,
+		}, "\x1e"))
+	}
+	return strings.Join(fields, "\x1d")
 }
 
 func logEntryDisplayTimestamp(entry SnapshotLogEntry) string {
@@ -1044,6 +1067,9 @@ func meaningfulProjectionEntryText(entry SnapshotLogEntry, userOnly bool) string
 	if userOnly && entry.Kind != "user" {
 		return ""
 	}
+	if isOperationalNativeCodexSummaryEntry(entry) {
+		return ""
+	}
 	var text string
 	switch entry.Kind {
 	case "markdown", "system", "user":
@@ -1060,6 +1086,21 @@ func meaningfulProjectionEntryText(entry SnapshotLogEntry, userOnly bool) string
 		return ""
 	}
 	return text
+}
+
+func isOperationalNativeCodexSummaryEntry(entry SnapshotLogEntry) bool {
+	if entry.Kind != "system" || entry.Context == nil {
+		return false
+	}
+	if strings.TrimSpace(entry.Context.Source) != "codex-native" {
+		return false
+	}
+	switch strings.TrimSpace(entry.Context.Type) {
+	case "codex_task", "codex_tool_call", "codex_tool_output", "codex_patch":
+		return true
+	default:
+		return false
+	}
 }
 
 func truncatePreview(text string) string {
