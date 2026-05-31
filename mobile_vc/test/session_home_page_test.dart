@@ -332,6 +332,7 @@ void main() {
     expect(find.text('Codex 审批策略'), findsOneWidget);
     expect(find.text('Codex Sandbox'), findsNothing);
     expect(find.text('Codex 权限'), findsNothing);
+    expect(find.text('请求目标'), findsNothing);
 
     await tester.tap(find.text('工作区写入'));
     await tester.pumpAndSettle();

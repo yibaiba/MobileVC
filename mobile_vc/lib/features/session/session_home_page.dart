@@ -708,7 +708,6 @@ class _SessionHomePageState extends State<SessionHomePage> {
         ? 'claude'
         : controller.config.engine.trim();
     var selectedCodexSandboxMode = controller.config.codexSandboxMode;
-    var selectedCodexTargetMode = controller.config.codexTargetMode;
     var pendingConfig = controller.config;
     var connectingFromSheet = false;
 
@@ -768,7 +767,6 @@ class _SessionHomePageState extends State<SessionHomePage> {
                   ? selectedEngine
                   : scanned.engine.trim();
               selectedCodexSandboxMode = scanned.codexSandboxMode;
-              selectedCodexTargetMode = scanned.codexTargetMode;
               scanHint = scanned.connectionMode != ConnectionMode.direct.name
                   ? '已导入 Relay 配对，点击连接完成配对'
                   : '已回填 ${scanned.displayHost}:${scanned.port}${scanned.token.isNotEmpty ? ' 与 token' : ''}';
@@ -791,7 +789,6 @@ class _SessionHomePageState extends State<SessionHomePage> {
                     cwd: cwdController.text.trim(),
                     engine: selectedEngine,
                     codexSandboxMode: selectedCodexSandboxMode,
-                    codexTargetMode: selectedCodexTargetMode,
                     permissionMode: permissionController.text.trim(),
                     fastMode: controller.fastMode,
                     adbIceServersJson: encodedIceConfig(),
@@ -901,7 +898,6 @@ class _SessionHomePageState extends State<SessionHomePage> {
                 cwd: cwdController.text.trim(),
                 engine: selectedEngine,
                 codexSandboxMode: selectedCodexSandboxMode,
-                codexTargetMode: selectedCodexTargetMode,
                 permissionMode: permissionController.text.trim(),
                 fastMode: controller.fastMode,
                 adbIceServersJson: encodedIceConfig(),
@@ -1256,23 +1252,6 @@ class _SessionHomePageState extends State<SessionHomePage> {
                                             AppConfig.normalizeCodexSandboxMode(
                                           value,
                                         );
-                                      });
-                                    },
-                            ),
-                            const SizedBox(height: 10),
-                            SwitchListTile.adaptive(
-                              contentPadding: EdgeInsets.zero,
-                              secondary:
-                                  const Icon(Icons.track_changes_outlined),
-                              title: const Text('请求目标'),
-                              subtitle:
-                                  const Text('开启后 Codex 请求会携带当前文件或 diff 目标上下文'),
-                              value: selectedCodexTargetMode,
-                              onChanged: connectionBusy
-                                  ? null
-                                  : (value) {
-                                      setSheetState(() {
-                                        selectedCodexTargetMode = value;
                                       });
                                     },
                             ),
