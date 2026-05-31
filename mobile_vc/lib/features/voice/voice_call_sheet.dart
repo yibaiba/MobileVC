@@ -40,6 +40,7 @@ class _VoiceCallSheetState extends State<VoiceCallSheet> {
   final List<_VoiceTurn> _turns = <_VoiceTurn>[];
   Completer<void>? _playbackCompleter;
   StreamSubscription<void>? _playbackSubscription;
+  Timer? _speechSilenceTimer;
 
   bool _configOpen = false;
   bool _showTranscript = false;
@@ -92,6 +93,7 @@ class _VoiceCallSheetState extends State<VoiceCallSheet> {
   void dispose() {
     controller.removeListener(_handleControllerAutomationUpdate);
     _durationTimer?.cancel();
+    _speechSilenceTimer?.cancel();
     unawaited(_playbackSubscription?.cancel());
     unawaited(_speech.stop());
     unawaited(_audioPlayer.dispose());
@@ -1225,6 +1227,8 @@ class _VoiceCallSheetState extends State<VoiceCallSheet> {
               return;
             }
             if (status == 'done' || status == 'notListening') {
+              _speechSilenceTimer?.cancel();
+              _speechSilenceTimer = null;
               final shouldSubmit = _listening;
               setState(() {
                 _listening = false;
@@ -1239,6 +1243,8 @@ class _VoiceCallSheetState extends State<VoiceCallSheet> {
             if (!mounted) {
               return;
             }
+            _speechSilenceTimer?.cancel();
+            _speechSilenceTimer = null;
             setState(() {
               _listening = false;
               _autoListening = false;
@@ -1263,6 +1269,8 @@ class _VoiceCallSheetState extends State<VoiceCallSheet> {
         listenOptions: speech.SpeechListenOptions(
           listenMode: speech.ListenMode.dictation,
           partialResults: true,
+          listenFor: const Duration(seconds: 45),
+          pauseFor: const Duration(milliseconds: 900),
           localeId: 'zh_CN',
         ),
         onResult: (result) {
@@ -1273,6 +1281,10 @@ class _VoiceCallSheetState extends State<VoiceCallSheet> {
           _userTextController.selection = TextSelection.collapsed(
             offset: _userTextController.text.length,
           );
+          _scheduleSpeechSilenceSubmit();
+          if (result.finalResult) {
+            unawaited(_stopListening(submit: true));
+          }
         },
       );
     } catch (error) {
@@ -1284,11 +1296,15 @@ class _VoiceCallSheetState extends State<VoiceCallSheet> {
         _autoListening = false;
         _status = '录音失败：$error';
       });
+      _speechSilenceTimer?.cancel();
+      _speechSilenceTimer = null;
       _scheduleAutoListen();
     }
   }
 
   Future<void> _stopListening({required bool submit}) async {
+    _speechSilenceTimer?.cancel();
+    _speechSilenceTimer = null;
     await _speech.stop();
     if (mounted) {
       setState(() {
@@ -1299,6 +1315,22 @@ class _VoiceCallSheetState extends State<VoiceCallSheet> {
     if (submit) {
       await _submitRecognizedSpeech();
     }
+  }
+
+  void _scheduleSpeechSilenceSubmit() {
+    if (!_listening || _sending || _userTextController.text.trim().isEmpty) {
+      return;
+    }
+    _speechSilenceTimer?.cancel();
+    _speechSilenceTimer = Timer(const Duration(milliseconds: 1200), () {
+      if (!mounted ||
+          !_listening ||
+          _sending ||
+          _userTextController.text.trim().isEmpty) {
+        return;
+      }
+      unawaited(_stopListening(submit: true));
+    });
   }
 
   void _scheduleAutoListen() {
@@ -1684,9 +1716,6 @@ class _VoiceCallSheetState extends State<VoiceCallSheet> {
     if (controller.hasPendingPlanQuestions || controller.hasPendingPlanPrompt) {
       final question = controller.currentPendingPlanQuestion;
       return 'plan:${controller.pendingPlanQuestionIndex}:${question?.id ?? _promptTextHash()}';
-    }
-    if (controller.awaitInput) {
-      return 'input:${_promptTextHash()}';
     }
     return '';
   }
