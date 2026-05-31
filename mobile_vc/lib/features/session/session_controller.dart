@@ -2790,6 +2790,19 @@ class SessionController extends ChangeNotifier {
     }
     final target = _removeSessionLocally(targetId);
     if (targetId == _selectedSessionId) {
+      _selectedSessionId = '';
+      _selectedSessionTitle = 'MobileVC';
+      _sessionState = null;
+      _agentState = null;
+      _runtimePhase = null;
+      _pendingPrompt = null;
+      _pendingInteraction = null;
+      _currentStep = null;
+      _currentStepSummary = '';
+      _executionActive = false;
+      _sessionRuntimeAlive = false;
+      _resetRuntimeProcessState();
+      _clearStoppingState();
       _beginSessionLoading();
     }
     if (target != null) {
@@ -2940,10 +2953,13 @@ class SessionController extends ChangeNotifier {
   bool _eventTargetsCurrentSession(String sessionId) {
     final normalized = sessionId.trim();
     if (normalized.isEmpty) {
-      return _selectedSessionId.trim().isEmpty;
+      return _selectedSessionId.trim().isEmpty && !_isLoadingSession;
     }
     final selected = _selectedSessionId.trim();
-    return selected.isEmpty || normalized == selected;
+    if (selected.isEmpty) {
+      return !_isLoadingSession;
+    }
+    return normalized == selected;
   }
 
   void _finishSessionLoading({String sessionId = ''}) {
@@ -5170,6 +5186,7 @@ class SessionController extends ChangeNotifier {
             state.runtimeMeta,
             finishedAt: state.timestamp,
           );
+          _checkAndClearExecutionState(state.state);
           _endUserSubmissionProtection();
         }
         if (_isIdleLikeState(state.state) && !_shouldPreserveBlockingPrompt()) {
@@ -5337,6 +5354,9 @@ class SessionController extends ChangeNotifier {
               : error.message.trim();
         }
         final errorMessage = error.message.trim();
+        if (error.code == 'ws_not_connected') {
+          break;
+        }
         if (error.code == 'ws_closed' ||
             error.code == 'ws_stream_error' ||
             error.code == 'ws_send_error' ||
@@ -6966,8 +6986,10 @@ class SessionController extends ChangeNotifier {
     if (_shouldHideTimelineLogMessage(item.body, item.stream)) {
       return false;
     }
+    final trustedAssistantText = item.kind == 'markdown' &&
+        _shouldPreferAssistantText(item.meta, item.body);
     if (_shouldFilterTimelineText(item.title) ||
-        _shouldFilterTimelineText(item.body)) {
+        (_shouldFilterTimelineText(item.body) && !trustedAssistantText)) {
       return false;
     }
     switch (item.kind) {
@@ -7210,18 +7232,19 @@ class SessionController extends ChangeNotifier {
       return null;
     }
     if (_looksLikeFrontendToolResultNoise(trimmed) ||
-        _shouldFilterTimelineText(trimmed)) {
+        (_shouldFilterTimelineText(trimmed) &&
+            !_shouldPreferAssistantText(meta, trimmed))) {
       return null;
     }
     final normalizedStream = stream.trim().toLowerCase();
     if (normalizedStream == 'stderr') {
       return null;
     }
-    if (_looksLikeProcessNoise(trimmed)) {
-      return null;
-    }
     if (_shouldPreferAssistantText(meta, trimmed)) {
       return 'markdown';
+    }
+    if (_looksLikeProcessNoise(trimmed)) {
+      return null;
     }
     if (_looksLikeTerminalOutput(trimmed) || message.startsWith('\r')) {
       return null;
@@ -7245,10 +7268,11 @@ class SessionController extends ChangeNotifier {
     }
     if (_looksLikeFrontendToolResultNoise(message) ||
         _looksLikeHardTerminalOutput(message) ||
-        _looksLikeProcessNoise(message)) {
+        looksLikeSessionBootstrapCommand(message)) {
       return false;
     }
-    return _looksLikeAssistantReplyAllowingSoftTerminal(message);
+    return _looksLikeAssistantReplyAllowingSoftTerminal(message) ||
+        _looksLikeTrustedShortAssistantReply(message);
   }
 
   String _timelineAiEngine(RuntimeMeta meta) {
@@ -7390,6 +7414,16 @@ class SessionController extends ChangeNotifier {
     }
     return RegExp(r'\p{Script=Han}|[A-Za-z]|\p{So}', unicode: true)
         .hasMatch(normalized);
+  }
+
+  bool _looksLikeTrustedShortAssistantReply(String message) {
+    final lower = message.trim().toLowerCase();
+    return lower == 'ok' ||
+        lower == 'done' ||
+        lower == 'yes' ||
+        lower == 'no' ||
+        lower == '好的' ||
+        lower == '完成';
   }
 
   bool _looksLikePassiveWaitingText(String message) {

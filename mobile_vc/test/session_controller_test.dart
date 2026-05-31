@@ -6442,6 +6442,45 @@ void main() {
       ]);
     });
 
+    test('deleteSession 删除当前会话时立即清空选中会话', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      service.emit(
+        SessionCreatedEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-a',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_created'},
+          summary: const SessionSummary(id: 'session-a', title: 'Session A'),
+        ),
+      );
+      await _flushEvents();
+      expect(controller.selectedSessionId, 'session-a');
+
+      controller.deleteSession('session-a');
+      await _flushEvents();
+
+      expect(controller.selectedSessionId, isEmpty);
+
+      service.emit(
+        LogEvent(
+          timestamp: _timestamp.add(const Duration(seconds: 1)),
+          sessionId: 'session-a',
+          runtimeMeta: const RuntimeMeta(engine: 'codex', command: 'codex'),
+          raw: const {'type': 'log'},
+          message: 'stale reply',
+          stream: 'stdout',
+        ),
+      );
+      await _flushEvents();
+
+      expect(controller.timeline.any((item) => item.body == 'stale reply'),
+          isFalse);
+    });
+
     test('deleteSession 失败时恢复本地会话并显示错误', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);
@@ -6781,6 +6820,17 @@ void main() {
       addTearDown(controller.disposeController);
 
       service.emit(
+        SessionCreatedEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-1',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_created'},
+          summary: const SessionSummary(id: 'session-1', title: 'Session 1'),
+        ),
+      );
+      await _flushEvents();
+
+      service.emit(
         LogEvent(
           timestamp: _timestamp,
           sessionId: 'session-1',
@@ -7075,6 +7125,56 @@ void main() {
         ),
         isFalse,
       );
+    });
+
+    test('codex 极短 OK 回复会进入 timeline', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      service.emit(
+        LogEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-1',
+          runtimeMeta: const RuntimeMeta(
+            command: 'codex',
+            engine: 'codex',
+            executionId: 'exec-codex-ok-1',
+            contextId: 'turn-ok-1',
+          ),
+          raw: const {'type': 'log'},
+          message: 'OK',
+          stream: 'stdout',
+        ),
+      );
+      await _flushEvents();
+
+      expect(controller.timeline, hasLength(1));
+      expect(controller.timeline.single.kind, 'markdown');
+      expect(controller.timeline.single.body, 'OK');
+    });
+
+    test('ws_not_connected 不展示为红色 timeline 错误', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      service.emit(
+        ErrorEvent(
+          timestamp: _timestamp,
+          sessionId: '',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'error'},
+          code: 'ws_not_connected',
+          message: 'WebSocket 未连接',
+        ),
+      );
+      await _flushEvents();
+
+      expect(controller.latestError, isNull);
+      expect(controller.timeline, isEmpty);
     });
 
     test('权限交接中的 signal killed 噪声不会进入 timeline', () async {
