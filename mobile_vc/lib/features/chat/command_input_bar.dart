@@ -361,6 +361,21 @@ class _CommandInputBarState extends State<CommandInputBar> {
                                     onPressed: widget.onOpenLogs,
                                   ),
                                   const SizedBox(width: 8),
+                                  if (isCodex) ...[
+                                    _ToolChip(
+                                      key: const ValueKey(
+                                        'codex-target-tool-chip',
+                                      ),
+                                      icon: Icons.track_changes_outlined,
+                                      label: '目标',
+                                      onPressed: () =>
+                                          widget.onCodexTargetModeChanged(
+                                        !widget.codexTargetMode,
+                                      ),
+                                      highlighted: widget.codexTargetMode,
+                                    ),
+                                    const SizedBox(width: 8),
+                                  ],
                                   _ToolChip(
                                     icon: Icons.extension_outlined,
                                     label: 'Skill',
@@ -404,13 +419,6 @@ class _CommandInputBarState extends State<CommandInputBar> {
                             inputColor: inputColor,
                             onSelected: widget.onPermissionModeChanged,
                           ),
-                          if (isCodex) ...[
-                            const SizedBox(width: 8),
-                            _TargetModeSwitch(
-                              enabled: widget.codexTargetMode,
-                              onChanged: widget.onCodexTargetModeChanged,
-                            ),
-                          ],
                         ],
                       ),
                     );
@@ -1023,55 +1031,6 @@ class _ToolChip extends StatelessWidget {
                     ),
               ),
             ],
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-class _TargetModeSwitch extends StatelessWidget {
-  const _TargetModeSwitch({
-    required this.enabled,
-    required this.onChanged,
-  });
-
-  final bool enabled;
-  final ValueChanged<bool> onChanged;
-
-  @override
-  Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
-    return Tooltip(
-      message: '请求目标',
-      child: Semantics(
-        label: '请求目标',
-        toggled: enabled,
-        child: DecoratedBox(
-          decoration: BoxDecoration(
-            color: scheme.surfaceContainerHigh.withValues(alpha: 0.82),
-            borderRadius: BorderRadius.circular(999),
-            border: Border.all(
-              color: scheme.outlineVariant.withValues(alpha: 0.38),
-            ),
-          ),
-          child: Padding(
-            padding: const EdgeInsets.only(left: 10, right: 4),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Icon(
-                  Icons.track_changes_outlined,
-                  size: 16,
-                  color: scheme.onSurfaceVariant,
-                ),
-                Switch.adaptive(
-                  value: enabled,
-                  onChanged: onChanged,
-                  materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                ),
-              ],
-            ),
           ),
         ),
       ),

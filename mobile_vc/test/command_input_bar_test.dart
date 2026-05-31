@@ -110,7 +110,7 @@ void main() {
       expect(changedMode, 'bypassPermissions');
     });
 
-    testWidgets('Codex 模式显示图标权限菜单和请求目标开关', (tester) async {
+    testWidgets('Codex 模式显示图标权限菜单和目标工具按钮', (tester) async {
       var targetMode = false;
       await tester.pumpWidget(
         _buildTestApp(
@@ -123,8 +123,13 @@ void main() {
       );
 
       expect(find.text('请求目标'), findsNothing);
+      expect(find.text('目标'), findsOneWidget);
       expect(find.text('完全访问权限'), findsNothing);
       expect(find.text('跳过审批'), findsNothing);
+      expect(
+        find.byKey(const ValueKey('codex-target-tool-chip')),
+        findsOneWidget,
+      );
       expect(find.byKey(const ValueKey('permission-mode-icon-button')),
           findsOneWidget);
       await tester
@@ -139,12 +144,12 @@ void main() {
 
       await tester.tap(find.text('自动审查'));
       await tester.pumpAndSettle();
-      await tester.tap(find.byType(Switch).first);
+      await tester.tap(find.byKey(const ValueKey('codex-target-tool-chip')));
       await tester.pump();
       expect(targetMode, isTrue);
     });
 
-    testWidgets('Codex 窄屏工具栏不会裁切请求目标开关', (tester) async {
+    testWidgets('Codex 窄屏工具栏不会裁切目标工具按钮', (tester) async {
       tester.view.devicePixelRatio = 1;
       tester.view.physicalSize = const Size(360, 780);
       addTearDown(tester.view.resetPhysicalSize);
@@ -161,9 +166,11 @@ void main() {
 
       expect(tester.takeException(), isNull);
       final barRect = tester.getRect(find.byType(CommandInputBar));
-      final switchRect = tester.getRect(find.byType(Switch).first);
-      expect(switchRect.left, greaterThanOrEqualTo(barRect.left));
-      expect(switchRect.right, lessThanOrEqualTo(barRect.right));
+      final targetRect = tester.getRect(
+        find.byKey(const ValueKey('codex-target-tool-chip')),
+      );
+      expect(targetRect.left, greaterThanOrEqualTo(barRect.left));
+      expect(targetRect.right, lessThanOrEqualTo(barRect.right));
     });
 
     testWidgets('canStop 为 true 时优先显示停止按钮', (tester) async {
