@@ -1515,25 +1515,73 @@ class SessionController extends ChangeNotifier {
       notifyListeners();
       return false;
     }
+    final relayReconnectImport = _isRelayReconnectImport(imported);
     if (imported.connectionMode != ConnectionMode.direct.name) {
-      await _prepareForImportedRelayLink();
+      if (relayReconnectImport) {
+        _autoReconnectEnabled = true;
+        unawaited(_saveConnectionIntent(true));
+      } else {
+        await _prepareForImportedRelayLink();
+      }
     }
     await saveConfig(imported);
-    _connectionMessage = imported.connectionMode == ConnectionMode.direct.name
-        ? '已导入连接配置'
-        : '已导入 Relay 配对，点击连接完成配对';
+    _connectionMessage = _connectionImportSuccessMessage(
+      imported,
+      relayReconnectImport: relayReconnectImport,
+    );
     if (imported.connectionMode != ConnectionMode.direct.name) {
-      _connectionStage = SessionConnectionStage.disconnected;
+      _connectionStage = relayReconnectImport && _connected
+          ? SessionConnectionStage.connected
+          : SessionConnectionStage.disconnected;
       _latestError = null;
     }
     _pushSystem(
       'session',
-      imported.connectionMode != ConnectionMode.direct.name
-          ? '已导入 Relay 配对，点击连接完成配对'
-          : '已导入连接配置：${imported.displayEndpoint}',
+      _connectionImportSystemMessage(
+        imported,
+        relayReconnectImport: relayReconnectImport,
+      ),
     );
     notifyListeners();
     return true;
+  }
+
+  bool _isRelayReconnectImport(AppConfig imported) {
+    if (_config.connectionMode == ConnectionMode.direct.name ||
+        imported.connectionMode == ConnectionMode.direct.name) {
+      return false;
+    }
+    return imported.relayUrl.trim() == _config.relayUrl.trim() &&
+        imported.relaySessionId.trim() == _config.relaySessionId.trim() &&
+        imported.relayPairingSecret.trim().isEmpty &&
+        imported.relayClientId.trim().isNotEmpty &&
+        imported.relayClientReconnectSecret.trim().isNotEmpty;
+  }
+
+  String _connectionImportSuccessMessage(
+    AppConfig imported, {
+    required bool relayReconnectImport,
+  }) {
+    if (imported.connectionMode == ConnectionMode.direct.name) {
+      return '已导入连接配置';
+    }
+    if (relayReconnectImport) {
+      return '已恢复 Relay 连接配置';
+    }
+    return '已导入 Relay 配对，点击连接完成配对';
+  }
+
+  String _connectionImportSystemMessage(
+    AppConfig imported, {
+    required bool relayReconnectImport,
+  }) {
+    if (imported.connectionMode == ConnectionMode.direct.name) {
+      return '已导入连接配置：${imported.displayEndpoint}';
+    }
+    return _connectionImportSuccessMessage(
+      imported,
+      relayReconnectImport: relayReconnectImport,
+    );
   }
 
   String _connectionImportErrorMessage(Object error) {

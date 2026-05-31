@@ -363,7 +363,7 @@ void main() {
       relayUrl: 'wss://relay.example.test',
       relaySessionId: 'rs_test',
       relayPairingSecret: 'pair_secret',
-      relayPairingExpiresAt: 1760000000,
+      relayPairingExpiresAt: 4102444800,
     ));
 
     await tester.pumpWidget(
@@ -410,7 +410,7 @@ void main() {
       relayUrl: 'wss://relay.example.test',
       relaySessionId: 'rs_test',
       relayPairingSecret: 'pair_secret',
-      relayPairingExpiresAt: 1760000000,
+      relayPairingExpiresAt: 4102444800,
     ));
     await controller.connect();
 

@@ -167,7 +167,7 @@ void main() {
     test('relay pairing uri selects relay mode without changing direct fields',
         () {
       final config = AppConfig.fromLaunchUri(
-        'mobilevc://relay/v1?relay=wss%3A%2F%2Frelay.example.test&session=rs_test&secret=pair_secret&exp=1760000000&nodeFingerprint=$testNodeFingerprint',
+        'mobilevc://relay/v1?relay=wss%3A%2F%2Frelay.example.test&session=rs_test&secret=pair_secret&exp=4102444800&nodeFingerprint=$testNodeFingerprint',
         fallback: const AppConfig(
           host: '192.168.1.2',
           port: '8001',
@@ -183,14 +183,14 @@ void main() {
       expect(config.relayUrl, 'wss://relay.example.test');
       expect(config.relaySessionId, 'rs_test');
       expect(config.relayPairingSecret, 'pair_secret');
-      expect(config.relayPairingExpiresAt, 1760000000);
+      expect(config.relayPairingExpiresAt, 4102444800);
       expect(config.relayNodeFingerprintHex, testNodeFingerprint);
     });
 
     test('relay pairing uri with LAN endpoint selects auto mode', () {
       final config = AppConfig.fromLaunchUri(
         'mobilevc://relay/v1?relay=wss%3A%2F%2Frelay.example.test'
-        '&session=rs_test&secret=pair_secret&exp=1760000000'
+        '&session=rs_test&secret=pair_secret&exp=4102444800'
         '&nodeFingerprint=$testNodeFingerprint'
         '&lanHost=192.168.1.9&lanPort=19080&lanToken=direct_secret'
         '&lanCwd=%2Fworkspace&lanSecureTransport=false',
@@ -221,7 +221,7 @@ void main() {
         'relayUrl': 'wss://relay.example.test',
         'sessionId': 'rs_json',
         'pairingSecret': 'pair_secret',
-        'expiresAt': 1760000000,
+        'expiresAt': 4102444800,
         'nodeFingerprintHex': testNodeFingerprint,
         'lanHost': '192.168.1.9',
         'lanPort': '19080',
@@ -281,7 +281,7 @@ void main() {
         relayUrl: 'wss://relay.example.test',
         relaySessionId: 'rs_test',
         relayPairingSecret: 'pair_secret',
-        relayPairingExpiresAt: 1760000000,
+        relayPairingExpiresAt: 4102444800,
         relayClientId: 'rc_test',
         relayClientReconnectSecret: 'reconnect_secret',
         relayNodeFingerprintHex: testNodeFingerprint,
@@ -329,7 +329,7 @@ void main() {
         () {
       final config = AppConfig.fromLaunchUri(
         'mobilevc://relay/v1?relay=wss%3A%2F%2Frelay.example.test'
-        '&session=rs_test&secret=stale_pair_secret&exp=1760000000'
+        '&session=rs_test&secret=stale_pair_secret&exp=1'
         '&nodeFingerprint=$testNodeFingerprint',
         fallback: const AppConfig(
           connectionMode: 'relay',
@@ -346,6 +346,31 @@ void main() {
       expect(config.relayPairingExpiresAt, 0);
       expect(config.relayClientId, 'rc_existing');
       expect(config.relayClientReconnectSecret, 'reconnect_existing');
+    });
+
+    test('expired relay pairing import rejects new sessions', () {
+      expect(
+        () => AppConfig.fromLaunchUri(
+          'mobilevc://relay/v1?relay=wss%3A%2F%2Frelay.example.test'
+          '&session=rs_expired&secret=stale_pair_secret&exp=1'
+          '&nodeFingerprint=$testNodeFingerprint',
+          fallback: const AppConfig(
+            connectionMode: 'relay',
+            relayUrl: 'wss://relay.example.test',
+            relaySessionId: 'rs_existing',
+            relayClientId: 'rc_existing',
+            relayClientReconnectSecret: 'reconnect_existing',
+            relayNodeFingerprintHex: testNodeFingerprint,
+          ),
+        ),
+        throwsA(
+          isA<FormatException>().having(
+            (error) => error.message,
+            'message',
+            contains('Relay 配对链接已过期'),
+          ),
+        ),
+      );
     });
 
     test('relay url validation rejects public ws and http schemes', () {
@@ -366,7 +391,7 @@ void main() {
     test('relay pairing uri validates capability hints', () {
       final pairing = parseRelayPairingUri(
         'mobilevc://relay/v1?relay=wss%3A%2F%2Frelay.example.test'
-        '&session=rs_test&secret=pair_secret&exp=1760000000'
+        '&session=rs_test&secret=pair_secret&exp=4102444800'
         '&nodeFingerprint=$testNodeFingerprint'
         '&relayProtocolVersion=1&e2eeProtocolVersion=1'
         '&cryptoSuite=p256-ecdsa%2Bp256-ecdh%2Bhkdf-sha256%2Baes-256-gcm'
@@ -385,7 +410,7 @@ void main() {
     test('relay capability hints are stored as non-secret config', () {
       final config = AppConfig.fromLaunchUri(
         'mobilevc://relay/v1?relay=wss%3A%2F%2Frelay.example.test'
-        '&session=rs_test&secret=pair_secret&exp=1760000000'
+        '&session=rs_test&secret=pair_secret&exp=4102444800'
         '&nodeFingerprint=$testNodeFingerprint'
         '&relayProtocolVersion=1&e2eeProtocolVersion=1'
         '&cryptoSuite=p256-ecdsa%2Bp256-ecdh%2Bhkdf-sha256%2Baes-256-gcm'
@@ -450,7 +475,7 @@ void main() {
   "relayUrl": "wss://relay.example.test",
   "sessionId": "rs_json",
   "pairingSecret": "pair_secret",
-  "expiresAt": 1760000000,
+  "expiresAt": 4102444800,
   "nodeFingerprintHex": "$testNodeFingerprint",
   "capabilities": {
     "relayProtocolVersion": 1,

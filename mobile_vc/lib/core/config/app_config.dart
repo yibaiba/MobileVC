@@ -376,6 +376,13 @@ class AppConfig {
       final hasReconnectCredentials =
           fallback.relayClientId.trim().isNotEmpty &&
               fallback.relayClientReconnectSecret.trim().isNotEmpty;
+      final canReconnectSameRelaySession =
+          sameRelaySession && hasReconnectCredentials;
+      if (!canReconnectSameRelaySession && _relayPairingExpired(relayPairing)) {
+        throw const FormatException(
+          'Relay 配对链接已过期，请在电脑端生成新的 Relay 链接后重新导入',
+        );
+      }
       return fallback.copyWith(
         connectionMode: relayPairing.hasLanEndpoint
             ? ConnectionMode.auto.name
@@ -394,16 +401,13 @@ class AppConfig {
             (relayPairing.hasLanEndpoint ? fallback.secureTransport : null),
         relayUrl: relayPairing.relayUrl,
         relaySessionId: relayPairing.sessionId,
-        relayPairingSecret: sameRelaySession && hasReconnectCredentials
-            ? ''
-            : relayPairing.pairingSecret,
-        relayPairingExpiresAt: sameRelaySession && hasReconnectCredentials
-            ? 0
-            : relayPairing.expiresAt,
-        relayClientId: sameRelaySession && hasReconnectCredentials
-            ? fallback.relayClientId
-            : '',
-        relayClientReconnectSecret: sameRelaySession && hasReconnectCredentials
+        relayPairingSecret:
+            canReconnectSameRelaySession ? '' : relayPairing.pairingSecret,
+        relayPairingExpiresAt:
+            canReconnectSameRelaySession ? 0 : relayPairing.expiresAt,
+        relayClientId:
+            canReconnectSameRelaySession ? fallback.relayClientId : '',
+        relayClientReconnectSecret: canReconnectSameRelaySession
             ? fallback.relayClientReconnectSecret
             : '',
         relayNodeFingerprintHex: relayPairing.nodeFingerprintHex,
@@ -427,6 +431,14 @@ class AppConfig {
       adbIceServersJson: ice,
       secureTransport: secureTransportFromScheme(uri.scheme),
     );
+  }
+
+  static bool _relayPairingExpired(RelayPairing pairing) {
+    if (pairing.expiresAt <= 0) {
+      return false;
+    }
+    final nowSeconds = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    return nowSeconds > pairing.expiresAt;
   }
 
   AppConnectionUrls _connectionUrls(bool? secureTransport) {

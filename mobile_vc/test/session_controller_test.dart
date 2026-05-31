@@ -1246,7 +1246,7 @@ void main() {
 
       final imported = await controller.importConnectionLink(
         'mobilevc://relay/v1?relay=wss%3A%2F%2Frelay.example.test'
-        '&session=rs_import&secret=pair_secret&exp=1760000000'
+        '&session=rs_import&secret=pair_secret&exp=4102444800'
         '&nodeFingerprint=1111111111111111111111111111111111111111111111111111111111111111'
         '&relayProtocolVersion=1&e2eeProtocolVersion=1'
         '&cryptoSuite=p256-ecdsa%2Bp256-ecdh%2Bhkdf-sha256%2Baes-256-gcm'
@@ -1280,7 +1280,7 @@ void main() {
 
       final imported = await controller.importConnectionLink(
         'mobilevc://relay/v1?relay=wss%3A%2F%2Frelay.example.test'
-        '&session=rs_import&secret=pair_secret&exp=1760000000'
+        '&session=rs_import&secret=pair_secret&exp=4102444800'
         '&nodeFingerprint=1111111111111111111111111111111111111111111111111111111111111111'
         '&lanHost=192.168.1.2&lanPort=8001&lanToken=direct-token'
         '&lanCwd=%2Fworkspace'
@@ -1307,7 +1307,7 @@ void main() {
           relayUrl: 'wss://relay.example.test',
           relaySessionId: 'rs_test',
           relayPairingSecret: 'pair_secret',
-          relayPairingExpiresAt: 1760000000,
+          relayPairingExpiresAt: 4102444800,
         ).toJson()),
       });
       final service = _FakeMobileVcWsService();
@@ -1320,7 +1320,7 @@ void main() {
         relayUrl: 'wss://relay.example.test',
         relaySessionId: 'rs_test',
         relayPairingSecret: 'pair_secret',
-        relayPairingExpiresAt: 1760000000,
+        relayPairingExpiresAt: 4102444800,
       ));
       await controller.connect();
 
@@ -1341,6 +1341,44 @@ void main() {
       expect(persisted['relayClientReconnectSecret'], 'reconnect_secret');
     });
 
+    test('expired new relay link is rejected without changing current config',
+        () async {
+      SharedPreferences.setMockInitialValues({
+        'mobilevc.app_config': jsonEncode(const AppConfig(
+          connectionMode: 'relay',
+          relayUrl: 'wss://relay.example.test',
+          relaySessionId: 'rs_existing',
+          relayClientId: 'rc_existing',
+          relayClientReconnectSecret: 'reconnect_existing',
+        ).toJson()),
+      });
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      final imported = await controller.importConnectionLink(
+        'mobilevc://relay/v1?relay=wss%3A%2F%2Frelay.example.test'
+        '&session=rs_expired&secret=stale_pair_secret&exp=1'
+        '&nodeFingerprint=1111111111111111111111111111111111111111111111111111111111111111'
+        '&relayProtocolVersion=1&e2eeProtocolVersion=1'
+        '&cryptoSuite=p256-ecdsa%2Bp256-ecdh%2Bhkdf-sha256%2Baes-256-gcm'
+        '&tunnelProtocolVersion=1&supportsMultiplexStreams=true'
+        '&supportsFileDownloadStream=true&supportsDeviceManagement=true'
+        '&requiresE2EE=true&plaintextTestMode=false',
+      );
+
+      expect(imported, isFalse);
+      expect(controller.connectionMessage, contains('Relay 配对链接已过期'));
+      expect(controller.config.relaySessionId, 'rs_existing');
+      expect(controller.config.relayClientId, 'rc_existing');
+      expect(
+        controller.config.relayClientReconnectSecret,
+        'reconnect_existing',
+      );
+      expect(service.disconnectCalls, 0);
+    });
+
     test('relay pairing failure keeps one-time secret for explicit retry',
         () async {
       final service = _FakeMobileVcWsService()
@@ -1357,7 +1395,7 @@ void main() {
         relayUrl: 'wss://relay.example.test',
         relaySessionId: 'rs_test',
         relayPairingSecret: 'pair_secret',
-        relayPairingExpiresAt: 1760000000,
+        relayPairingExpiresAt: 4102444800,
       ));
 
       await controller.connect();
@@ -1366,7 +1404,7 @@ void main() {
       expect(controller.connectionStage, SessionConnectionStage.failed);
       expect(controller.connectionMessage, contains('Relay E2EE 握手失败'));
       expect(controller.config.relayPairingSecret, 'pair_secret');
-      expect(controller.config.relayPairingExpiresAt, 1760000000);
+      expect(controller.config.relayPairingExpiresAt, 4102444800);
 
       final prefs = await SharedPreferences.getInstance();
       final persisted = jsonDecode(prefs.getString('mobilevc.app_config')!)
@@ -1580,7 +1618,7 @@ void main() {
         relayUrl: 'wss://relay.example.test',
         relaySessionId: 'rs_test',
         relayPairingSecret: 'pair_secret',
-        relayPairingExpiresAt: 1760000000,
+        relayPairingExpiresAt: 4102444800,
       ));
 
       await controller.connect();
@@ -1588,7 +1626,7 @@ void main() {
       expect(controller.connected, isFalse);
       expect(controller.connectionStage, SessionConnectionStage.reconnecting);
       expect(controller.config.relayPairingSecret, 'pair_secret');
-      expect(controller.config.relayPairingExpiresAt, 1760000000);
+      expect(controller.config.relayPairingExpiresAt, 4102444800);
     });
 
     test('relay agent disconnect auto reconnects and resends unacked action',
@@ -2009,7 +2047,7 @@ void main() {
 
       final imported = await controller.importConnectionLink(
         'mobilevc://relay/v1?relay=wss%3A%2F%2Frelay.example.test'
-        '&session=rs_new&secret=new_pair_secret&exp=1760000000'
+        '&session=rs_new&secret=new_pair_secret&exp=4102444800'
         '&nodeFingerprint=1111111111111111111111111111111111111111111111111111111111111111'
         '&relayProtocolVersion=1&e2eeProtocolVersion=1'
         '&cryptoSuite=p256-ecdsa%2Bp256-ecdh%2Bhkdf-sha256%2Baes-256-gcm'
@@ -2048,7 +2086,7 @@ void main() {
 
       final imported = await controller.importConnectionLink(
         'mobilevc://relay/v1?relay=wss%3A%2F%2Frelay.example.test'
-        '&session=rs_test&secret=stale_pair_secret&exp=1760000000'
+        '&session=rs_test&secret=stale_pair_secret&exp=4102444800'
         '&nodeFingerprint=1111111111111111111111111111111111111111111111111111111111111111'
         '&relayProtocolVersion=1&e2eeProtocolVersion=1'
         '&cryptoSuite=p256-ecdsa%2Bp256-ecdh%2Bhkdf-sha256%2Baes-256-gcm'
@@ -2071,6 +2109,48 @@ void main() {
       expect(call.clientReconnectSecret, 'reconnect_existing');
     });
 
+    test('reimporting same connected relay link does not disconnect', () async {
+      SharedPreferences.setMockInitialValues({
+        'mobilevc.app_config': jsonEncode(const AppConfig(
+          connectionMode: 'relay',
+          relayUrl: 'wss://relay.example.test',
+          relaySessionId: 'rs_test',
+          relayClientId: 'rc_existing',
+          relayClientReconnectSecret: 'reconnect_existing',
+        ).toJson()),
+      });
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      expect(controller.connected, isTrue);
+
+      final imported = await controller.importConnectionLink(
+        'mobilevc://relay/v1?relay=wss%3A%2F%2Frelay.example.test'
+        '&session=rs_test&secret=stale_pair_secret&exp=1'
+        '&nodeFingerprint=1111111111111111111111111111111111111111111111111111111111111111'
+        '&relayProtocolVersion=1&e2eeProtocolVersion=1'
+        '&cryptoSuite=p256-ecdsa%2Bp256-ecdh%2Bhkdf-sha256%2Baes-256-gcm'
+        '&tunnelProtocolVersion=1&supportsMultiplexStreams=true'
+        '&supportsFileDownloadStream=true&supportsDeviceManagement=true'
+        '&requiresE2EE=true&plaintextTestMode=false',
+      );
+
+      expect(imported, isTrue);
+      expect(controller.connected, isTrue);
+      expect(controller.connectionStage, SessionConnectionStage.connected);
+      expect(controller.connectionMessage, '已恢复 Relay 连接配置');
+      expect(service.disconnectCalls, 0);
+      expect(controller.config.relayPairingSecret, isEmpty);
+      expect(controller.config.relayClientId, 'rc_existing');
+      expect(
+        controller.config.relayClientReconnectSecret,
+        'reconnect_existing',
+      );
+    });
+
     test('imported relay pairing link disconnects active stale relay session',
         () async {
       SharedPreferences.setMockInitialValues({});
@@ -2091,7 +2171,7 @@ void main() {
 
       final imported = await controller.importConnectionLink(
         'mobilevc://relay/v1?relay=wss%3A%2F%2Frelay.example.test'
-        '&session=rs_new&secret=new_pair_secret&exp=1760000000'
+        '&session=rs_new&secret=new_pair_secret&exp=4102444800'
         '&nodeFingerprint=1111111111111111111111111111111111111111111111111111111111111111'
         '&relayProtocolVersion=1&e2eeProtocolVersion=1'
         '&cryptoSuite=p256-ecdsa%2Bp256-ecdh%2Bhkdf-sha256%2Baes-256-gcm'
