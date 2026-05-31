@@ -15,6 +15,7 @@ import '../../data/models/runtime_meta.dart';
 import '../../data/models/session_models.dart';
 import '../../data/services/adb_webrtc_service.dart';
 import '../../data/services/mobilevc_ws_service.dart';
+import '../permissions/permission_mode_options.dart';
 import 'claude_model_utils.dart';
 import 'session_display_text.dart';
 
@@ -2082,12 +2083,14 @@ class SessionController extends ChangeNotifier {
     List<ChatImageAttachment> imageAttachments = const [],
   }) {
     final normalizedEngine = engine.trim().toLowerCase();
+    final normalizedPermissionMode =
+        normalizePermissionModeForEngine(permissionMode, normalizedEngine);
     final payload = <String, dynamic>{
       'action': 'ai_turn',
       ...meta.toJson(),
       'engine': normalizedEngine,
       'cwd': effectiveCwd,
-      'permissionMode': permissionMode,
+      'permissionMode': normalizedPermissionMode,
     };
     payload.remove('command');
     payload.remove('claudeLifecycle');
@@ -10028,31 +10031,11 @@ class SessionController extends ChangeNotifier {
   }
 
   String _permissionModeLabel(String permissionMode) {
-    switch (permissionMode.trim()) {
-      case 'bypassPermissions':
-        return '跳过权限确认';
-      case 'config':
-        return '自定义(config.toml)';
-      case 'default':
-        return '手动审核';
-      case 'auto':
-      case 'acceptEdits':
-      default:
-        return '自动模式';
-    }
+    return permissionModeLabelForEngine(permissionMode, configuredAiEngine);
   }
 
   String _normalizeDisplayPermissionMode(String permissionMode) {
-    switch (permissionMode.trim()) {
-      case 'bypassPermissions':
-        return 'bypassPermissions';
-      case 'config':
-        return 'config';
-      case 'default':
-        return 'default';
-      default:
-        return 'auto';
-    }
+    return normalizePermissionModeForEngine(permissionMode, configuredAiEngine);
   }
 
   void _maybeAutoSyncAiModel(

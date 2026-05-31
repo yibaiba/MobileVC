@@ -260,6 +260,46 @@ void main() {
     await controller.disposeController();
   });
 
+  testWidgets('连接设置里 Claude 使用官方权限模式下拉', (tester) async {
+    await _useTallSurface(tester);
+    final service = _FakeMobileVcWsService();
+    final controller = SessionController(service: service);
+    await controller.saveConfig(
+      const AppConfig(
+        cwd: '/workspace',
+        engine: 'claude',
+        permissionMode: 'default',
+      ),
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SessionHomePage(controller: controller),
+      ),
+    );
+    await _pumpFrames(tester);
+
+    await tester.tap(find.byIcon(Icons.settings_outlined));
+    await _pumpFrames(tester);
+    await tester.ensureVisible(find.text('Claude 权限'));
+    await tester.pump();
+
+    final dropdown = find.byKey(
+      const ValueKey('connection-config-claude-permission-mode'),
+    );
+    expect(dropdown, findsOneWidget);
+    await tester.tap(dropdown);
+    await tester.pumpAndSettle();
+
+    expect(find.text('默认权限'), findsAtLeastNWidgets(1));
+    expect(find.text('自动模式'), findsOneWidget);
+    expect(find.text('完全访问权限'), findsOneWidget);
+    expect(find.text('自动审查'), findsNothing);
+    expect(find.text('自定义(config.toml)'), findsNothing);
+
+    await controller.disposeController();
+  });
+
   testWidgets('Relay 连接中禁用重复点击并显示进度', (tester) async {
     await _useTallSurface(tester);
     final service = _BlockingRelayWsService();

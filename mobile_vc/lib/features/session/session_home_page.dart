@@ -25,6 +25,7 @@ import '../../features/diff/diff_viewer_sheet.dart';
 import '../../features/files/file_browser_sheet.dart';
 import '../../features/files/file_viewer_sheet.dart';
 import '../../features/memory/memory_management_sheet.dart';
+import '../../features/permissions/permission_mode_options.dart';
 import '../../features/permissions/permission_rule_management_sheet.dart';
 import '../../features/runtime_info/runtime_info_sheet.dart';
 import '../../features/skills/skill_management_sheet.dart';
@@ -532,6 +533,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
       onCodexTargetModeChanged: controller.updateCodexTargetMode,
       showClaudeMode: controller.shouldShowClaudeMode,
       currentEngine: controller.commandBarEngine,
+      configuredEngine: controller.configuredAiEngine,
       modelSummary: controller.commandBarModelSummary,
       permissionRuleSummary: controller.permissionRuleSummary,
       isSessionLoading: controller.isLoadingSession,
@@ -702,6 +704,20 @@ class _SessionHomePageState extends State<SessionHomePage> {
                 pendingConfig.relayPairingSecret.trim().isNotEmpty ||
                 (pendingConfig.relayClientId.trim().isNotEmpty &&
                     pendingConfig.relayClientReconnectSecret.trim().isNotEmpty);
+            final permissionModeEngine = selectedEngine.trim().toLowerCase();
+            final selectedPermissionMode = normalizePermissionModeForEngine(
+              permissionController.text,
+              permissionModeEngine,
+            );
+            final permissionModeItems =
+                permissionModeOptionsForEngine(permissionModeEngine)
+                    .map(
+                      (option) => DropdownMenuItem<String>(
+                        value: option.value,
+                        child: Text(option.label),
+                      ),
+                    )
+                    .toList(growable: false);
 
             void applyScannedConfig(AppConfig scanned) {
               pendingConfig = scanned;
@@ -1159,6 +1175,11 @@ class _SessionHomePageState extends State<SessionHomePage> {
                                     }
                                     setSheetState(() {
                                       selectedEngine = value;
+                                      permissionController.text =
+                                          normalizePermissionModeForEngine(
+                                        permissionController.text,
+                                        selectedEngine,
+                                      );
                                     });
                                   },
                           ),
@@ -1223,31 +1244,34 @@ class _SessionHomePageState extends State<SessionHomePage> {
                           const SizedBox(height: 10),
                           if (selectedEngine.trim().toLowerCase() == 'codex')
                             DropdownButtonFormField<String>(
-                              initialValue:
-                                  AppConfig.normalizePermissionModeForDisplay(
-                                permissionController.text,
+                              key: const ValueKey(
+                                'connection-config-codex-permission-mode',
                               ),
+                              initialValue: selectedPermissionMode,
                               decoration: const InputDecoration(
                                 labelText: 'Codex 权限',
                               ),
-                              items: const [
-                                DropdownMenuItem(
-                                  value: 'default',
-                                  child: Text('默认权限'),
-                                ),
-                                DropdownMenuItem(
-                                  value: 'auto',
-                                  child: Text('自动审查'),
-                                ),
-                                DropdownMenuItem(
-                                  value: 'bypassPermissions',
-                                  child: Text('完全访问权限'),
-                                ),
-                                DropdownMenuItem(
-                                  value: 'config',
-                                  child: Text('自定义(config.toml)'),
-                                ),
-                              ],
+                              items: permissionModeItems,
+                              onChanged: connectionBusy
+                                  ? null
+                                  : (value) {
+                                      if (value == null) {
+                                        return;
+                                      }
+                                      permissionController.text = value;
+                                    },
+                            )
+                          else if (selectedEngine.trim().toLowerCase() ==
+                              'claude')
+                            DropdownButtonFormField<String>(
+                              key: const ValueKey(
+                                'connection-config-claude-permission-mode',
+                              ),
+                              initialValue: selectedPermissionMode,
+                              decoration: const InputDecoration(
+                                labelText: 'Claude 权限',
+                              ),
+                              items: permissionModeItems,
                               onChanged: connectionBusy
                                   ? null
                                   : (value) {
@@ -1262,7 +1286,8 @@ class _SessionHomePageState extends State<SessionHomePage> {
                               controller: permissionController,
                               enabled: !connectionBusy,
                               decoration: const InputDecoration(
-                                  labelText: 'Permission Mode'),
+                                labelText: 'Permission Mode',
+                              ),
                             ),
                         ],
                       ),
@@ -2207,6 +2232,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
                     connected: controller.connected,
                     awaitInput: controller.awaitInput,
                     permissionMode: controller.config.permissionMode,
+                    engine: controller.configuredAiEngine,
                     currentPath: controller.currentDirectoryPath,
                     runtimeMeta: controller.currentMeta,
                     currentStep: controller.currentStep,

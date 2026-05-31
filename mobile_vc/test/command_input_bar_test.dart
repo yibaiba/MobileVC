@@ -84,12 +84,37 @@ void main() {
       expect(field.decoration?.hintText, '回复 Claude');
     });
 
+    testWidgets('Claude 模式显示 Claude 权限菜单', (tester) async {
+      String? changedMode;
+      await tester.pumpWidget(
+        _buildTestApp(
+          showClaudeMode: true,
+          currentEngine: 'claude',
+          onPermissionModeChanged: (value) => changedMode = value,
+        ),
+      );
+
+      await tester.tap(find.byType(DropdownButton<String>));
+      await tester.pumpAndSettle();
+
+      expect(find.text('默认权限'), findsAtLeastNWidgets(1));
+      expect(find.text('自动模式'), findsOneWidget);
+      expect(find.text('完全访问权限'), findsOneWidget);
+      expect(find.text('自动审查'), findsNothing);
+      expect(find.text('自定义(config.toml)'), findsNothing);
+
+      await tester.tap(find.text('完全访问权限').last);
+      await tester.pumpAndSettle();
+      expect(changedMode, 'bypassPermissions');
+    });
+
     testWidgets('Codex 模式显示 Codex 权限文案和请求目标开关', (tester) async {
       var targetMode = false;
       await tester.pumpWidget(
         _buildTestApp(
           showClaudeMode: true,
           currentEngine: 'codex',
+          configuredEngine: 'codex',
           codexTargetMode: targetMode,
           onCodexTargetModeChanged: (value) => targetMode = value,
         ),
@@ -532,6 +557,7 @@ Widget _buildTestApp({
   bool canStop = false,
   bool showClaudeMode = true,
   String currentEngine = 'claude',
+  String? configuredEngine,
   bool codexTargetMode = false,
   ValueChanged<bool>? onCodexTargetModeChanged,
   bool isSessionLoading = false,
@@ -540,6 +566,7 @@ Widget _buildTestApp({
       onSubmit,
   Future<ChatImageAttachment?> Function()? onAttachImage,
   VoidCallback? onStop,
+  ValueChanged<String>? onPermissionModeChanged,
   EdgeInsets viewInsets = EdgeInsets.zero,
   Widget body = const SizedBox.shrink(),
 }) {
@@ -573,11 +600,12 @@ Widget _buildTestApp({
           onOpenMemory: () {},
           onOpenPermissions: () {},
           onOpenModels: () {},
-          onPermissionModeChanged: (_) {},
+          onPermissionModeChanged: onPermissionModeChanged ?? (_) {},
           codexTargetMode: codexTargetMode,
           onCodexTargetModeChanged: onCodexTargetModeChanged ?? (_) {},
           showClaudeMode: showClaudeMode,
           currentEngine: currentEngine,
+          configuredEngine: configuredEngine ?? currentEngine,
           modelSummary: 'Sonnet',
           permissionRuleSummary: '默认',
           shouldShowPlanChoices: false,

@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../../app/theme.dart';
 import '../../data/models/session_models.dart';
+import '../permissions/permission_mode_options.dart';
 
 class CommandInputBar extends StatefulWidget {
   const CommandInputBar({
@@ -33,6 +34,7 @@ class CommandInputBar extends StatefulWidget {
     required this.onCodexTargetModeChanged,
     required this.showClaudeMode,
     required this.currentEngine,
+    required this.configuredEngine,
     required this.modelSummary,
     required this.permissionRuleSummary,
     required this.shouldShowPermissionChoices,
@@ -72,6 +74,7 @@ class CommandInputBar extends StatefulWidget {
   final ValueChanged<bool> onCodexTargetModeChanged;
   final bool showClaudeMode;
   final String currentEngine;
+  final String configuredEngine;
   final String modelSummary;
   final String permissionRuleSummary;
   final bool shouldShowPermissionChoices;
@@ -244,6 +247,23 @@ class _CommandInputBarState extends State<CommandInputBar> {
     final engineLabel =
         _engineLabel(widget.currentEngine, widget.showClaudeMode);
     final isCodex = widget.currentEngine.trim().toLowerCase() == 'codex';
+    final permissionEngine = widget.configuredEngine.trim().isEmpty
+        ? widget.currentEngine
+        : widget.configuredEngine;
+    final permissionMode = normalizePermissionModeForEngine(
+      widget.permissionMode,
+      permissionEngine,
+    );
+    final permissionModeItems = permissionModeOptionsForEngine(
+      permissionEngine,
+    )
+        .map(
+          (option) => DropdownMenuItem<String>(
+            value: option.value,
+            child: Text(option.label),
+          ),
+        )
+        .toList(growable: false);
     final compactChipLabel = widget.isCompacting
         ? (widget.compactStatusLabel.trim().isEmpty
             ? '压缩中'
@@ -367,44 +387,12 @@ class _CommandInputBarState extends State<CommandInputBar> {
                         padding: const EdgeInsets.symmetric(horizontal: 12),
                         child: DropdownButtonHideUnderline(
                           child: DropdownButton<String>(
-                            value: widget.permissionMode,
+                            value: permissionMode,
                             borderRadius: BorderRadius.circular(16),
                             style: theme.textTheme.bodySmall?.copyWith(
                               fontWeight: FontWeight.w600,
                             ),
-                            items: isCodex
-                                ? const [
-                                    DropdownMenuItem(
-                                      value: 'default',
-                                      child: Text('默认权限'),
-                                    ),
-                                    DropdownMenuItem(
-                                      value: 'auto',
-                                      child: Text('自动审查'),
-                                    ),
-                                    DropdownMenuItem(
-                                      value: 'bypassPermissions',
-                                      child: Text('完全访问权限'),
-                                    ),
-                                    DropdownMenuItem(
-                                      value: 'config',
-                                      child: Text('自定义(config.toml)'),
-                                    ),
-                                  ]
-                                : const [
-                                    DropdownMenuItem(
-                                      value: 'auto',
-                                      child: Text('自动模式'),
-                                    ),
-                                    DropdownMenuItem(
-                                      value: 'default',
-                                      child: Text('手动审核'),
-                                    ),
-                                    DropdownMenuItem(
-                                      value: 'bypassPermissions',
-                                      child: Text('跳过权限确认'),
-                                    ),
-                                  ],
+                            items: permissionModeItems,
                             onChanged: (value) {
                               if (value != null) {
                                 widget.onPermissionModeChanged(value);
