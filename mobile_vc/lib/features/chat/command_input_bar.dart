@@ -90,6 +90,9 @@ class CommandInputBar extends StatefulWidget {
 }
 
 class _CommandInputBarState extends State<CommandInputBar> {
+  static const double _inputActionButtonSize = 36;
+  static const double _inputActionIconSize = 18;
+
   final TextEditingController _controller = TextEditingController();
   final FocusNode _focusNode = FocusNode();
   final List<ChatImageAttachment> _imageAttachments = [];
@@ -255,16 +258,9 @@ class _CommandInputBarState extends State<CommandInputBar> {
       widget.permissionMode,
       permissionEngine,
     );
-    final permissionModeItems = permissionModeOptionsForEngine(
+    final permissionModeOptions = permissionModeOptionsForEngine(
       permissionEngine,
-    )
-        .map(
-          (option) => DropdownMenuItem<String>(
-            value: option.value,
-            child: Text(option.label),
-          ),
-        )
-        .toList(growable: false);
+    );
     final compactChipLabel = widget.isCompacting
         ? (widget.compactStatusLabel.trim().isEmpty
             ? '压缩中'
@@ -318,121 +314,107 @@ class _CommandInputBarState extends State<CommandInputBar> {
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                Container(
-                  padding: const EdgeInsets.fromLTRB(8, 8, 8, 8),
-                  decoration: BoxDecoration(
-                    color: railColor,
-                    borderRadius: BorderRadius.circular(24),
-                    border: Border.all(
-                      color: scheme.outlineVariant
-                          .withValues(alpha: isLight ? 0.46 : 0.26),
-                    ),
-                  ),
-                  child: Row(
-                    children: [
-                      Expanded(
-                        child: SingleChildScrollView(
-                          scrollDirection: Axis.horizontal,
-                          child: Row(
-                            children: [
-                              _ToolChip(
-                                icon: Icons.history,
-                                label: '会话',
-                                onPressed: widget.onOpenSessions,
-                              ),
-                              const SizedBox(width: 8),
-                              if (widget.canCompact || widget.isCompacting) ...[
-                                _ToolChip(
-                                  icon: widget.isCompacting
-                                      ? Icons.hourglass_top_rounded
-                                      : Icons.content_cut_rounded,
-                                  label: compactChipLabel,
-                                  onPressed: widget.isCompacting
-                                      ? null
-                                      : widget.onCompact,
-                                  highlighted: widget.isCompacting,
-                                  showSpinner: widget.isCompacting,
-                                ),
-                                const SizedBox(width: 8),
-                              ],
-                              _ToolChip(
-                                icon: Icons.terminal,
-                                label: '日志',
-                                onPressed: widget.onOpenLogs,
-                              ),
-                              const SizedBox(width: 8),
-                              _ToolChip(
-                                icon: Icons.extension_outlined,
-                                label: 'Skill',
-                                onPressed: widget.onOpenSkills,
-                              ),
-                              const SizedBox(width: 8),
-                              _ToolChip(
-                                icon: Icons.psychology_alt_outlined,
-                                label: 'Memory',
-                                onPressed: widget.onOpenMemory,
-                              ),
-                              const SizedBox(width: 8),
-                              _ToolChip(
-                                icon: Icons.verified_user_outlined,
-                                label: '权限 · ${widget.permissionRuleSummary}',
-                                onPressed: widget.onOpenPermissions,
-                              ),
-                              const SizedBox(width: 8),
-                              _ToolChip(
-                                key: const ValueKey(
-                                  'command-bar-model-button',
-                                ),
-                                icon: Icons.model_training_outlined,
-                                label: '模型 · ${widget.modelSummary}',
-                                onPressed: widget.onOpenModels,
-                              ),
-                            ],
-                          ),
+                LayoutBuilder(
+                  builder: (context, constraints) {
+                    final compactRail = constraints.maxWidth < 390;
+                    return Container(
+                      padding: const EdgeInsets.fromLTRB(8, 8, 8, 8),
+                      decoration: BoxDecoration(
+                        color: railColor,
+                        borderRadius: BorderRadius.circular(24),
+                        border: Border.all(
+                          color: scheme.outlineVariant
+                              .withValues(alpha: isLight ? 0.46 : 0.26),
                         ),
                       ),
-                      const SizedBox(width: 10),
-                      _ContextWindowUsageButton(
-                        usage: widget.contextWindowUsage,
-                        onPressed: widget.onOpenContextWindowUsage,
-                      ),
-                      const SizedBox(width: 8),
-                      DecoratedBox(
-                        decoration: BoxDecoration(
-                          color: inputColor,
-                          borderRadius: BorderRadius.circular(999),
-                          border: Border.all(
-                            color: scheme.outlineVariant.withValues(alpha: 0.4),
-                          ),
-                        ),
-                        child: Padding(
-                          padding: const EdgeInsets.symmetric(horizontal: 12),
-                          child: DropdownButtonHideUnderline(
-                            child: DropdownButton<String>(
-                              value: permissionMode,
-                              borderRadius: BorderRadius.circular(16),
-                              style: theme.textTheme.bodySmall?.copyWith(
-                                fontWeight: FontWeight.w600,
+                      child: Row(
+                        children: [
+                          Expanded(
+                            child: SingleChildScrollView(
+                              scrollDirection: Axis.horizontal,
+                              child: Row(
+                                children: [
+                                  _ToolChip(
+                                    icon: Icons.history,
+                                    label: '会话',
+                                    onPressed: widget.onOpenSessions,
+                                  ),
+                                  const SizedBox(width: 8),
+                                  if (widget.canCompact ||
+                                      widget.isCompacting) ...[
+                                    _ToolChip(
+                                      icon: widget.isCompacting
+                                          ? Icons.hourglass_top_rounded
+                                          : Icons.content_cut_rounded,
+                                      label: compactChipLabel,
+                                      onPressed: widget.isCompacting
+                                          ? null
+                                          : widget.onCompact,
+                                      highlighted: widget.isCompacting,
+                                      showSpinner: widget.isCompacting,
+                                    ),
+                                    const SizedBox(width: 8),
+                                  ],
+                                  _ToolChip(
+                                    icon: Icons.terminal,
+                                    label: '日志',
+                                    onPressed: widget.onOpenLogs,
+                                  ),
+                                  const SizedBox(width: 8),
+                                  _ToolChip(
+                                    icon: Icons.extension_outlined,
+                                    label: 'Skill',
+                                    onPressed: widget.onOpenSkills,
+                                  ),
+                                  const SizedBox(width: 8),
+                                  _ToolChip(
+                                    icon: Icons.psychology_alt_outlined,
+                                    label: 'Memory',
+                                    onPressed: widget.onOpenMemory,
+                                  ),
+                                  const SizedBox(width: 8),
+                                  _ToolChip(
+                                    icon: Icons.verified_user_outlined,
+                                    label:
+                                        '权限 · ${widget.permissionRuleSummary}',
+                                    onPressed: widget.onOpenPermissions,
+                                  ),
+                                  const SizedBox(width: 8),
+                                  _ToolChip(
+                                    key: const ValueKey(
+                                      'command-bar-model-button',
+                                    ),
+                                    icon: Icons.model_training_outlined,
+                                    label: '模型 · ${widget.modelSummary}',
+                                    onPressed: widget.onOpenModels,
+                                  ),
+                                ],
                               ),
-                              items: permissionModeItems,
-                              onChanged: (value) {
-                                if (value != null) {
-                                  widget.onPermissionModeChanged(value);
-                                }
-                              },
                             ),
                           ),
-                        ),
+                          SizedBox(width: compactRail ? 6 : 10),
+                          _ContextWindowUsageButton(
+                            usage: widget.contextWindowUsage,
+                            onPressed: widget.onOpenContextWindowUsage,
+                          ),
+                          const SizedBox(width: 8),
+                          _PermissionModeIconButton(
+                            value: permissionMode,
+                            options: permissionModeOptions,
+                            inputColor: inputColor,
+                            onSelected: widget.onPermissionModeChanged,
+                          ),
+                          if (isCodex) ...[
+                            const SizedBox(width: 8),
+                            _TargetModeSwitch(
+                              enabled: widget.codexTargetMode,
+                              onChanged: widget.onCodexTargetModeChanged,
+                            ),
+                          ],
+                        ],
                       ),
-                      if (isCodex) ...[
-                        const SizedBox(width: 8),
-                        _TargetModeSwitch(
-                          enabled: widget.codexTargetMode,
-                          onChanged: widget.onCodexTargetModeChanged,
-                        ),
-                      ],
-                    ],
-                  ),
+                    );
+                  },
                 ),
                 const SizedBox(height: 10),
                 Container(
@@ -529,19 +511,33 @@ class _CommandInputBarState extends State<CommandInputBar> {
                             ),
                           ),
                           Padding(
-                            padding: const EdgeInsets.fromLTRB(0, 0, 4, 7),
+                            padding: const EdgeInsets.fromLTRB(0, 0, 2, 6),
                             child: SizedBox(
-                              width: 42,
-                              height: 42,
+                              key:
+                                  const ValueKey('command-image-action-button'),
+                              width: _inputActionButtonSize,
+                              height: _inputActionButtonSize,
                               child: IconButton.filledTonal(
                                 onPressed: _inputLocked || _pickingImage
                                     ? null
                                     : _attachImage,
                                 tooltip: '添加图片',
+                                style: IconButton.styleFrom(
+                                  fixedSize: const Size.square(
+                                    _inputActionButtonSize,
+                                  ),
+                                  minimumSize: const Size.square(
+                                    _inputActionButtonSize,
+                                  ),
+                                  padding: EdgeInsets.zero,
+                                  tapTargetSize:
+                                      MaterialTapTargetSize.shrinkWrap,
+                                  visualDensity: VisualDensity.compact,
+                                ),
                                 icon: _pickingImage
                                     ? SizedBox(
-                                        width: 18,
-                                        height: 18,
+                                        width: _inputActionIconSize,
+                                        height: _inputActionIconSize,
                                         child: CircularProgressIndicator(
                                           strokeWidth: 2,
                                           color: scheme.primary,
@@ -549,16 +545,17 @@ class _CommandInputBarState extends State<CommandInputBar> {
                                       )
                                     : const Icon(
                                         Icons.image_outlined,
-                                        size: 20,
+                                        size: _inputActionIconSize,
                                       ),
                               ),
                             ),
                           ),
                           Padding(
-                            padding: const EdgeInsets.fromLTRB(0, 0, 7, 7),
+                            padding: const EdgeInsets.fromLTRB(0, 0, 4, 6),
                             child: SizedBox(
-                              width: 42,
-                              height: 42,
+                              key: const ValueKey('command-send-action-button'),
+                              width: _inputActionButtonSize,
+                              height: _inputActionButtonSize,
                               child: ValueListenableBuilder<TextEditingValue>(
                                 valueListenable: _controller,
                                 builder: (context, value, _) {
@@ -580,8 +577,16 @@ class _CommandInputBarState extends State<CommandInputBar> {
                                           : showStopAction
                                               ? scheme.onError
                                               : scheme.onPrimary,
+                                      fixedSize: const Size.square(
+                                        _inputActionButtonSize,
+                                      ),
                                       padding: EdgeInsets.zero,
-                                      minimumSize: const Size(42, 42),
+                                      minimumSize: const Size.square(
+                                        _inputActionButtonSize,
+                                      ),
+                                      tapTargetSize:
+                                          MaterialTapTargetSize.shrinkWrap,
+                                      visualDensity: VisualDensity.compact,
                                       shape: RoundedRectangleBorder(
                                         borderRadius:
                                             BorderRadius.circular(999),
@@ -591,7 +596,7 @@ class _CommandInputBarState extends State<CommandInputBar> {
                                       showStopAction
                                           ? Icons.stop_rounded
                                           : Icons.arrow_upward,
-                                      size: 18,
+                                      size: _inputActionIconSize,
                                     ),
                                   );
                                 },
@@ -716,6 +721,105 @@ class _ContextWindowUsageButton extends StatelessWidget {
         ),
       ),
     );
+  }
+}
+
+class _PermissionModeIconButton extends StatelessWidget {
+  const _PermissionModeIconButton({
+    required this.value,
+    required this.options,
+    required this.inputColor,
+    required this.onSelected,
+  });
+
+  final String value;
+  final List<PermissionModeOption> options;
+  final Color inputColor;
+  final ValueChanged<String> onSelected;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final selected = _selectedOption;
+    final tooltip = '权限：${selected.label}';
+
+    return Tooltip(
+      message: tooltip,
+      child: Semantics(
+        button: true,
+        label: tooltip,
+        child: PopupMenuButton<String>(
+          key: const ValueKey('permission-mode-icon-button'),
+          initialValue: value,
+          tooltip: tooltip,
+          onSelected: onSelected,
+          itemBuilder: (context) => [
+            for (final option in options)
+              PopupMenuItem<String>(
+                value: option.value,
+                child: Row(
+                  children: [
+                    Icon(
+                      option.value == value
+                          ? Icons.check_circle_rounded
+                          : _permissionModeIcon(option.value),
+                      size: 18,
+                      color: option.value == value
+                          ? scheme.primary
+                          : scheme.onSurfaceVariant,
+                    ),
+                    const SizedBox(width: 10),
+                    Text(option.label),
+                  ],
+                ),
+              ),
+          ],
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              color: inputColor,
+              borderRadius: BorderRadius.circular(999),
+              border: Border.all(
+                color: scheme.outlineVariant.withValues(alpha: 0.4),
+              ),
+            ),
+            child: SizedBox(
+              width: 44,
+              height: 40,
+              child: Center(
+                child: Icon(
+                  _permissionModeIcon(value),
+                  size: 20,
+                  color: scheme.onSurface,
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  PermissionModeOption get _selectedOption {
+    for (final option in options) {
+      if (option.value == value) {
+        return option;
+      }
+    }
+    return options.first;
+  }
+}
+
+IconData _permissionModeIcon(String value) {
+  switch (value) {
+    case 'bypassPermissions':
+      return Icons.lock_open_rounded;
+    case 'auto':
+      return Icons.rate_review_outlined;
+    case 'config':
+      return Icons.tune_rounded;
+    case 'default':
+    default:
+      return Icons.lock_outline_rounded;
   }
 }
 
@@ -938,38 +1042,37 @@ class _TargetModeSwitch extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    return DecoratedBox(
-      decoration: BoxDecoration(
-        color: scheme.surfaceContainerHigh.withValues(alpha: 0.82),
-        borderRadius: BorderRadius.circular(999),
-        border: Border.all(
-          color: scheme.outlineVariant.withValues(alpha: 0.38),
-        ),
-      ),
-      child: Padding(
-        padding: const EdgeInsets.only(left: 10, right: 4),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(
-              Icons.track_changes_outlined,
-              size: 16,
-              color: scheme.onSurfaceVariant,
+    return Tooltip(
+      message: '请求目标',
+      child: Semantics(
+        label: '请求目标',
+        toggled: enabled,
+        child: DecoratedBox(
+          decoration: BoxDecoration(
+            color: scheme.surfaceContainerHigh.withValues(alpha: 0.82),
+            borderRadius: BorderRadius.circular(999),
+            border: Border.all(
+              color: scheme.outlineVariant.withValues(alpha: 0.38),
             ),
-            const SizedBox(width: 6),
-            Text(
-              '请求目标',
-              style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                    fontWeight: FontWeight.w600,
-                    color: scheme.onSurface,
-                  ),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.only(left: 10, right: 4),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  Icons.track_changes_outlined,
+                  size: 16,
+                  color: scheme.onSurfaceVariant,
+                ),
+                Switch.adaptive(
+                  value: enabled,
+                  onChanged: onChanged,
+                  materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                ),
+              ],
             ),
-            Switch.adaptive(
-              value: enabled,
-              onChanged: onChanged,
-              materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-            ),
-          ],
+          ),
         ),
       ),
     );

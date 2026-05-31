@@ -296,8 +296,59 @@ void main() {
     expect(find.text('默认权限'), findsAtLeastNWidgets(1));
     expect(find.text('自动模式'), findsOneWidget);
     expect(find.text('完全访问权限'), findsOneWidget);
+    expect(find.text('跳过审批'), findsNothing);
     expect(find.text('自动审查'), findsNothing);
     expect(find.text('自定义(config.toml)'), findsNothing);
+
+    await controller.disposeController();
+  });
+
+  testWidgets('连接设置里 Codex 沙箱范围和审批策略分开显示', (tester) async {
+    await _useTallSurface(tester);
+    final service = _FakeMobileVcWsService();
+    final controller = SessionController(service: service);
+    await controller.saveConfig(
+      const AppConfig(
+        cwd: '/workspace',
+        engine: 'codex',
+        codexSandboxMode: 'workspace-write',
+        permissionMode: 'default',
+      ),
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SessionHomePage(controller: controller),
+      ),
+    );
+    await _pumpFrames(tester);
+
+    await tester.tap(find.byIcon(Icons.settings_outlined));
+    await _pumpFrames(tester);
+    await tester.ensureVisible(find.text('Codex 沙箱范围'));
+    await tester.pump();
+
+    expect(find.text('Codex 沙箱范围'), findsOneWidget);
+    expect(find.text('Codex 审批策略'), findsOneWidget);
+    expect(find.text('Codex Sandbox'), findsNothing);
+    expect(find.text('Codex 权限'), findsNothing);
+
+    await tester.tap(find.text('工作区写入'));
+    await tester.pumpAndSettle();
+    expect(find.text('关闭沙箱'), findsOneWidget);
+    await tester.tap(find.text('关闭沙箱').last);
+    await tester.pumpAndSettle();
+
+    final approvalDropdown = find.byKey(
+      const ValueKey('connection-config-codex-permission-mode'),
+    );
+    await tester.tap(approvalDropdown);
+    await tester.pumpAndSettle();
+
+    expect(find.text('跳过审批'), findsOneWidget);
+    expect(find.text('完全访问权限'), findsNothing);
+    expect(find.text('自动审查'), findsOneWidget);
+    expect(find.text('自定义(config.toml)'), findsOneWidget);
 
     await controller.disposeController();
   });

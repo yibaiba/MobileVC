@@ -11,7 +11,7 @@ class PermissionModeOption {
 const codexPermissionModeOptions = <PermissionModeOption>[
   PermissionModeOption(value: 'default', label: '默认权限'),
   PermissionModeOption(value: 'auto', label: '自动审查'),
-  PermissionModeOption(value: 'bypassPermissions', label: '完全访问权限'),
+  PermissionModeOption(value: 'bypassPermissions', label: '跳过审批'),
   PermissionModeOption(value: 'config', label: '自定义(config.toml)'),
 ];
 

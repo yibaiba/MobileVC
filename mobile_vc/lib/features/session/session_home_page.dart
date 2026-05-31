@@ -1225,7 +1225,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
                             DropdownButtonFormField<String>(
                               initialValue: selectedCodexSandboxMode,
                               decoration: const InputDecoration(
-                                labelText: 'Codex Sandbox',
+                                labelText: 'Codex 沙箱范围',
                               ),
                               items: const [
                                 DropdownMenuItem(
@@ -1234,7 +1234,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
                                 ),
                                 DropdownMenuItem(
                                   value: 'danger-full-access',
-                                  child: Text('完全访问权限'),
+                                  child: Text('关闭沙箱'),
                                 ),
                                 DropdownMenuItem(
                                   value: 'read-only',
@@ -1285,7 +1285,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
                               ),
                               initialValue: selectedPermissionMode,
                               decoration: const InputDecoration(
-                                labelText: 'Codex 权限',
+                                labelText: 'Codex 审批策略',
                               ),
                               items: permissionModeItems,
                               onChanged: connectionBusy

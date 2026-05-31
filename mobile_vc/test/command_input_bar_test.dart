@@ -94,12 +94,14 @@ void main() {
         ),
       );
 
-      await tester.tap(find.byType(DropdownButton<String>));
+      await tester
+          .tap(find.byKey(const ValueKey('permission-mode-icon-button')));
       await tester.pumpAndSettle();
 
-      expect(find.text('默认权限'), findsAtLeastNWidgets(1));
+      expect(find.text('默认权限'), findsOneWidget);
       expect(find.text('自动模式'), findsOneWidget);
       expect(find.text('完全访问权限'), findsOneWidget);
+      expect(find.text('跳过审批'), findsNothing);
       expect(find.text('自动审查'), findsNothing);
       expect(find.text('自定义(config.toml)'), findsNothing);
 
@@ -108,7 +110,7 @@ void main() {
       expect(changedMode, 'bypassPermissions');
     });
 
-    testWidgets('Codex 模式显示 Codex 权限文案和请求目标开关', (tester) async {
+    testWidgets('Codex 模式显示图标权限菜单和请求目标开关', (tester) async {
       var targetMode = false;
       await tester.pumpWidget(
         _buildTestApp(
@@ -120,13 +122,19 @@ void main() {
         ),
       );
 
-      expect(find.text('请求目标'), findsOneWidget);
-      await tester.tap(find.byType(DropdownButton<String>));
+      expect(find.text('请求目标'), findsNothing);
+      expect(find.text('完全访问权限'), findsNothing);
+      expect(find.text('跳过审批'), findsNothing);
+      expect(find.byKey(const ValueKey('permission-mode-icon-button')),
+          findsOneWidget);
+      await tester
+          .tap(find.byKey(const ValueKey('permission-mode-icon-button')));
       await tester.pumpAndSettle();
 
-      expect(find.text('默认权限'), findsAtLeastNWidgets(1));
+      expect(find.text('默认权限'), findsOneWidget);
       expect(find.text('自动审查'), findsOneWidget);
-      expect(find.text('完全访问权限'), findsOneWidget);
+      expect(find.text('跳过审批'), findsOneWidget);
+      expect(find.text('完全访问权限'), findsNothing);
       expect(find.text('自定义(config.toml)'), findsOneWidget);
 
       await tester.tap(find.text('自动审查'));
@@ -134,6 +142,28 @@ void main() {
       await tester.tap(find.byType(Switch).first);
       await tester.pump();
       expect(targetMode, isTrue);
+    });
+
+    testWidgets('Codex 窄屏工具栏不会裁切请求目标开关', (tester) async {
+      tester.view.devicePixelRatio = 1;
+      tester.view.physicalSize = const Size(360, 780);
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+
+      await tester.pumpWidget(
+        _buildTestApp(
+          showClaudeMode: true,
+          currentEngine: 'codex',
+          configuredEngine: 'codex',
+        ),
+      );
+      await tester.pump();
+
+      expect(tester.takeException(), isNull);
+      final barRect = tester.getRect(find.byType(CommandInputBar));
+      final switchRect = tester.getRect(find.byType(Switch).first);
+      expect(switchRect.left, greaterThanOrEqualTo(barRect.left));
+      expect(switchRect.right, lessThanOrEqualTo(barRect.right));
     });
 
     testWidgets('canStop 为 true 时优先显示停止按钮', (tester) async {
@@ -331,6 +361,21 @@ void main() {
       await tester.pumpWidget(_buildTestApp());
 
       expect(find.byType(BackdropFilter), findsNothing);
+    });
+
+    testWidgets('输入框右侧图片和发送按钮保持紧凑尺寸', (tester) async {
+      await tester.pumpWidget(_buildTestApp());
+
+      expect(
+        tester
+            .getSize(find.byKey(const ValueKey('command-image-action-button'))),
+        const Size.square(36),
+      );
+      expect(
+        tester
+            .getSize(find.byKey(const ValueKey('command-send-action-button'))),
+        const Size.square(36),
+      );
     });
 
     testWidgets('键盘 inset 不会额外撑高输入栏底部 padding', (tester) async {
