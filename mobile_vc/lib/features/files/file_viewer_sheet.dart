@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
+import 'package:flutter_markdown/flutter_markdown.dart';
 
 import '../../data/models/events.dart';
 import '../../data/models/session_models.dart';
@@ -76,6 +77,7 @@ class FileViewerSheet extends StatefulWidget {
 class _FileViewerSheetState extends State<FileViewerSheet> {
   final TextEditingController _controller = TextEditingController();
   final FocusNode _focusNode = FocusNode();
+  bool _markdownPreview = true;
 
   bool get _inputLocked =>
       widget.shouldShowPermissionChoices ||
@@ -138,6 +140,9 @@ class _FileViewerSheetState extends State<FileViewerSheet> {
     if (_inputLocked && !oldLocked) {
       _focusNode.unfocus();
     }
+    if (oldWidget.file?.path != widget.file?.path && _isMarkdown(widget.file)) {
+      _markdownPreview = true;
+    }
   }
 
   @override
@@ -164,6 +169,7 @@ class _FileViewerSheetState extends State<FileViewerSheet> {
     final interaction = widget.pendingInteraction;
     final showPermissionBar =
         widget.shouldShowPermissionChoices && !widget.shouldShowReviewChoices;
+    final showMarkdownToggle = _isMarkdown(result) && !widget.isDiffMode;
     return SafeArea(
       top: false,
       child: AnimatedPadding(
@@ -293,6 +299,29 @@ class _FileViewerSheetState extends State<FileViewerSheet> {
                     compact: true,
                   ),
                   const SizedBox(width: 6),
+                  if (showMarkdownToggle) ...[
+                    SegmentedButton<bool>(
+                      segments: const [
+                        ButtonSegment<bool>(
+                          value: true,
+                          icon: Icon(Icons.preview_rounded, size: 16),
+                          label: Text('预览'),
+                        ),
+                        ButtonSegment<bool>(
+                          value: false,
+                          icon: Icon(Icons.code_rounded, size: 16),
+                          label: Text('源码'),
+                        ),
+                      ],
+                      selected: {_markdownPreview},
+                      onSelectionChanged: (selection) {
+                        setState(() {
+                          _markdownPreview = selection.first;
+                        });
+                      },
+                    ),
+                    const SizedBox(width: 6),
+                  ],
                   FilledButton.tonalIcon(
                     onPressed: result == null ? null : widget.onUseAsContext,
                     style: FilledButton.styleFrom(
@@ -561,6 +590,51 @@ class _FileViewerSheetState extends State<FileViewerSheet> {
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
     if (result.isText) {
+      if (_isMarkdown(result) && _markdownPreview) {
+        return Container(
+          width: double.infinity,
+          decoration: BoxDecoration(
+            color: scheme.surfaceContainerLowest,
+            borderRadius: BorderRadius.circular(18),
+            border: Border.all(
+              color: scheme.outlineVariant.withValues(alpha: 0.45),
+            ),
+          ),
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(18),
+            child: Markdown(
+              data: result.content,
+              selectable: true,
+              padding: const EdgeInsets.all(14),
+              styleSheet: MarkdownStyleSheet.fromTheme(theme).copyWith(
+                p: theme.textTheme.bodyMedium?.copyWith(
+                  color: scheme.onSurface,
+                  height: 1.55,
+                ),
+                code: theme.textTheme.bodyMedium?.copyWith(
+                  color: scheme.onSurface,
+                  fontFamily: 'monospace',
+                  backgroundColor:
+                      scheme.surfaceContainerHighest.withValues(alpha: 0.55),
+                ),
+                codeblockDecoration: BoxDecoration(
+                  color: scheme.surfaceContainerHighest.withValues(alpha: 0.55),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                blockquoteDecoration: BoxDecoration(
+                  color: scheme.surfaceContainerHigh.withValues(alpha: 0.55),
+                  border: Border(
+                    left: BorderSide(
+                      color: scheme.primary.withValues(alpha: 0.7),
+                      width: 4,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+      }
       return SingleChildScrollView(
         child: Container(
           width: double.infinity,
@@ -622,6 +696,14 @@ class _FileViewerSheetState extends State<FileViewerSheet> {
     }
 
     return _buildUnsupportedPreview(context, '该文件不是文本文件，当前无法预览。');
+  }
+
+  bool _isMarkdown(FileReadResult? result) {
+    if (result == null || !result.isText) {
+      return false;
+    }
+    final extension = result.extension.toLowerCase();
+    return extension == 'md' || extension == 'markdown';
   }
 
   Widget _buildUnsupportedPreview(BuildContext context, String message) {
