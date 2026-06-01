@@ -1129,6 +1129,7 @@ void main() {
         cwd: '/workspace/MobileVC',
         engine: 'codex',
         permissionMode: 'bypassPermissions',
+        codexSandboxMode: 'danger-full-access',
       ));
       await controller.connect();
       service.emit(
@@ -1172,6 +1173,7 @@ void main() {
       expect(payload['engine'], 'codex');
       expect(payload['cwd'], '/workspace/MobileVC');
       expect(payload['permissionMode'], 'bypassPermissions');
+      expect(payload['codexSandboxMode'], 'danger-full-access');
       expect(payload['source'], 'compact');
       expect(payload['targetType'], 'compact');
     });
@@ -4826,6 +4828,7 @@ void main() {
       final payload = service.sentPayloads.single;
       expect(payload['action'], 'input');
       expect(payload['data'], '看下这张图\n');
+      expect(payload['codexSandboxMode'], 'workspace-write');
       expect(payload.containsKey('imageAttachments'), isTrue);
       expect(controller.canStopCurrentRun, isTrue);
     });
@@ -4913,6 +4916,47 @@ void main() {
       expect(resumes.single['engine'], 'codex');
       expect(resumes.single['codexSandboxMode'], 'danger-full-access');
       expect(resumes.single['permissionMode'], 'config');
+    });
+
+    test('Codex thread id 恢复时即使 runtime 为空也带入当前沙箱配置', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+      await controller.saveConfig(
+        controller.config.copyWith(
+          engine: 'claude',
+          codexSandboxMode: 'danger-full-access',
+          permissionMode: 'bypassPermissions',
+        ),
+      );
+
+      await controller.connect();
+      service.emit(
+        SessionHistoryEvent(
+          timestamp: _timestamp,
+          sessionId: 'codex-thread:early',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_history'},
+          summary: const SessionSummary(
+            id: 'codex-thread:early',
+            title: 'Codex thread',
+          ),
+          resumeRuntimeMeta: const RuntimeMeta(),
+        ),
+      );
+      await _flushEvents();
+
+      service.sentPayloads.clear();
+      controller.resumeConnectionIfNeeded();
+
+      final resumes = service.sentPayloads
+          .where((payload) => payload['action'] == 'session_resume')
+          .toList();
+      expect(resumes, hasLength(1));
+      expect(resumes.single['engine'], 'codex');
+      expect(resumes.single['codexSandboxMode'], 'danger-full-access');
+      expect(resumes.single['permissionMode'], 'bypassPermissions');
     });
 
     test('前台恢复空 runtime 元信息时不会按当前配置误带 Codex 沙箱', () async {

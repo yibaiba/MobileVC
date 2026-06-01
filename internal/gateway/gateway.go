@@ -2058,6 +2058,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 					TargetText:        reqEvent.TargetText,
 					Command:           reqEvent.Command,
 					Engine:            reqEvent.Engine,
+					CodexSandboxMode:  reqEvent.RuntimeMeta.CodexSandboxMode,
 					CWD:               reqEvent.CWD,
 					PermissionMode:    reqEvent.PermissionMode,
 					ClaudeSessionUUID: lookupClaudeSessionUUID(sessionID),

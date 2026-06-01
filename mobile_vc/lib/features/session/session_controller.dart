@@ -2233,6 +2233,20 @@ class SessionController extends ChangeNotifier {
     return payload;
   }
 
+  bool get _currentSessionShouldSendCodexSandboxMode =>
+      _runtimeMetaIsCodex(_liveRuntimeMeta) ||
+      _runtimeMetaIsCodex(currentMeta) ||
+      _selectedSessionId.trim().toLowerCase().startsWith('codex-thread:') ||
+      _sessionSummaryIsCodex(_selectedSessionSummary);
+
+  void _applyCodexSandboxModeIfNeeded(Map<String, dynamic> payload) {
+    if (_currentSessionShouldSendCodexSandboxMode) {
+      payload['codexSandboxMode'] = _config.codexSandboxMode;
+    } else {
+      payload.remove('codexSandboxMode');
+    }
+  }
+
   String _aiTurnModelForEngine(String engine) {
     final normalizedEngine = engine.trim().toLowerCase();
     final configured = _configuredModelForEngine(normalizedEngine).trim();
@@ -2832,6 +2846,7 @@ class SessionController extends ChangeNotifier {
     final runtimeState =
         (_agentState?.state ?? _sessionState?.state ?? '').trim();
     final shouldSendCodexRuntimeMeta = _runtimeMetaIsCodex(_liveRuntimeMeta) ||
+        sessionId.toLowerCase().startsWith('codex-thread:') ||
         _sessionSummaryIsCodex(_selectedSessionSummary);
     final codexPermissionMode =
         normalizePermissionModeForEngine(_config.permissionMode, 'codex');
@@ -4604,6 +4619,7 @@ class SessionController extends ChangeNotifier {
       ...currentMeta.toJson(),
       'permissionMode': _config.permissionMode,
     };
+    _applyCodexSandboxModeIfNeeded(payload);
     if (!_sendUserVisibleAction(payload, userText: value, label: '命令')) {
       return;
     }
@@ -4639,6 +4655,7 @@ class SessionController extends ChangeNotifier {
         engine: 'codex',
         cwd: effectiveCwd,
         permissionMode: _config.permissionMode,
+        codexSandboxMode: _config.codexSandboxMode,
         claudeLifecycle: 'active',
       ),
     );
@@ -4649,6 +4666,7 @@ class SessionController extends ChangeNotifier {
       'cwd': effectiveCwd,
       'engine': 'codex',
       'permissionMode': _config.permissionMode,
+      'codexSandboxMode': _config.codexSandboxMode,
     });
     if (!sent) {
       _isCompacting = false;
@@ -4978,6 +4996,7 @@ class SessionController extends ChangeNotifier {
       'data': '$value\n',
       'permissionMode': _config.permissionMode,
     };
+    _applyCodexSandboxModeIfNeeded(payload);
     if (imageAttachments.isNotEmpty) {
       payload['imageAttachments'] =
           imageAttachments.map((attachment) => attachment.toJson()).toList();

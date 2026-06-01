@@ -380,6 +380,54 @@ func TestSendInputOrResumeRestartsDetachedResumeSession(t *testing.T) {
 	}
 }
 
+func TestSendInputOrResumePreservesCodexYoloRuntimeMeta(t *testing.T) {
+	resumed := newResumeStubRunner("thread-yolo", true)
+	svc := NewService("s1", Dependencies{
+		NewExecRunner: func() engine.Runner { return newResumeStubRunner("", true) },
+		NewPtyRunner:  func() engine.Runner { return resumed },
+	})
+	svc.manager.updateResumeSessionID("thread-yolo")
+
+	err := svc.SendInputOrResume(context.Background(), "s1", ExecuteRequest{
+		Command:        "codex",
+		CWD:            "/tmp/project",
+		Mode:           engine.ModePTY,
+		PermissionMode: "bypassPermissions",
+		RuntimeMeta: protocol.RuntimeMeta{
+			Command:          "codex",
+			Engine:           "codex",
+			CWD:              "/tmp/project",
+			CodexSandboxMode: "danger-full-access",
+			PermissionMode:   "bypassPermissions",
+			ResumeSessionID:  "thread-yolo",
+		},
+	}, InputRequest{
+		Data: "check github\n",
+		RuntimeMeta: protocol.RuntimeMeta{
+			Source:           "input",
+			CodexSandboxMode: "danger-full-access",
+			PermissionMode:   "bypassPermissions",
+		},
+	}, func(any) {})
+	if err != nil {
+		t.Fatalf("send input or resume: %v", err)
+	}
+
+	waitSignal(t, resumed.started, "detached codex resume runner start")
+	if !strings.HasPrefix(strings.ToLower(resumed.lastReq.Command), "codex resume thread-yolo") {
+		t.Fatalf("expected codex resume command, got %q", resumed.lastReq.Command)
+	}
+	if resumed.lastReq.PermissionMode != "bypassPermissions" {
+		t.Fatalf("expected bypass permission mode, got %q", resumed.lastReq.PermissionMode)
+	}
+	if resumed.lastReq.RuntimeMeta.CodexSandboxMode != "danger-full-access" {
+		t.Fatalf("expected danger-full-access sandbox, got %q", resumed.lastReq.RuntimeMeta.CodexSandboxMode)
+	}
+	if len(resumed.writes) != 1 || string(resumed.writes[0]) != "check github\n" {
+		t.Fatalf("unexpected resumed runner writes: %#v", resumed.writes)
+	}
+}
+
 func TestSendInputOrResumeAllowsSlowDetachedResumeStartup(t *testing.T) {
 	resumed := newResumeStubRunner("resume-detached", true)
 	resumed.writeDelay = 4500 * time.Millisecond

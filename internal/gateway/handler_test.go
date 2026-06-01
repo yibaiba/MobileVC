@@ -2745,6 +2745,43 @@ func TestHandlerExecFlow(t *testing.T) {
 	requireAgentState(t, readUntilType(t, conn, protocol.EventTypeAgentState), "IDLE", false)
 }
 
+func TestHandlerExecPreservesCodexSandboxMode(t *testing.T) {
+	ptyRunner := newSwitchableStubRunner()
+
+	h := newTestHandler()
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	h.SessionStore = tempStore
+	h.NewPtyRunner = func() engine.Runner { return ptyRunner }
+
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+	_ = createHistorySessionForHandlerTest(t, h, conn, "exec-codex-sandbox")
+
+	if err := conn.WriteJSON(protocol.ExecRequestEvent{
+		ClientEvent:    protocol.ClientEvent{Action: "exec"},
+		Command:        "codex",
+		Mode:           "pty",
+		PermissionMode: "bypassPermissions",
+		RuntimeMeta: protocol.RuntimeMeta{
+			Engine:           "codex",
+			CodexSandboxMode: "danger-full-access",
+		},
+	}); err != nil {
+		t.Fatalf("write exec request: %v", err)
+	}
+	ptyRunner.WaitStarted(t)
+
+	if got := ptyRunner.req.RuntimeMeta.CodexSandboxMode; got != "danger-full-access" {
+		t.Fatalf("codex sandbox mode: %q", got)
+	}
+	if got := ptyRunner.req.PermissionMode; got != "bypassPermissions" {
+		t.Fatalf("permission mode: %q", got)
+	}
+}
+
 func TestHandlerRuntimeProcessListReturnsActiveTree(t *testing.T) {
 	execRunner := newHoldingStubRunner()
 	execRunner.processRef = engine.ProcessRef{
