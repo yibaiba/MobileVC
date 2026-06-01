@@ -2,6 +2,7 @@
 /server
 /mobilevc-server
 /mobilevc-relay
+/qr-relay-pairing*.png
 /relay
 /*.apk
 /*.aab
