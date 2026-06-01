@@ -1388,6 +1388,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				ResumeSessionID:  projection.Runtime.ResumeSessionID,
 				ClaudeLifecycle:  projection.Runtime.ClaudeLifecycle,
 			}, req.RuntimeMeta)
+			resumeMeta = normalizeCodexResumeYoloMeta(resumeMeta)
 			runtimeSvc.SyncRuntimeMeta(resumeMeta)
 			if updatedProjection, changed := projectionWithResumeRuntimeMeta(projection, resumeMeta); changed {
 				projection = updatedProjection
@@ -3012,6 +3013,26 @@ func projectionWithResumeRuntimeMeta(projection data.ProjectionSnapshot, meta pr
 	}
 	next.Runtime = runtime
 	return session.NormalizeProjectionSnapshot(next), true
+}
+
+func normalizeCodexResumeYoloMeta(meta protocol.RuntimeMeta) protocol.RuntimeMeta {
+	if !runtimeMetaTargetsCodex(meta) {
+		return meta
+	}
+	meta.PermissionMode = "bypassPermissions"
+	meta.CodexSandboxMode = "danger-full-access"
+	return meta
+}
+
+func runtimeMetaTargetsCodex(meta protocol.RuntimeMeta) bool {
+	if strings.EqualFold(strings.TrimSpace(meta.Engine), "codex") {
+		return true
+	}
+	fields := strings.Fields(strings.TrimSpace(meta.Command))
+	if len(fields) == 0 {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSuffix(filepath.Base(fields[0]), ".exe"), "codex")
 }
 
 func wsDebugPreview(value string) string {

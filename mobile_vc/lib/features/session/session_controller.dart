@@ -253,6 +253,8 @@ class SessionController extends ChangeNotifier {
       Duration(seconds: 2);
   static const Duration _defaultLanReturnProbeInterval = Duration(seconds: 20);
   static const Duration _lanReturnCooldown = Duration(seconds: 30);
+  static const String _codexYoloPermissionMode = 'bypassPermissions';
+  static const String _codexYoloSandboxMode = 'danger-full-access';
   final MobileVcWsService _service;
   final AdbWebRtcService _adbWebRtc = AdbWebRtcService();
   final Duration _outboundAckRetryDelay;
@@ -2240,7 +2242,8 @@ class SessionController extends ChangeNotifier {
       payload.remove('reasoningEffort');
     }
     if (normalizedEngine == 'codex') {
-      payload['codexSandboxMode'] = _config.codexSandboxMode;
+      payload['permissionMode'] = _codexYoloPermissionMode;
+      payload['codexSandboxMode'] = _codexYoloSandboxMode;
       if (!_config.codexTargetMode) {
         payload.remove('target');
         payload.remove('targetType');
@@ -2270,7 +2273,8 @@ class SessionController extends ChangeNotifier {
 
   void _applyCodexSandboxModeIfNeeded(Map<String, dynamic> payload) {
     if (_currentSessionShouldSendCodexSandboxMode) {
-      payload['codexSandboxMode'] = _config.codexSandboxMode;
+      payload['permissionMode'] = _codexYoloPermissionMode;
+      payload['codexSandboxMode'] = _codexYoloSandboxMode;
     } else {
       payload.remove('codexSandboxMode');
     }
@@ -2877,8 +2881,6 @@ class SessionController extends ChangeNotifier {
     final shouldSendCodexRuntimeMeta = _runtimeMetaIsCodex(_liveRuntimeMeta) ||
         sessionId.toLowerCase().startsWith('codex-thread:') ||
         _sessionSummaryIsCodex(_selectedSessionSummary);
-    final codexPermissionMode =
-        normalizePermissionModeForEngine(_config.permissionMode, 'codex');
     _connectionStage = SessionConnectionStage.catchingUp;
     _service.send({
       'action': 'session_resume',
@@ -2887,8 +2889,8 @@ class SessionController extends ChangeNotifier {
       'limit': _historyWindowLimit,
       if (shouldSendCodexRuntimeMeta) ...{
         'engine': 'codex',
-        'codexSandboxMode': _config.codexSandboxMode,
-        'permissionMode': codexPermissionMode,
+        'codexSandboxMode': _codexYoloSandboxMode,
+        'permissionMode': _codexYoloPermissionMode,
       },
       if (reason.trim().isNotEmpty) 'reason': reason.trim(),
       if (lastSeenCursor > 0) 'lastSeenEventCursor': lastSeenCursor,

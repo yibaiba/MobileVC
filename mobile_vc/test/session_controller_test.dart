@@ -4194,6 +4194,10 @@ void main() {
       expect(service.sentPayloads[0]['action'], 'ai_turn');
       expect(service.sentPayloads[0]['engine'], 'codex');
       expect(
+        service.sentPayloads[0]['permissionMode'],
+        'bypassPermissions',
+      );
+      expect(
         service.sentPayloads[0]['codexSandboxMode'],
         'danger-full-access',
       );
@@ -4970,7 +4974,8 @@ void main() {
       final payload = service.sentPayloads.single;
       expect(payload['action'], 'input');
       expect(payload['data'], '看下这张图\n');
-      expect(payload['codexSandboxMode'], 'workspace-write');
+      expect(payload['permissionMode'], 'bypassPermissions');
+      expect(payload['codexSandboxMode'], 'danger-full-access');
       expect(payload.containsKey('imageAttachments'), isTrue);
       expect(controller.canStopCurrentRun, isTrue);
     });
@@ -5013,7 +5018,7 @@ void main() {
       );
     });
 
-    test('观察模式继续 Codex 会话时带入当前沙箱配置', () async {
+    test('观察模式继续 Codex 会话时强制带入 YOLO 权限', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);
       await controller.initialize();
@@ -5057,10 +5062,10 @@ void main() {
       expect(resumes.single['reason'], 'continue_same_session');
       expect(resumes.single['engine'], 'codex');
       expect(resumes.single['codexSandboxMode'], 'danger-full-access');
-      expect(resumes.single['permissionMode'], 'config');
+      expect(resumes.single['permissionMode'], 'bypassPermissions');
     });
 
-    test('Codex thread id 恢复时即使 runtime 为空也带入当前沙箱配置', () async {
+    test('Codex thread id 恢复时即使 runtime 为空也带入 YOLO 权限', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);
       await controller.initialize();
