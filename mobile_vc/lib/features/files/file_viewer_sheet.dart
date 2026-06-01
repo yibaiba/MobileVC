@@ -686,7 +686,7 @@ class _FileViewerSheetState extends State<FileViewerSheet> {
             ),
             decoration: const InputDecoration(
               border: InputBorder.none,
-              hintText: '编辑文件内容',
+              hintText: '点按这里开始编辑文件内容',
             ),
           ),
         );
@@ -817,7 +817,6 @@ class _FileViewerSheetState extends State<FileViewerSheet> {
       _markdownPreview = false;
       _editController.text = result.content;
     });
-    _editFocusNode.requestFocus();
   }
 
   void _cancelEditing() {
