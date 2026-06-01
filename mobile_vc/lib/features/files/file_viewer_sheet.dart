@@ -293,33 +293,35 @@ class _FileViewerSheetState extends State<FileViewerSheet> {
               scrollDirection: Axis.horizontal,
               child: Row(
                 children: [
-                  _MetaChip(label: '显示', value: modeLabel, compact: true),
-                  const SizedBox(width: 6),
-                  _MetaChip(
-                    label: '类型',
-                    value: fileType?.label ?? '-',
-                    compact: true,
-                  ),
-                  const SizedBox(width: 6),
-                  _MetaChip(
-                    label: '语言',
-                    value: (result?.lang ?? '').isEmpty ? '-' : result!.lang,
-                    compact: true,
-                  ),
-                  const SizedBox(width: 6),
-                  _MetaChip(
-                    label: '编码',
-                    value: result?.encoding ?? 'utf-8',
-                    compact: true,
-                  ),
-                  const SizedBox(width: 6),
-                  _MetaChip(
-                    label: '大小',
-                    value: _sizeLabel(result?.size ?? 0),
-                    compact: true,
-                  ),
-                  const SizedBox(width: 6),
-                  if (showMarkdownToggle) ...[
+                  if (!_editing) ...[
+                    _MetaChip(label: '显示', value: modeLabel, compact: true),
+                    const SizedBox(width: 6),
+                    _MetaChip(
+                      label: '类型',
+                      value: fileType?.label ?? '-',
+                      compact: true,
+                    ),
+                    const SizedBox(width: 6),
+                    _MetaChip(
+                      label: '语言',
+                      value: (result?.lang ?? '').isEmpty ? '-' : result!.lang,
+                      compact: true,
+                    ),
+                    const SizedBox(width: 6),
+                    _MetaChip(
+                      label: '编码',
+                      value: result?.encoding ?? 'utf-8',
+                      compact: true,
+                    ),
+                    const SizedBox(width: 6),
+                    _MetaChip(
+                      label: '大小',
+                      value: _sizeLabel(result?.size ?? 0),
+                      compact: true,
+                    ),
+                    const SizedBox(width: 6),
+                  ],
+                  if (showMarkdownToggle && !_editing) ...[
                     SegmentedButton<bool>(
                       segments: const [
                         ButtonSegment<bool>(
@@ -406,7 +408,7 @@ class _FileViewerSheetState extends State<FileViewerSheet> {
                 ],
               ),
             ),
-            if ((result?.path ?? '').isNotEmpty) ...[
+            if (!_editing && (result?.path ?? '').isNotEmpty) ...[
               const SizedBox(height: 8),
               Container(
                 width: double.infinity,
@@ -427,7 +429,7 @@ class _FileViewerSheetState extends State<FileViewerSheet> {
                 ),
               ),
             ],
-            if (widget.showReviewActions) ...[
+            if (!_editing && widget.showReviewActions) ...[
               const SizedBox(height: 8),
               Container(
                 width: double.infinity,
@@ -608,7 +610,8 @@ class _FileViewerSheetState extends State<FileViewerSheet> {
                 ),
               ),
             ],
-            if (!widget.showReviewActions &&
+            if (!_editing &&
+                !widget.showReviewActions &&
                 !widget.shouldShowReviewChoices &&
                 !widget.shouldShowPermissionChoices &&
                 _visiblePrompt != null) ...[
@@ -618,7 +621,7 @@ class _FileViewerSheetState extends State<FileViewerSheet> {
                 onSubmit: widget.onSubmitPrompt,
               ),
             ],
-            if (showPermissionBar) ...[
+            if (!_editing && showPermissionBar) ...[
               const SizedBox(height: 8),
               _PermissionActionBar(
                 key: const ValueKey('fileViewer.permissionBar'),
@@ -627,28 +630,30 @@ class _FileViewerSheetState extends State<FileViewerSheet> {
                 onSubmit: widget.onSubmitPrompt,
               ),
             ],
-            const SizedBox(height: 8),
-            TextField(
-              key: const ValueKey('fileViewer.input'),
-              controller: _controller,
-              focusNode: _focusNode,
-              enabled: !_inputLocked,
-              readOnly: _inputLocked,
-              canRequestFocus: !_inputLocked,
-              minLines: 1,
-              maxLines: 3,
-              textInputAction: TextInputAction.send,
-              onTap: _inputLocked ? () => _focusNode.unfocus() : null,
-              onSubmitted: _inputLocked ? null : (_) => _submitPrompt(),
-              decoration: InputDecoration(
-                hintText: _lockedHintText,
-                suffixIcon: IconButton(
-                  key: const ValueKey('fileViewer.sendButton'),
-                  onPressed: _inputLocked ? null : _submitPrompt,
-                  icon: const Icon(Icons.send),
+            if (!_editing) ...[
+              const SizedBox(height: 8),
+              TextField(
+                key: const ValueKey('fileViewer.input'),
+                controller: _controller,
+                focusNode: _focusNode,
+                enabled: !_inputLocked,
+                readOnly: _inputLocked,
+                canRequestFocus: !_inputLocked,
+                minLines: 1,
+                maxLines: 3,
+                textInputAction: TextInputAction.send,
+                onTap: _inputLocked ? () => _focusNode.unfocus() : null,
+                onSubmitted: _inputLocked ? null : (_) => _submitPrompt(),
+                decoration: InputDecoration(
+                  hintText: _lockedHintText,
+                  suffixIcon: IconButton(
+                    key: const ValueKey('fileViewer.sendButton'),
+                    onPressed: _inputLocked ? null : _submitPrompt,
+                    icon: const Icon(Icons.send),
+                  ),
                 ),
               ),
-            ),
+            ],
           ],
         ),
       ),
