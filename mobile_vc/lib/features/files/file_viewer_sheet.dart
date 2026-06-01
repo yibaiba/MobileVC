@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import '../../data/models/events.dart';
 import '../../data/models/session_models.dart';
 import '../diff/diff_code_view.dart';
+import 'file_type_utils.dart';
 
 const List<PromptOption> _permissionPromptOptions = <PromptOption>[
   PromptOption(value: 'approve', label: '允许一次'),
@@ -151,6 +152,7 @@ class _FileViewerSheetState extends State<FileViewerSheet> {
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
     final result = widget.file;
+    final fileType = result == null ? null : fileTypeInfoFor(result.title);
     final diff = widget.reviewDiff;
     final activeGroup = _activeGroup();
     final groupDiffs = _groupDiffs(activeGroup);
@@ -191,13 +193,48 @@ class _FileViewerSheetState extends State<FileViewerSheet> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text(
-                    result?.title ?? '文件内容',
-                    style: theme.textTheme.titleLarge?.copyWith(
-                      fontWeight: FontWeight.w800,
-                      color: scheme.onSurface,
-                    ),
+                  Row(
+                    children: [
+                      if (fileType != null) ...[
+                        _HeaderFileTypeIcon(info: fileType),
+                        const SizedBox(width: 10),
+                      ],
+                      Expanded(
+                        child: Text(
+                          result?.title ?? '文件内容',
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                          style: theme.textTheme.titleLarge?.copyWith(
+                            fontWeight: FontWeight.w800,
+                            color: scheme.onSurface,
+                          ),
+                        ),
+                      ),
+                    ],
                   ),
+                  if (fileType?.isImage == true) ...[
+                    const SizedBox(height: 8),
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 10,
+                        vertical: 6,
+                      ),
+                      decoration: BoxDecoration(
+                        color: fileType!.color.withValues(alpha: 0.12),
+                        borderRadius: BorderRadius.circular(999),
+                        border: Border.all(
+                          color: fileType.color.withValues(alpha: 0.24),
+                        ),
+                      ),
+                      child: Text(
+                        '图片文件会在下方直接预览，支持双指缩放',
+                        style: theme.textTheme.labelSmall?.copyWith(
+                          color: fileType.color,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ),
+                  ],
                   const SizedBox(height: 6),
                   Text(
                     widget.isDiffMode
@@ -231,6 +268,12 @@ class _FileViewerSheetState extends State<FileViewerSheet> {
               child: Row(
                 children: [
                   _MetaChip(label: '显示', value: modeLabel, compact: true),
+                  const SizedBox(width: 6),
+                  _MetaChip(
+                    label: '类型',
+                    value: fileType?.label ?? '-',
+                    compact: true,
+                  ),
                   const SizedBox(width: 6),
                   _MetaChip(
                     label: '语言',
@@ -958,6 +1001,32 @@ class _PromptOptionAction extends StatelessWidget {
 }
 
 enum _PromptActionStyle { filled, tonal, outlined }
+
+class _HeaderFileTypeIcon extends StatelessWidget {
+  const _HeaderFileTypeIcon({required this.info});
+
+  final FileTypeInfo info;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 42,
+      height: 42,
+      decoration: BoxDecoration(
+        color: info.color.withValues(alpha: 0.14),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(
+          color: info.color.withValues(alpha: 0.22),
+        ),
+      ),
+      child: Icon(
+        info.icon,
+        color: info.color,
+        size: 23,
+      ),
+    );
+  }
+}
 
 class _MetaChip extends StatelessWidget {
   const _MetaChip({

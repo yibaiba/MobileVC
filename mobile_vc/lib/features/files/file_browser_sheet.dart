@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../../data/models/session_models.dart';
+import 'file_type_utils.dart';
 
 class FileBrowserSheet extends StatelessWidget {
   const FileBrowserSheet({
@@ -87,6 +88,10 @@ class FileBrowserSheet extends StatelessWidget {
                               itemBuilder: (context, index) {
                                 final item = items[index];
                                 final path = _joinPath(currentPath, item.name);
+                                final typeInfo = fileTypeInfoFor(
+                                  item.name,
+                                  isDir: item.isDir,
+                                );
                                 return Material(
                                   color: Colors.transparent,
                                   child: ListTile(
@@ -94,17 +99,15 @@ class FileBrowserSheet extends StatelessWidget {
                                     shape: RoundedRectangleBorder(
                                         borderRadius:
                                             BorderRadius.circular(12)),
-                                    leading: Icon(item.isDir
-                                        ? Icons.folder_outlined
-                                        : Icons.description_outlined),
+                                    leading: _FileTypeIcon(info: typeInfo),
                                     title: Text(
                                       item.name,
                                       maxLines: 1,
                                       overflow: TextOverflow.ellipsis,
                                     ),
-                                    subtitle: item.isDir
-                                        ? const Text('目录')
-                                        : Text(_sizeLabel(item.size)),
+                                    subtitle: Text(item.isDir
+                                        ? typeInfo.label
+                                        : '${typeInfo.label} · ${_sizeLabel(item.size)}'),
                                     onTap: () {
                                       if (item.isDir) {
                                         onOpenDirectory(path);
@@ -150,5 +153,28 @@ class FileBrowserSheet extends StatelessWidget {
       return '${(size / 1024).toStringAsFixed(1)} KB';
     }
     return '${(size / (1024 * 1024)).toStringAsFixed(1)} MB';
+  }
+}
+
+class _FileTypeIcon extends StatelessWidget {
+  const _FileTypeIcon({required this.info});
+
+  final FileTypeInfo info;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 40,
+      height: 40,
+      decoration: BoxDecoration(
+        color: info.color.withValues(alpha: 0.14),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Icon(
+        info.icon,
+        color: info.color,
+        size: 22,
+      ),
+    );
   }
 }
