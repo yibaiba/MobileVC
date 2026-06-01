@@ -1232,6 +1232,148 @@ void main() {
       expect(payload['engine'], 'codex');
       expect(payload['cwd'], '/workspace/MobileVC');
     });
+
+    test('恢复的 Codex 空闲会话有残留 RUNNING 状态时仍允许手动 Compact', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.saveConfig(const AppConfig(
+        cwd: '/workspace/MobileVC',
+        engine: 'codex',
+        permissionMode: 'bypassPermissions',
+      ));
+      await controller.connect();
+      service.emit(
+        SessionHistoryEvent(
+          timestamp: _timestamp,
+          sessionId: 'codex-thread:thread-stale-running',
+          runtimeMeta: const RuntimeMeta(engine: 'codex'),
+          raw: const {'type': 'session_history'},
+          summary: const SessionSummary(
+            id: 'codex-thread:thread-stale-running',
+            title: 'Codex thread',
+            source: 'codex-native',
+            external: true,
+            runtime: RuntimeMeta(
+              engine: 'codex',
+              command: 'codex resume thread-stale-running',
+              cwd: '/workspace/MobileVC',
+              resumeSessionId: 'thread-stale-running',
+              claudeLifecycle: 'waiting_input',
+            ),
+          ),
+          canResume: true,
+          runtimeAlive: true,
+          resumeRuntimeMeta: const RuntimeMeta(
+            engine: 'codex',
+            command: 'codex resume thread-stale-running',
+            cwd: '/workspace/MobileVC',
+            resumeSessionId: 'thread-stale-running',
+            claudeLifecycle: 'waiting_input',
+          ),
+        ),
+      );
+      service.emit(
+        SessionStateEvent(
+          timestamp: _timestamp,
+          sessionId: 'codex-thread:thread-stale-running',
+          runtimeMeta: const RuntimeMeta(
+            engine: 'codex',
+            command: 'codex resume thread-stale-running',
+            cwd: '/workspace/MobileVC',
+            resumeSessionId: 'thread-stale-running',
+            claudeLifecycle: 'waiting_input',
+          ),
+          raw: const {'type': 'session_state'},
+          state: 'RUNNING',
+          message: 'runtime alive',
+        ),
+      );
+      await _flushEvents();
+      service.sentPayloads.clear();
+
+      expect(controller.shouldShowCompactButton, isTrue);
+      expect(controller.isSessionBusy, isTrue);
+      expect(controller.canCompactCurrentSession, isTrue);
+
+      controller.compactCurrentSession();
+
+      expect(service.sentPayloads, hasLength(1));
+      final payload = service.sentPayloads.single;
+      expect(payload['action'], 'compact');
+      expect(payload['sessionId'], 'codex-thread:thread-stale-running');
+      expect(payload['resumeSessionId'], 'thread-stale-running');
+      expect(payload['engine'], 'codex');
+    });
+
+    test('真实运行中的 Codex 会话仍禁止手动 Compact', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.saveConfig(const AppConfig(
+        cwd: '/workspace/MobileVC',
+        engine: 'codex',
+      ));
+      await controller.connect();
+      service.emit(
+        SessionHistoryEvent(
+          timestamp: _timestamp,
+          sessionId: 'codex-thread:thread-running',
+          runtimeMeta: const RuntimeMeta(engine: 'codex'),
+          raw: const {'type': 'session_history'},
+          summary: const SessionSummary(
+            id: 'codex-thread:thread-running',
+            title: 'Codex running',
+            source: 'codex-native',
+            external: true,
+            runtime: RuntimeMeta(
+              engine: 'codex',
+              command: 'codex resume thread-running',
+              cwd: '/workspace/MobileVC',
+              resumeSessionId: 'thread-running',
+            ),
+          ),
+          canResume: true,
+          runtimeAlive: true,
+          resumeRuntimeMeta: const RuntimeMeta(
+            engine: 'codex',
+            command: 'codex resume thread-running',
+            cwd: '/workspace/MobileVC',
+            resumeSessionId: 'thread-running',
+          ),
+        ),
+      );
+      service.emit(
+        SessionStateEvent(
+          timestamp: _timestamp,
+          sessionId: 'codex-thread:thread-running',
+          runtimeMeta: const RuntimeMeta(
+            engine: 'codex',
+            command: 'codex resume thread-running',
+            cwd: '/workspace/MobileVC',
+            resumeSessionId: 'thread-running',
+            executionId: 'exec-running',
+          ),
+          raw: const {'type': 'session_state'},
+          state: 'RUNNING',
+          message: 'running',
+        ),
+      );
+      await _flushEvents();
+      service.sentPayloads.clear();
+
+      expect(controller.shouldShowCompactButton, isTrue);
+      expect(controller.isSessionBusy, isTrue);
+      expect(controller.canCompactCurrentSession, isFalse);
+
+      controller.compactCurrentSession();
+
+      expect(service.sentPayloads, isEmpty);
+    });
   });
 
   group('SessionController action needed signal', () {

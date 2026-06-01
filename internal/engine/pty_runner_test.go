@@ -1687,6 +1687,75 @@ func resolveNextPendingRPC(t *testing.T, app *codexAppSession, result any) {
 	t.Fatal("timed out waiting for pending codex rpc call")
 }
 
+func resolveNextPendingRPCError(t *testing.T, app *codexAppSession, rpcError codexRPCError) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		app.mu.Lock()
+		var id string
+		for key := range app.pending {
+			id = key
+			break
+		}
+		app.mu.Unlock()
+		if id != "" {
+			app.resolvePending(codexRPCMessage{
+				ID:    json.RawMessage(id),
+				Error: &rpcError,
+			})
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("timed out waiting for pending codex rpc call")
+}
+
+func TestCodexContextWindowUsageUnsupportedReadIsOptional(t *testing.T) {
+	buf := &nopWriteCloser{}
+	app := &codexAppSession{
+		runner:    NewPtyRunner(),
+		stdin:     buf,
+		sessionID: "s-context-window-unsupported",
+	}
+	app.setThreadID("thread-context-1")
+
+	errCh := make(chan error, 1)
+	okCh := make(chan bool, 1)
+	go func() {
+		_, ok, err := app.ContextWindowUsage(context.Background())
+		okCh <- ok
+		errCh <- err
+	}()
+
+	resolveNextPendingRPCError(t, app, codexRPCError{
+		Code:    -32600,
+		Message: "Invalid request: unknown variant `thread/contextWindow/read`, expected one of `thread/compact/start`",
+	})
+
+	if err := <-errCh; err != nil {
+		t.Fatalf("ContextWindowUsage returned err: %v", err)
+	}
+	if ok := <-okCh; ok {
+		t.Fatal("ContextWindowUsage returned ok=true for unsupported optional method")
+	}
+	firstOutput := buf.String()
+	if !strings.Contains(firstOutput, `"method":"thread/contextWindow/read"`) {
+		t.Fatalf("expected first call to request context window usage, got %q", firstOutput)
+	}
+
+	buf.Reset()
+	_, ok, err := app.ContextWindowUsage(context.Background())
+	if err != nil {
+		t.Fatalf("second ContextWindowUsage returned err: %v", err)
+	}
+	if ok {
+		t.Fatal("second ContextWindowUsage returned ok=true after unsupported method")
+	}
+	if got := buf.String(); got != "" {
+		t.Fatalf("expected unsupported context window read to be cached, got rpc output %q", got)
+	}
+}
+
 func TestCodexAppSessionResumePassesSandboxAndApprovalPolicy(t *testing.T) {
 	buf := &nopWriteCloser{}
 	runner := NewPtyRunner()

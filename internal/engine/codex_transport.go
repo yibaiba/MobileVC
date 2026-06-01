@@ -48,6 +48,16 @@ type codexRPCResponse struct {
 	err     error
 }
 
+type codexRPCMethodError struct {
+	method  string
+	code    int
+	message string
+}
+
+func (e *codexRPCMethodError) Error() string {
+	return fmt.Sprintf("%s: %s", e.method, strings.TrimSpace(e.message))
+}
+
 type codexAppSession struct {
 	runner    *PtyRunner
 	sessionID string
@@ -67,18 +77,19 @@ type codexAppSession struct {
 	pending map[string]chan codexRPCResponse
 	readErr error
 
-	threadID          string
-	activeTurnID      string
-	lastDiff          string
-	assistantBuffer   strings.Builder
-	lastAssistantText string
-	assistantEmitted  string
-	pendingApproval   *codexPendingApproval
-	readyPromptSeq    uint64
-	compactionID      string
-	compactionTurnID  string
-	compactionStatus  string
-	compactionEventID string
+	threadID                     string
+	activeTurnID                 string
+	lastDiff                     string
+	assistantBuffer              strings.Builder
+	lastAssistantText            string
+	assistantEmitted             string
+	pendingApproval              *codexPendingApproval
+	readyPromptSeq               uint64
+	compactionID                 string
+	compactionTurnID             string
+	compactionStatus             string
+	compactionEventID            string
+	contextWindowReadUnsupported bool
 }
 
 type codexPendingApproval struct {
@@ -424,11 +435,23 @@ func (s *codexAppSession) ContextWindowUsage(ctx context.Context) (protocol.Cont
 	if threadID == "" {
 		return protocol.ContextWindowUsage{}, false, nil
 	}
+	s.mu.Lock()
+	readUnsupported := s.contextWindowReadUnsupported
+	s.mu.Unlock()
+	if readUnsupported {
+		return protocol.ContextWindowUsage{}, false, nil
+	}
 
 	var result map[string]any
 	if err := s.call(ctx, "thread/contextWindow/read", map[string]any{
 		"threadId": threadID,
 	}, &result); err != nil {
+		if isCodexUnsupportedMethodError(err, "thread/contextWindow/read") {
+			s.mu.Lock()
+			s.contextWindowReadUnsupported = true
+			s.mu.Unlock()
+			return protocol.ContextWindowUsage{}, false, nil
+		}
 		return protocol.ContextWindowUsage{}, false, err
 	}
 
@@ -441,6 +464,23 @@ func (s *codexAppSession) ContextWindowUsage(ctx context.Context) (protocol.Cont
 		return protocol.ContextWindowUsage{}, false, nil
 	}
 	return usage, true, nil
+}
+
+func isCodexUnsupportedMethodError(err error, method string) bool {
+	var rpcErr *codexRPCMethodError
+	if !errors.As(err, &rpcErr) {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(rpcErr.method), strings.TrimSpace(method)) {
+		return false
+	}
+	message := strings.ToLower(strings.TrimSpace(rpcErr.message))
+	lowerMethod := strings.ToLower(strings.TrimSpace(method))
+	if strings.Contains(message, "unknown variant") && strings.Contains(message, "`"+lowerMethod+"`") {
+		return true
+	}
+	return strings.Contains(message, "method not found") ||
+		strings.Contains(message, "unknown method")
 }
 
 func (s *codexAppSession) WritePermissionResponse(ctx context.Context, decision string) error {
@@ -1098,7 +1138,11 @@ func (s *codexAppSession) call(ctx context.Context, method string, params any, r
 			return response.err
 		}
 		if response.message.Error != nil {
-			return fmt.Errorf("%s: %s", method, strings.TrimSpace(response.message.Error.Message))
+			return &codexRPCMethodError{
+				method:  method,
+				code:    response.message.Error.Code,
+				message: response.message.Error.Message,
+			}
 		}
 		if result != nil && len(response.message.Result) > 0 {
 			if err := json.Unmarshal(response.message.Result, result); err != nil {

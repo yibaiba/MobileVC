@@ -1174,6 +1174,9 @@ class SessionController extends ChangeNotifier {
         shouldShowPlanChoices) {
       return false;
     }
+    if (_canCompactIdleCodexSession) {
+      return !_isCompacting;
+    }
     return !_isCompacting && !isSessionBusy && !canStopCurrentRun;
   }
 
@@ -1194,6 +1197,32 @@ class SessionController extends ChangeNotifier {
     }
     final command = currentMeta.command.trim().toLowerCase();
     return command == 'codex' || command.startsWith('codex ');
+  }
+
+  bool get _canCompactIdleCodexSession {
+    if (!_currentSessionSupportsNativeCompact) {
+      return false;
+    }
+    if (_isSubmitting || _executionActive || _hasRunningTerminalExecution) {
+      return false;
+    }
+    final agentState = (_agentState?.state ?? '').trim().toUpperCase();
+    if (agentState == 'THINKING' ||
+        agentState == 'RECOVERING' ||
+        agentState == 'RUNNING_TOOL') {
+      return false;
+    }
+    final sessionState = (_sessionState?.state ?? '').trim().toUpperCase();
+    if (sessionState == 'THINKING' || sessionState == 'RUNNING_TOOL') {
+      return false;
+    }
+    final lifecycle = currentMeta.claudeLifecycle.trim().toLowerCase();
+    return awaitInput ||
+        (agentState.isNotEmpty && _isIdleLikeState(agentState)) ||
+        agentState == 'WAIT_INPUT' ||
+        lifecycle == 'waiting_input' ||
+        lifecycle == 'resumable' ||
+        lifecycle == 'settled';
   }
 
   bool get _canBypassBusyGuardForCodexContinuation {
