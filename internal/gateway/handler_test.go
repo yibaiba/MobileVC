@@ -1389,6 +1389,7 @@ func TestSessionResumeSyncsCodexSandboxMode(t *testing.T) {
 		RuntimeMeta: protocol.RuntimeMeta{
 			Engine:           "codex",
 			CodexSandboxMode: "danger-full-access",
+			PermissionMode:   "config",
 		},
 		SessionID: sessionID,
 	}); err != nil {
@@ -1402,6 +1403,22 @@ func TestSessionResumeSyncsCodexSandboxMode(t *testing.T) {
 	}
 	if got := runtimeEntry.service.RuntimeSnapshot().ActiveMeta.CodexSandboxMode; got != "danger-full-access" {
 		t.Fatalf("expected synced codex sandbox mode, got %q", got)
+	}
+	if got := runtimeEntry.service.RuntimeSnapshot().ActiveMeta.PermissionMode; got != "config" {
+		t.Fatalf("expected synced codex permission mode, got %q", got)
+	}
+	updated, err := h.SessionStore.GetSession(context.Background(), sessionID)
+	if err != nil {
+		t.Fatalf("get updated session: %v", err)
+	}
+	if got := updated.Projection.Runtime.CodexSandboxMode; got != "danger-full-access" {
+		t.Fatalf("expected persisted projection codex sandbox mode, got %#v", updated.Projection.Runtime)
+	}
+	if got := updated.Summary.Runtime.CodexSandboxMode; got != "danger-full-access" {
+		t.Fatalf("expected persisted summary codex sandbox mode, got %#v", updated.Summary.Runtime)
+	}
+	if got := updated.Projection.Runtime.PermissionMode; got != "config" {
+		t.Fatalf("expected persisted projection permission mode, got %#v", updated.Projection.Runtime)
 	}
 }
 

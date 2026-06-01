@@ -4039,6 +4039,7 @@ void main() {
         controller.config.copyWith(
           engine: 'codex',
           codexSandboxMode: 'danger-full-access',
+          permissionMode: 'config',
         ),
       );
 
@@ -4707,8 +4708,7 @@ void main() {
             runtime: RuntimeMeta(command: 'codex', engine: 'codex'),
           ),
           runtimeAlive: true,
-          resumeRuntimeMeta:
-              const RuntimeMeta(command: 'codex', engine: 'codex'),
+          resumeRuntimeMeta: const RuntimeMeta(),
         ),
       );
       await _flushEvents();
@@ -4877,6 +4877,7 @@ void main() {
         controller.config.copyWith(
           engine: 'codex',
           codexSandboxMode: 'danger-full-access',
+          permissionMode: 'config',
         ),
       );
 
@@ -4896,8 +4897,7 @@ void main() {
             runtime: RuntimeMeta(command: 'codex', engine: 'codex'),
           ),
           runtimeAlive: true,
-          resumeRuntimeMeta:
-              const RuntimeMeta(command: 'codex', engine: 'codex'),
+          resumeRuntimeMeta: const RuntimeMeta(),
         ),
       );
       await _flushEvents();
@@ -4912,6 +4912,7 @@ void main() {
       expect(resumes.single['reason'], 'continue_same_session');
       expect(resumes.single['engine'], 'codex');
       expect(resumes.single['codexSandboxMode'], 'danger-full-access');
+      expect(resumes.single['permissionMode'], 'config');
     });
 
     test('前台恢复空 runtime 元信息时不会按当前配置误带 Codex 沙箱', () async {
@@ -4951,6 +4952,7 @@ void main() {
       expect(resumes, hasLength(1));
       expect(resumes.single.containsKey('codexSandboxMode'), isFalse);
       expect(resumes.single.containsKey('engine'), isFalse);
+      expect(resumes.single.containsKey('permissionMode'), isFalse);
     });
 
     test('summary executionActive=false 会清掉陈旧 stop 锁存', () async {

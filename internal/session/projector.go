@@ -40,6 +40,9 @@ func NormalizeProjectionSnapshot(snapshot data.ProjectionSnapshot) data.Projecti
 	if snapshot.Runtime.PermissionMode == "" {
 		snapshot.Runtime.PermissionMode = snapshot.Controller.ActiveMeta.PermissionMode
 	}
+	if snapshot.Runtime.CodexSandboxMode == "" {
+		snapshot.Runtime.CodexSandboxMode = snapshot.Controller.ActiveMeta.CodexSandboxMode
+	}
 	snapshot.Runtime.ClaudeLifecycle = NormalizeProjectionLifecycle(
 		firstNonEmptyString(snapshot.Controller.ClaudeLifecycle, snapshot.Controller.ActiveMeta.ClaudeLifecycle, snapshot.Runtime.ClaudeLifecycle),
 		snapshot.Runtime.ResumeSessionID,
@@ -89,11 +92,13 @@ func WithRuntimeSnapshot(snapshot data.ProjectionSnapshot, svc *Service) data.Pr
 		strings.TrimSpace(runtimeSnapshot.ActiveMeta.ResumeSessionID) != "" ||
 		strings.TrimSpace(runtimeSnapshot.ActiveMeta.Command) != "" ||
 		strings.TrimSpace(runtimeSnapshot.ActiveMeta.Engine) != "" ||
+		strings.TrimSpace(runtimeSnapshot.ActiveMeta.CodexSandboxMode) != "" ||
 		(strings.TrimSpace(string(controller.State)) != "" && controller.State != ControllerStateIdle) ||
 		strings.TrimSpace(controller.ResumeSession) != "" ||
 		strings.TrimSpace(controller.CurrentCommand) != "" ||
 		strings.TrimSpace(controller.ActiveMeta.Command) != "" ||
 		strings.TrimSpace(controller.ActiveMeta.Engine) != "" ||
+		strings.TrimSpace(controller.ActiveMeta.CodexSandboxMode) != "" ||
 		strings.TrimSpace(controller.ClaudeLifecycle) != ""
 	if !hasLiveRuntimeState {
 		return snapshot
@@ -117,8 +122,9 @@ func WithRuntimeSnapshot(snapshot data.ProjectionSnapshot, svc *Service) data.Pr
 			runtimeMeta.SkillName,
 			snapshot.Runtime.Engine,
 		),
-		PermissionMode: firstNonEmptyString(runtimeMeta.PermissionMode, snapshot.Runtime.PermissionMode),
-		CWD:            firstNonEmptyString(runtimeMeta.CWD, snapshot.Runtime.CWD),
+		PermissionMode:   firstNonEmptyString(runtimeMeta.PermissionMode, snapshot.Runtime.PermissionMode),
+		CodexSandboxMode: firstNonEmptyString(runtimeMeta.CodexSandboxMode, snapshot.Runtime.CodexSandboxMode),
+		CWD:              firstNonEmptyString(runtimeMeta.CWD, snapshot.Runtime.CWD),
 		ClaudeLifecycle: NormalizeProjectionLifecycle(
 			firstNonEmptyString(controller.ClaudeLifecycle, runtimeMeta.ClaudeLifecycle, runtimeSnapshot.ClaudeLifecycle),
 			firstNonEmptyString(controller.ResumeSession, runtimeMeta.ResumeSessionID, runtimeSnapshot.ResumeSessionID),
@@ -243,13 +249,14 @@ func BuildResumeRecoveryStateEvent(sessionID string, svc *Service, projection da
 	if svc != nil {
 		snapshot := svc.RuntimeSnapshot()
 		runtimeMeta = MergeStoreSessionRuntime(runtimeMeta, data.SessionRuntime{
-			ResumeSessionID: snapshot.ResumeSessionID,
-			Command:         snapshot.ActiveMeta.Command,
-			Engine:          snapshot.ActiveMeta.Engine,
-			PermissionMode:  snapshot.ActiveMeta.PermissionMode,
-			CWD:             snapshot.ActiveMeta.CWD,
-			ClaudeLifecycle: snapshot.ClaudeLifecycle,
-			Source:          "mobilevc",
+			ResumeSessionID:  snapshot.ResumeSessionID,
+			Command:          snapshot.ActiveMeta.Command,
+			Engine:           snapshot.ActiveMeta.Engine,
+			PermissionMode:   snapshot.ActiveMeta.PermissionMode,
+			CodexSandboxMode: snapshot.ActiveMeta.CodexSandboxMode,
+			CWD:              snapshot.ActiveMeta.CWD,
+			ClaudeLifecycle:  snapshot.ClaudeLifecycle,
+			Source:           "mobilevc",
 		})
 		controller = svc.ControllerSnapshot()
 	}
@@ -365,13 +372,14 @@ func (s *Service) WaitForInteractive(ctx context.Context, timeout time.Duration)
 
 func MergeStoreSessionRuntime(base data.SessionRuntime, overlay data.SessionRuntime) data.SessionRuntime {
 	return data.SessionRuntime{
-		ResumeSessionID: firstNonEmptyString(overlay.ResumeSessionID, base.ResumeSessionID),
-		Command:         firstNonEmptyString(overlay.Command, base.Command),
-		Engine:          firstNonEmptyString(overlay.Engine, base.Engine),
-		PermissionMode:  firstNonEmptyString(overlay.PermissionMode, base.PermissionMode),
-		CWD:             firstNonEmptyString(overlay.CWD, base.CWD),
-		ClaudeLifecycle: firstNonEmptyString(overlay.ClaudeLifecycle, base.ClaudeLifecycle),
-		Source:          firstNonEmptyString(overlay.Source, base.Source),
+		ResumeSessionID:  firstNonEmptyString(overlay.ResumeSessionID, base.ResumeSessionID),
+		Command:          firstNonEmptyString(overlay.Command, base.Command),
+		Engine:           firstNonEmptyString(overlay.Engine, base.Engine),
+		PermissionMode:   firstNonEmptyString(overlay.PermissionMode, base.PermissionMode),
+		CodexSandboxMode: firstNonEmptyString(overlay.CodexSandboxMode, base.CodexSandboxMode),
+		CWD:              firstNonEmptyString(overlay.CWD, base.CWD),
+		ClaudeLifecycle:  firstNonEmptyString(overlay.ClaudeLifecycle, base.ClaudeLifecycle),
+		Source:           firstNonEmptyString(overlay.Source, base.Source),
 	}
 }
 

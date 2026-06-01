@@ -25,13 +25,14 @@ func ToProtocolSummary(item data.SessionSummary) protocol.SessionSummary {
 		Ownership:       item.Ownership,
 		ExecutionActive: item.ExecutionActive,
 		Runtime: protocol.RuntimeMeta{
-			ResumeSessionID: item.Runtime.ResumeSessionID,
-			Command:         item.Runtime.Command,
-			Engine:          item.Runtime.Engine,
-			CWD:             item.Runtime.CWD,
-			PermissionMode:  item.Runtime.PermissionMode,
-			ClaudeLifecycle: item.Runtime.ClaudeLifecycle,
-			Source:          item.Runtime.Source,
+			ResumeSessionID:  item.Runtime.ResumeSessionID,
+			Command:          item.Runtime.Command,
+			Engine:           item.Runtime.Engine,
+			CodexSandboxMode: item.Runtime.CodexSandboxMode,
+			CWD:              item.Runtime.CWD,
+			PermissionMode:   item.Runtime.PermissionMode,
+			ClaudeLifecycle:  item.Runtime.ClaudeLifecycle,
+			Source:           item.Runtime.Source,
 		},
 	}
 }
@@ -286,12 +287,13 @@ func SessionHistoryWindowEventFromRecord(record data.SessionRecord, runtimeAlive
 	window := snapshotLogEntryWindow(projection.LogEntries, len(projection.LogEntries), limit)
 	executions := protocolTerminalExecutions(projection.TerminalExecutions)
 	resumeMeta := protocol.RuntimeMeta{
-		ResumeSessionID: projection.Runtime.ResumeSessionID,
-		Command:         projection.Runtime.Command,
-		Engine:          projection.Runtime.Engine,
-		CWD:             projection.Runtime.CWD,
-		PermissionMode:  projection.Runtime.PermissionMode,
-		ClaudeLifecycle: NormalizeProjectionLifecycle(projection.Runtime.ClaudeLifecycle, projection.Runtime.ResumeSessionID),
+		ResumeSessionID:  projection.Runtime.ResumeSessionID,
+		Command:          projection.Runtime.Command,
+		Engine:           projection.Runtime.Engine,
+		CodexSandboxMode: projection.Runtime.CodexSandboxMode,
+		CWD:              projection.Runtime.CWD,
+		PermissionMode:   projection.Runtime.PermissionMode,
+		ClaudeLifecycle:  NormalizeProjectionLifecycle(projection.Runtime.ClaudeLifecycle, projection.Runtime.ResumeSessionID),
 	}
 	return protocol.NewSessionHistoryWindowEvent(
 		record.Summary.ID,
@@ -321,12 +323,13 @@ func SessionHistoryPageEventFromRecord(record data.SessionRecord, before, limit 
 	projection := NormalizeProjectionSnapshot(record.Projection)
 	window := snapshotLogEntryWindow(projection.LogEntries, before, limit)
 	resumeMeta := protocol.RuntimeMeta{
-		ResumeSessionID: projection.Runtime.ResumeSessionID,
-		Command:         projection.Runtime.Command,
-		Engine:          projection.Runtime.Engine,
-		CWD:             projection.Runtime.CWD,
-		PermissionMode:  projection.Runtime.PermissionMode,
-		ClaudeLifecycle: NormalizeProjectionLifecycle(projection.Runtime.ClaudeLifecycle, projection.Runtime.ResumeSessionID),
+		ResumeSessionID:  projection.Runtime.ResumeSessionID,
+		Command:          projection.Runtime.Command,
+		Engine:           projection.Runtime.Engine,
+		CodexSandboxMode: projection.Runtime.CodexSandboxMode,
+		CWD:              projection.Runtime.CWD,
+		PermissionMode:   projection.Runtime.PermissionMode,
+		ClaudeLifecycle:  NormalizeProjectionLifecycle(projection.Runtime.ClaudeLifecycle, projection.Runtime.ResumeSessionID),
 	}
 	return protocol.NewSessionHistoryPageEvent(
 		record.Summary.ID,
@@ -419,12 +422,13 @@ func SessionDeltaEventFromRecord(record data.SessionRecord, known protocol.Sessi
 		terminalOutputChanged: stdoutStart < len(stdout) || stderrStart < len(stderr),
 	})
 	resumeMeta := protocol.RuntimeMeta{
-		ResumeSessionID: projection.Runtime.ResumeSessionID,
-		Command:         projection.Runtime.Command,
-		Engine:          projection.Runtime.Engine,
-		CWD:             projection.Runtime.CWD,
-		PermissionMode:  projection.Runtime.PermissionMode,
-		ClaudeLifecycle: NormalizeProjectionLifecycle(projection.Runtime.ClaudeLifecycle, projection.Runtime.ResumeSessionID),
+		ResumeSessionID:  projection.Runtime.ResumeSessionID,
+		Command:          projection.Runtime.Command,
+		Engine:           projection.Runtime.Engine,
+		CodexSandboxMode: projection.Runtime.CodexSandboxMode,
+		CWD:              projection.Runtime.CWD,
+		PermissionMode:   projection.Runtime.PermissionMode,
+		ClaudeLifecycle:  NormalizeProjectionLifecycle(projection.Runtime.ClaudeLifecycle, projection.Runtime.ResumeSessionID),
 	}
 	latest := protocol.SessionDeltaKnown{
 		EventCursor:            latestCursor,
@@ -546,6 +550,10 @@ func RestoredAgentStateEventFromRecord(record data.SessionRecord, hasActiveRunne
 		Engine: firstNonEmptyString(
 			projection.Controller.ActiveMeta.Engine,
 			projection.Runtime.Engine,
+		),
+		CodexSandboxMode: firstNonEmptyString(
+			projection.Controller.ActiveMeta.CodexSandboxMode,
+			projection.Runtime.CodexSandboxMode,
 		),
 		CWD: firstNonEmptyString(
 			projection.Controller.ActiveMeta.CWD,

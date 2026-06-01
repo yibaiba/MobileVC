@@ -457,7 +457,7 @@ func (s *Service) SendInput(ctx context.Context, sessionID string, req InputRequ
 		return ErrNoActiveRunner
 	}
 	if req.RuntimeMeta.PermissionMode != "" {
-		req.RuntimeMeta.PermissionMode = normalizeClaudePermissionMode(req.RuntimeMeta.PermissionMode)
+		req.RuntimeMeta.PermissionMode = normalizePermissionModeForRuntime(req.RuntimeMeta.PermissionMode, req.RuntimeMeta, meta)
 	}
 	effectiveMeta := meta
 	if req.RuntimeMeta.Source != "" || req.RuntimeMeta.SkillName != "" || req.RuntimeMeta.ResumeSessionID != "" || req.RuntimeMeta.ExecutionID != "" || req.RuntimeMeta.GroupID != "" || req.RuntimeMeta.GroupTitle != "" || req.RuntimeMeta.ContextID != "" || req.RuntimeMeta.ContextTitle != "" || req.RuntimeMeta.TargetText != "" || req.RuntimeMeta.TargetPath != "" || req.RuntimeMeta.PermissionMode != "" || req.RuntimeMeta.CodexSandboxMode != "" {
@@ -534,7 +534,7 @@ func (s *Service) SendPermissionDecision(ctx context.Context, sessionID string, 
 		return ErrNoActiveRunner
 	}
 	if meta.PermissionMode != "" {
-		meta.PermissionMode = normalizeClaudePermissionMode(meta.PermissionMode)
+		meta.PermissionMode = normalizePermissionModeForRuntime(meta.PermissionMode, meta, activeMeta)
 	}
 	responder, ok := currentRunner.(engine.PermissionResponseWriter)
 	if !ok {
@@ -602,7 +602,7 @@ func (s *Service) ReviewDecision(ctx context.Context, sessionID string, req Revi
 	}
 	meta := req.RuntimeMeta
 	if meta.PermissionMode != "" {
-		meta.PermissionMode = normalizeClaudePermissionMode(meta.PermissionMode)
+		meta.PermissionMode = normalizePermissionModeForRuntime(meta.PermissionMode, meta)
 	}
 	meta.Source = "review-decision"
 	meta.TargetText = decision
@@ -629,7 +629,7 @@ func (s *Service) PlanDecision(ctx context.Context, sessionID string, req PlanDe
 	}
 	meta := req.RuntimeMeta
 	if meta.PermissionMode != "" {
-		meta.PermissionMode = normalizeClaudePermissionMode(meta.PermissionMode)
+		meta.PermissionMode = normalizePermissionModeForRuntime(meta.PermissionMode, meta, protocol.RuntimeMeta{Command: req.Command})
 	}
 	meta.Source = "plan-decision"
 	meta.TargetText = decision
@@ -697,7 +697,14 @@ func (s *Service) RecordUserInput(input string) {
 }
 
 func (s *Service) UpdatePermissionMode(mode string) {
-	trimmed := normalizeClaudePermissionMode(mode)
+	s.updatePermissionMode(normalizeClaudePermissionMode(mode))
+}
+
+func (s *Service) UpdatePermissionModeForEngine(mode string, engine string) {
+	s.updatePermissionMode(NormalizePermissionModeForEngine(mode, engine))
+}
+
+func (s *Service) updatePermissionMode(trimmed string) {
 	s.manager.updateMeta(func(m *protocol.RuntimeMeta) {
 		m.PermissionMode = trimmed
 	})
@@ -712,6 +719,16 @@ func (s *Service) UpdatePermissionMode(mode string) {
 }
 
 func (s *Service) SyncRuntimeMeta(meta protocol.RuntimeMeta) {
+	if strings.TrimSpace(meta.PermissionMode) != "" {
+		snapshot := s.manager.snapshot()
+		controller := s.controller.Snapshot()
+		meta.PermissionMode = normalizePermissionModeForRuntime(
+			meta.PermissionMode,
+			meta,
+			snapshot.ActiveMeta,
+			controller.ActiveMeta,
+		)
+	}
 	s.manager.updateMeta(func(m *protocol.RuntimeMeta) {
 		*m = protocol.MergeRuntimeMeta(*m, meta)
 	})
@@ -720,6 +737,10 @@ func (s *Service) SyncRuntimeMeta(meta protocol.RuntimeMeta) {
 	}
 	if strings.TrimSpace(meta.PermissionMode) != "" {
 		s.controller.UpdatePermissionMode(meta.PermissionMode)
+		r, _, _ := s.manager.current()
+		if pr, ok := r.(interface{ SetPermissionMode(string) }); ok {
+			pr.SetPermissionMode(meta.PermissionMode)
+		}
 	}
 }
 
@@ -746,7 +767,11 @@ func (s *Service) prepareExecuteRequest(req ExecuteRequest) ExecuteRequest {
 		}
 	}
 	if prepared.Mode == engine.ModePTY && runnerIsClaudeSession(nil, prepared.Command, prepared.RuntimeMeta.Command) {
-		prepared.PermissionMode = normalizeClaudePermissionMode(prepared.PermissionMode)
+		prepared.PermissionMode = normalizePermissionModeForRuntime(
+			prepared.PermissionMode,
+			prepared.RuntimeMeta,
+			protocol.RuntimeMeta{Command: prepared.Command},
+		)
 	}
 	prepared.RuntimeMeta = protocol.MergeRuntimeMeta(prepared.RuntimeMeta, protocol.RuntimeMeta{
 		Command: prepared.Command,
@@ -795,6 +820,20 @@ func normalizeClaudePermissionMode(mode string) string {
 	return NormalizeClaudePermissionMode(mode)
 }
 
+func normalizePermissionModeForRuntime(mode string, metas ...protocol.RuntimeMeta) string {
+	engineName := ""
+	for _, meta := range metas {
+		if strings.EqualFold(strings.TrimSpace(meta.Engine), "codex") || isCodexCommandHead(meta.Command) {
+			engineName = "codex"
+			break
+		}
+		if strings.TrimSpace(engineName) == "" {
+			engineName = strings.TrimSpace(meta.Engine)
+		}
+	}
+	return NormalizePermissionModeForEngine(mode, engineName)
+}
+
 func (s *Service) buildDetachedResumeRequest(req ExecuteRequest, targetPermissionMode string) (ExecuteRequest, error) {
 	prepared := s.prepareExecuteRequest(req)
 	if prepared.Mode != engine.ModePTY {
@@ -834,7 +873,7 @@ func (s *Service) buildDetachedResumeRequest(req ExecuteRequest, targetPermissio
 			command += " --permission-prompt-tool stdio"
 		}
 	}
-	targetPermissionMode = normalizeClaudePermissionMode(targetPermissionMode)
+	targetPermissionMode = normalizePermissionModeForRuntime(targetPermissionMode, prepared.RuntimeMeta)
 	prepared.Command = command
 	prepared.RuntimeMeta.Command = command
 	prepared.PermissionMode = targetPermissionMode

@@ -25,6 +25,22 @@ func NormalizeClaudePermissionMode(mode string) string {
 	}
 }
 
+func NormalizePermissionModeForEngine(mode string, engine string) string {
+	if strings.EqualFold(strings.TrimSpace(engine), "codex") {
+		switch strings.TrimSpace(mode) {
+		case "bypassPermissions":
+			return "bypassPermissions"
+		case "default":
+			return "default"
+		case "config":
+			return "config"
+		default:
+			return "auto"
+		}
+	}
+	return NormalizeClaudePermissionMode(mode)
+}
+
 func RefreshedPermissionPromptEvent(sessionID string, req protocol.PermissionDecisionRequestEvent, service *Service) *protocol.PromptRequestEvent {
 	if service == nil {
 		return nil

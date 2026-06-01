@@ -1303,6 +1303,25 @@ class SessionController extends ChangeNotifier {
     return command == 'codex' || command.startsWith('codex ');
   }
 
+  bool _sessionSummaryIsCodex(SessionSummary? summary) {
+    if (summary == null) {
+      return false;
+    }
+    if (_runtimeMetaIsCodex(summary.runtime)) {
+      return true;
+    }
+    final sessionId = summary.id.trim().toLowerCase();
+    if (sessionId.startsWith('codex-thread:')) {
+      return true;
+    }
+    final source = summary.source.trim().toLowerCase();
+    final ownership = summary.ownership.trim().toLowerCase();
+    final runtimeSource = summary.runtime.source.trim().toLowerCase();
+    return source == 'codex-native' ||
+        ownership == 'codex-native' ||
+        runtimeSource == 'codex-native';
+  }
+
   bool get inClaudeMode {
     if (_isLoadingSession) {
       return false;
@@ -2812,16 +2831,20 @@ class SessionController extends ChangeNotifier {
     final lastSeenCursor = _sessionEventCursors[sessionId] ?? 0;
     final runtimeState =
         (_agentState?.state ?? _sessionState?.state ?? '').trim();
-    final shouldSendCodexSandbox = _runtimeMetaIsCodex(_liveRuntimeMeta);
+    final shouldSendCodexRuntimeMeta = _runtimeMetaIsCodex(_liveRuntimeMeta) ||
+        _sessionSummaryIsCodex(_selectedSessionSummary);
+    final codexPermissionMode =
+        normalizePermissionModeForEngine(_config.permissionMode, 'codex');
     _connectionStage = SessionConnectionStage.catchingUp;
     _service.send({
       'action': 'session_resume',
       'sessionId': sessionId,
       'cwd': effectiveCwd,
       'limit': _historyWindowLimit,
-      if (shouldSendCodexSandbox) ...{
+      if (shouldSendCodexRuntimeMeta) ...{
         'engine': 'codex',
         'codexSandboxMode': _config.codexSandboxMode,
+        'permissionMode': codexPermissionMode,
       },
       if (reason.trim().isNotEmpty) 'reason': reason.trim(),
       if (lastSeenCursor > 0) 'lastSeenEventCursor': lastSeenCursor,
@@ -3007,6 +3030,9 @@ class SessionController extends ChangeNotifier {
     }
     return null;
   }
+
+  SessionSummary? get _selectedSessionSummary =>
+      _findSessionSummary(_sessions, _selectedSessionId);
 
   Future<void> _restoreLastSelectedSession(
     String sessionId,

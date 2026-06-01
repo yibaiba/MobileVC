@@ -289,26 +289,22 @@ func (s *codexAppSession) startOrResumeThread(ctx context.Context, resumeSession
 	resumeSessionID = strings.TrimSpace(resumeSessionID)
 	if resumeSessionID != "" {
 		method = "thread/resume"
-		params = map[string]any{"threadId": resumeSessionID}
-	} else {
-		method = "thread/start"
-		sandbox, err := normalizeCodexSandboxMode(s.req.RuntimeMeta.CodexSandboxMode, s.defaults)
+		threadParams, err := s.threadRuntimeParams()
 		if err != nil {
 			return err
 		}
-		params = map[string]any{
-			"cwd":                   s.cwd,
-			"approvalPolicy":        codexApprovalPolicy(s.runner.currentPermissionMode(), s.defaults),
-			"approvalsReviewer":     "user",
-			"sandbox":               sandbox,
-			"serviceName":           "MobileVC",
-			"experimentalRawEvents": false,
+		threadParams["threadId"] = resumeSessionID
+		delete(threadParams, "approvalsReviewer")
+		delete(threadParams, "serviceName")
+		delete(threadParams, "experimentalRawEvents")
+		params = threadParams
+	} else {
+		method = "thread/start"
+		threadParams, err := s.threadRuntimeParams()
+		if err != nil {
+			return err
 		}
-		if model := extractCodexModelFlag(s.req.Command); model != "" {
-			params["model"] = model
-		} else if model := s.defaults.model; model != "" {
-			params["model"] = model
-		}
+		params = threadParams
 	}
 	if err := s.call(ctx, method, params, &resp); err != nil {
 		return err
@@ -318,6 +314,27 @@ func (s *codexAppSession) startOrResumeThread(ctx context.Context, resumeSession
 	}
 	s.setThreadID(resp.Thread.ID)
 	return nil
+}
+
+func (s *codexAppSession) threadRuntimeParams() (map[string]any, error) {
+	sandbox, err := normalizeCodexSandboxMode(s.req.RuntimeMeta.CodexSandboxMode, s.defaults)
+	if err != nil {
+		return nil, err
+	}
+	params := map[string]any{
+		"cwd":                   s.cwd,
+		"approvalPolicy":        codexApprovalPolicy(s.runner.currentPermissionMode(), s.defaults),
+		"approvalsReviewer":     "user",
+		"sandbox":               sandbox,
+		"serviceName":           "MobileVC",
+		"experimentalRawEvents": false,
+	}
+	if model := extractCodexModelFlag(s.req.Command); model != "" {
+		params["model"] = model
+	} else if model := s.defaults.model; model != "" {
+		params["model"] = model
+	}
+	return params, nil
 }
 
 func (s *codexAppSession) SendUserInput(ctx context.Context, data []byte) error {

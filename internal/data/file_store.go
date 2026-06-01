@@ -789,13 +789,14 @@ func normalizeClientActionRecords(items []ClientActionRecord, now time.Time, ttl
 
 func mergeSessionRuntime(base SessionRuntime, overlay SessionRuntime) SessionRuntime {
 	return SessionRuntime{
-		ResumeSessionID: firstNonEmptyString(overlay.ResumeSessionID, base.ResumeSessionID),
-		Command:         firstNonEmptyString(overlay.Command, base.Command),
-		Engine:          firstNonEmptyString(overlay.Engine, base.Engine),
-		PermissionMode:  firstNonEmptyString(overlay.PermissionMode, base.PermissionMode),
-		CWD:             firstNonEmptyString(overlay.CWD, base.CWD),
-		ClaudeLifecycle: firstNonEmptyString(overlay.ClaudeLifecycle, base.ClaudeLifecycle),
-		Source:          firstNonEmptyString(overlay.Source, base.Source),
+		ResumeSessionID:  firstNonEmptyString(overlay.ResumeSessionID, base.ResumeSessionID),
+		Command:          firstNonEmptyString(overlay.Command, base.Command),
+		Engine:           firstNonEmptyString(overlay.Engine, base.Engine),
+		PermissionMode:   firstNonEmptyString(overlay.PermissionMode, base.PermissionMode),
+		CodexSandboxMode: firstNonEmptyString(overlay.CodexSandboxMode, base.CodexSandboxMode),
+		CWD:              firstNonEmptyString(overlay.CWD, base.CWD),
+		ClaudeLifecycle:  firstNonEmptyString(overlay.ClaudeLifecycle, base.ClaudeLifecycle),
+		Source:           firstNonEmptyString(overlay.Source, base.Source),
 	}
 }
 

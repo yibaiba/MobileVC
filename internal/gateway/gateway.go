@@ -1180,12 +1180,13 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			}
 			record.Summary.Runtime = record.Projection.Runtime
 			runtimeSvc.SyncRuntimeMeta(protocol.RuntimeMeta{
-				Command:         record.Projection.Runtime.Command,
-				Engine:          record.Projection.Runtime.Engine,
-				CWD:             record.Projection.Runtime.CWD,
-				PermissionMode:  record.Projection.Runtime.PermissionMode,
-				ResumeSessionID: record.Projection.Runtime.ResumeSessionID,
-				ClaudeLifecycle: record.Projection.Runtime.ClaudeLifecycle,
+				Command:          record.Projection.Runtime.Command,
+				Engine:           record.Projection.Runtime.Engine,
+				CodexSandboxMode: record.Projection.Runtime.CodexSandboxMode,
+				CWD:              record.Projection.Runtime.CWD,
+				PermissionMode:   record.Projection.Runtime.PermissionMode,
+				ResumeSessionID:  record.Projection.Runtime.ResumeSessionID,
+				ClaudeLifecycle:  record.Projection.Runtime.ClaudeLifecycle,
 			})
 			loadRuntimeAlive := sessionRecordRuntimeAlive(record, runtimeSvc)
 			trace.Step("merge_projection")
@@ -1379,14 +1380,25 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			record.Projection = projection
 			record.Summary.Runtime = projection.Runtime
 			resumeMeta := protocol.MergeRuntimeMeta(protocol.RuntimeMeta{
-				Command:         projection.Runtime.Command,
-				Engine:          projection.Runtime.Engine,
-				CWD:             projection.Runtime.CWD,
-				PermissionMode:  projection.Runtime.PermissionMode,
-				ResumeSessionID: projection.Runtime.ResumeSessionID,
-				ClaudeLifecycle: projection.Runtime.ClaudeLifecycle,
+				Command:          projection.Runtime.Command,
+				Engine:           projection.Runtime.Engine,
+				CodexSandboxMode: projection.Runtime.CodexSandboxMode,
+				CWD:              projection.Runtime.CWD,
+				PermissionMode:   projection.Runtime.PermissionMode,
+				ResumeSessionID:  projection.Runtime.ResumeSessionID,
+				ClaudeLifecycle:  projection.Runtime.ClaudeLifecycle,
 			}, req.RuntimeMeta)
 			runtimeSvc.SyncRuntimeMeta(resumeMeta)
+			if updatedProjection, changed := projectionWithResumeRuntimeMeta(projection, resumeMeta); changed {
+				projection = updatedProjection
+				record.Projection = projection
+				record.Summary.Runtime = projection.Runtime
+				if _, err := h.SessionStore.SaveProjection(ctx, record.Summary.ID, record.Projection); err != nil {
+					logx.Error("ws", "persist session_resume runtime meta failed: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, record.Summary.ID, remoteAddr, err)
+					emit(protocol.NewErrorEvent(record.Summary.ID, fmt.Sprintf("persist session resume runtime meta: %v", err), ""))
+					continue
+				}
+			}
 			runtimeAlive := sessionRecordRuntimeAlive(record, runtimeSvc)
 			if runtimeAlive && session.ShouldEmitResumeRecoveryStateEvent(runtimeSvc, projection, req.LastKnownRuntimeState) {
 				recovery := session.BuildResumeRecoveryStateEvent(record.Summary.ID, runtimeSvc, projection, req.LastKnownRuntimeState)
@@ -1807,9 +1819,6 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			if sessionRuntime != nil {
 				service.SetSink(sessionRuntime.EnsureBufferedSinkWithProcessor(emitAndPersist))
 			}
-			if strings.TrimSpace(aiReq.PermissionMode) != "" {
-				service.UpdatePermissionMode(aiReq.PermissionMode)
-			}
 			controller := service.ControllerSnapshot()
 			snapshot := service.RuntimeSnapshot()
 			projection := buildProjectionSnapshotFor(sessionID)
@@ -1822,6 +1831,12 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			)))
 			if engineName == "" {
 				engineName = "claude"
+			}
+			if strings.TrimSpace(aiReq.PermissionMode) != "" {
+				service.UpdatePermissionModeForEngine(aiReq.PermissionMode, engineName)
+				controller = service.ControllerSnapshot()
+				snapshot = service.RuntimeSnapshot()
+				projection = buildProjectionSnapshotFor(sessionID)
 			}
 			command := strings.TrimSpace(firstNonEmptyString(
 				aiReq.RuntimeMeta.Command,
@@ -1844,12 +1859,21 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				projection.Runtime.CWD,
 				"/",
 			)
-			permissionMode := normalizePermissionModeForClaude(firstNonEmptyString(
+			permissionMode := session.NormalizePermissionModeForEngine(firstNonEmptyString(
 				aiReq.PermissionMode,
 				snapshot.ActiveMeta.PermissionMode,
 				controller.ActiveMeta.PermissionMode,
 				projection.Runtime.PermissionMode,
-			))
+			), engineName)
+			codexSandboxMode := ""
+			if engineName == "codex" {
+				codexSandboxMode = firstNonEmptyString(
+					aiReq.RuntimeMeta.CodexSandboxMode,
+					snapshot.ActiveMeta.CodexSandboxMode,
+					controller.ActiveMeta.CodexSandboxMode,
+					projection.Runtime.CodexSandboxMode,
+				)
+			}
 			visibleUserText := strings.TrimRight(aiReq.Data, "\n")
 			inputData := aiReq.Data
 			attachments, err := persistImageAttachments(ctx, sessionID, aiReq.ImageAttachments)
@@ -1875,6 +1899,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				Source:            fallback(aiReq.Source, "ai_turn"),
 				Command:           command,
 				Engine:            engineName,
+				CodexSandboxMode:  codexSandboxMode,
 				CWD:               cwd,
 				PermissionMode:    permissionMode,
 				ClaudeSessionUUID: lookupClaudeSessionUUID(sessionID),
@@ -1901,7 +1926,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				RuntimeMeta: protocol.RuntimeMeta{
 					Source:           "ai_turn",
 					PermissionMode:   permissionMode,
-					CodexSandboxMode: aiReq.RuntimeMeta.CodexSandboxMode,
+					CodexSandboxMode: reqMeta.CodexSandboxMode,
 				},
 			}
 			logx.Info("ws", "dispatch ai_turn input/resume: connectionID=%s sessionID=%s remoteAddr=%s command=%q cwd=%q permissionMode=%q preview=%q", connectionID, sessionID, remoteAddr, command, cwd, permissionMode, wsDebugPreview(inputData))
@@ -1917,13 +1942,14 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 						projection.Controller.LastTool,
 					),
 					protocol.MergeRuntimeMeta(projection.Controller.ActiveMeta, protocol.RuntimeMeta{
-						Source:          "ai_turn",
-						ResumeSessionID: execReq.RuntimeMeta.ResumeSessionID,
-						Command:         execReq.Command,
-						Engine:          firstNonEmptyString(execReq.RuntimeMeta.Engine, projection.Runtime.Engine),
-						CWD:             execReq.CWD,
-						PermissionMode:  execReq.PermissionMode,
-						ClaudeLifecycle: "active",
+						Source:           "ai_turn",
+						ResumeSessionID:  execReq.RuntimeMeta.ResumeSessionID,
+						Command:          execReq.Command,
+						Engine:           firstNonEmptyString(execReq.RuntimeMeta.Engine, projection.Runtime.Engine),
+						CodexSandboxMode: execReq.RuntimeMeta.CodexSandboxMode,
+						CWD:              execReq.CWD,
+						PermissionMode:   execReq.PermissionMode,
+						ClaudeLifecycle:  "active",
 					}),
 				))
 			}
@@ -2070,7 +2096,11 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			emitAndPersist := emitAndPersistFor(sessionID)
 			if shouldTreatInputAsAICommand(inputEvent.Data) {
 				command := strings.TrimSpace(inputEvent.Data)
-				permissionMode := normalizePermissionModeForClaude(inputEvent.PermissionMode)
+				promotedEngine := "claude"
+				if isCodexRuntime(data.SessionRuntime{Command: command, Engine: inputEvent.RuntimeMeta.Engine}) {
+					promotedEngine = "codex"
+				}
+				permissionMode := session.NormalizePermissionModeForEngine(inputEvent.PermissionMode, promotedEngine)
 				logx.Info("ws", "promote input to exec: connectionID=%s sessionID=%s remoteAddr=%s action=input command=%q", connectionID, sessionID, remoteAddr, command)
 				appendUserProjectionEntry(h.SessionStore, ctx, sessionID, command, "命令", connectionID, remoteAddr, nil)
 				if sessionRuntime != nil {
@@ -2084,6 +2114,8 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 					RuntimeMeta: protocol.RuntimeMeta{
 						Source:            "input-promoted-exec",
 						Command:           command,
+						Engine:            promotedEngine,
+						CodexSandboxMode:  inputEvent.RuntimeMeta.CodexSandboxMode,
 						CWD:               firstNonEmptyString(inputEvent.CWD, "/"),
 						PermissionMode:    permissionMode,
 						ClaudeSessionUUID: lookupClaudeSessionUUID(sessionID),
@@ -2122,9 +2154,33 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				}
 				inputData = skills.InjectConversationPrefixes(inputData, skillPrefix, memoryPrefix)
 			}
+			resumeCommand := firstNonEmptyString(
+				snapshot.ActiveMeta.Command,
+				controller.CurrentCommand,
+				projection.Runtime.Command,
+				defaultAICommandFromEngine(
+					snapshot.ActiveMeta.Engine,
+					controller.ActiveMeta.Engine,
+					projection.Runtime.Engine,
+				),
+			)
+			resumeEngine := firstNonEmptyString(
+				snapshot.ActiveMeta.Engine,
+				controller.ActiveMeta.Engine,
+				projection.Runtime.Engine,
+			)
+			if isCodexRuntime(data.SessionRuntime{
+				Command: resumeCommand,
+				Engine:  resumeEngine,
+				Source:  projection.Runtime.Source,
+			}) {
+				resumeEngine = "codex"
+			}
 			inputMeta := protocol.RuntimeMeta{}
 			if pm := inputEvent.PermissionMode; pm != "" {
-				service.UpdatePermissionMode(pm)
+				service.UpdatePermissionModeForEngine(pm, resumeEngine)
+				controller = service.ControllerSnapshot()
+				snapshot = service.RuntimeSnapshot()
 				inputMeta.PermissionMode = service.ControllerSnapshot().ActiveMeta.PermissionMode
 			}
 			// 权限请求待处理时，阻止普通文本输入写入 Claude stdin，
@@ -2138,23 +2194,24 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				}
 			}
 			logx.Info("ws", "dispatch input: connectionID=%s sessionID=%s remoteAddr=%s action=input permissionMode=%q preview=%q", connectionID, sessionID, remoteAddr, inputMeta.PermissionMode, wsDebugPreview(inputData))
-			resumePermissionMode := normalizePermissionModeForClaude(firstNonEmptyString(
+			resumePermissionMode := session.NormalizePermissionModeForEngine(firstNonEmptyString(
 				inputEvent.PermissionMode,
 				snapshot.ActiveMeta.PermissionMode,
 				controller.ActiveMeta.PermissionMode,
 				projection.Runtime.PermissionMode,
-			))
+			), resumeEngine)
+			codexSandboxMode := ""
+			if resumeEngine == "codex" {
+				codexSandboxMode = firstNonEmptyString(
+					inputEvent.RuntimeMeta.CodexSandboxMode,
+					snapshot.ActiveMeta.CodexSandboxMode,
+					controller.ActiveMeta.CodexSandboxMode,
+					projection.Runtime.CodexSandboxMode,
+				)
+				inputMeta.CodexSandboxMode = codexSandboxMode
+			}
 			resumeReq := session.ExecuteRequest{
-				Command: firstNonEmptyString(
-					snapshot.ActiveMeta.Command,
-					controller.CurrentCommand,
-					projection.Runtime.Command,
-					defaultAICommandFromEngine(
-						snapshot.ActiveMeta.Engine,
-						controller.ActiveMeta.Engine,
-						projection.Runtime.Engine,
-					),
-				),
+				Command: resumeCommand,
 				CWD: firstNonEmptyString(
 					snapshot.ActiveMeta.CWD,
 					controller.ActiveMeta.CWD,
@@ -2170,16 +2227,9 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 						controller.ResumeSession,
 						projection.Runtime.ResumeSessionID,
 					),
-					Command: firstNonEmptyString(
-						snapshot.ActiveMeta.Command,
-						controller.CurrentCommand,
-						projection.Runtime.Command,
-						defaultAICommandFromEngine(
-							snapshot.ActiveMeta.Engine,
-							controller.ActiveMeta.Engine,
-							projection.Runtime.Engine,
-						),
-					),
+					Command:          resumeCommand,
+					Engine:           resumeEngine,
+					CodexSandboxMode: codexSandboxMode,
 					CWD: firstNonEmptyString(
 						snapshot.ActiveMeta.CWD,
 						controller.ActiveMeta.CWD,
@@ -2201,13 +2251,14 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 						projection.Controller.LastTool,
 					),
 					protocol.MergeRuntimeMeta(projection.Controller.ActiveMeta, protocol.RuntimeMeta{
-						Source:          "input",
-						ResumeSessionID: resumeReq.RuntimeMeta.ResumeSessionID,
-						Command:         resumeReq.Command,
-						Engine:          firstNonEmptyString(resumeReq.RuntimeMeta.Engine, projection.Runtime.Engine),
-						CWD:             resumeReq.CWD,
-						PermissionMode:  resumeReq.PermissionMode,
-						ClaudeLifecycle: "active",
+						Source:           "input",
+						ResumeSessionID:  resumeReq.RuntimeMeta.ResumeSessionID,
+						Command:          resumeReq.Command,
+						Engine:           firstNonEmptyString(resumeReq.RuntimeMeta.Engine, projection.Runtime.Engine),
+						CodexSandboxMode: resumeReq.RuntimeMeta.CodexSandboxMode,
+						CWD:              resumeReq.CWD,
+						PermissionMode:   resumeReq.PermissionMode,
+						ClaudeLifecycle:  "active",
 					}),
 				))
 			}
@@ -2475,12 +2526,16 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				continue
 			}
 			_, service := runtimeForSession(selectedSessionID)
-			service.UpdatePermissionMode(modeEvent.PermissionMode)
+			projection := buildProjectionSnapshotFor(selectedSessionID)
+			engineName := strings.TrimSpace(projection.Runtime.Engine)
+			if isCodexRuntime(projection.Runtime) {
+				engineName = "codex"
+			}
+			service.UpdatePermissionModeForEngine(modeEvent.PermissionMode, engineName)
 			effectivePermissionMode := service.ControllerSnapshot().ActiveMeta.PermissionMode
 			if strings.TrimSpace(effectivePermissionMode) != "" {
-				projection := buildProjectionSnapshotFor(selectedSessionID)
 				projection.Runtime.PermissionMode = effectivePermissionMode
-				if session.NormalizeClaudePermissionMode(effectivePermissionMode) != "default" {
+				if effectivePermissionMode == "auto" || effectivePermissionMode == "bypassPermissions" {
 					projection = session.ApplyAutoReviewAcceptanceToProjection(projection)
 					emitReviewStateFromProjection(emit, selectedSessionID, projection)
 				}
@@ -2936,6 +2991,26 @@ func fallback(value, defaultValue string) string {
 		return defaultValue
 	}
 	return value
+}
+
+func projectionWithResumeRuntimeMeta(projection data.ProjectionSnapshot, meta protocol.RuntimeMeta) (data.ProjectionSnapshot, bool) {
+	next := session.NormalizeProjectionSnapshot(projection)
+	runtime := next.Runtime
+	runtime = session.MergeStoreSessionRuntime(runtime, data.SessionRuntime{
+		ResumeSessionID:  meta.ResumeSessionID,
+		Command:          meta.Command,
+		Engine:           meta.Engine,
+		PermissionMode:   meta.PermissionMode,
+		CodexSandboxMode: meta.CodexSandboxMode,
+		CWD:              meta.CWD,
+		ClaudeLifecycle:  meta.ClaudeLifecycle,
+		Source:           meta.Source,
+	})
+	if runtime == next.Runtime {
+		return next, false
+	}
+	next.Runtime = runtime
+	return session.NormalizeProjectionSnapshot(next), true
 }
 
 func wsDebugPreview(value string) string {

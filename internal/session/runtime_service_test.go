@@ -496,13 +496,14 @@ func TestBuildDetachedResumeRequestForCodexDoesNotAppendClaudeFlags(t *testing.T
 		Mode:           engine.ModePTY,
 		PermissionMode: "default",
 		RuntimeMeta: protocol.RuntimeMeta{
-			Command:         "codex -m gpt-5",
-			Engine:          "codex",
-			CWD:             "/tmp",
-			ResumeSessionID: "resume-codex-123",
-			PermissionMode:  "default",
+			Command:          "codex -m gpt-5",
+			Engine:           "codex",
+			CodexSandboxMode: "danger-full-access",
+			CWD:              "/tmp",
+			ResumeSessionID:  "resume-codex-123",
+			PermissionMode:   "default",
 		},
-	}, "auto")
+	}, "config")
 	if err != nil {
 		t.Fatalf("buildDetachedResumeRequest: %v", err)
 	}
@@ -512,6 +513,12 @@ func TestBuildDetachedResumeRequestForCodexDoesNotAppendClaudeFlags(t *testing.T
 	}
 	if strings.Contains(lower, "--print") || strings.Contains(lower, "--input-format") || strings.Contains(lower, "--output-format") || strings.Contains(lower, "--permission-prompt-tool") {
 		t.Fatalf("did not expect claude stream flags on codex command, got %q", req.Command)
+	}
+	if req.PermissionMode != "config" || req.RuntimeMeta.PermissionMode != "config" {
+		t.Fatalf("expected codex config permission mode to be preserved, got req=%q meta=%q", req.PermissionMode, req.RuntimeMeta.PermissionMode)
+	}
+	if req.RuntimeMeta.CodexSandboxMode != "danger-full-access" {
+		t.Fatalf("expected codex sandbox mode to be preserved, got %q", req.RuntimeMeta.CodexSandboxMode)
 	}
 }
 

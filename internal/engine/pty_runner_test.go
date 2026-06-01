@@ -1687,6 +1687,54 @@ func resolveNextPendingRPC(t *testing.T, app *codexAppSession, result any) {
 	t.Fatal("timed out waiting for pending codex rpc call")
 }
 
+func TestCodexAppSessionResumePassesSandboxAndApprovalPolicy(t *testing.T) {
+	buf := &nopWriteCloser{}
+	runner := NewPtyRunner()
+	runner.SetPermissionMode("bypassPermissions")
+	app := &codexAppSession{
+		runner: runner,
+		req: ExecRequest{
+			Command: "codex -m gpt-5.4",
+			RuntimeMeta: protocol.RuntimeMeta{
+				CodexSandboxMode: "danger-full-access",
+			},
+		},
+		cwd:   "/tmp/project",
+		stdin: buf,
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- app.startOrResumeThread(context.Background(), "thread-123")
+	}()
+
+	resolveNextPendingRPC(t, app, map[string]any{
+		"thread": map[string]any{
+			"id": "thread-123",
+		},
+	})
+
+	if err := <-errCh; err != nil {
+		t.Fatalf("resume thread: %v", err)
+	}
+	output := buf.String()
+	for _, want := range []string{
+		`"method":"thread/resume"`,
+		`"threadId":"thread-123"`,
+		`"cwd":"/tmp/project"`,
+		`"approvalPolicy":"never"`,
+		`"sandbox":"danger-full-access"`,
+		`"model":"gpt-5.4"`,
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("expected %s in thread/resume payload, got %q", want, output)
+		}
+	}
+	if strings.Contains(output, "approvalsReviewer") || strings.Contains(output, "serviceName") {
+		t.Fatalf("did not expect start-only fields in thread/resume payload, got %q", output)
+	}
+}
+
 func TestCodexAppSessionTurnStartPassesReasoningEffort(t *testing.T) {
 	buf := &nopWriteCloser{}
 	app := &codexAppSession{

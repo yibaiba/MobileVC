@@ -52,17 +52,19 @@ func TestIsBusyRuntimeState(t *testing.T) {
 
 func TestMergeStoreSessionRuntime(t *testing.T) {
 	base := data.SessionRuntime{
-		ResumeSessionID: "base-resume",
-		Command:         "claude",
-		Engine:          "claude",
-		PermissionMode:  "auto",
-		CWD:             "/base",
-		ClaudeLifecycle: "active",
-		Source:          "mobilevc",
+		ResumeSessionID:  "base-resume",
+		Command:          "claude",
+		Engine:           "claude",
+		PermissionMode:   "auto",
+		CodexSandboxMode: "workspace-write",
+		CWD:              "/base",
+		ClaudeLifecycle:  "active",
+		Source:           "mobilevc",
 	}
 	overlay := data.SessionRuntime{
-		ResumeSessionID: "ovr-resume",
-		PermissionMode:  "bypassPermissions",
+		ResumeSessionID:  "ovr-resume",
+		PermissionMode:   "bypassPermissions",
+		CodexSandboxMode: "danger-full-access",
 	}
 	merged := MergeStoreSessionRuntime(base, overlay)
 	if merged.ResumeSessionID != "ovr-resume" {
@@ -70,6 +72,9 @@ func TestMergeStoreSessionRuntime(t *testing.T) {
 	}
 	if merged.PermissionMode != "bypassPermissions" {
 		t.Errorf("perm mode: %q", merged.PermissionMode)
+	}
+	if merged.CodexSandboxMode != "danger-full-access" {
+		t.Errorf("codex sandbox mode: %q", merged.CodexSandboxMode)
 	}
 	// 未覆盖的字段保持 base
 	if merged.Command != "claude" || merged.CWD != "/base" || merged.Source != "mobilevc" {
@@ -282,9 +287,10 @@ func TestNormalizeProjectionSnapshot_FillsDefaults(t *testing.T) {
 			ResumeSession:  "ctrl-resume",
 			CurrentCommand: "claude",
 			ActiveMeta: protocol.RuntimeMeta{
-				Engine:         "claude",
-				CWD:            "/proj",
-				PermissionMode: "auto",
+				Engine:           "claude",
+				CWD:              "/proj",
+				PermissionMode:   "auto",
+				CodexSandboxMode: "danger-full-access",
 			},
 		},
 	}
@@ -303,6 +309,9 @@ func TestNormalizeProjectionSnapshot_FillsDefaults(t *testing.T) {
 	}
 	if out.Runtime.PermissionMode != "auto" {
 		t.Errorf("perm mode: %q", out.Runtime.PermissionMode)
+	}
+	if out.Runtime.CodexSandboxMode != "danger-full-access" {
+		t.Errorf("codex sandbox mode: %q", out.Runtime.CodexSandboxMode)
 	}
 	if out.LogEntries == nil {
 		t.Errorf("log entries should be initialized")
