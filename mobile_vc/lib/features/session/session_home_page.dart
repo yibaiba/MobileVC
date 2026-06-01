@@ -1655,6 +1655,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
                   return FileViewerSheet(
                     file: controller.openedFile,
                     loading: controller.fileReading,
+                    saving: controller.fileSaving,
                     showReviewActions:
                         controller.openedFileMatchesPendingDiff &&
                             controller.canShowReviewActions,
@@ -1687,6 +1688,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
                     onRevise: () => controller.sendReviewDecision('revise'),
                     onUseAsContext: () =>
                         controller.continueWithCurrentFile('基于当前文件继续处理'),
+                    onSaveFile: controller.requestFileWrite,
                     onSendFilePrompt: controller.continueWithCurrentFile,
                     onSubmitPrompt: controller.submitPromptOption,
                   );

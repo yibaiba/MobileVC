@@ -49,6 +49,8 @@ class MobileVcMapper {
         return FSListResultEvent.fromJson(json);
       case 'fs_read_result':
         return FSReadResultEvent.fromJson(json);
+      case 'fs_write_result':
+        return FSWriteResultEvent.fromJson(json);
       case 'media_preview_result':
         return MediaPreviewResultEvent.fromJson(json);
       case 'step_update':

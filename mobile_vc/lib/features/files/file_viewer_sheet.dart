@@ -21,6 +21,7 @@ class FileViewerSheet extends StatefulWidget {
     super.key,
     required this.file,
     required this.loading,
+    required this.saving,
     required this.showReviewActions,
     required this.isDiffMode,
     required this.reviewDiff,
@@ -41,12 +42,14 @@ class FileViewerSheet extends StatefulWidget {
     required this.onSelectReviewDiff,
     required this.onOpenDiffList,
     required this.onUseAsContext,
+    required this.onSaveFile,
     required this.onSendFilePrompt,
     required this.onSubmitPrompt,
   });
 
   final FileReadResult? file;
   final bool loading;
+  final bool saving;
   final bool showReviewActions;
   final bool isDiffMode;
   final HistoryContext? reviewDiff;
@@ -67,6 +70,7 @@ class FileViewerSheet extends StatefulWidget {
   final ValueChanged<String> onSelectReviewDiff;
   final VoidCallback onOpenDiffList;
   final VoidCallback onUseAsContext;
+  final void Function(String path, String content) onSaveFile;
   final ValueChanged<String> onSendFilePrompt;
   final ValueChanged<String> onSubmitPrompt;
 
@@ -76,8 +80,11 @@ class FileViewerSheet extends StatefulWidget {
 
 class _FileViewerSheetState extends State<FileViewerSheet> {
   final TextEditingController _controller = TextEditingController();
+  final TextEditingController _editController = TextEditingController();
   final FocusNode _focusNode = FocusNode();
+  final FocusNode _editFocusNode = FocusNode();
   bool _markdownPreview = true;
+  bool _editing = false;
 
   bool get _inputLocked =>
       widget.shouldShowPermissionChoices ||
@@ -140,15 +147,25 @@ class _FileViewerSheetState extends State<FileViewerSheet> {
     if (_inputLocked && !oldLocked) {
       _focusNode.unfocus();
     }
-    if (oldWidget.file?.path != widget.file?.path && _isMarkdown(widget.file)) {
-      _markdownPreview = true;
+    if (oldWidget.file?.path != widget.file?.path) {
+      _editing = false;
+      _editController.text = widget.file?.content ?? '';
+      if (_isMarkdown(widget.file)) {
+        _markdownPreview = true;
+      }
+    } else if (oldWidget.file?.content != widget.file?.content &&
+        widget.file != null) {
+      _editing = false;
+      _editController.text = widget.file!.content;
     }
   }
 
   @override
   void dispose() {
     _controller.dispose();
+    _editController.dispose();
     _focusNode.dispose();
+    _editFocusNode.dispose();
     super.dispose();
   }
 
@@ -170,6 +187,9 @@ class _FileViewerSheetState extends State<FileViewerSheet> {
     final showPermissionBar =
         widget.shouldShowPermissionChoices && !widget.shouldShowReviewChoices;
     final showMarkdownToggle = _isMarkdown(result) && !widget.isDiffMode;
+    final showEditControls = result?.isText == true &&
+        !widget.isDiffMode &&
+        result?.path.isNotEmpty == true;
     return SafeArea(
       top: false,
       child: AnimatedPadding(
@@ -320,6 +340,55 @@ class _FileViewerSheetState extends State<FileViewerSheet> {
                         });
                       },
                     ),
+                    const SizedBox(width: 6),
+                  ],
+                  if (showEditControls) ...[
+                    if (_editing) ...[
+                      OutlinedButton.icon(
+                        onPressed: widget.saving ? null : _cancelEditing,
+                        style: OutlinedButton.styleFrom(
+                          visualDensity: VisualDensity.compact,
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 12,
+                            vertical: 10,
+                          ),
+                        ),
+                        icon: const Icon(Icons.close_rounded, size: 16),
+                        label: const Text('取消'),
+                      ),
+                      const SizedBox(width: 6),
+                      FilledButton.icon(
+                        onPressed: widget.saving ? null : _saveEditing,
+                        style: FilledButton.styleFrom(
+                          visualDensity: VisualDensity.compact,
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 12,
+                            vertical: 10,
+                          ),
+                        ),
+                        icon: widget.saving
+                            ? const SizedBox(
+                                width: 16,
+                                height: 16,
+                                child:
+                                    CircularProgressIndicator(strokeWidth: 2),
+                              )
+                            : const Icon(Icons.save_rounded, size: 16),
+                        label: Text(widget.saving ? '保存中' : '保存'),
+                      ),
+                    ] else
+                      OutlinedButton.icon(
+                        onPressed: widget.saving ? null : _startEditing,
+                        style: OutlinedButton.styleFrom(
+                          visualDensity: VisualDensity.compact,
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 12,
+                            vertical: 10,
+                          ),
+                        ),
+                        icon: const Icon(Icons.edit_rounded, size: 16),
+                        label: const Text('编辑'),
+                      ),
                     const SizedBox(width: 6),
                   ],
                   FilledButton.tonalIcon(
@@ -590,6 +659,38 @@ class _FileViewerSheetState extends State<FileViewerSheet> {
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
     if (result.isText) {
+      if (_editing) {
+        return Container(
+          width: double.infinity,
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            color: scheme.surfaceContainerLowest,
+            borderRadius: BorderRadius.circular(18),
+            border: Border.all(
+              color: scheme.primary.withValues(alpha: 0.45),
+            ),
+          ),
+          child: TextField(
+            controller: _editController,
+            focusNode: _editFocusNode,
+            enabled: !widget.saving,
+            expands: true,
+            maxLines: null,
+            minLines: null,
+            keyboardType: TextInputType.multiline,
+            textAlignVertical: TextAlignVertical.top,
+            style: theme.textTheme.bodyMedium?.copyWith(
+              color: scheme.onSurface,
+              fontFamily: 'monospace',
+              height: 1.45,
+            ),
+            decoration: const InputDecoration(
+              border: InputBorder.none,
+              hintText: '编辑文件内容',
+            ),
+          ),
+        );
+      }
       if (_isMarkdown(result) && _markdownPreview) {
         return Container(
           width: double.infinity,
@@ -704,6 +805,35 @@ class _FileViewerSheetState extends State<FileViewerSheet> {
     }
     final extension = result.extension.toLowerCase();
     return extension == 'md' || extension == 'markdown';
+  }
+
+  void _startEditing() {
+    final result = widget.file;
+    if (result == null || !result.isText || result.path.isEmpty) {
+      return;
+    }
+    setState(() {
+      _editing = true;
+      _markdownPreview = false;
+      _editController.text = result.content;
+    });
+    _editFocusNode.requestFocus();
+  }
+
+  void _cancelEditing() {
+    setState(() {
+      _editing = false;
+      _editController.text = widget.file?.content ?? '';
+    });
+    _editFocusNode.unfocus();
+  }
+
+  void _saveEditing() {
+    final result = widget.file;
+    if (result == null || result.path.isEmpty || widget.saving) {
+      return;
+    }
+    widget.onSaveFile(result.path, _editController.text);
   }
 
   Widget _buildUnsupportedPreview(BuildContext context, String message) {
