@@ -1175,6 +1175,61 @@ void main() {
       expect(payload['source'], 'compact');
       expect(payload['targetType'], 'compact');
     });
+
+    test('恢复的 Codex 会话即使 engine 为空也允许手动 Compact', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.saveConfig(const AppConfig(
+        cwd: '/workspace/MobileVC',
+        engine: 'claude',
+        permissionMode: 'auto',
+      ));
+      await controller.connect();
+      service.emit(
+        SessionHistoryEvent(
+          timestamp: _timestamp,
+          sessionId: 'codex-thread:thread-command-only',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_history'},
+          summary: const SessionSummary(
+            id: 'codex-thread:thread-command-only',
+            title: 'Codex thread',
+            runtime: RuntimeMeta(
+              command: 'codex resume thread-command-only',
+              cwd: '/workspace/MobileVC',
+              resumeSessionId: 'thread-command-only',
+            ),
+          ),
+          canResume: true,
+          runtimeAlive: true,
+          resumeRuntimeMeta: const RuntimeMeta(
+            command: 'codex resume thread-command-only',
+            cwd: '/workspace/MobileVC',
+            resumeSessionId: 'thread-command-only',
+            claudeLifecycle: 'waiting_input',
+          ),
+        ),
+      );
+      await _flushEvents();
+      service.sentPayloads.clear();
+
+      expect(controller.shouldShowCompactButton, isTrue);
+      expect(controller.canCompactCurrentSession, isTrue);
+
+      controller.compactCurrentSession();
+
+      expect(service.sentPayloads, hasLength(1));
+      final payload = service.sentPayloads.single;
+      expect(payload['action'], 'compact');
+      expect(payload['sessionId'], 'codex-thread:thread-command-only');
+      expect(payload['resumeSessionId'], 'thread-command-only');
+      expect(payload['command'], 'codex resume thread-command-only');
+      expect(payload['engine'], 'codex');
+      expect(payload['cwd'], '/workspace/MobileVC');
+    });
   });
 
   group('SessionController action needed signal', () {

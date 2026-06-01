@@ -1140,11 +1140,7 @@ class SessionController extends ChangeNotifier {
     if (!connected || _isLoadingSession) {
       return false;
     }
-    if (!shouldShowClaudeMode) {
-      return false;
-    }
-    final engine = currentMeta.engine.trim().toLowerCase();
-    if (engine != 'codex') {
+    if (!_currentSessionSupportsNativeCompact) {
       return false;
     }
     if (hasPendingPermissionPrompt ||
@@ -1162,15 +1158,19 @@ class SessionController extends ChangeNotifier {
     if (_isLoadingSession) {
       return false;
     }
-    final engine = currentMeta.engine.trim().toLowerCase();
-    if (engine == 'codex') {
+    return _currentSessionSupportsNativeCompact;
+  }
+
+  bool get _currentSessionSupportsNativeCompact {
+    if (_runtimeMetaIsCodex(_liveRuntimeMeta)) {
+      return true;
+    }
+    final sessionId = _selectedSessionId.trim().toLowerCase();
+    if (sessionId.startsWith('codex-thread:')) {
       return true;
     }
     final command = currentMeta.command.trim().toLowerCase();
-    if (command == 'codex' || command.startsWith('codex ')) {
-      return true;
-    }
-    return currentAiEngine == 'codex';
+    return command == 'codex' || command.startsWith('codex ');
   }
 
   bool get _canBypassBusyGuardForCodexContinuation {
@@ -4509,18 +4509,17 @@ class SessionController extends ChangeNotifier {
       _pushSystem('session', '会话切换中，请等待加载完成');
       return;
     }
-    if (!canCompactCurrentSession) {
-      _pushSystem('session', '当前状态暂不支持手动 Compact');
-      return;
-    }
     final sessionId = _selectedSessionId.trim();
     if (sessionId.isEmpty) {
       _pushSystem('session', '请先创建或加载会话后再执行 Compact');
       return;
     }
-    if (currentMeta.engine.trim().toLowerCase() != 'codex' &&
-        currentAiEngine.trim().toLowerCase() != 'codex') {
+    if (!_currentSessionSupportsNativeCompact) {
       _pushSystem('session', '当前会话暂不支持原生 Compact');
+      return;
+    }
+    if (!canCompactCurrentSession) {
+      _pushSystem('session', '当前状态暂不支持手动 Compact');
       return;
     }
     final compactMeta = currentMeta.merge(
