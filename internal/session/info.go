@@ -27,13 +27,14 @@ type Snapshot struct {
 }
 
 var runtimeInfoQueries = map[string]string{
-	"help":          "命令帮助",
-	"model":         "模型信息",
-	"claude_models": "Claude 模型目录",
-	"codex_models":  "Codex 模型目录",
-	"cost":          "成本信息",
-	"context":       "运行上下文",
-	"doctor":        "环境诊断",
+	"help":              "命令帮助",
+	"model":             "模型信息",
+	"claude_models":     "Claude 模型目录",
+	"codex_models":      "Codex 模型目录",
+	"voice_api_configs": "Voice API 配置",
+	"cost":              "成本信息",
+	"context":           "运行上下文",
+	"doctor":            "环境诊断",
 }
 
 var fetchCodexModelCatalog = engine.FetchCodexModelCatalog
@@ -62,6 +63,7 @@ func BuildRuntimeInfoResult(sessionID, query, cwd string, svc *Service) (protoco
 			{Label: "model", Value: "查看当前模型识别状态", Available: true, Status: "ready"},
 			{Label: "claude_models", Value: "查看 Claude 可用模型目录（从 settings.json 与 API）", Available: true, Status: "ready"},
 			{Label: "codex_models", Value: "查看 Codex 原生模型与推理强度目录", Available: true, Status: "ready"},
+			{Label: "voice_api_configs", Value: "读取本机 Codex / Claude API 配置作为 Voice API 候选", Available: true, Status: "ready"},
 			{Label: "cost", Value: "查看成本遥测接入状态", Available: true, Status: "ready"},
 			{Label: "context", Value: "查看当前 cwd / 会话 / 运行状态", Available: true, Status: "ready"},
 			{Label: "doctor", Value: "查看环境与连接诊断", Available: true, Status: "ready"},
@@ -130,6 +132,20 @@ func BuildRuntimeInfoResult(sessionID, query, cwd string, svc *Service) (protoco
 			title,
 			fmt.Sprintf("已同步 %d 个 Codex 原生模型，可用于 Flutter 侧动态选择。", len(items)),
 			false,
+			items,
+		), nil
+	case "voice_api_configs":
+		items, availableCount := buildVoiceAPIConfigItems()
+		message := fmt.Sprintf("已读取 %d 个可同步 Voice API 配置。", availableCount)
+		if availableCount == 0 {
+			message = "没有找到可直接同步的 Codex / Claude API 配置。"
+		}
+		return protocol.NewRuntimeInfoResultEvent(
+			sessionID,
+			key,
+			title,
+			message,
+			availableCount == 0,
 			items,
 		), nil
 	case "cost":

@@ -28,10 +28,16 @@
 	<true/>
 	<key>NSCameraUsageDescription</key>
 	<string>用于扫描 MobileVC 后端二维码并自动填写连接信息。</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>用于语音通话前录入任务说明并转写为文字。</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>用于在你主动选择本地照片或视频作为文件时访问系统相册，便于导入到 MobileVC 中使用。</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>用于将语音通话内容转写为任务说明。</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
 		<key>NSAllowsArbitraryLoadsInWebContent</key>
 		<true/>
 		<key>NSAllowsLocalNetworking</key>

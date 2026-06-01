@@ -333,6 +333,10 @@ class SessionController extends ChangeNotifier {
   bool _claudeModelCatalogLoading = false;
   String _claudeModelCatalogMessage = '';
   bool _claudeModelCatalogUnavailable = false;
+  final List<VoiceApiConfigCandidate> _voiceApiConfigCandidates = [];
+  bool _voiceApiConfigLoading = false;
+  String _voiceApiConfigMessage = '';
+  bool _voiceApiConfigUnavailable = false;
   FileDiffEvent? _currentDiff;
   PromptRequestEvent? _pendingPrompt;
   InteractionRequestEvent? _pendingInteraction;
@@ -582,6 +586,11 @@ class SessionController extends ChangeNotifier {
   bool get claudeModelCatalogLoading => _claudeModelCatalogLoading;
   String get claudeModelCatalogMessage => _claudeModelCatalogMessage;
   bool get claudeModelCatalogUnavailable => _claudeModelCatalogUnavailable;
+  List<VoiceApiConfigCandidate> get voiceApiConfigCandidates =>
+      List.unmodifiable(_voiceApiConfigCandidates);
+  bool get voiceApiConfigLoading => _voiceApiConfigLoading;
+  String get voiceApiConfigMessage => _voiceApiConfigMessage;
+  bool get voiceApiConfigUnavailable => _voiceApiConfigUnavailable;
   FileDiffEvent? get currentDiff => _currentDiff;
   PromptRequestEvent? get pendingPrompt {
     final prompt = _pendingPrompt;
@@ -728,6 +737,20 @@ class SessionController extends ChangeNotifier {
   bool get hasPendingPlanPrompt =>
       pendingInteraction?.isPlan == true || pendingPrompt?.isPlan == true;
   bool get hasPendingPlanQuestions => _pendingPlanQuestions.isNotEmpty;
+  List<PlanQuestion> get pendingPlanQuestions => UnmodifiableListView(
+        _pendingPlanQuestions.isNotEmpty
+            ? _pendingPlanQuestions
+            : (pendingInteraction?.planQuestions ?? const <PlanQuestion>[]),
+      );
+  PlanQuestion? get currentPendingPlanQuestion {
+    final questions = pendingPlanQuestions;
+    if (questions.isEmpty) {
+      return null;
+    }
+    final index = _pendingPlanQuestionIndex.clamp(0, questions.length - 1);
+    return questions[index];
+  }
+
   PlanQuestion? get pendingPlanQuestion {
     if (!hasPendingPlanQuestions) {
       return null;
@@ -3157,6 +3180,19 @@ class SessionController extends ChangeNotifier {
     }
     final target = _removeSessionLocally(targetId);
     if (targetId == _selectedSessionId) {
+      _selectedSessionId = '';
+      _selectedSessionTitle = 'MobileVC';
+      _sessionState = null;
+      _agentState = null;
+      _runtimePhase = null;
+      _pendingPrompt = null;
+      _pendingInteraction = null;
+      _currentStep = null;
+      _currentStepSummary = '';
+      _executionActive = false;
+      _sessionRuntimeAlive = false;
+      _resetRuntimeProcessState();
+      _clearStoppingState();
       _beginSessionLoading();
     }
     _clearLastSelectedSessionIfMatches(targetId);
@@ -3227,6 +3263,7 @@ class SessionController extends ChangeNotifier {
     _contextWindowUsage = const ContextWindowUsage();
     _runtimePermissionMode = '';
     _runtimeInfo = null;
+    _voiceApiConfigLoading = false;
     _agentState = null;
     _runtimePhase = null;
     _sessionState = null;
@@ -3307,10 +3344,13 @@ class SessionController extends ChangeNotifier {
   bool _eventTargetsCurrentSession(String sessionId) {
     final normalized = sessionId.trim();
     if (normalized.isEmpty) {
-      return _selectedSessionId.trim().isEmpty;
+      return _selectedSessionId.trim().isEmpty && !_isLoadingSession;
     }
     final selected = _selectedSessionId.trim();
-    return selected.isEmpty || normalized == selected;
+    if (selected.isEmpty) {
+      return !_isLoadingSession;
+    }
+    return normalized == selected;
   }
 
   void _finishSessionLoading({String sessionId = ''}) {
@@ -4378,6 +4418,45 @@ class SessionController extends ChangeNotifier {
     sendInputTextWithImages(text, const []);
   }
 
+  bool submitVoiceHandoff(
+    String text, {
+    String permissionMode = '',
+  }) {
+    final value = text.trim();
+    if (value.isEmpty) {
+      _pushSystem('session', '语音通话没有可交接的任务内容');
+      return false;
+    }
+    if (!_connected) {
+      _pushSystem('session', '请先连接 MobileVC 后端，再把语音通话交给 AI');
+      return false;
+    }
+    if (_isLoadingSession) {
+      _pushSystem('session', '会话切换中，请等待加载完成');
+      return false;
+    }
+    if (hasPendingPermissionPrompt && !shouldShowReviewChoices) {
+      _pushSystem('session', '请先完成当前授权请求，再交接语音通话');
+      return false;
+    }
+    if (hasPendingPlanQuestions || hasPendingPlanPrompt) {
+      _pushSystem('session', '请先完成当前计划选择，再交接语音通话');
+      return false;
+    }
+    if (isSessionBusy && !awaitInput && !canSendToContinuedSameSession) {
+      _pushSystem('session', '当前 AI 助手会话仍在处理中，请稍后再交接语音通话');
+      return false;
+    }
+    final normalizedMode = permissionMode.trim();
+    if (normalizedMode.isNotEmpty &&
+        _normalizeDisplayPermissionMode(normalizedMode) !=
+            _config.permissionMode) {
+      updatePermissionMode(normalizedMode);
+    }
+    sendInputText(value);
+    return true;
+  }
+
   void sendInputTextWithImages(
     String text,
     List<ChatImageAttachment> imageAttachments,
@@ -5036,6 +5115,24 @@ class SessionController extends ChangeNotifier {
     notifyListeners();
   }
 
+  void requestVoiceApiConfigCandidates({bool force = false}) {
+    if (!_connected) {
+      return;
+    }
+    if (_voiceApiConfigLoading && !force) {
+      return;
+    }
+    _voiceApiConfigLoading = true;
+    _voiceApiConfigMessage = '正在读取本机 Codex / Claude API 配置...';
+    _voiceApiConfigUnavailable = false;
+    _service.send({
+      'action': 'runtime_info',
+      'query': 'voice_api_configs',
+      'cwd': effectiveCwd,
+    });
+    notifyListeners();
+  }
+
   CodexModelCatalogEntry? codexModelCatalogEntry(String model) {
     return _findCodexModelCatalogEntry(model);
   }
@@ -5079,6 +5176,7 @@ class SessionController extends ChangeNotifier {
     _resumeRuntimeMeta = const RuntimeMeta();
     _contextWindowUsage = const ContextWindowUsage();
     _runtimeInfo = null;
+    _voiceApiConfigLoading = false;
     _pendingPrompt = null;
     _pendingInteraction = null;
     _runtimePhase = null;
@@ -5553,6 +5651,7 @@ class SessionController extends ChangeNotifier {
             state.runtimeMeta,
             finishedAt: state.timestamp,
           );
+          _checkAndClearExecutionState(state.state);
           _endUserSubmissionProtection();
         }
         if (_isIdleLikeState(state.state) && !_shouldPreserveBlockingPrompt()) {
@@ -5726,6 +5825,9 @@ class SessionController extends ChangeNotifier {
               : error.message.trim();
         }
         final errorMessage = error.message.trim();
+        if (error.code == 'ws_not_connected') {
+          break;
+        }
         if (error.code == 'ws_closed' ||
             error.code == 'ws_stream_error' ||
             error.code == 'ws_send_error' ||
@@ -6053,6 +6155,19 @@ class SessionController extends ChangeNotifier {
             runtimeInfo.runtimeMeta,
             runtimeInfo: runtimeInfo,
           );
+          break;
+        }
+        if (runtimeInfo.query.trim().toLowerCase() == 'voice_api_configs') {
+          _voiceApiConfigLoading = false;
+          _voiceApiConfigMessage = runtimeInfo.message.trim();
+          _voiceApiConfigUnavailable = runtimeInfo.unavailable;
+          final nextCandidates = runtimeInfo.items
+              .map(VoiceApiConfigCandidate.fromRuntimeInfoItem)
+              .where((item) => item.provider.trim().isNotEmpty)
+              .toList();
+          _voiceApiConfigCandidates
+            ..clear()
+            ..addAll(nextCandidates);
           break;
         }
         _runtimeInfo = runtimeInfo;
@@ -7847,8 +7962,10 @@ class SessionController extends ChangeNotifier {
     if (_shouldHideTimelineLogMessage(item.body, item.stream)) {
       return false;
     }
+    final trustedAssistantText = item.kind == 'markdown' &&
+        _shouldPreferAssistantText(item.meta, item.body);
     if (_shouldFilterTimelineText(item.title) ||
-        _shouldFilterTimelineText(item.body)) {
+        (_shouldFilterTimelineText(item.body) && !trustedAssistantText)) {
       return false;
     }
     switch (item.kind) {
@@ -8224,18 +8341,19 @@ class SessionController extends ChangeNotifier {
       return null;
     }
     if (_looksLikeFrontendToolResultNoise(trimmed) ||
-        _shouldFilterTimelineText(trimmed)) {
+        (_shouldFilterTimelineText(trimmed) &&
+            !_shouldPreferAssistantText(meta, trimmed))) {
       return null;
     }
     final normalizedStream = stream.trim().toLowerCase();
     if (normalizedStream == 'stderr') {
       return null;
     }
-    if (_looksLikeProcessNoise(trimmed)) {
-      return null;
-    }
     if (_shouldPreferAssistantText(meta, trimmed)) {
       return 'markdown';
+    }
+    if (_looksLikeProcessNoise(trimmed)) {
+      return null;
     }
     if (_looksLikeTerminalOutput(trimmed) || message.startsWith('\r')) {
       return null;
@@ -8259,10 +8377,11 @@ class SessionController extends ChangeNotifier {
     }
     if (_looksLikeFrontendToolResultNoise(message) ||
         _looksLikeHardTerminalOutput(message) ||
-        _looksLikeProcessNoise(message)) {
+        looksLikeSessionBootstrapCommand(message)) {
       return false;
     }
-    return _looksLikeAssistantReplyAllowingSoftTerminal(message);
+    return _looksLikeAssistantReplyAllowingSoftTerminal(message) ||
+        _looksLikeTrustedShortAssistantReply(message);
   }
 
   String _timelineAiEngine(RuntimeMeta meta) {
@@ -8404,6 +8523,16 @@ class SessionController extends ChangeNotifier {
     }
     return RegExp(r'\p{Script=Han}|[A-Za-z]|\p{So}', unicode: true)
         .hasMatch(normalized);
+  }
+
+  bool _looksLikeTrustedShortAssistantReply(String message) {
+    final lower = message.trim().toLowerCase();
+    return lower == 'ok' ||
+        lower == 'done' ||
+        lower == 'yes' ||
+        lower == 'no' ||
+        lower == '好的' ||
+        lower == '完成';
   }
 
   bool _looksLikePassiveWaitingText(String message) {

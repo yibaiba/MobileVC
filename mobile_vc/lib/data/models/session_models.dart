@@ -1073,6 +1073,58 @@ class ClaudeModelCatalogEntry {
   }
 }
 
+class VoiceApiConfigCandidate {
+  const VoiceApiConfigCandidate({
+    required this.provider,
+    this.label = '',
+    this.apiUrl = '',
+    this.apiKey = '',
+    this.modelName = '',
+    this.endpointType = '',
+    this.sourcePath = '',
+    this.keySource = '',
+    this.status = '',
+    this.detail = '',
+    this.available = false,
+  });
+
+  final String provider;
+  final String label;
+  final String apiUrl;
+  final String apiKey;
+  final String modelName;
+  final String endpointType;
+  final String sourcePath;
+  final String keySource;
+  final String status;
+  final String detail;
+  final bool available;
+
+  bool get hasUsableConfig =>
+      available &&
+      apiUrl.trim().isNotEmpty &&
+      apiKey.trim().isNotEmpty &&
+      modelName.trim().isNotEmpty;
+
+  factory VoiceApiConfigCandidate.fromRuntimeInfoItem(RuntimeInfoItem item) {
+    final meta = item.meta;
+    return VoiceApiConfigCandidate(
+      provider:
+          (meta['provider'] ?? item.label).toString().trim().toLowerCase(),
+      label: item.label.trim(),
+      apiUrl: (meta['apiUrl'] ?? '').toString().trim(),
+      apiKey: (meta['apiKey'] ?? '').toString().trim(),
+      modelName: (meta['modelName'] ?? '').toString().trim(),
+      endpointType: (meta['endpointType'] ?? '').toString().trim(),
+      sourcePath: (meta['sourcePath'] ?? '').toString().trim(),
+      keySource: (meta['keySource'] ?? '').toString().trim(),
+      status: item.status.trim(),
+      detail: item.detail.trim(),
+      available: item.available,
+    );
+  }
+}
+
 class FSItem {
   const FSItem({
     required this.name,

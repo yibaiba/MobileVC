@@ -3715,6 +3715,22 @@ void main() {
       expect(service.sentPayloads.first['query'], 'codex_models');
     });
 
+    test('请求 Voice API 配置候选会发送 voice_api_configs 查询', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+      await controller.connect();
+      service.sentPayloads.clear();
+
+      controller.requestVoiceApiConfigCandidates();
+
+      expect(controller.voiceApiConfigLoading, isTrue);
+      expect(service.sentPayloads, hasLength(1));
+      expect(service.sentPayloads.first['action'], 'runtime_info');
+      expect(service.sentPayloads.first['query'], 'voice_api_configs');
+    });
+
     test('codex_models 结果会填充动态 Codex 模型目录且不覆盖普通 runtime info', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);
@@ -3833,6 +3849,72 @@ void main() {
       expect(controller.configuredAiModel, isEmpty);
       expect(controller.configuredAiReasoningEffort, isEmpty);
       expect(controller.commandBarModelSummary, 'Default · config.toml');
+    });
+
+    test('voice_api_configs 结果会填充候选项且不覆盖普通 runtime info', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+      await controller.connect();
+
+      service.emit(
+        RuntimeInfoResultEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-1',
+          runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+          raw: const {'type': 'runtime_info_result'},
+          query: 'context',
+          items: const [
+            RuntimeInfoItem(
+              label: 'cwd',
+              value: '.',
+              available: true,
+            ),
+          ],
+        ),
+      );
+      await _flushEvents();
+      expect(controller.runtimeInfo?.query, 'context');
+
+      service.emit(
+        RuntimeInfoResultEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-1',
+          runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+          raw: const {'type': 'runtime_info_result'},
+          query: 'voice_api_configs',
+          message: '已读取 1 个可同步 Voice API 配置。',
+          items: const [
+            RuntimeInfoItem(
+              label: 'Codex',
+              value: 'gpt-5.5 · responses',
+              status: 'ready',
+              available: true,
+              detail: '来自 ~/.codex/config.toml 和 ~/.codex/auth.json',
+              meta: {
+                'provider': 'codex',
+                'apiUrl': 'https://api.example.test/v1/responses',
+                'apiKey': 'codex-key',
+                'modelName': 'gpt-5.5',
+                'endpointType': 'responses',
+              },
+            ),
+          ],
+        ),
+      );
+      await _flushEvents();
+
+      expect(controller.voiceApiConfigLoading, isFalse);
+      expect(controller.voiceApiConfigMessage, '已读取 1 个可同步 Voice API 配置。');
+      expect(controller.runtimeInfo?.query, 'context');
+      expect(controller.voiceApiConfigCandidates, hasLength(1));
+      final candidate = controller.voiceApiConfigCandidates.single;
+      expect(candidate.provider, 'codex');
+      expect(candidate.apiUrl, 'https://api.example.test/v1/responses');
+      expect(candidate.apiKey, 'codex-key');
+      expect(candidate.modelName, 'gpt-5.5');
+      expect(candidate.hasUsableConfig, isTrue);
     });
 
     test('手动应用 Codex 配置后不会被旧运行时模型回填覆盖', () async {
@@ -7012,6 +7094,45 @@ void main() {
       ]);
     });
 
+    test('deleteSession 删除当前会话时立即清空选中会话', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      service.emit(
+        SessionCreatedEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-a',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_created'},
+          summary: const SessionSummary(id: 'session-a', title: 'Session A'),
+        ),
+      );
+      await _flushEvents();
+      expect(controller.selectedSessionId, 'session-a');
+
+      controller.deleteSession('session-a');
+      await _flushEvents();
+
+      expect(controller.selectedSessionId, isEmpty);
+
+      service.emit(
+        LogEvent(
+          timestamp: _timestamp.add(const Duration(seconds: 1)),
+          sessionId: 'session-a',
+          runtimeMeta: const RuntimeMeta(engine: 'codex', command: 'codex'),
+          raw: const {'type': 'log'},
+          message: 'stale reply',
+          stream: 'stdout',
+        ),
+      );
+      await _flushEvents();
+
+      expect(controller.timeline.any((item) => item.body == 'stale reply'),
+          isFalse);
+    });
+
     test('deleteSession 失败时恢复本地会话并显示错误', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);
@@ -7351,6 +7472,17 @@ void main() {
       addTearDown(controller.disposeController);
 
       service.emit(
+        SessionCreatedEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-1',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_created'},
+          summary: const SessionSummary(id: 'session-1', title: 'Session 1'),
+        ),
+      );
+      await _flushEvents();
+
+      service.emit(
         LogEvent(
           timestamp: _timestamp,
           sessionId: 'session-1',
@@ -7645,6 +7777,56 @@ void main() {
         ),
         isFalse,
       );
+    });
+
+    test('codex 极短 OK 回复会进入 timeline', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      service.emit(
+        LogEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-1',
+          runtimeMeta: const RuntimeMeta(
+            command: 'codex',
+            engine: 'codex',
+            executionId: 'exec-codex-ok-1',
+            contextId: 'turn-ok-1',
+          ),
+          raw: const {'type': 'log'},
+          message: 'OK',
+          stream: 'stdout',
+        ),
+      );
+      await _flushEvents();
+
+      expect(controller.timeline, hasLength(1));
+      expect(controller.timeline.single.kind, 'markdown');
+      expect(controller.timeline.single.body, 'OK');
+    });
+
+    test('ws_not_connected 不展示为红色 timeline 错误', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      service.emit(
+        ErrorEvent(
+          timestamp: _timestamp,
+          sessionId: '',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'error'},
+          code: 'ws_not_connected',
+          message: 'WebSocket 未连接',
+        ),
+      );
+      await _flushEvents();
+
+      expect(controller.latestError, isNull);
+      expect(controller.timeline, isEmpty);
     });
 
     test('权限交接中的 signal killed 噪声不会进入 timeline', () async {

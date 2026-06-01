@@ -169,11 +169,13 @@ func newCodexAppServerCommand(ctx context.Context, command string) *exec.Cmd {
 		cmdLine := executable + " app-server --listen stdio://"
 		cmd := exec.CommandContext(ctx, "cmd.exe", "/C", cmdLine)
 		cmd.Env = shellEnvironmentWithPath(spec, command, launch.pathEnv)
+		hideCommandWindow(cmd)
 		return cmd
 	}
 
 	cmd := exec.CommandContext(ctx, launch.executable, "app-server", "--listen", "stdio://")
 	cmd.Env = shellEnvironmentWithPath(spec, command, launch.pathEnv)
+	hideCommandWindow(cmd)
 	return cmd
 }
 
