@@ -2943,6 +2943,20 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				continue
 			}
 			emit(result)
+		case "fs_write":
+			var fsWriteReq protocol.FSWriteRequestEvent
+			if err := json.Unmarshal(payloadBytes, &fsWriteReq); err != nil {
+				logx.Warn("ws", "invalid fs_write request: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
+				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid fs_write request: %v", err), ""))
+				continue
+			}
+			result, err := writeFile(selectedSessionID, fsWriteReq.Path, fsWriteReq.Content)
+			if err != nil {
+				logx.Warn("ws", "write file failed: connectionID=%s sessionID=%s remoteAddr=%s path=%q err=%v", connectionID, selectedSessionID, remoteAddr, fsWriteReq.Path, err)
+				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("write file: %v", err), ""))
+				continue
+			}
+			emit(result)
 		case "media_preview":
 			var previewReq protocol.MediaPreviewRequestEvent
 			if err := json.Unmarshal(payloadBytes, &previewReq); err != nil {
@@ -4402,6 +4416,68 @@ func readFile(sessionID, rawPath string) (protocol.FSReadResultEvent, error) {
 		textContent = ""
 	}
 	return protocol.NewFSReadResultEvent(sessionID, absPath, textContent, info.Size(), detectLangFromPath(absPath), "utf-8", isText), nil
+}
+
+func writeFile(sessionID, rawPath, content string) (protocol.FSWriteResultEvent, error) {
+	target := strings.TrimSpace(rawPath)
+	if target == "" {
+		return protocol.FSWriteResultEvent{}, fmt.Errorf("path is required")
+	}
+	if len([]byte(content)) > maxInlineFileReadBytes {
+		return protocol.FSWriteResultEvent{}, fmt.Errorf("file exceeds inline write limit of %d bytes", maxInlineFileReadBytes)
+	}
+
+	cleanTarget := filepath.Clean(target)
+	absPath, err := filepath.Abs(cleanTarget)
+	if err != nil {
+		return protocol.FSWriteResultEvent{}, err
+	}
+
+	info, err := os.Stat(absPath)
+	if err != nil {
+		return protocol.FSWriteResultEvent{}, err
+	}
+	if info.IsDir() {
+		return protocol.FSWriteResultEvent{}, fmt.Errorf("path is a directory")
+	}
+	if isPreviewableImagePath(absPath) {
+		return protocol.FSWriteResultEvent{}, fmt.Errorf("image files cannot be edited inline")
+	}
+
+	dir := filepath.Dir(absPath)
+	tempFile, err := os.CreateTemp(dir, "."+filepath.Base(absPath)+".*.tmp")
+	if err != nil {
+		return protocol.FSWriteResultEvent{}, err
+	}
+	tempPath := tempFile.Name()
+	cleanupTemp := true
+	defer func() {
+		if cleanupTemp {
+			_ = os.Remove(tempPath)
+		}
+	}()
+
+	if _, err := tempFile.WriteString(content); err != nil {
+		_ = tempFile.Close()
+		return protocol.FSWriteResultEvent{}, err
+	}
+	if err := tempFile.Chmod(info.Mode().Perm()); err != nil {
+		_ = tempFile.Close()
+		return protocol.FSWriteResultEvent{}, err
+	}
+	if err := tempFile.Close(); err != nil {
+		return protocol.FSWriteResultEvent{}, err
+	}
+	if err := os.Rename(tempPath, absPath); err != nil {
+		return protocol.FSWriteResultEvent{}, err
+	}
+	cleanupTemp = false
+
+	writtenInfo, err := os.Stat(absPath)
+	if err != nil {
+		return protocol.FSWriteResultEvent{}, err
+	}
+	return protocol.NewFSWriteResultEvent(sessionID, absPath, content, writtenInfo.Size(), detectLangFromPath(absPath), "utf-8", true), nil
 }
 
 func readMediaPreview(sessionID, attachmentID, rawPath string) protocol.MediaPreviewResultEvent {

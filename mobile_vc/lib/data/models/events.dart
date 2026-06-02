@@ -1002,6 +1002,27 @@ class FSReadResultEvent extends AppEvent {
       );
 }
 
+class FSWriteResultEvent extends AppEvent {
+  const FSWriteResultEvent({
+    required super.timestamp,
+    required super.sessionId,
+    required super.runtimeMeta,
+    required super.raw,
+    required this.result,
+  }) : super(type: 'fs_write_result');
+
+  final FileReadResult result;
+
+  factory FSWriteResultEvent.fromJson(Map<String, dynamic> json) =>
+      FSWriteResultEvent(
+        timestamp: _readTimestamp(json),
+        sessionId: (json['sessionId'] ?? '').toString(),
+        runtimeMeta: RuntimeMeta.fromJson(json),
+        raw: json,
+        result: FileReadResult.fromJson(json),
+      );
+}
+
 class MediaPreviewResultEvent extends AppEvent {
   const MediaPreviewResultEvent({
     required super.timestamp,

@@ -291,6 +291,7 @@ class SessionController extends ChangeNotifier {
       <String, DateTime>{};
   bool _fileListLoading = false;
   bool _fileReading = false;
+  bool _fileSaving = false;
   bool _relayDeviceListLoading = false;
   bool _canResumeCurrentSession = false;
   bool _sessionRuntimeAlive = false;
@@ -529,6 +530,7 @@ class SessionController extends ChangeNotifier {
           (_selectedSessionId.trim().isNotEmpty || _timeline.isNotEmpty));
   bool get fileListLoading => _fileListLoading;
   bool get fileReading => _fileReading;
+  bool get fileSaving => _fileSaving;
   bool get canResumeCurrentSession => _canResumeCurrentSession;
   String get connectionMessage => _connectionMessage;
   String get selectedSessionId => _selectedSessionId;
@@ -2703,6 +2705,7 @@ class SessionController extends ChangeNotifier {
     _lastSessionRestorePending = false;
     _fileListLoading = false;
     _fileReading = false;
+    _fileSaving = false;
     _relayDeviceListLoading = false;
     _relayDeviceStatus = '';
     _relayDevices.clear();
@@ -3632,6 +3635,20 @@ class SessionController extends ChangeNotifier {
     }
     _fileReading = true;
     _service.send({'action': 'fs_read', 'path': target});
+    notifyListeners();
+  }
+
+  void requestFileWrite(String path, String content) {
+    final target = path.trim();
+    if (target.isEmpty) {
+      return;
+    }
+    _fileSaving = true;
+    _service.send({
+      'action': 'fs_write',
+      'path': target,
+      'content': content,
+    });
     notifyListeners();
   }
 
@@ -5892,6 +5909,7 @@ class SessionController extends ChangeNotifier {
       case ErrorEvent error:
         _fileListLoading = false;
         _fileReading = false;
+        _fileSaving = false;
         final mutationFailureHandled = _handleMutationFailure(error);
         if (error.code.startsWith('device_') ||
             error.code.startsWith('e2ee_')) {
@@ -6085,6 +6103,13 @@ class SessionController extends ChangeNotifier {
             ),
           ),
         );
+        break;
+      case FSWriteResultEvent fsWrite:
+        _fileSaving = false;
+        _fileReading = false;
+        _openedFile = fsWrite.result;
+        _pushSystem('file', '已保存 ${fsWrite.result.title}');
+        requestFileList(_parentDirectory(fsWrite.result.path));
         break;
       case StepUpdateEvent step:
         if (!_eventTargetsCurrentSession(step.sessionId)) {

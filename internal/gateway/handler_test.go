@@ -515,6 +515,38 @@ func TestHandlerFileAccessReadsAbsolutePath(t *testing.T) {
 	}
 }
 
+func TestHandlerFileAccessWritesTextFile(t *testing.T) {
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "note.md")
+	if err := os.WriteFile(filePath, []byte("# Old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h := newTestHandler()
+	conn := newTestConn(t, h)
+
+	if err := conn.WriteJSON(protocol.FSWriteRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "fs_write"},
+		Path:        filePath,
+		Content:     "# New\n\nBody",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	writeEvent := readUntilType(t, conn, protocol.EventTypeFSWriteResult)
+	if writeEvent["content"] != "# New\n\nBody" {
+		t.Fatalf("content: got %#v", writeEvent["content"])
+	}
+	if writeEvent["isText"] != true {
+		t.Fatalf("isText: got %#v", writeEvent["isText"])
+	}
+	raw, err := os.ReadFile(filePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != "# New\n\nBody" {
+		t.Fatalf("file content: got %#v", string(raw))
+	}
+}
+
 func TestHandlerFileAccessRejectsOversizedTextFile(t *testing.T) {
 	dir := t.TempDir()
 	filePath := filepath.Join(dir, "large.log")

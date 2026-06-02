@@ -1,12 +1,32 @@
 # Changelog
 
-This changelog tracks repository-facing npm package changes. Current package version: `0.2.9`.
+This changelog tracks repository-facing npm package changes. Current package version: `0.2.10`.
 
 ## Unreleased
 
+_No package-facing changes yet._
+
+## [0.2.10] - 2026-06-01
+
 ### Added
 
-- **移动端语音通话预沟通**：新增可配置 Voice API / TTS API 的通话入口，支持先语音澄清任务、权限模式和约束，再交接给本机 Claude Code / Codex 执行。
+- **移动端语音通话助手**：新增可配置 Voice API / TTS API 的通话入口，支持先用语音澄清任务、权限模式和约束，再交接给本机 Claude Code / Codex 执行。
+- **移动端 Codex 沙箱设置**：新增 Codex 沙箱模式选项，可在移动端直接配置。
+- **会话历史窗口可配置**：会话历史长度可配置，续接历史按窗口收敛。
+
+### Changed
+
+- **npm 发布到 `0.2.10`**：平台二进制包和主包已同步发布。
+- **Android 安装入口更新**：Android 下载入口指向 `1.0.0 (20260601 arm64)`。
+- **Codex 移动端控制增强**：细化移动端 Codex 权限控制，Codex 目标切换移入聊天工具栏，权限菜单改用审批图标，并跟随 Codex 默认 reasoning 展示。
+- **Claude 权限模式 UI**：调整 Claude 权限模式选择与展示。
+
+### Fixed
+
+- **语音通话自动提交**：支持自动识别停顿发送，并调优静默判定，避免刚开口就被提前发送；修正交接后误提示“需要补充信息”的执行态。
+- **公网 Relay agent 重连恢复**：修复 agent 重连后陈旧连接 / stale relay link 的恢复与导入问题。
+- **会话同步与续接**：修复会话同步、Codex 短回复、手动 compact resume 元数据和续接历史回放等问题。
+- **聊天键盘布局**：修复移动端聊天键盘 inset 布局与输入冻结。
 
 ## [0.2.9] - 2026-05-31
 

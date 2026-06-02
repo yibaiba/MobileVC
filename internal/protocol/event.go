@@ -27,6 +27,7 @@ const (
 	EventTypeTaskSnapshot              = "task_snapshot"
 	EventTypeFSListResult              = "fs_list_result"
 	EventTypeFSReadResult              = "fs_read_result"
+	EventTypeFSWriteResult             = "fs_write_result"
 	EventTypeMediaPreviewResult        = "media_preview_result"
 	EventTypeStepUpdate                = "step_update"
 	EventTypeFileDiff                  = "file_diff"
@@ -395,6 +396,12 @@ type FSListRequestEvent struct {
 type FSReadRequestEvent struct {
 	ClientEvent
 	Path string `json:"path,omitempty"`
+}
+
+type FSWriteRequestEvent struct {
+	ClientEvent
+	Path    string `json:"path,omitempty"`
+	Content string `json:"content"`
 }
 
 type MediaPreviewRequestEvent struct {
@@ -1019,6 +1026,16 @@ type FSReadResultEvent struct {
 	IsText   bool   `json:"isText"`
 }
 
+type FSWriteResultEvent struct {
+	Event
+	Path     string `json:"path"`
+	Content  string `json:"content"`
+	Size     int64  `json:"size"`
+	Lang     string `json:"lang,omitempty"`
+	Encoding string `json:"encoding,omitempty"`
+	IsText   bool   `json:"isText"`
+}
+
 type MediaPreviewResultEvent struct {
 	Event
 	AttachmentID string `json:"attachmentId,omitempty"`
@@ -1337,6 +1354,18 @@ func NewFSListResultEvent(sessionID, currentPath string, items []FSItem) FSListR
 func NewFSReadResultEvent(sessionID, path, content string, size int64, lang, encoding string, isText bool) FSReadResultEvent {
 	return FSReadResultEvent{
 		Event:    NewBaseEvent(EventTypeFSReadResult, sessionID),
+		Path:     path,
+		Content:  content,
+		Size:     size,
+		Lang:     lang,
+		Encoding: encoding,
+		IsText:   isText,
+	}
+}
+
+func NewFSWriteResultEvent(sessionID, path, content string, size int64, lang, encoding string, isText bool) FSWriteResultEvent {
+	return FSWriteResultEvent{
+		Event:    NewBaseEvent(EventTypeFSWriteResult, sessionID),
 		Path:     path,
 		Content:  content,
 		Size:     size,

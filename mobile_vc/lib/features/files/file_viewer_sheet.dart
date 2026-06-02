@@ -2,10 +2,12 @@ import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
+import 'package:flutter_markdown/flutter_markdown.dart';
 
 import '../../data/models/events.dart';
 import '../../data/models/session_models.dart';
 import '../diff/diff_code_view.dart';
+import 'file_type_utils.dart';
 
 const List<PromptOption> _permissionPromptOptions = <PromptOption>[
   PromptOption(value: 'approve', label: '允许一次'),
@@ -19,6 +21,7 @@ class FileViewerSheet extends StatefulWidget {
     super.key,
     required this.file,
     required this.loading,
+    required this.saving,
     required this.showReviewActions,
     required this.isDiffMode,
     required this.reviewDiff,
@@ -39,12 +42,14 @@ class FileViewerSheet extends StatefulWidget {
     required this.onSelectReviewDiff,
     required this.onOpenDiffList,
     required this.onUseAsContext,
+    required this.onSaveFile,
     required this.onSendFilePrompt,
     required this.onSubmitPrompt,
   });
 
   final FileReadResult? file;
   final bool loading;
+  final bool saving;
   final bool showReviewActions;
   final bool isDiffMode;
   final HistoryContext? reviewDiff;
@@ -65,6 +70,7 @@ class FileViewerSheet extends StatefulWidget {
   final ValueChanged<String> onSelectReviewDiff;
   final VoidCallback onOpenDiffList;
   final VoidCallback onUseAsContext;
+  final void Function(String path, String content) onSaveFile;
   final ValueChanged<String> onSendFilePrompt;
   final ValueChanged<String> onSubmitPrompt;
 
@@ -74,7 +80,11 @@ class FileViewerSheet extends StatefulWidget {
 
 class _FileViewerSheetState extends State<FileViewerSheet> {
   final TextEditingController _controller = TextEditingController();
+  final TextEditingController _editController = TextEditingController();
   final FocusNode _focusNode = FocusNode();
+  final FocusNode _editFocusNode = FocusNode();
+  bool _markdownPreview = true;
+  bool _editing = false;
 
   bool get _inputLocked =>
       widget.shouldShowPermissionChoices ||
@@ -137,12 +147,25 @@ class _FileViewerSheetState extends State<FileViewerSheet> {
     if (_inputLocked && !oldLocked) {
       _focusNode.unfocus();
     }
+    if (oldWidget.file?.path != widget.file?.path) {
+      _editing = false;
+      _editController.text = widget.file?.content ?? '';
+      if (_isMarkdown(widget.file)) {
+        _markdownPreview = true;
+      }
+    } else if (oldWidget.file?.content != widget.file?.content &&
+        widget.file != null) {
+      _editing = false;
+      _editController.text = widget.file!.content;
+    }
   }
 
   @override
   void dispose() {
     _controller.dispose();
+    _editController.dispose();
     _focusNode.dispose();
+    _editFocusNode.dispose();
     super.dispose();
   }
 
@@ -151,6 +174,7 @@ class _FileViewerSheetState extends State<FileViewerSheet> {
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
     final result = widget.file;
+    final fileType = result == null ? null : fileTypeInfoFor(result.title);
     final diff = widget.reviewDiff;
     final activeGroup = _activeGroup();
     final groupDiffs = _groupDiffs(activeGroup);
@@ -162,6 +186,10 @@ class _FileViewerSheetState extends State<FileViewerSheet> {
     final interaction = widget.pendingInteraction;
     final showPermissionBar =
         widget.shouldShowPermissionChoices && !widget.shouldShowReviewChoices;
+    final showMarkdownToggle = _isMarkdown(result) && !widget.isDiffMode;
+    final showEditControls = result?.isText == true &&
+        !widget.isDiffMode &&
+        result?.path.isNotEmpty == true;
     return SafeArea(
       top: false,
       child: AnimatedPadding(
@@ -191,13 +219,48 @@ class _FileViewerSheetState extends State<FileViewerSheet> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text(
-                    result?.title ?? '文件内容',
-                    style: theme.textTheme.titleLarge?.copyWith(
-                      fontWeight: FontWeight.w800,
-                      color: scheme.onSurface,
-                    ),
+                  Row(
+                    children: [
+                      if (fileType != null) ...[
+                        _HeaderFileTypeIcon(info: fileType),
+                        const SizedBox(width: 10),
+                      ],
+                      Expanded(
+                        child: Text(
+                          result?.title ?? '文件内容',
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                          style: theme.textTheme.titleLarge?.copyWith(
+                            fontWeight: FontWeight.w800,
+                            color: scheme.onSurface,
+                          ),
+                        ),
+                      ),
+                    ],
                   ),
+                  if (fileType?.isImage == true) ...[
+                    const SizedBox(height: 8),
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 10,
+                        vertical: 6,
+                      ),
+                      decoration: BoxDecoration(
+                        color: fileType!.color.withValues(alpha: 0.12),
+                        borderRadius: BorderRadius.circular(999),
+                        border: Border.all(
+                          color: fileType.color.withValues(alpha: 0.24),
+                        ),
+                      ),
+                      child: Text(
+                        '图片文件会在下方直接预览，支持双指缩放',
+                        style: theme.textTheme.labelSmall?.copyWith(
+                          color: fileType.color,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ),
+                  ],
                   const SizedBox(height: 6),
                   Text(
                     widget.isDiffMode
@@ -230,26 +293,106 @@ class _FileViewerSheetState extends State<FileViewerSheet> {
               scrollDirection: Axis.horizontal,
               child: Row(
                 children: [
-                  _MetaChip(label: '显示', value: modeLabel, compact: true),
-                  const SizedBox(width: 6),
-                  _MetaChip(
-                    label: '语言',
-                    value: (result?.lang ?? '').isEmpty ? '-' : result!.lang,
-                    compact: true,
-                  ),
-                  const SizedBox(width: 6),
-                  _MetaChip(
-                    label: '编码',
-                    value: result?.encoding ?? 'utf-8',
-                    compact: true,
-                  ),
-                  const SizedBox(width: 6),
-                  _MetaChip(
-                    label: '大小',
-                    value: _sizeLabel(result?.size ?? 0),
-                    compact: true,
-                  ),
-                  const SizedBox(width: 6),
+                  if (!_editing) ...[
+                    _MetaChip(label: '显示', value: modeLabel, compact: true),
+                    const SizedBox(width: 6),
+                    _MetaChip(
+                      label: '类型',
+                      value: fileType?.label ?? '-',
+                      compact: true,
+                    ),
+                    const SizedBox(width: 6),
+                    _MetaChip(
+                      label: '语言',
+                      value: (result?.lang ?? '').isEmpty ? '-' : result!.lang,
+                      compact: true,
+                    ),
+                    const SizedBox(width: 6),
+                    _MetaChip(
+                      label: '编码',
+                      value: result?.encoding ?? 'utf-8',
+                      compact: true,
+                    ),
+                    const SizedBox(width: 6),
+                    _MetaChip(
+                      label: '大小',
+                      value: _sizeLabel(result?.size ?? 0),
+                      compact: true,
+                    ),
+                    const SizedBox(width: 6),
+                  ],
+                  if (showMarkdownToggle && !_editing) ...[
+                    SegmentedButton<bool>(
+                      segments: const [
+                        ButtonSegment<bool>(
+                          value: true,
+                          icon: Icon(Icons.preview_rounded, size: 16),
+                          label: Text('预览'),
+                        ),
+                        ButtonSegment<bool>(
+                          value: false,
+                          icon: Icon(Icons.code_rounded, size: 16),
+                          label: Text('源码'),
+                        ),
+                      ],
+                      selected: {_markdownPreview},
+                      onSelectionChanged: (selection) {
+                        setState(() {
+                          _markdownPreview = selection.first;
+                        });
+                      },
+                    ),
+                    const SizedBox(width: 6),
+                  ],
+                  if (showEditControls) ...[
+                    if (_editing) ...[
+                      OutlinedButton.icon(
+                        onPressed: widget.saving ? null : _cancelEditing,
+                        style: OutlinedButton.styleFrom(
+                          visualDensity: VisualDensity.compact,
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 12,
+                            vertical: 10,
+                          ),
+                        ),
+                        icon: const Icon(Icons.close_rounded, size: 16),
+                        label: const Text('取消'),
+                      ),
+                      const SizedBox(width: 6),
+                      FilledButton.icon(
+                        onPressed: widget.saving ? null : _saveEditing,
+                        style: FilledButton.styleFrom(
+                          visualDensity: VisualDensity.compact,
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 12,
+                            vertical: 10,
+                          ),
+                        ),
+                        icon: widget.saving
+                            ? const SizedBox(
+                                width: 16,
+                                height: 16,
+                                child:
+                                    CircularProgressIndicator(strokeWidth: 2),
+                              )
+                            : const Icon(Icons.save_rounded, size: 16),
+                        label: Text(widget.saving ? '保存中' : '保存'),
+                      ),
+                    ] else
+                      OutlinedButton.icon(
+                        onPressed: widget.saving ? null : _startEditing,
+                        style: OutlinedButton.styleFrom(
+                          visualDensity: VisualDensity.compact,
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 12,
+                            vertical: 10,
+                          ),
+                        ),
+                        icon: const Icon(Icons.edit_rounded, size: 16),
+                        label: const Text('编辑'),
+                      ),
+                    const SizedBox(width: 6),
+                  ],
                   FilledButton.tonalIcon(
                     onPressed: result == null ? null : widget.onUseAsContext,
                     style: FilledButton.styleFrom(
@@ -265,7 +408,7 @@ class _FileViewerSheetState extends State<FileViewerSheet> {
                 ],
               ),
             ),
-            if ((result?.path ?? '').isNotEmpty) ...[
+            if (!_editing && (result?.path ?? '').isNotEmpty) ...[
               const SizedBox(height: 8),
               Container(
                 width: double.infinity,
@@ -286,7 +429,7 @@ class _FileViewerSheetState extends State<FileViewerSheet> {
                 ),
               ),
             ],
-            if (widget.showReviewActions) ...[
+            if (!_editing && widget.showReviewActions) ...[
               const SizedBox(height: 8),
               Container(
                 width: double.infinity,
@@ -467,7 +610,8 @@ class _FileViewerSheetState extends State<FileViewerSheet> {
                 ),
               ),
             ],
-            if (!widget.showReviewActions &&
+            if (!_editing &&
+                !widget.showReviewActions &&
                 !widget.shouldShowReviewChoices &&
                 !widget.shouldShowPermissionChoices &&
                 _visiblePrompt != null) ...[
@@ -477,7 +621,7 @@ class _FileViewerSheetState extends State<FileViewerSheet> {
                 onSubmit: widget.onSubmitPrompt,
               ),
             ],
-            if (showPermissionBar) ...[
+            if (!_editing && showPermissionBar) ...[
               const SizedBox(height: 8),
               _PermissionActionBar(
                 key: const ValueKey('fileViewer.permissionBar'),
@@ -486,28 +630,30 @@ class _FileViewerSheetState extends State<FileViewerSheet> {
                 onSubmit: widget.onSubmitPrompt,
               ),
             ],
-            const SizedBox(height: 8),
-            TextField(
-              key: const ValueKey('fileViewer.input'),
-              controller: _controller,
-              focusNode: _focusNode,
-              enabled: !_inputLocked,
-              readOnly: _inputLocked,
-              canRequestFocus: !_inputLocked,
-              minLines: 1,
-              maxLines: 3,
-              textInputAction: TextInputAction.send,
-              onTap: _inputLocked ? () => _focusNode.unfocus() : null,
-              onSubmitted: _inputLocked ? null : (_) => _submitPrompt(),
-              decoration: InputDecoration(
-                hintText: _lockedHintText,
-                suffixIcon: IconButton(
-                  key: const ValueKey('fileViewer.sendButton'),
-                  onPressed: _inputLocked ? null : _submitPrompt,
-                  icon: const Icon(Icons.send),
+            if (!_editing) ...[
+              const SizedBox(height: 8),
+              TextField(
+                key: const ValueKey('fileViewer.input'),
+                controller: _controller,
+                focusNode: _focusNode,
+                enabled: !_inputLocked,
+                readOnly: _inputLocked,
+                canRequestFocus: !_inputLocked,
+                minLines: 1,
+                maxLines: 3,
+                textInputAction: TextInputAction.send,
+                onTap: _inputLocked ? () => _focusNode.unfocus() : null,
+                onSubmitted: _inputLocked ? null : (_) => _submitPrompt(),
+                decoration: InputDecoration(
+                  hintText: _lockedHintText,
+                  suffixIcon: IconButton(
+                    key: const ValueKey('fileViewer.sendButton'),
+                    onPressed: _inputLocked ? null : _submitPrompt,
+                    icon: const Icon(Icons.send),
+                  ),
                 ),
               ),
-            ),
+            ],
           ],
         ),
       ),
@@ -518,6 +664,83 @@ class _FileViewerSheetState extends State<FileViewerSheet> {
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
     if (result.isText) {
+      if (_editing) {
+        return Container(
+          width: double.infinity,
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            color: scheme.surfaceContainerLowest,
+            borderRadius: BorderRadius.circular(18),
+            border: Border.all(
+              color: scheme.primary.withValues(alpha: 0.45),
+            ),
+          ),
+          child: TextField(
+            controller: _editController,
+            focusNode: _editFocusNode,
+            enabled: !widget.saving,
+            expands: true,
+            maxLines: null,
+            minLines: null,
+            keyboardType: TextInputType.multiline,
+            textAlignVertical: TextAlignVertical.top,
+            style: theme.textTheme.bodyMedium?.copyWith(
+              color: scheme.onSurface,
+              fontFamily: 'monospace',
+              height: 1.45,
+            ),
+            decoration: const InputDecoration(
+              border: InputBorder.none,
+              hintText: '点按这里开始编辑文件内容',
+            ),
+          ),
+        );
+      }
+      if (_isMarkdown(result) && _markdownPreview) {
+        return Container(
+          width: double.infinity,
+          decoration: BoxDecoration(
+            color: scheme.surfaceContainerLowest,
+            borderRadius: BorderRadius.circular(18),
+            border: Border.all(
+              color: scheme.outlineVariant.withValues(alpha: 0.45),
+            ),
+          ),
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(18),
+            child: Markdown(
+              data: result.content,
+              selectable: true,
+              padding: const EdgeInsets.all(14),
+              styleSheet: MarkdownStyleSheet.fromTheme(theme).copyWith(
+                p: theme.textTheme.bodyMedium?.copyWith(
+                  color: scheme.onSurface,
+                  height: 1.55,
+                ),
+                code: theme.textTheme.bodyMedium?.copyWith(
+                  color: scheme.onSurface,
+                  fontFamily: 'monospace',
+                  backgroundColor:
+                      scheme.surfaceContainerHighest.withValues(alpha: 0.55),
+                ),
+                codeblockDecoration: BoxDecoration(
+                  color: scheme.surfaceContainerHighest.withValues(alpha: 0.55),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                blockquoteDecoration: BoxDecoration(
+                  color: scheme.surfaceContainerHigh.withValues(alpha: 0.55),
+                  border: Border(
+                    left: BorderSide(
+                      color: scheme.primary.withValues(alpha: 0.7),
+                      width: 4,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+      }
       return SingleChildScrollView(
         child: Container(
           width: double.infinity,
@@ -579,6 +802,42 @@ class _FileViewerSheetState extends State<FileViewerSheet> {
     }
 
     return _buildUnsupportedPreview(context, '该文件不是文本文件，当前无法预览。');
+  }
+
+  bool _isMarkdown(FileReadResult? result) {
+    if (result == null || !result.isText) {
+      return false;
+    }
+    final extension = result.extension.toLowerCase();
+    return extension == 'md' || extension == 'markdown';
+  }
+
+  void _startEditing() {
+    final result = widget.file;
+    if (result == null || !result.isText || result.path.isEmpty) {
+      return;
+    }
+    setState(() {
+      _editing = true;
+      _markdownPreview = false;
+      _editController.text = result.content;
+    });
+  }
+
+  void _cancelEditing() {
+    setState(() {
+      _editing = false;
+      _editController.text = widget.file?.content ?? '';
+    });
+    _editFocusNode.unfocus();
+  }
+
+  void _saveEditing() {
+    final result = widget.file;
+    if (result == null || result.path.isEmpty || widget.saving) {
+      return;
+    }
+    widget.onSaveFile(result.path, _editController.text);
   }
 
   Widget _buildUnsupportedPreview(BuildContext context, String message) {
@@ -958,6 +1217,32 @@ class _PromptOptionAction extends StatelessWidget {
 }
 
 enum _PromptActionStyle { filled, tonal, outlined }
+
+class _HeaderFileTypeIcon extends StatelessWidget {
+  const _HeaderFileTypeIcon({required this.info});
+
+  final FileTypeInfo info;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 42,
+      height: 42,
+      decoration: BoxDecoration(
+        color: info.color.withValues(alpha: 0.14),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(
+          color: info.color.withValues(alpha: 0.22),
+        ),
+      ),
+      child: Icon(
+        info.icon,
+        color: info.color,
+        size: 23,
+      ),
+    );
+  }
+}
 
 class _MetaChip extends StatelessWidget {
   const _MetaChip({
