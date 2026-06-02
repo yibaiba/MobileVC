@@ -582,6 +582,7 @@ func TestCompactRestartsDetachedCodexResumeSession(t *testing.T) {
 		m.Engine = "codex"
 		m.CWD = "/tmp"
 		m.PermissionMode = "default"
+		m.CodexSandboxMode = "danger-full-access"
 		m.ResumeSessionID = "resume-codex-123"
 	})
 
@@ -594,6 +595,9 @@ func TestCompactRestartsDetachedCodexResumeSession(t *testing.T) {
 	lower := strings.ToLower(strings.TrimSpace(resumed.lastReq.Command))
 	if !strings.HasPrefix(lower, "codex resume resume-codex-123") {
 		t.Fatalf("expected codex resume command before compact, got %q", resumed.lastReq.Command)
+	}
+	if got := resumed.lastReq.RuntimeMeta.CodexSandboxMode; got != "danger-full-access" {
+		t.Fatalf("expected stored codex sandbox mode on detached compact resume, got %q", got)
 	}
 }
 
@@ -609,15 +613,17 @@ func TestCompactDetachedCodexResumePrefersRequestRuntimeMeta(t *testing.T) {
 		m.Engine = "codex"
 		m.CWD = "/tmp/stale"
 		m.PermissionMode = "default"
+		m.CodexSandboxMode = "workspace-write"
 		m.ResumeSessionID = "resume-stale"
 	})
 
 	err := svc.Compact(context.Background(), "s1", protocol.RuntimeMeta{
-		Command:         "codex -m gpt-5.5",
-		Engine:          "codex",
-		CWD:             "/tmp/request",
-		PermissionMode:  "bypassPermissions",
-		ResumeSessionID: "resume-request",
+		Command:          "codex -m gpt-5.5",
+		Engine:           "codex",
+		CWD:              "/tmp/request",
+		PermissionMode:   "bypassPermissions",
+		CodexSandboxMode: "danger-full-access",
+		ResumeSessionID:  "resume-request",
 	}, func(any) {})
 	if !errors.Is(err, engine.ErrInputNotSupported) {
 		t.Fatalf("expected detached codex resume runner to restart into compact path and fail on missing compactor, got %v", err)
@@ -636,6 +642,9 @@ func TestCompactDetachedCodexResumePrefersRequestRuntimeMeta(t *testing.T) {
 	}
 	if resumed.lastReq.PermissionMode != "bypassPermissions" {
 		t.Fatalf("expected request permission mode on detached compact resume, got %q", resumed.lastReq.PermissionMode)
+	}
+	if got := resumed.lastReq.RuntimeMeta.CodexSandboxMode; got != "danger-full-access" {
+		t.Fatalf("expected request codex sandbox mode on detached compact resume, got %q", got)
 	}
 }
 

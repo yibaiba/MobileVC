@@ -299,6 +299,11 @@ func (s *Service) Compact(ctx context.Context, sessionID string, requestMeta pro
 				Engine:         firstNonEmptyRuntimeValue(effectiveMeta.Engine, activeMeta.Engine, snapshot.ActiveMeta.Engine),
 				CWD:            firstNonEmptyRuntimeValue(effectiveMeta.CWD, activeMeta.CWD, snapshot.ActiveMeta.CWD),
 				PermissionMode: firstNonEmptyRuntimeValue(effectiveMeta.PermissionMode, activeMeta.PermissionMode, snapshot.ActiveMeta.PermissionMode),
+				CodexSandboxMode: firstNonEmptyRuntimeValue(
+					effectiveMeta.CodexSandboxMode,
+					activeMeta.CodexSandboxMode,
+					snapshot.ActiveMeta.CodexSandboxMode,
+				),
 				ResumeSessionID: firstNonEmptyRuntimeValue(
 					effectiveMeta.ResumeSessionID,
 					activeMeta.ResumeSessionID,

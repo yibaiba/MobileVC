@@ -63,7 +63,8 @@ func RefreshedPermissionPromptEventWithID(sessionID string, req protocol.Permiss
 		Command:             strings.TrimSpace(req.FallbackCommand),
 		Engine:              strings.TrimSpace(req.FallbackEngine),
 		CWD:                 strings.TrimSpace(req.FallbackCWD),
-		PermissionMode:      NormalizeClaudePermissionMode(req.PermissionMode),
+		PermissionMode:      strings.TrimSpace(req.PermissionMode),
+		CodexSandboxMode:    strings.TrimSpace(req.CodexSandboxMode),
 		PermissionRequestID: requestID,
 		BlockingKind:        "permission",
 		ContextID:           strings.TrimSpace(req.ContextID),
@@ -71,6 +72,9 @@ func RefreshedPermissionPromptEventWithID(sessionID string, req protocol.Permiss
 		TargetPath:          strings.TrimSpace(req.TargetPath),
 		Target:              strings.TrimSpace(req.FallbackTarget),
 		TargetType:          strings.TrimSpace(req.FallbackTargetType),
+	}
+	if meta.PermissionMode != "" {
+		meta.PermissionMode = normalizePermissionModeForRuntime(meta.PermissionMode, meta)
 	}
 	if service != nil {
 		snapshot := service.RuntimeSnapshot()
@@ -81,7 +85,10 @@ func RefreshedPermissionPromptEventWithID(sessionID string, req protocol.Permiss
 		meta.PermissionRequestID = requestID
 		meta.BlockingKind = "permission"
 		if mode := strings.TrimSpace(req.PermissionMode); mode != "" {
-			meta.PermissionMode = NormalizeClaudePermissionMode(mode)
+			meta.PermissionMode = normalizePermissionModeForRuntime(mode, meta)
+		}
+		if sandboxMode := strings.TrimSpace(req.CodexSandboxMode); sandboxMode != "" {
+			meta.CodexSandboxMode = sandboxMode
 		}
 	}
 	message := strings.TrimSpace(req.PromptMessage)

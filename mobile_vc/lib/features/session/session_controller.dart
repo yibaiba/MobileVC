@@ -253,8 +253,6 @@ class SessionController extends ChangeNotifier {
       Duration(seconds: 2);
   static const Duration _defaultLanReturnProbeInterval = Duration(seconds: 20);
   static const Duration _lanReturnCooldown = Duration(seconds: 30);
-  static const String _codexYoloPermissionMode = 'bypassPermissions';
-  static const String _codexYoloSandboxMode = 'danger-full-access';
   final MobileVcWsService _service;
   final AdbWebRtcService _adbWebRtc = AdbWebRtcService();
   final Duration _outboundAckRetryDelay;
@@ -2212,6 +2210,11 @@ class SessionController extends ChangeNotifier {
     return false;
   }
 
+  String get _configuredCodexPermissionMode =>
+      normalizePermissionModeForEngine(_config.permissionMode, 'codex');
+
+  String get _configuredCodexSandboxMode => _config.codexSandboxMode.trim();
+
   Map<String, dynamic> _aiTurnPayload({
     required String engine,
     required RuntimeMeta meta,
@@ -2244,8 +2247,8 @@ class SessionController extends ChangeNotifier {
       payload.remove('reasoningEffort');
     }
     if (normalizedEngine == 'codex') {
-      payload['permissionMode'] = _codexYoloPermissionMode;
-      payload['codexSandboxMode'] = _codexYoloSandboxMode;
+      payload['permissionMode'] = _configuredCodexPermissionMode;
+      payload['codexSandboxMode'] = _configuredCodexSandboxMode;
       if (!_config.codexTargetMode) {
         payload.remove('target');
         payload.remove('targetType');
@@ -2269,14 +2272,26 @@ class SessionController extends ChangeNotifier {
 
   bool get _currentSessionShouldSendCodexSandboxMode =>
       _runtimeMetaIsCodex(_liveRuntimeMeta) ||
-      _runtimeMetaIsCodex(currentMeta) ||
+      _runtimeMetaIsCodex(_resumeRuntimeMeta) ||
       _selectedSessionId.trim().toLowerCase().startsWith('codex-thread:') ||
       _sessionSummaryIsCodex(_selectedSessionSummary);
 
   void _applyCodexSandboxModeIfNeeded(Map<String, dynamic> payload) {
     if (_currentSessionShouldSendCodexSandboxMode) {
-      payload['permissionMode'] = _codexYoloPermissionMode;
-      payload['codexSandboxMode'] = _codexYoloSandboxMode;
+      payload['permissionMode'] = _configuredCodexPermissionMode;
+      payload['codexSandboxMode'] = _configuredCodexSandboxMode;
+    } else {
+      payload.remove('codexSandboxMode');
+    }
+  }
+
+  void _applyCodexSandboxModeForRuntimeMeta(
+    Map<String, dynamic> payload,
+    RuntimeMeta meta,
+  ) {
+    final payloadMeta = RuntimeMeta.fromJson(payload);
+    if (_runtimeMetaIsCodex(meta) || _runtimeMetaIsCodex(payloadMeta)) {
+      payload['codexSandboxMode'] = _configuredCodexSandboxMode;
     } else {
       payload.remove('codexSandboxMode');
     }
@@ -2881,9 +2896,8 @@ class SessionController extends ChangeNotifier {
     final lastSeenCursor = _sessionEventCursors[sessionId] ?? 0;
     final runtimeState =
         (_agentState?.state ?? _sessionState?.state ?? '').trim();
-    final shouldSendCodexRuntimeMeta = _runtimeMetaIsCodex(_liveRuntimeMeta) ||
-        sessionId.toLowerCase().startsWith('codex-thread:') ||
-        _sessionSummaryIsCodex(_selectedSessionSummary);
+    final shouldSendCodexRuntimeMeta =
+        _currentSessionShouldSendCodexSandboxMode;
     _connectionStage = SessionConnectionStage.catchingUp;
     _service.send({
       'action': 'session_resume',
@@ -2892,8 +2906,8 @@ class SessionController extends ChangeNotifier {
       'limit': _historyWindowLimit,
       if (shouldSendCodexRuntimeMeta) ...{
         'engine': 'codex',
-        'codexSandboxMode': _codexYoloSandboxMode,
-        'permissionMode': _codexYoloPermissionMode,
+        'codexSandboxMode': _configuredCodexSandboxMode,
+        'permissionMode': _configuredCodexPermissionMode,
       },
       if (reason.trim().isNotEmpty) 'reason': reason.trim(),
       if (lastSeenCursor > 0) 'lastSeenEventCursor': lastSeenCursor,
@@ -5000,7 +5014,7 @@ class SessionController extends ChangeNotifier {
       final effectivePermissionRequestId = livePromptRequestId.isNotEmpty
           ? livePromptRequestId
           : decisionMeta.permissionRequestId;
-      _service.send({
+      final payload = <String, dynamic>{
         'action': 'permission_decision',
         'sessionId': _selectedSessionId,
         'decision': selection.decision,
@@ -5019,7 +5033,9 @@ class SessionController extends ChangeNotifier {
             : _config.engine,
         'target': decisionMeta.target,
         'targetType': decisionMeta.targetType,
-      });
+      };
+      _applyCodexSandboxModeForRuntimeMeta(payload, decisionMeta);
+      _service.send(payload);
       _clearPermissionBlockingState();
       _syncDerivedState();
       notifyListeners();
@@ -5090,7 +5106,7 @@ class SessionController extends ChangeNotifier {
         permissionMode: _currentDecisionPermissionMode,
       ),
     );
-    _service.send({
+    final payload = <String, dynamic>{
       'action': 'permission_decision',
       'sessionId': _selectedSessionId,
       'decision': selection.decision,
@@ -5108,7 +5124,9 @@ class SessionController extends ChangeNotifier {
           decisionMeta.engine.isNotEmpty ? decisionMeta.engine : _config.engine,
       'target': decisionMeta.target,
       'targetType': decisionMeta.targetType,
-    });
+    };
+    _applyCodexSandboxModeForRuntimeMeta(payload, decisionMeta);
+    _service.send(payload);
     _clearPermissionBlockingState();
     _syncDerivedState();
     notifyListeners();

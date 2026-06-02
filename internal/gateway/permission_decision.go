@@ -24,7 +24,7 @@ func executePermissionDecision(
 		return err
 	}
 	if plan.Meta.PermissionMode != "" {
-		service.UpdatePermissionMode(plan.Meta.PermissionMode)
+		service.UpdatePermissionModeForEngine(plan.Meta.PermissionMode, plan.Meta.Engine)
 	}
 	switch plan.Action {
 	case session.PermissionDecisionActionDirect:

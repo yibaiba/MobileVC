@@ -1390,7 +1390,7 @@ func TestSessionResumeReplaysPendingEvents(t *testing.T) {
 	}
 }
 
-func TestSessionResumeForcesCodexYoloPermissions(t *testing.T) {
+func TestSessionResumePreservesRequestedCodexPermissions(t *testing.T) {
 	tempStore, err := data.NewFileStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("new file store: %v", err)
@@ -1436,8 +1436,8 @@ func TestSessionResumeForcesCodexYoloPermissions(t *testing.T) {
 	if got := runtimeEntry.service.RuntimeSnapshot().ActiveMeta.CodexSandboxMode; got != "danger-full-access" {
 		t.Fatalf("expected synced codex sandbox mode, got %q", got)
 	}
-	if got := runtimeEntry.service.RuntimeSnapshot().ActiveMeta.PermissionMode; got != "bypassPermissions" {
-		t.Fatalf("expected forced codex yolo permission mode, got %q", got)
+	if got := runtimeEntry.service.RuntimeSnapshot().ActiveMeta.PermissionMode; got != "config" {
+		t.Fatalf("expected synced codex permission mode, got %q", got)
 	}
 	updated, err := h.SessionStore.GetSession(context.Background(), sessionID)
 	if err != nil {
@@ -1449,15 +1449,15 @@ func TestSessionResumeForcesCodexYoloPermissions(t *testing.T) {
 	if got := updated.Summary.Runtime.CodexSandboxMode; got != "danger-full-access" {
 		t.Fatalf("expected persisted summary codex sandbox mode, got %#v", updated.Summary.Runtime)
 	}
-	if got := updated.Projection.Runtime.PermissionMode; got != "bypassPermissions" {
-		t.Fatalf("expected persisted codex yolo permission mode, got %#v", updated.Projection.Runtime)
+	if got := updated.Projection.Runtime.PermissionMode; got != "config" {
+		t.Fatalf("expected persisted codex permission mode, got %#v", updated.Projection.Runtime)
 	}
-	if got := updated.Summary.Runtime.PermissionMode; got != "bypassPermissions" {
-		t.Fatalf("expected persisted summary codex yolo permission mode, got %#v", updated.Summary.Runtime)
+	if got := updated.Summary.Runtime.PermissionMode; got != "config" {
+		t.Fatalf("expected persisted summary codex permission mode, got %#v", updated.Summary.Runtime)
 	}
 }
 
-func TestSessionResumeForcesCodexYoloPermissionsFromCommand(t *testing.T) {
+func TestSessionResumePreservesStoredCodexPermissionsFromCommand(t *testing.T) {
 	tempStore, err := data.NewFileStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("new file store: %v", err)
@@ -1473,9 +1473,11 @@ func TestSessionResumeForcesCodexYoloPermissionsFromCommand(t *testing.T) {
 	}
 	record.Projection = session.NormalizeProjectionSnapshot(data.ProjectionSnapshot{
 		Runtime: data.SessionRuntime{
-			Command:         "/usr/local/bin/codex resume thread-command",
-			CWD:             "/tmp/project",
-			ResumeSessionID: "thread-command",
+			Command:          "/usr/local/bin/codex resume thread-command",
+			CWD:              "/tmp/project",
+			PermissionMode:   "auto",
+			CodexSandboxMode: "workspace-write",
+			ResumeSessionID:  "thread-command",
 		},
 	})
 	if _, err := h.SessionStore.SaveProjection(context.Background(), sessionID, record.Projection); err != nil {
@@ -1494,21 +1496,21 @@ func TestSessionResumeForcesCodexYoloPermissionsFromCommand(t *testing.T) {
 	if runtimeEntry == nil || runtimeEntry.service == nil {
 		t.Fatal("expected runtime service")
 	}
-	if got := runtimeEntry.service.RuntimeSnapshot().ActiveMeta.CodexSandboxMode; got != "danger-full-access" {
-		t.Fatalf("expected forced codex yolo sandbox mode, got %q", got)
+	if got := runtimeEntry.service.RuntimeSnapshot().ActiveMeta.CodexSandboxMode; got != "workspace-write" {
+		t.Fatalf("expected stored codex sandbox mode, got %q", got)
 	}
-	if got := runtimeEntry.service.RuntimeSnapshot().ActiveMeta.PermissionMode; got != "bypassPermissions" {
-		t.Fatalf("expected forced codex yolo permission mode, got %q", got)
+	if got := runtimeEntry.service.RuntimeSnapshot().ActiveMeta.PermissionMode; got != "auto" {
+		t.Fatalf("expected stored codex permission mode, got %q", got)
 	}
 	updated, err := h.SessionStore.GetSession(context.Background(), sessionID)
 	if err != nil {
 		t.Fatalf("get updated session: %v", err)
 	}
-	if got := updated.Projection.Runtime.CodexSandboxMode; got != "danger-full-access" {
-		t.Fatalf("expected persisted codex yolo sandbox mode, got %#v", updated.Projection.Runtime)
+	if got := updated.Projection.Runtime.CodexSandboxMode; got != "workspace-write" {
+		t.Fatalf("expected persisted codex sandbox mode, got %#v", updated.Projection.Runtime)
 	}
-	if got := updated.Projection.Runtime.PermissionMode; got != "bypassPermissions" {
-		t.Fatalf("expected persisted codex yolo permission mode, got %#v", updated.Projection.Runtime)
+	if got := updated.Projection.Runtime.PermissionMode; got != "auto" {
+		t.Fatalf("expected persisted codex permission mode, got %#v", updated.Projection.Runtime)
 	}
 }
 
@@ -7424,13 +7426,14 @@ func TestHandlerCompactRestartsLoadedCodexMirrorSession(t *testing.T) {
 		RawTerminalByStream: map[string]string{"stdout": "", "stderr": ""},
 		LogEntries:          record.Projection.LogEntries,
 		Runtime: data.SessionRuntime{
-			ResumeSessionID: threadID,
-			Command:         "codex resume " + threadID,
-			Engine:          "codex",
-			CWD:             projectDir,
-			PermissionMode:  "default",
-			ClaudeLifecycle: "resumable",
-			Source:          "codex-native",
+			ResumeSessionID:  threadID,
+			Command:          "codex resume " + threadID,
+			Engine:           "codex",
+			CWD:              projectDir,
+			PermissionMode:   "default",
+			CodexSandboxMode: "danger-full-access",
+			ClaudeLifecycle:  "resumable",
+			Source:           "codex-native",
 		},
 		Controller: session.ControllerSnapshot{
 			SessionID:       record.Summary.ID,
@@ -7439,12 +7442,13 @@ func TestHandlerCompactRestartsLoadedCodexMirrorSession(t *testing.T) {
 			ResumeSession:   threadID,
 			ClaudeLifecycle: "resumable",
 			ActiveMeta: protocol.RuntimeMeta{
-				ResumeSessionID: threadID,
-				Command:         "codex resume " + threadID,
-				Engine:          "codex",
-				CWD:             projectDir,
-				PermissionMode:  "default",
-				ClaudeLifecycle: "resumable",
+				ResumeSessionID:  threadID,
+				Command:          "codex resume " + threadID,
+				Engine:           "codex",
+				CWD:              projectDir,
+				PermissionMode:   "default",
+				CodexSandboxMode: "danger-full-access",
+				ClaudeLifecycle:  "resumable",
 			},
 		},
 	}); err != nil {
@@ -7483,6 +7487,9 @@ func TestHandlerCompactRestartsLoadedCodexMirrorSession(t *testing.T) {
 	resumed.WaitStarted(t)
 	if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(resumed.lastReq.Command)), "codex resume "+strings.ToLower(threadID)) {
 		t.Fatalf("expected codex resume command on compact restore, got %q", resumed.lastReq.Command)
+	}
+	if got := resumed.lastReq.RuntimeMeta.CodexSandboxMode; got != "danger-full-access" {
+		t.Fatalf("expected codex sandbox on compact restore, got %q", got)
 	}
 }
 

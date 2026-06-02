@@ -4193,10 +4193,7 @@ void main() {
 
       expect(service.sentPayloads[0]['action'], 'ai_turn');
       expect(service.sentPayloads[0]['engine'], 'codex');
-      expect(
-        service.sentPayloads[0]['permissionMode'],
-        'bypassPermissions',
-      );
+      expect(service.sentPayloads[0]['permissionMode'], 'config');
       expect(
         service.sentPayloads[0]['codexSandboxMode'],
         'danger-full-access',
@@ -4974,8 +4971,8 @@ void main() {
       final payload = service.sentPayloads.single;
       expect(payload['action'], 'input');
       expect(payload['data'], '看下这张图\n');
-      expect(payload['permissionMode'], 'bypassPermissions');
-      expect(payload['codexSandboxMode'], 'danger-full-access');
+      expect(payload['permissionMode'], 'auto');
+      expect(payload['codexSandboxMode'], 'workspace-write');
       expect(payload.containsKey('imageAttachments'), isTrue);
       expect(controller.canStopCurrentRun, isTrue);
     });
@@ -5018,7 +5015,7 @@ void main() {
       );
     });
 
-    test('观察模式继续 Codex 会话时强制带入 YOLO 权限', () async {
+    test('观察模式继续 Codex 会话时带入当前配置权限', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);
       await controller.initialize();
@@ -5062,10 +5059,10 @@ void main() {
       expect(resumes.single['reason'], 'continue_same_session');
       expect(resumes.single['engine'], 'codex');
       expect(resumes.single['codexSandboxMode'], 'danger-full-access');
-      expect(resumes.single['permissionMode'], 'bypassPermissions');
+      expect(resumes.single['permissionMode'], 'config');
     });
 
-    test('Codex thread id 恢复时即使 runtime 为空也带入 YOLO 权限', () async {
+    test('Codex thread id 恢复时即使 runtime 为空也带入当前配置权限', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);
       await controller.initialize();
@@ -9604,6 +9601,7 @@ void main() {
       expect(payload['targetPath'], '/workspace/README.md');
       expect(payload['promptMessage'], 'Allow write to README.md?');
       expect(payload['cwd'], '/workspace');
+      expect(payload.containsKey('codexSandboxMode'), isFalse);
     });
 
     test('permission prompt 中文允许也发送 permission_decision', () async {
@@ -9778,6 +9776,47 @@ void main() {
       expect(payload['action'], 'permission_decision');
       expect(payload['decision'], 'approve');
       expect(payload['scope'], 'session');
+    });
+
+    test('Codex permission prompt 会带入沙箱配置', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.saveConfig(
+        controller.config.copyWith(
+          engine: 'codex',
+          codexSandboxMode: 'danger-full-access',
+          permissionMode: 'config',
+        ),
+      );
+      service.emit(
+        PromptRequestEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-1',
+          runtimeMeta: const RuntimeMeta(
+            command: 'codex',
+            engine: 'codex',
+            targetPath: '/workspace/lib/main.dart',
+            blockingKind: 'permission',
+          ),
+          raw: const {'type': 'prompt_request', 'msg': 'Allow edit main.dart?'},
+          message: 'Allow edit main.dart?',
+          options: const [PromptOption(value: 'y'), PromptOption(value: 'n')],
+        ),
+      );
+      await _flushEvents();
+      service.sentPayloads.clear();
+
+      controller.submitPromptOption('approve');
+
+      expect(service.sentPayloads, hasLength(1));
+      final payload = service.sentPayloads.single;
+      expect(payload['action'], 'permission_decision');
+      expect(payload['decision'], 'approve');
+      expect(payload['engine'], 'codex');
+      expect(payload['codexSandboxMode'], 'danger-full-access');
     });
 
     test('permission prompt 选择长期允许会发送 persistent scope', () async {

@@ -1842,6 +1842,51 @@ func TestCodexAppSessionTurnStartPassesReasoningEffort(t *testing.T) {
 	}
 }
 
+func TestCodexAppSessionTurnStartPassesRuntimeSandbox(t *testing.T) {
+	buf := &nopWriteCloser{}
+	runner := NewPtyRunner()
+	runner.SetPermissionMode("bypassPermissions")
+	app := &codexAppSession{
+		runner: runner,
+		req: ExecRequest{
+			Command: "codex -m gpt-5.4",
+			RuntimeMeta: protocol.RuntimeMeta{
+				CodexSandboxMode: "danger-full-access",
+			},
+		},
+		stdin: buf,
+	}
+	app.setThreadID("thread-123")
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- app.SendUserInput(context.Background(), []byte("hello\n"))
+	}()
+
+	resolveNextPendingRPC(t, app, map[string]any{
+		"turn": map[string]any{
+			"id": "turn-1",
+		},
+	})
+
+	if err := <-errCh; err != nil {
+		t.Fatalf("send user input: %v", err)
+	}
+
+	output := buf.String()
+	for _, want := range []string{
+		`"method":"turn/start"`,
+		`"threadId":"thread-123"`,
+		`"approvalPolicy":"never"`,
+		`"sandbox":"danger-full-access"`,
+		`"model":"gpt-5.4"`,
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("expected %s in turn/start payload, got %q", want, output)
+		}
+	}
+}
+
 func TestCodexAppSessionTurnStartUsesCodexConfigDefaults(t *testing.T) {
 	buf := &nopWriteCloser{}
 	app := &codexAppSession{

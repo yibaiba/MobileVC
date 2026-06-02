@@ -380,10 +380,30 @@ func (s *codexAppSession) SendUserInput(ctx context.Context, data []byte) error 
 		return nil
 	}
 
+	params, err := s.turnStartParams(threadID, input)
+	if err != nil {
+		return err
+	}
+	var resp codexTurnStartResponse
+	if err := s.call(ctx, "turn/start", params, &resp); err != nil {
+		return err
+	}
+	if strings.TrimSpace(resp.Turn.ID) != "" {
+		s.setActiveTurnID(resp.Turn.ID)
+	}
+	return nil
+}
+
+func (s *codexAppSession) turnStartParams(threadID string, input []map[string]any) (map[string]any, error) {
+	sandbox, err := normalizeCodexSandboxMode(s.req.RuntimeMeta.CodexSandboxMode, s.defaults)
+	if err != nil {
+		return nil, err
+	}
 	params := map[string]any{
 		"threadId":       threadID,
 		"input":          input,
 		"approvalPolicy": codexApprovalPolicy(s.runner.currentPermissionMode(), s.defaults),
+		"sandbox":        sandbox,
 	}
 	if model := extractCodexModelFlag(s.req.Command); model != "" {
 		params["model"] = model
@@ -395,14 +415,7 @@ func (s *codexAppSession) SendUserInput(ctx context.Context, data []byte) error 
 	} else if effort := s.defaults.reasoningEffort; effort != "" {
 		params["effort"] = effort
 	}
-	var resp codexTurnStartResponse
-	if err := s.call(ctx, "turn/start", params, &resp); err != nil {
-		return err
-	}
-	if strings.TrimSpace(resp.Turn.ID) != "" {
-		s.setActiveTurnID(resp.Turn.ID)
-	}
-	return nil
+	return params, nil
 }
 
 func (s *codexAppSession) Compact(ctx context.Context) error {
