@@ -130,13 +130,14 @@ type SessionContext struct {
 }
 
 type SessionRuntime struct {
-	ResumeSessionID string `json:"resumeSessionId,omitempty"`
-	Command         string `json:"command,omitempty"`
-	Engine          string `json:"engine,omitempty"`
-	PermissionMode  string `json:"permissionMode,omitempty"`
-	CWD             string `json:"cwd,omitempty"`
-	ClaudeLifecycle string `json:"claudeLifecycle,omitempty"`
-	Source          string `json:"source,omitempty"`
+	ResumeSessionID  string `json:"resumeSessionId,omitempty"`
+	Command          string `json:"command,omitempty"`
+	Engine           string `json:"engine,omitempty"`
+	PermissionMode   string `json:"permissionMode,omitempty"`
+	CodexSandboxMode string `json:"codexSandboxMode,omitempty"`
+	CWD              string `json:"cwd,omitempty"`
+	ClaudeLifecycle  string `json:"claudeLifecycle,omitempty"`
+	Source           string `json:"source,omitempty"`
 }
 
 type ContextWindowUsage struct {
@@ -236,20 +237,20 @@ type ReviewGroup struct {
 }
 
 type ControllerSnapshot struct {
-	SessionID       string               `json:"sessionId"`
-	State           ControllerState      `json:"state"`
-	CurrentCommand  string               `json:"currentCommand,omitempty"`
-	LastStep        string               `json:"lastStep,omitempty"`
-	LastTool        string               `json:"lastTool,omitempty"`
-	ResumeSession   string               `json:"resumeSession,omitempty"`
-	ClaudeLifecycle string               `json:"claudeLifecycle,omitempty"`
-	LastUserInput   string               `json:"lastUserInput,omitempty"`
-	ActiveMeta             protocol.RuntimeMeta `json:"activeMeta,omitempty"`
-	RecentDiffs            []DiffContext        `json:"recentDiffs,omitempty"`
-	RecentDiff             DiffContext          `json:"recentDiff,omitempty"`
-	ReviewGroups           []ReviewGroup        `json:"reviewGroups,omitempty"`
-	ActiveReviewID         string               `json:"activeReviewId,omitempty"`
-	ResolvedPermissionIDs  []string             `json:"resolvedPermissionIds,omitempty"`
+	SessionID             string               `json:"sessionId"`
+	State                 ControllerState      `json:"state"`
+	CurrentCommand        string               `json:"currentCommand,omitempty"`
+	LastStep              string               `json:"lastStep,omitempty"`
+	LastTool              string               `json:"lastTool,omitempty"`
+	ResumeSession         string               `json:"resumeSession,omitempty"`
+	ClaudeLifecycle       string               `json:"claudeLifecycle,omitempty"`
+	LastUserInput         string               `json:"lastUserInput,omitempty"`
+	ActiveMeta            protocol.RuntimeMeta `json:"activeMeta,omitempty"`
+	RecentDiffs           []DiffContext        `json:"recentDiffs,omitempty"`
+	RecentDiff            DiffContext          `json:"recentDiff,omitempty"`
+	ReviewGroups          []ReviewGroup        `json:"reviewGroups,omitempty"`
+	ActiveReviewID        string               `json:"activeReviewId,omitempty"`
+	ResolvedPermissionIDs []string             `json:"resolvedPermissionIds,omitempty"`
 }
 
 type SnapshotLogEntry struct {

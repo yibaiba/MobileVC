@@ -99,6 +99,7 @@ func (s *Server) reconnectAgent(peer *peerConn, raw []byte) (string, error) {
 		return "", errors.New("agent reconnect rejected")
 	}
 	disconnectedAt := state.agentDisconnectedAt
+	staleAgent := state.agent
 	staleClient := state.client
 	staleClientID := state.clientID
 	state.agent = peer
@@ -115,6 +116,9 @@ func (s *Server) reconnectAgent(peer *peerConn, raw []byte) (string, error) {
 		return "", err
 	}
 	s.mu.Unlock()
+	if staleAgent != nil && staleAgent != peer {
+		_ = staleAgent.Close()
+	}
 	if staleClient != nil {
 		_ = staleClient.Close()
 	}
@@ -126,7 +130,7 @@ func (s *Server) reconnectAgent(peer *peerConn, raw []byte) (string, error) {
 }
 
 func (s *Server) canReconnectAgent(state *sessionState, secret string) bool {
-	if state == nil || state.agent != nil {
+	if state == nil {
 		return false
 	}
 	if !state.agentDisconnectedAt.IsZero() &&

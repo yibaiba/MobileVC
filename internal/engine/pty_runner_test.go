@@ -1687,6 +1687,123 @@ func resolveNextPendingRPC(t *testing.T, app *codexAppSession, result any) {
 	t.Fatal("timed out waiting for pending codex rpc call")
 }
 
+func resolveNextPendingRPCError(t *testing.T, app *codexAppSession, rpcError codexRPCError) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		app.mu.Lock()
+		var id string
+		for key := range app.pending {
+			id = key
+			break
+		}
+		app.mu.Unlock()
+		if id != "" {
+			app.resolvePending(codexRPCMessage{
+				ID:    json.RawMessage(id),
+				Error: &rpcError,
+			})
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("timed out waiting for pending codex rpc call")
+}
+
+func TestCodexContextWindowUsageUnsupportedReadIsOptional(t *testing.T) {
+	buf := &nopWriteCloser{}
+	app := &codexAppSession{
+		runner:    NewPtyRunner(),
+		stdin:     buf,
+		sessionID: "s-context-window-unsupported",
+	}
+	app.setThreadID("thread-context-1")
+
+	errCh := make(chan error, 1)
+	okCh := make(chan bool, 1)
+	go func() {
+		_, ok, err := app.ContextWindowUsage(context.Background())
+		okCh <- ok
+		errCh <- err
+	}()
+
+	resolveNextPendingRPCError(t, app, codexRPCError{
+		Code:    -32600,
+		Message: "Invalid request: unknown variant `thread/contextWindow/read`, expected one of `thread/compact/start`",
+	})
+
+	if err := <-errCh; err != nil {
+		t.Fatalf("ContextWindowUsage returned err: %v", err)
+	}
+	if ok := <-okCh; ok {
+		t.Fatal("ContextWindowUsage returned ok=true for unsupported optional method")
+	}
+	firstOutput := buf.String()
+	if !strings.Contains(firstOutput, `"method":"thread/contextWindow/read"`) {
+		t.Fatalf("expected first call to request context window usage, got %q", firstOutput)
+	}
+
+	buf.Reset()
+	_, ok, err := app.ContextWindowUsage(context.Background())
+	if err != nil {
+		t.Fatalf("second ContextWindowUsage returned err: %v", err)
+	}
+	if ok {
+		t.Fatal("second ContextWindowUsage returned ok=true after unsupported method")
+	}
+	if got := buf.String(); got != "" {
+		t.Fatalf("expected unsupported context window read to be cached, got rpc output %q", got)
+	}
+}
+
+func TestCodexAppSessionResumePassesSandboxAndApprovalPolicy(t *testing.T) {
+	buf := &nopWriteCloser{}
+	runner := NewPtyRunner()
+	runner.SetPermissionMode("bypassPermissions")
+	app := &codexAppSession{
+		runner: runner,
+		req: ExecRequest{
+			Command: "codex -m gpt-5.4",
+			RuntimeMeta: protocol.RuntimeMeta{
+				CodexSandboxMode: "danger-full-access",
+			},
+		},
+		cwd:   "/tmp/project",
+		stdin: buf,
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- app.startOrResumeThread(context.Background(), "thread-123")
+	}()
+
+	resolveNextPendingRPC(t, app, map[string]any{
+		"thread": map[string]any{
+			"id": "thread-123",
+		},
+	})
+
+	if err := <-errCh; err != nil {
+		t.Fatalf("resume thread: %v", err)
+	}
+	output := buf.String()
+	for _, want := range []string{
+		`"method":"thread/resume"`,
+		`"threadId":"thread-123"`,
+		`"cwd":"/tmp/project"`,
+		`"approvalPolicy":"never"`,
+		`"sandbox":"danger-full-access"`,
+		`"model":"gpt-5.4"`,
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("expected %s in thread/resume payload, got %q", want, output)
+		}
+	}
+	if strings.Contains(output, "approvalsReviewer") || strings.Contains(output, "serviceName") {
+		t.Fatalf("did not expect start-only fields in thread/resume payload, got %q", output)
+	}
+}
+
 func TestCodexAppSessionTurnStartPassesReasoningEffort(t *testing.T) {
 	buf := &nopWriteCloser{}
 	app := &codexAppSession{
@@ -1722,6 +1839,51 @@ func TestCodexAppSessionTurnStartPassesReasoningEffort(t *testing.T) {
 	}
 	if !strings.Contains(output, `"effort":"xhigh"`) {
 		t.Fatalf("expected reasoning effort override in turn/start payload, got %q", output)
+	}
+}
+
+func TestCodexAppSessionTurnStartPassesRuntimeSandbox(t *testing.T) {
+	buf := &nopWriteCloser{}
+	runner := NewPtyRunner()
+	runner.SetPermissionMode("bypassPermissions")
+	app := &codexAppSession{
+		runner: runner,
+		req: ExecRequest{
+			Command: "codex -m gpt-5.4",
+			RuntimeMeta: protocol.RuntimeMeta{
+				CodexSandboxMode: "danger-full-access",
+			},
+		},
+		stdin: buf,
+	}
+	app.setThreadID("thread-123")
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- app.SendUserInput(context.Background(), []byte("hello\n"))
+	}()
+
+	resolveNextPendingRPC(t, app, map[string]any{
+		"turn": map[string]any{
+			"id": "turn-1",
+		},
+	})
+
+	if err := <-errCh; err != nil {
+		t.Fatalf("send user input: %v", err)
+	}
+
+	output := buf.String()
+	for _, want := range []string{
+		`"method":"turn/start"`,
+		`"threadId":"thread-123"`,
+		`"approvalPolicy":"never"`,
+		`"sandbox":"danger-full-access"`,
+		`"model":"gpt-5.4"`,
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("expected %s in turn/start payload, got %q", want, output)
+		}
 	}
 }
 

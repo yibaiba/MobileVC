@@ -223,6 +223,7 @@ type PermissionDecisionRequestEvent struct {
 	Decision            string `json:"decision"`
 	Scope               string `json:"scope,omitempty"`
 	PermissionMode      string `json:"permissionMode,omitempty"`
+	CodexSandboxMode    string `json:"codexSandboxMode,omitempty"`
 	PermissionRequestID string `json:"permissionRequestId,omitempty"`
 	ResumeSessionID     string `json:"resumeSessionId,omitempty"`
 	TargetPath          string `json:"targetPath,omitempty"`
@@ -530,6 +531,7 @@ type RegisterPushTokenRequestEvent struct {
 
 type SessionResumeRequestEvent struct {
 	ClientEvent
+	RuntimeMeta
 	SessionID             string `json:"sessionId"`
 	CWD                   string `json:"cwd,omitempty"`
 	Reason                string `json:"reason,omitempty"`

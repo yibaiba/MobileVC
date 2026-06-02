@@ -82,6 +82,34 @@ func TestRelayKeepsTrustedDeviceSessionAfterAgentGrace(t *testing.T) {
 	readAttached(t, reconnectedAgent, clientID)
 }
 
+func TestRelayAgentReconnectTakesOverStaleActiveAgent(t *testing.T) {
+	server := newLimitedTestRelayServer(t, Config{AgentGracePeriod: testShortAgentGrace})
+	defer server.Close()
+
+	sessionID := "rs_agent_takeover"
+	pairingSecret := "pair-secret-128-bit-minimum"
+	agentReconnectSecret := "agent-reconnect-secret"
+	agent := dialRelay(t, server.URL, "/relay/agent")
+	registerAgent(t, agent, sessionID, pairingSecret, agentReconnectSecret, time.Now().Add(time.Minute))
+	client := dialRelay(t, server.URL, "/relay/client")
+	clientID, clientReconnectSecret := pairClientWithReconnectSecret(t, client, sessionID, pairingSecret)
+	readAttached(t, agent, clientID)
+
+	reconnectedAgent := dialRelay(t, server.URL, "/relay/agent")
+	defer reconnectedAgent.Close()
+	reconnectAgent(t, reconnectedAgent, sessionID, agentReconnectSecret)
+
+	_ = agent.SetReadDeadline(time.Now().Add(testShortAgentGrace * 4))
+	if err := agent.ReadJSON(&ErrorFrame{}); err == nil {
+		t.Fatal("expected old agent connection to close after reconnect takeover")
+	}
+
+	reconnectedClient := dialRelay(t, server.URL, "/relay/client")
+	defer reconnectedClient.Close()
+	reconnectClient(t, reconnectedClient, sessionID, clientID, clientReconnectSecret)
+	readAttached(t, reconnectedAgent, clientID)
+}
+
 func TestRelayClientReconnectReportsAgentDisconnectedAfterGraceForTrustedDevice(t *testing.T) {
 	server := newLimitedTestRelayServer(t, Config{AgentGracePeriod: testShortAgentGrace})
 	defer server.Close()

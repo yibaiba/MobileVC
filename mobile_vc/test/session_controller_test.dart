@@ -1129,6 +1129,7 @@ void main() {
         cwd: '/workspace/MobileVC',
         engine: 'codex',
         permissionMode: 'bypassPermissions',
+        codexSandboxMode: 'danger-full-access',
       ));
       await controller.connect();
       service.emit(
@@ -1172,8 +1173,206 @@ void main() {
       expect(payload['engine'], 'codex');
       expect(payload['cwd'], '/workspace/MobileVC');
       expect(payload['permissionMode'], 'bypassPermissions');
+      expect(payload['codexSandboxMode'], 'danger-full-access');
       expect(payload['source'], 'compact');
       expect(payload['targetType'], 'compact');
+    });
+
+    test('恢复的 Codex 会话即使 engine 为空也允许手动 Compact', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.saveConfig(const AppConfig(
+        cwd: '/workspace/MobileVC',
+        engine: 'claude',
+        permissionMode: 'auto',
+      ));
+      await controller.connect();
+      service.emit(
+        SessionHistoryEvent(
+          timestamp: _timestamp,
+          sessionId: 'codex-thread:thread-command-only',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_history'},
+          summary: const SessionSummary(
+            id: 'codex-thread:thread-command-only',
+            title: 'Codex thread',
+            runtime: RuntimeMeta(
+              command: 'codex resume thread-command-only',
+              cwd: '/workspace/MobileVC',
+              resumeSessionId: 'thread-command-only',
+            ),
+          ),
+          canResume: true,
+          runtimeAlive: true,
+          resumeRuntimeMeta: const RuntimeMeta(
+            command: 'codex resume thread-command-only',
+            cwd: '/workspace/MobileVC',
+            resumeSessionId: 'thread-command-only',
+            claudeLifecycle: 'waiting_input',
+          ),
+        ),
+      );
+      await _flushEvents();
+      service.sentPayloads.clear();
+
+      expect(controller.shouldShowCompactButton, isTrue);
+      expect(controller.canCompactCurrentSession, isTrue);
+
+      controller.compactCurrentSession();
+
+      expect(service.sentPayloads, hasLength(1));
+      final payload = service.sentPayloads.single;
+      expect(payload['action'], 'compact');
+      expect(payload['sessionId'], 'codex-thread:thread-command-only');
+      expect(payload['resumeSessionId'], 'thread-command-only');
+      expect(payload['command'], 'codex resume thread-command-only');
+      expect(payload['engine'], 'codex');
+      expect(payload['cwd'], '/workspace/MobileVC');
+    });
+
+    test('恢复的 Codex 空闲会话有残留 RUNNING 状态时仍允许手动 Compact', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.saveConfig(const AppConfig(
+        cwd: '/workspace/MobileVC',
+        engine: 'codex',
+        permissionMode: 'bypassPermissions',
+      ));
+      await controller.connect();
+      service.emit(
+        SessionHistoryEvent(
+          timestamp: _timestamp,
+          sessionId: 'codex-thread:thread-stale-running',
+          runtimeMeta: const RuntimeMeta(engine: 'codex'),
+          raw: const {'type': 'session_history'},
+          summary: const SessionSummary(
+            id: 'codex-thread:thread-stale-running',
+            title: 'Codex thread',
+            source: 'codex-native',
+            external: true,
+            runtime: RuntimeMeta(
+              engine: 'codex',
+              command: 'codex resume thread-stale-running',
+              cwd: '/workspace/MobileVC',
+              resumeSessionId: 'thread-stale-running',
+              claudeLifecycle: 'waiting_input',
+            ),
+          ),
+          canResume: true,
+          runtimeAlive: true,
+          resumeRuntimeMeta: const RuntimeMeta(
+            engine: 'codex',
+            command: 'codex resume thread-stale-running',
+            cwd: '/workspace/MobileVC',
+            resumeSessionId: 'thread-stale-running',
+            claudeLifecycle: 'waiting_input',
+          ),
+        ),
+      );
+      service.emit(
+        SessionStateEvent(
+          timestamp: _timestamp,
+          sessionId: 'codex-thread:thread-stale-running',
+          runtimeMeta: const RuntimeMeta(
+            engine: 'codex',
+            command: 'codex resume thread-stale-running',
+            cwd: '/workspace/MobileVC',
+            resumeSessionId: 'thread-stale-running',
+            claudeLifecycle: 'waiting_input',
+          ),
+          raw: const {'type': 'session_state'},
+          state: 'RUNNING',
+          message: 'runtime alive',
+        ),
+      );
+      await _flushEvents();
+      service.sentPayloads.clear();
+
+      expect(controller.shouldShowCompactButton, isTrue);
+      expect(controller.isSessionBusy, isTrue);
+      expect(controller.canCompactCurrentSession, isTrue);
+
+      controller.compactCurrentSession();
+
+      expect(service.sentPayloads, hasLength(1));
+      final payload = service.sentPayloads.single;
+      expect(payload['action'], 'compact');
+      expect(payload['sessionId'], 'codex-thread:thread-stale-running');
+      expect(payload['resumeSessionId'], 'thread-stale-running');
+      expect(payload['engine'], 'codex');
+    });
+
+    test('真实运行中的 Codex 会话仍禁止手动 Compact', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.saveConfig(const AppConfig(
+        cwd: '/workspace/MobileVC',
+        engine: 'codex',
+      ));
+      await controller.connect();
+      service.emit(
+        SessionHistoryEvent(
+          timestamp: _timestamp,
+          sessionId: 'codex-thread:thread-running',
+          runtimeMeta: const RuntimeMeta(engine: 'codex'),
+          raw: const {'type': 'session_history'},
+          summary: const SessionSummary(
+            id: 'codex-thread:thread-running',
+            title: 'Codex running',
+            source: 'codex-native',
+            external: true,
+            runtime: RuntimeMeta(
+              engine: 'codex',
+              command: 'codex resume thread-running',
+              cwd: '/workspace/MobileVC',
+              resumeSessionId: 'thread-running',
+            ),
+          ),
+          canResume: true,
+          runtimeAlive: true,
+          resumeRuntimeMeta: const RuntimeMeta(
+            engine: 'codex',
+            command: 'codex resume thread-running',
+            cwd: '/workspace/MobileVC',
+            resumeSessionId: 'thread-running',
+          ),
+        ),
+      );
+      service.emit(
+        SessionStateEvent(
+          timestamp: _timestamp,
+          sessionId: 'codex-thread:thread-running',
+          runtimeMeta: const RuntimeMeta(
+            engine: 'codex',
+            command: 'codex resume thread-running',
+            cwd: '/workspace/MobileVC',
+            resumeSessionId: 'thread-running',
+            executionId: 'exec-running',
+          ),
+          raw: const {'type': 'session_state'},
+          state: 'RUNNING',
+          message: 'running',
+        ),
+      );
+      await _flushEvents();
+      service.sentPayloads.clear();
+
+      expect(controller.shouldShowCompactButton, isTrue);
+      expect(controller.isSessionBusy, isTrue);
+      expect(controller.canCompactCurrentSession, isFalse);
+
+      controller.compactCurrentSession();
+
+      expect(service.sentPayloads, isEmpty);
     });
   });
 
@@ -3984,6 +4183,7 @@ void main() {
         controller.config.copyWith(
           engine: 'codex',
           codexSandboxMode: 'danger-full-access',
+          permissionMode: 'config',
         ),
       );
 
@@ -3993,6 +4193,7 @@ void main() {
 
       expect(service.sentPayloads[0]['action'], 'ai_turn');
       expect(service.sentPayloads[0]['engine'], 'codex');
+      expect(service.sentPayloads[0]['permissionMode'], 'config');
       expect(
         service.sentPayloads[0]['codexSandboxMode'],
         'danger-full-access',
@@ -4652,8 +4853,7 @@ void main() {
             runtime: RuntimeMeta(command: 'codex', engine: 'codex'),
           ),
           runtimeAlive: true,
-          resumeRuntimeMeta:
-              const RuntimeMeta(command: 'codex', engine: 'codex'),
+          resumeRuntimeMeta: const RuntimeMeta(),
         ),
       );
       await _flushEvents();
@@ -4771,6 +4971,8 @@ void main() {
       final payload = service.sentPayloads.single;
       expect(payload['action'], 'input');
       expect(payload['data'], '看下这张图\n');
+      expect(payload['permissionMode'], 'auto');
+      expect(payload['codexSandboxMode'], 'workspace-write');
       expect(payload.containsKey('imageAttachments'), isTrue);
       expect(controller.canStopCurrentRun, isTrue);
     });
@@ -4811,6 +5013,134 @@ void main() {
             payload['reason'] == 'observe_active_session_start'),
         isTrue,
       );
+    });
+
+    test('观察模式继续 Codex 会话时带入当前配置权限', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+      await controller.saveConfig(
+        controller.config.copyWith(
+          engine: 'codex',
+          codexSandboxMode: 'danger-full-access',
+          permissionMode: 'config',
+        ),
+      );
+
+      await controller.connect();
+      service.emit(
+        SessionHistoryEvent(
+          timestamp: _timestamp,
+          sessionId: 'codex-thread:observe',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_history'},
+          summary: const SessionSummary(
+            id: 'codex-thread:observe',
+            title: 'Native Codex',
+            source: 'codex-native',
+            external: true,
+            executionActive: true,
+            runtime: RuntimeMeta(command: 'codex', engine: 'codex'),
+          ),
+          runtimeAlive: true,
+          resumeRuntimeMeta: const RuntimeMeta(),
+        ),
+      );
+      await _flushEvents();
+
+      service.sentPayloads.clear();
+      controller.continueSameSessionFromPhone();
+
+      final resumes = service.sentPayloads
+          .where((payload) => payload['action'] == 'session_resume')
+          .toList();
+      expect(resumes, hasLength(1));
+      expect(resumes.single['reason'], 'continue_same_session');
+      expect(resumes.single['engine'], 'codex');
+      expect(resumes.single['codexSandboxMode'], 'danger-full-access');
+      expect(resumes.single['permissionMode'], 'config');
+    });
+
+    test('Codex thread id 恢复时即使 runtime 为空也带入当前配置权限', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+      await controller.saveConfig(
+        controller.config.copyWith(
+          engine: 'claude',
+          codexSandboxMode: 'danger-full-access',
+          permissionMode: 'bypassPermissions',
+        ),
+      );
+
+      await controller.connect();
+      service.emit(
+        SessionHistoryEvent(
+          timestamp: _timestamp,
+          sessionId: 'codex-thread:early',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_history'},
+          summary: const SessionSummary(
+            id: 'codex-thread:early',
+            title: 'Codex thread',
+          ),
+          resumeRuntimeMeta: const RuntimeMeta(),
+        ),
+      );
+      await _flushEvents();
+
+      service.sentPayloads.clear();
+      controller.resumeConnectionIfNeeded();
+
+      final resumes = service.sentPayloads
+          .where((payload) => payload['action'] == 'session_resume')
+          .toList();
+      expect(resumes, hasLength(1));
+      expect(resumes.single['engine'], 'codex');
+      expect(resumes.single['codexSandboxMode'], 'danger-full-access');
+      expect(resumes.single['permissionMode'], 'bypassPermissions');
+    });
+
+    test('前台恢复空 runtime 元信息时不会按当前配置误带 Codex 沙箱', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+      await controller.saveConfig(
+        controller.config.copyWith(
+          engine: 'codex',
+          codexSandboxMode: 'danger-full-access',
+        ),
+      );
+
+      await controller.connect();
+      service.emit(
+        SessionHistoryEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-unknown-runtime',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_history'},
+          summary: const SessionSummary(
+            id: 'session-unknown-runtime',
+            title: 'Unknown runtime',
+          ),
+          resumeRuntimeMeta: const RuntimeMeta(),
+        ),
+      );
+      await _flushEvents();
+
+      service.sentPayloads.clear();
+      controller.resumeConnectionIfNeeded();
+
+      final resumes = service.sentPayloads
+          .where((payload) => payload['action'] == 'session_resume')
+          .toList();
+      expect(resumes, hasLength(1));
+      expect(resumes.single.containsKey('codexSandboxMode'), isFalse);
+      expect(resumes.single.containsKey('engine'), isFalse);
+      expect(resumes.single.containsKey('permissionMode'), isFalse);
     });
 
     test('summary executionActive=false 会清掉陈旧 stop 锁存', () async {
@@ -6134,6 +6464,114 @@ void main() {
         'session-b',
       ]);
       expect(controller.selectedSessionId, isEmpty);
+    });
+
+    test('连接后自动恢复配置里的上次会话', () async {
+      SharedPreferences.setMockInitialValues({
+        'mobilevc.app_config': jsonEncode(const AppConfig(
+          lastSessionId: 'session-target',
+          lastSessionCwd: '/workspace/Saved',
+          historyWindowLimit: 240,
+        ).toJson()),
+      });
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.sentPayloads.clear();
+
+      service.emit(
+        SessionListResultEvent(
+          timestamp: _timestamp,
+          sessionId: 'conn-1',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_list_result'},
+          items: const [
+            SessionSummary(
+              id: 'session-target',
+              title: '上次会话',
+              runtime: RuntimeMeta(cwd: '/workspace/Target'),
+            ),
+            SessionSummary(id: 'session-other', title: 'Other'),
+          ],
+        ),
+      );
+      await _flushEvents();
+
+      final loads = service.sentPayloads
+          .where((payload) => payload['action'] == 'session_load')
+          .toList();
+      expect(loads, hasLength(1));
+      expect(loads.single['sessionId'], 'session-target');
+      expect(loads.single['cwd'], '/workspace/Target');
+      expect(loads.single['limit'], 240);
+    });
+
+    test('通知目标优先于配置里的上次会话恢复', () async {
+      SharedPreferences.setMockInitialValues({
+        'mobilevc.app_config': jsonEncode(const AppConfig(
+          lastSessionId: 'session-old',
+        ).toJson()),
+      });
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.sentPayloads.clear();
+
+      await controller.restoreSessionFromNotification('session-notify');
+      service.emit(
+        SessionListResultEvent(
+          timestamp: _timestamp,
+          sessionId: 'conn-1',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_list_result'},
+          items: const [
+            SessionSummary(id: 'session-old', title: 'Old'),
+          ],
+        ),
+      );
+      await _flushEvents();
+
+      final loads = service.sentPayloads
+          .where((payload) => payload['action'] == 'session_load')
+          .toList();
+      expect(loads, hasLength(1));
+      expect(loads.single['sessionId'], 'session-notify');
+    });
+
+    test('成功恢复历史后保存上次会话', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(
+        SessionHistoryEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-history',
+          runtimeMeta: const RuntimeMeta(command: 'claude'),
+          raw: const {'type': 'session_history'},
+          summary: const SessionSummary(
+            id: 'session-history',
+            title: '历史会话',
+          ),
+          resumeRuntimeMeta: const RuntimeMeta(cwd: '/workspace/History'),
+        ),
+      );
+      await _flushEvents();
+
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString('mobilevc.app_config');
+      final restored =
+          AppConfig.fromJson(jsonDecode(raw!) as Map<String, dynamic>);
+      expect(restored.lastSessionId, 'session-history');
+      expect(restored.lastSessionCwd, '/workspace/History');
     });
 
     test('连接后收到空 session 列表时，不自动 create session', () async {
@@ -9163,6 +9601,7 @@ void main() {
       expect(payload['targetPath'], '/workspace/README.md');
       expect(payload['promptMessage'], 'Allow write to README.md?');
       expect(payload['cwd'], '/workspace');
+      expect(payload.containsKey('codexSandboxMode'), isFalse);
     });
 
     test('permission prompt 中文允许也发送 permission_decision', () async {
@@ -9337,6 +9776,47 @@ void main() {
       expect(payload['action'], 'permission_decision');
       expect(payload['decision'], 'approve');
       expect(payload['scope'], 'session');
+    });
+
+    test('Codex permission prompt 会带入沙箱配置', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.saveConfig(
+        controller.config.copyWith(
+          engine: 'codex',
+          codexSandboxMode: 'danger-full-access',
+          permissionMode: 'config',
+        ),
+      );
+      service.emit(
+        PromptRequestEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-1',
+          runtimeMeta: const RuntimeMeta(
+            command: 'codex',
+            engine: 'codex',
+            targetPath: '/workspace/lib/main.dart',
+            blockingKind: 'permission',
+          ),
+          raw: const {'type': 'prompt_request', 'msg': 'Allow edit main.dart?'},
+          message: 'Allow edit main.dart?',
+          options: const [PromptOption(value: 'y'), PromptOption(value: 'n')],
+        ),
+      );
+      await _flushEvents();
+      service.sentPayloads.clear();
+
+      controller.submitPromptOption('approve');
+
+      expect(service.sentPayloads, hasLength(1));
+      final payload = service.sentPayloads.single;
+      expect(payload['action'], 'permission_decision');
+      expect(payload['decision'], 'approve');
+      expect(payload['engine'], 'codex');
+      expect(payload['codexSandboxMode'], 'danger-full-access');
     });
 
     test('permission prompt 选择长期允许会发送 persistent scope', () async {

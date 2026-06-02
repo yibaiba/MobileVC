@@ -45,6 +45,7 @@ func BuildPermissionDecisionPlan(req protocol.PermissionDecisionRequestEvent, pr
 		Target:              firstNonEmptyString(req.FallbackTarget, controller.ActiveMeta.Target),
 		TargetType:          firstNonEmptyString(req.FallbackTargetType, controller.ActiveMeta.TargetType),
 		PermissionMode:      effectivePermissionMode,
+		CodexSandboxMode:    firstNonEmptyString(req.CodexSandboxMode, controller.ActiveMeta.CodexSandboxMode, projection.Runtime.CodexSandboxMode),
 		PermissionRequestID: strings.TrimSpace(req.PermissionRequestID),
 	}
 	if !IsClaudeCommandLike(meta.Command) {

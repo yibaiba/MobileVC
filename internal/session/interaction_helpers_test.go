@@ -227,6 +227,34 @@ func TestRefreshedPermissionPromptEventWithID_BuildsPrompt(t *testing.T) {
 	}
 }
 
+func TestRefreshedPermissionPromptEventWithID_PreservesRequestedCodexSandbox(t *testing.T) {
+	svc := NewService("sess-1", Dependencies{})
+	svc.SyncRuntimeMeta(protocol.RuntimeMeta{
+		Command:          "codex",
+		Engine:           "codex",
+		PermissionMode:   "auto",
+		CodexSandboxMode: "workspace-write",
+	})
+	req := protocol.PermissionDecisionRequestEvent{
+		PromptMessage:    "Allow shell?",
+		FallbackCommand:  "codex",
+		FallbackEngine:   "codex",
+		PermissionMode:   "config",
+		CodexSandboxMode: "danger-full-access",
+	}
+
+	p := RefreshedPermissionPromptEventWithID("sess-1", req, svc, "perm-codex")
+	if p == nil {
+		t.Fatal("expected prompt event")
+	}
+	if got := p.RuntimeMeta.CodexSandboxMode; got != "danger-full-access" {
+		t.Fatalf("expected requested codex sandbox to win, got %q", got)
+	}
+	if got := p.RuntimeMeta.PermissionMode; got != "config" {
+		t.Fatalf("expected codex config permission mode to survive refresh, got %q", got)
+	}
+}
+
 func TestRefreshedPermissionPromptEventWithID_DefaultMessage(t *testing.T) {
 	svc := NewService("sess-1", Dependencies{})
 	p := RefreshedPermissionPromptEventWithID("sess-1", protocol.PermissionDecisionRequestEvent{}, svc, "id")

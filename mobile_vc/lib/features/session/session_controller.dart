@@ -308,6 +308,8 @@ class SessionController extends ChangeNotifier {
   String _relayDeviceStatus = '';
   String _selectedSessionId = '';
   String _selectedSessionTitle = 'MobileVC';
+  bool _lastSessionRestoreRequested = false;
+  bool _lastSessionRestorePending = false;
   String _currentDirectoryPath = '';
   String _terminalStdout = '';
   String _terminalStderr = '';
@@ -1163,11 +1165,7 @@ class SessionController extends ChangeNotifier {
     if (!connected || _isLoadingSession) {
       return false;
     }
-    if (!shouldShowClaudeMode) {
-      return false;
-    }
-    final engine = currentMeta.engine.trim().toLowerCase();
-    if (engine != 'codex') {
+    if (!_currentSessionSupportsNativeCompact) {
       return false;
     }
     if (hasPendingPermissionPrompt ||
@@ -1178,6 +1176,9 @@ class SessionController extends ChangeNotifier {
         shouldShowPlanChoices) {
       return false;
     }
+    if (_canCompactIdleCodexSession) {
+      return !_isCompacting;
+    }
     return !_isCompacting && !isSessionBusy && !canStopCurrentRun;
   }
 
@@ -1185,15 +1186,45 @@ class SessionController extends ChangeNotifier {
     if (_isLoadingSession) {
       return false;
     }
-    final engine = currentMeta.engine.trim().toLowerCase();
-    if (engine == 'codex') {
+    return _currentSessionSupportsNativeCompact;
+  }
+
+  bool get _currentSessionSupportsNativeCompact {
+    if (_runtimeMetaIsCodex(_liveRuntimeMeta)) {
+      return true;
+    }
+    final sessionId = _selectedSessionId.trim().toLowerCase();
+    if (sessionId.startsWith('codex-thread:')) {
       return true;
     }
     final command = currentMeta.command.trim().toLowerCase();
-    if (command == 'codex' || command.startsWith('codex ')) {
-      return true;
+    return command == 'codex' || command.startsWith('codex ');
+  }
+
+  bool get _canCompactIdleCodexSession {
+    if (!_currentSessionSupportsNativeCompact) {
+      return false;
     }
-    return currentAiEngine == 'codex';
+    if (_isSubmitting || _executionActive || _hasRunningTerminalExecution) {
+      return false;
+    }
+    final agentState = (_agentState?.state ?? '').trim().toUpperCase();
+    if (agentState == 'THINKING' ||
+        agentState == 'RECOVERING' ||
+        agentState == 'RUNNING_TOOL') {
+      return false;
+    }
+    final sessionState = (_sessionState?.state ?? '').trim().toUpperCase();
+    if (sessionState == 'THINKING' || sessionState == 'RUNNING_TOOL') {
+      return false;
+    }
+    final lifecycle = currentMeta.claudeLifecycle.trim().toLowerCase();
+    return awaitInput ||
+        (agentState.isNotEmpty && _isIdleLikeState(agentState)) ||
+        agentState == 'WAIT_INPUT' ||
+        lifecycle == 'waiting_input' ||
+        lifecycle == 'resumable' ||
+        lifecycle == 'settled';
   }
 
   bool get _canBypassBusyGuardForCodexContinuation {
@@ -1293,6 +1324,34 @@ class SessionController extends ChangeNotifier {
           .merge(_sessionState?.runtimeMeta ?? const RuntimeMeta())
           .merge(_runtimeInfo?.runtimeMeta ?? const RuntimeMeta())
           .merge(_resumeRuntimeMeta);
+
+  bool _runtimeMetaIsCodex(RuntimeMeta meta) {
+    final engine = meta.engine.trim().toLowerCase();
+    if (engine == 'codex') {
+      return true;
+    }
+    final command = meta.command.trim().toLowerCase();
+    return command == 'codex' || command.startsWith('codex ');
+  }
+
+  bool _sessionSummaryIsCodex(SessionSummary? summary) {
+    if (summary == null) {
+      return false;
+    }
+    if (_runtimeMetaIsCodex(summary.runtime)) {
+      return true;
+    }
+    final sessionId = summary.id.trim().toLowerCase();
+    if (sessionId.startsWith('codex-thread:')) {
+      return true;
+    }
+    final source = summary.source.trim().toLowerCase();
+    final ownership = summary.ownership.trim().toLowerCase();
+    final runtimeSource = summary.runtime.source.trim().toLowerCase();
+    return source == 'codex-native' ||
+        ownership == 'codex-native' ||
+        runtimeSource == 'codex-native';
+  }
 
   bool get inClaudeMode {
     if (_isLoadingSession) {
@@ -2151,6 +2210,11 @@ class SessionController extends ChangeNotifier {
     return false;
   }
 
+  String get _configuredCodexPermissionMode =>
+      normalizePermissionModeForEngine(_config.permissionMode, 'codex');
+
+  String get _configuredCodexSandboxMode => _config.codexSandboxMode.trim();
+
   Map<String, dynamic> _aiTurnPayload({
     required String engine,
     required RuntimeMeta meta,
@@ -2183,7 +2247,8 @@ class SessionController extends ChangeNotifier {
       payload.remove('reasoningEffort');
     }
     if (normalizedEngine == 'codex') {
-      payload['codexSandboxMode'] = _config.codexSandboxMode;
+      payload['permissionMode'] = _configuredCodexPermissionMode;
+      payload['codexSandboxMode'] = _configuredCodexSandboxMode;
       if (!_config.codexTargetMode) {
         payload.remove('target');
         payload.remove('targetType');
@@ -2203,6 +2268,33 @@ class SessionController extends ChangeNotifier {
           imageAttachments.map((attachment) => attachment.toJson()).toList();
     }
     return payload;
+  }
+
+  bool get _currentSessionShouldSendCodexSandboxMode =>
+      _runtimeMetaIsCodex(_liveRuntimeMeta) ||
+      _runtimeMetaIsCodex(_resumeRuntimeMeta) ||
+      _selectedSessionId.trim().toLowerCase().startsWith('codex-thread:') ||
+      _sessionSummaryIsCodex(_selectedSessionSummary);
+
+  void _applyCodexSandboxModeIfNeeded(Map<String, dynamic> payload) {
+    if (_currentSessionShouldSendCodexSandboxMode) {
+      payload['permissionMode'] = _configuredCodexPermissionMode;
+      payload['codexSandboxMode'] = _configuredCodexSandboxMode;
+    } else {
+      payload.remove('codexSandboxMode');
+    }
+  }
+
+  void _applyCodexSandboxModeForRuntimeMeta(
+    Map<String, dynamic> payload,
+    RuntimeMeta meta,
+  ) {
+    final payloadMeta = RuntimeMeta.fromJson(payload);
+    if (_runtimeMetaIsCodex(meta) || _runtimeMetaIsCodex(payloadMeta)) {
+      payload['codexSandboxMode'] = _configuredCodexSandboxMode;
+    } else {
+      payload.remove('codexSandboxMode');
+    }
   }
 
   String _aiTurnModelForEngine(String engine) {
@@ -2344,6 +2436,8 @@ class SessionController extends ChangeNotifier {
       _autoSessionRequested = false;
       _autoSessionCreating = false;
       _sessionListSyncedSinceConnect = false;
+      _lastSessionRestoreRequested = false;
+      _lastSessionRestorePending = false;
       _runtimePermissionMode = '';
       _codexModelCatalogLoading = false;
       _codexModelCatalogMessage = '';
@@ -2622,6 +2716,8 @@ class SessionController extends ChangeNotifier {
     _clearDeferredFirstInput();
     _pendingOutboundActions.clear();
     _sessionListSyncedSinceConnect = false;
+    _lastSessionRestoreRequested = false;
+    _lastSessionRestorePending = false;
     _fileListLoading = false;
     _fileReading = false;
     _fileSaving = false;
@@ -2800,12 +2896,19 @@ class SessionController extends ChangeNotifier {
     final lastSeenCursor = _sessionEventCursors[sessionId] ?? 0;
     final runtimeState =
         (_agentState?.state ?? _sessionState?.state ?? '').trim();
+    final shouldSendCodexRuntimeMeta =
+        _currentSessionShouldSendCodexSandboxMode;
     _connectionStage = SessionConnectionStage.catchingUp;
     _service.send({
       'action': 'session_resume',
       'sessionId': sessionId,
       'cwd': effectiveCwd,
       'limit': _historyWindowLimit,
+      if (shouldSendCodexRuntimeMeta) ...{
+        'engine': 'codex',
+        'codexSandboxMode': _configuredCodexSandboxMode,
+        'permissionMode': _configuredCodexPermissionMode,
+      },
       if (reason.trim().isNotEmpty) 'reason': reason.trim(),
       if (lastSeenCursor > 0) 'lastSeenEventCursor': lastSeenCursor,
       if (runtimeState.isNotEmpty) 'lastKnownRuntimeState': runtimeState,
@@ -2956,6 +3059,98 @@ class SessionController extends ChangeNotifier {
     if (_autoSessionCreating) {
       return;
     }
+    if (_isLoadingSession ||
+        _lastSessionRestoreRequested ||
+        _lastSessionRestorePending ||
+        _pendingNotificationSessionTargetId.trim().isNotEmpty) {
+      return;
+    }
+    final targetId = _config.lastSessionId.trim();
+    if (targetId.isEmpty) {
+      return;
+    }
+    _lastSessionRestoreRequested = true;
+    _lastSessionRestorePending = true;
+    _pushSystem('session', '正在恢复上次会话...');
+    unawaited(_restoreLastSelectedSession(
+      targetId,
+      _findSessionSummary(items, targetId),
+    ));
+  }
+
+  SessionSummary? _findSessionSummary(
+    List<SessionSummary> items,
+    String sessionId,
+  ) {
+    final targetId = sessionId.trim();
+    if (targetId.isEmpty) {
+      return null;
+    }
+    for (final item in items) {
+      if (item.id.trim() == targetId) {
+        return item;
+      }
+    }
+    return null;
+  }
+
+  SessionSummary? get _selectedSessionSummary =>
+      _findSessionSummary(_sessions, _selectedSessionId);
+
+  Future<void> _restoreLastSelectedSession(
+    String sessionId,
+    SessionSummary? summary,
+  ) async {
+    final targetId = sessionId.trim();
+    if (targetId.isEmpty) {
+      _lastSessionRestorePending = false;
+      return;
+    }
+    try {
+      if (!_canRestoreLastSessionTarget(targetId)) {
+        return;
+      }
+      final targetCwd = _lastSessionRestoreCwd(summary);
+      if (targetCwd.isNotEmpty &&
+          _normalizePath(targetCwd) != _normalizePath(effectiveCwd)) {
+        await switchWorkingDirectory(targetCwd);
+      }
+      if (!_canRestoreLastSessionTarget(targetId)) {
+        return;
+      }
+      loadSession(targetId);
+    } catch (error, stack) {
+      _pushDebug(
+        'restore last session failed',
+        'sessionId=$targetId errorType=${error.runtimeType}',
+      );
+      debugPrintStack(
+        stackTrace: stack,
+        label: '[session] restore last session stack',
+      );
+      _pushSystem('error', '恢复上次会话失败：$error');
+    } finally {
+      _lastSessionRestorePending = false;
+      _syncDerivedState();
+      notifyListeners();
+    }
+  }
+
+  bool _canRestoreLastSessionTarget(String targetId) {
+    return _connected &&
+        !_connecting &&
+        !_isLoadingSession &&
+        _selectedSessionId.trim().isEmpty &&
+        _pendingNotificationSessionTargetId.trim().isEmpty &&
+        targetId.trim().isNotEmpty;
+  }
+
+  String _lastSessionRestoreCwd(SessionSummary? summary) {
+    final summaryCwd = summary?.runtime.cwd.trim() ?? '';
+    if (summaryCwd.isNotEmpty) {
+      return summaryCwd;
+    }
+    return _config.lastSessionCwd.trim();
   }
 
   void createSession([String title = '']) {
@@ -2974,6 +3169,7 @@ class SessionController extends ChangeNotifier {
         _sessionListSyncedSinceConnect &&
         _selectedSessionId.trim().isEmpty &&
         _pendingNotificationSessionTargetId.trim().isEmpty &&
+        !_lastSessionRestorePending &&
         !_autoSessionCreating;
   }
 
@@ -3088,6 +3284,7 @@ class SessionController extends ChangeNotifier {
       _clearStoppingState();
       _beginSessionLoading();
     }
+    _clearLastSelectedSessionIfMatches(targetId);
     if (target != null) {
       _pendingDeletedSessions[targetId] = target;
       _pushSystem('system', '正在删除会话：${sessionDisplayTitle(target)}');
@@ -3329,6 +3526,56 @@ class SessionController extends ChangeNotifier {
         label: '[session] save permission mode stack',
       );
     }
+  }
+
+  void _rememberLastSelectedSession(
+    SessionSummary summary, {
+    String cwd = '',
+  }) {
+    final sessionId = summary.id.trim();
+    if (sessionId.isEmpty) {
+      return;
+    }
+    final sessionCwd = _lastSessionCwdForPersistence(summary, cwd);
+    final sameSession = _config.lastSessionId.trim() == sessionId;
+    final sameCwd =
+        _normalizePath(_config.lastSessionCwd) == _normalizePath(sessionCwd);
+    if (sameSession && sameCwd) {
+      return;
+    }
+    _config = _config.copyWith(
+      lastSessionId: sessionId,
+      lastSessionCwd: sessionCwd,
+    );
+    unawaited(_persistCurrentConfig());
+  }
+
+  String _lastSessionCwdForPersistence(
+    SessionSummary summary,
+    String cwd,
+  ) {
+    final explicitCwd = cwd.trim();
+    if (explicitCwd.isNotEmpty) {
+      return explicitCwd;
+    }
+    final summaryCwd = summary.runtime.cwd.trim();
+    if (summaryCwd.isNotEmpty) {
+      return summaryCwd;
+    }
+    final currentCwd = effectiveCwd.trim();
+    if (currentCwd.isNotEmpty) {
+      return currentCwd;
+    }
+    return _config.cwd.trim();
+  }
+
+  void _clearLastSelectedSessionIfMatches(String sessionId) {
+    final targetId = sessionId.trim();
+    if (targetId.isEmpty || _config.lastSessionId.trim() != targetId) {
+      return;
+    }
+    _config = _config.copyWith(lastSessionId: '', lastSessionCwd: '');
+    unawaited(_persistCurrentConfig());
   }
 
   Future<void> updateAiModelSelection({
@@ -4434,6 +4681,7 @@ class SessionController extends ChangeNotifier {
       ...currentMeta.toJson(),
       'permissionMode': _config.permissionMode,
     };
+    _applyCodexSandboxModeIfNeeded(payload);
     if (!_sendUserVisibleAction(payload, userText: value, label: '命令')) {
       return;
     }
@@ -4444,18 +4692,17 @@ class SessionController extends ChangeNotifier {
       _pushSystem('session', '会话切换中，请等待加载完成');
       return;
     }
-    if (!canCompactCurrentSession) {
-      _pushSystem('session', '当前状态暂不支持手动 Compact');
-      return;
-    }
     final sessionId = _selectedSessionId.trim();
     if (sessionId.isEmpty) {
       _pushSystem('session', '请先创建或加载会话后再执行 Compact');
       return;
     }
-    if (currentMeta.engine.trim().toLowerCase() != 'codex' &&
-        currentAiEngine.trim().toLowerCase() != 'codex') {
+    if (!_currentSessionSupportsNativeCompact) {
       _pushSystem('session', '当前会话暂不支持原生 Compact');
+      return;
+    }
+    if (!canCompactCurrentSession) {
+      _pushSystem('session', '当前状态暂不支持手动 Compact');
       return;
     }
     final compactMeta = currentMeta.merge(
@@ -4470,6 +4717,7 @@ class SessionController extends ChangeNotifier {
         engine: 'codex',
         cwd: effectiveCwd,
         permissionMode: _config.permissionMode,
+        codexSandboxMode: _config.codexSandboxMode,
         claudeLifecycle: 'active',
       ),
     );
@@ -4480,6 +4728,7 @@ class SessionController extends ChangeNotifier {
       'cwd': effectiveCwd,
       'engine': 'codex',
       'permissionMode': _config.permissionMode,
+      'codexSandboxMode': _config.codexSandboxMode,
     });
     if (!sent) {
       _isCompacting = false;
@@ -4765,7 +5014,7 @@ class SessionController extends ChangeNotifier {
       final effectivePermissionRequestId = livePromptRequestId.isNotEmpty
           ? livePromptRequestId
           : decisionMeta.permissionRequestId;
-      _service.send({
+      final payload = <String, dynamic>{
         'action': 'permission_decision',
         'sessionId': _selectedSessionId,
         'decision': selection.decision,
@@ -4784,7 +5033,9 @@ class SessionController extends ChangeNotifier {
             : _config.engine,
         'target': decisionMeta.target,
         'targetType': decisionMeta.targetType,
-      });
+      };
+      _applyCodexSandboxModeForRuntimeMeta(payload, decisionMeta);
+      _service.send(payload);
       _clearPermissionBlockingState();
       _syncDerivedState();
       notifyListeners();
@@ -4809,6 +5060,7 @@ class SessionController extends ChangeNotifier {
       'data': '$value\n',
       'permissionMode': _config.permissionMode,
     };
+    _applyCodexSandboxModeIfNeeded(payload);
     if (imageAttachments.isNotEmpty) {
       payload['imageAttachments'] =
           imageAttachments.map((attachment) => attachment.toJson()).toList();
@@ -4854,7 +5106,7 @@ class SessionController extends ChangeNotifier {
         permissionMode: _currentDecisionPermissionMode,
       ),
     );
-    _service.send({
+    final payload = <String, dynamic>{
       'action': 'permission_decision',
       'sessionId': _selectedSessionId,
       'decision': selection.decision,
@@ -4872,7 +5124,9 @@ class SessionController extends ChangeNotifier {
           decisionMeta.engine.isNotEmpty ? decisionMeta.engine : _config.engine,
       'target': decisionMeta.target,
       'targetType': decisionMeta.targetType,
-    });
+    };
+    _applyCodexSandboxModeForRuntimeMeta(payload, decisionMeta);
+    _service.send(payload);
     _clearPermissionBlockingState();
     _syncDerivedState();
     notifyListeners();
@@ -5229,6 +5483,7 @@ class SessionController extends ChangeNotifier {
         _selectedSessionTitle = sessionDisplayTitle(created.summary);
         _selectedSessionExternalNative =
             _isExternalNativeSession(created.summary);
+        _rememberLastSelectedSession(created.summary);
         _sendCachedPushTokenIfPossible();
         _resetNewSessionState();
         _upsertSession(created.summary);
@@ -5295,6 +5550,10 @@ class SessionController extends ChangeNotifier {
         _selectedSessionTitle = sessionDisplayTitle(resolvedHistorySummary);
         _selectedSessionExternalNative =
             _isExternalNativeSession(resolvedHistorySummary);
+        _rememberLastSelectedSession(
+          resolvedHistorySummary,
+          cwd: history.resumeRuntimeMeta.cwd,
+        );
         _executionActive = resolvedHistorySummary.executionActive;
         _sendCachedPushTokenIfPossible();
         _applyContextWindowUsage(history.contextWindowUsage);
@@ -6544,6 +6803,10 @@ class SessionController extends ChangeNotifier {
       _selectedSessionExternalNative =
           _isExternalNativeSession(resolvedSummary);
       _executionActive = resolvedSummary.executionActive;
+      _rememberLastSelectedSession(
+        resolvedSummary,
+        cwd: delta.resumeRuntimeMeta.cwd,
+      );
       _upsertSession(resolvedSummary);
     }
     _sessionContext = delta.sessionContext;

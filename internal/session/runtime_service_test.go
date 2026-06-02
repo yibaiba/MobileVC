@@ -380,6 +380,54 @@ func TestSendInputOrResumeRestartsDetachedResumeSession(t *testing.T) {
 	}
 }
 
+func TestSendInputOrResumePreservesCodexYoloRuntimeMeta(t *testing.T) {
+	resumed := newResumeStubRunner("thread-yolo", true)
+	svc := NewService("s1", Dependencies{
+		NewExecRunner: func() engine.Runner { return newResumeStubRunner("", true) },
+		NewPtyRunner:  func() engine.Runner { return resumed },
+	})
+	svc.manager.updateResumeSessionID("thread-yolo")
+
+	err := svc.SendInputOrResume(context.Background(), "s1", ExecuteRequest{
+		Command:        "codex",
+		CWD:            "/tmp/project",
+		Mode:           engine.ModePTY,
+		PermissionMode: "bypassPermissions",
+		RuntimeMeta: protocol.RuntimeMeta{
+			Command:          "codex",
+			Engine:           "codex",
+			CWD:              "/tmp/project",
+			CodexSandboxMode: "danger-full-access",
+			PermissionMode:   "bypassPermissions",
+			ResumeSessionID:  "thread-yolo",
+		},
+	}, InputRequest{
+		Data: "check github\n",
+		RuntimeMeta: protocol.RuntimeMeta{
+			Source:           "input",
+			CodexSandboxMode: "danger-full-access",
+			PermissionMode:   "bypassPermissions",
+		},
+	}, func(any) {})
+	if err != nil {
+		t.Fatalf("send input or resume: %v", err)
+	}
+
+	waitSignal(t, resumed.started, "detached codex resume runner start")
+	if !strings.HasPrefix(strings.ToLower(resumed.lastReq.Command), "codex resume thread-yolo") {
+		t.Fatalf("expected codex resume command, got %q", resumed.lastReq.Command)
+	}
+	if resumed.lastReq.PermissionMode != "bypassPermissions" {
+		t.Fatalf("expected bypass permission mode, got %q", resumed.lastReq.PermissionMode)
+	}
+	if resumed.lastReq.RuntimeMeta.CodexSandboxMode != "danger-full-access" {
+		t.Fatalf("expected danger-full-access sandbox, got %q", resumed.lastReq.RuntimeMeta.CodexSandboxMode)
+	}
+	if len(resumed.writes) != 1 || string(resumed.writes[0]) != "check github\n" {
+		t.Fatalf("unexpected resumed runner writes: %#v", resumed.writes)
+	}
+}
+
 func TestSendInputOrResumeAllowsSlowDetachedResumeStartup(t *testing.T) {
 	resumed := newResumeStubRunner("resume-detached", true)
 	resumed.writeDelay = 4500 * time.Millisecond
@@ -496,13 +544,14 @@ func TestBuildDetachedResumeRequestForCodexDoesNotAppendClaudeFlags(t *testing.T
 		Mode:           engine.ModePTY,
 		PermissionMode: "default",
 		RuntimeMeta: protocol.RuntimeMeta{
-			Command:         "codex -m gpt-5",
-			Engine:          "codex",
-			CWD:             "/tmp",
-			ResumeSessionID: "resume-codex-123",
-			PermissionMode:  "default",
+			Command:          "codex -m gpt-5",
+			Engine:           "codex",
+			CodexSandboxMode: "danger-full-access",
+			CWD:              "/tmp",
+			ResumeSessionID:  "resume-codex-123",
+			PermissionMode:   "default",
 		},
-	}, "auto")
+	}, "config")
 	if err != nil {
 		t.Fatalf("buildDetachedResumeRequest: %v", err)
 	}
@@ -512,6 +561,12 @@ func TestBuildDetachedResumeRequestForCodexDoesNotAppendClaudeFlags(t *testing.T
 	}
 	if strings.Contains(lower, "--print") || strings.Contains(lower, "--input-format") || strings.Contains(lower, "--output-format") || strings.Contains(lower, "--permission-prompt-tool") {
 		t.Fatalf("did not expect claude stream flags on codex command, got %q", req.Command)
+	}
+	if req.PermissionMode != "config" || req.RuntimeMeta.PermissionMode != "config" {
+		t.Fatalf("expected codex config permission mode to be preserved, got req=%q meta=%q", req.PermissionMode, req.RuntimeMeta.PermissionMode)
+	}
+	if req.RuntimeMeta.CodexSandboxMode != "danger-full-access" {
+		t.Fatalf("expected codex sandbox mode to be preserved, got %q", req.RuntimeMeta.CodexSandboxMode)
 	}
 }
 
@@ -527,6 +582,7 @@ func TestCompactRestartsDetachedCodexResumeSession(t *testing.T) {
 		m.Engine = "codex"
 		m.CWD = "/tmp"
 		m.PermissionMode = "default"
+		m.CodexSandboxMode = "danger-full-access"
 		m.ResumeSessionID = "resume-codex-123"
 	})
 
@@ -539,6 +595,9 @@ func TestCompactRestartsDetachedCodexResumeSession(t *testing.T) {
 	lower := strings.ToLower(strings.TrimSpace(resumed.lastReq.Command))
 	if !strings.HasPrefix(lower, "codex resume resume-codex-123") {
 		t.Fatalf("expected codex resume command before compact, got %q", resumed.lastReq.Command)
+	}
+	if got := resumed.lastReq.RuntimeMeta.CodexSandboxMode; got != "danger-full-access" {
+		t.Fatalf("expected stored codex sandbox mode on detached compact resume, got %q", got)
 	}
 }
 
@@ -554,15 +613,17 @@ func TestCompactDetachedCodexResumePrefersRequestRuntimeMeta(t *testing.T) {
 		m.Engine = "codex"
 		m.CWD = "/tmp/stale"
 		m.PermissionMode = "default"
+		m.CodexSandboxMode = "workspace-write"
 		m.ResumeSessionID = "resume-stale"
 	})
 
 	err := svc.Compact(context.Background(), "s1", protocol.RuntimeMeta{
-		Command:         "codex -m gpt-5.5",
-		Engine:          "codex",
-		CWD:             "/tmp/request",
-		PermissionMode:  "bypassPermissions",
-		ResumeSessionID: "resume-request",
+		Command:          "codex -m gpt-5.5",
+		Engine:           "codex",
+		CWD:              "/tmp/request",
+		PermissionMode:   "bypassPermissions",
+		CodexSandboxMode: "danger-full-access",
+		ResumeSessionID:  "resume-request",
 	}, func(any) {})
 	if !errors.Is(err, engine.ErrInputNotSupported) {
 		t.Fatalf("expected detached codex resume runner to restart into compact path and fail on missing compactor, got %v", err)
@@ -581,6 +642,9 @@ func TestCompactDetachedCodexResumePrefersRequestRuntimeMeta(t *testing.T) {
 	}
 	if resumed.lastReq.PermissionMode != "bypassPermissions" {
 		t.Fatalf("expected request permission mode on detached compact resume, got %q", resumed.lastReq.PermissionMode)
+	}
+	if got := resumed.lastReq.RuntimeMeta.CodexSandboxMode; got != "danger-full-access" {
+		t.Fatalf("expected request codex sandbox mode on detached compact resume, got %q", got)
 	}
 }
 

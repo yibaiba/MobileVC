@@ -277,6 +277,33 @@ func TestBuildPermissionDecisionPlan_ClaudeApproveWhenAlreadyAutoIsDirect(t *tes
 	}
 }
 
+func TestBuildPermissionDecisionPlan_PreservesCodexSandboxMode(t *testing.T) {
+	plan, err := BuildPermissionDecisionPlan(
+		protocol.PermissionDecisionRequestEvent{
+			Decision:         "approve",
+			FallbackCommand:  "codex",
+			FallbackEngine:   "codex",
+			PermissionMode:   "config",
+			CodexSandboxMode: "danger-full-access",
+		},
+		data.ProjectionSnapshot{
+			Runtime: data.SessionRuntime{
+				CodexSandboxMode: "workspace-write",
+			},
+		},
+		ControllerSnapshot{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Meta.CodexSandboxMode != "danger-full-access" {
+		t.Errorf("expected request codex sandbox preserved, got %q", plan.Meta.CodexSandboxMode)
+	}
+	if plan.Meta.PermissionMode != "config" {
+		t.Errorf("expected codex permission mode preserved, got %q", plan.Meta.PermissionMode)
+	}
+}
+
 func TestBuildPermissionDecisionPlan_ClaudeDenyEmitsPrompt(t *testing.T) {
 	plan, err := BuildPermissionDecisionPlan(
 		protocol.PermissionDecisionRequestEvent{

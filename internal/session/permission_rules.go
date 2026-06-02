@@ -195,6 +195,7 @@ func BuildPermissionDecisionFromEvent(
 		ClientEvent:         protocol.ClientEvent{Action: "permission_decision"},
 		Decision:            "approve",
 		PermissionMode:      firstNonEmptyString(meta.PermissionMode, controller.ActiveMeta.PermissionMode, projection.Runtime.PermissionMode),
+		CodexSandboxMode:    firstNonEmptyString(meta.CodexSandboxMode, controller.ActiveMeta.CodexSandboxMode, projection.Runtime.CodexSandboxMode),
 		PermissionRequestID: strings.TrimSpace(meta.PermissionRequestID),
 		ResumeSessionID:     firstNonEmptyString(meta.ResumeSessionID, controller.ResumeSession, controller.ActiveMeta.ResumeSessionID, projection.Runtime.ResumeSessionID),
 		TargetPath:          strings.TrimSpace(meta.TargetPath),

@@ -1390,6 +1390,130 @@ func TestSessionResumeReplaysPendingEvents(t *testing.T) {
 	}
 }
 
+func TestSessionResumePreservesRequestedCodexPermissions(t *testing.T) {
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new file store: %v", err)
+	}
+	h := NewHandler("test", tempStore)
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+
+	sessionID := createHistorySessionForHandlerTest(t, h, conn, "codex-resume-sandbox")
+	record, err := h.SessionStore.GetSession(context.Background(), sessionID)
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	record.Projection = session.NormalizeProjectionSnapshot(data.ProjectionSnapshot{
+		Runtime: data.SessionRuntime{
+			Command:         "codex",
+			Engine:          "codex",
+			CWD:             "/tmp/project",
+			ResumeSessionID: "thread-sandbox",
+		},
+	})
+	if _, err := h.SessionStore.SaveProjection(context.Background(), sessionID, record.Projection); err != nil {
+		t.Fatalf("save projection: %v", err)
+	}
+
+	if err := conn.WriteJSON(protocol.SessionResumeRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_resume"},
+		RuntimeMeta: protocol.RuntimeMeta{
+			Engine:           "codex",
+			CodexSandboxMode: "danger-full-access",
+			PermissionMode:   "config",
+		},
+		SessionID: sessionID,
+	}); err != nil {
+		t.Fatalf("write session_resume request: %v", err)
+	}
+
+	_ = readUntilSessionHistory(t, conn)
+	runtimeEntry := h.runtimeSessions.Ensure(sessionID)
+	if runtimeEntry == nil || runtimeEntry.service == nil {
+		t.Fatal("expected runtime service")
+	}
+	if got := runtimeEntry.service.RuntimeSnapshot().ActiveMeta.CodexSandboxMode; got != "danger-full-access" {
+		t.Fatalf("expected synced codex sandbox mode, got %q", got)
+	}
+	if got := runtimeEntry.service.RuntimeSnapshot().ActiveMeta.PermissionMode; got != "config" {
+		t.Fatalf("expected synced codex permission mode, got %q", got)
+	}
+	updated, err := h.SessionStore.GetSession(context.Background(), sessionID)
+	if err != nil {
+		t.Fatalf("get updated session: %v", err)
+	}
+	if got := updated.Projection.Runtime.CodexSandboxMode; got != "danger-full-access" {
+		t.Fatalf("expected persisted projection codex sandbox mode, got %#v", updated.Projection.Runtime)
+	}
+	if got := updated.Summary.Runtime.CodexSandboxMode; got != "danger-full-access" {
+		t.Fatalf("expected persisted summary codex sandbox mode, got %#v", updated.Summary.Runtime)
+	}
+	if got := updated.Projection.Runtime.PermissionMode; got != "config" {
+		t.Fatalf("expected persisted codex permission mode, got %#v", updated.Projection.Runtime)
+	}
+	if got := updated.Summary.Runtime.PermissionMode; got != "config" {
+		t.Fatalf("expected persisted summary codex permission mode, got %#v", updated.Summary.Runtime)
+	}
+}
+
+func TestSessionResumePreservesStoredCodexPermissionsFromCommand(t *testing.T) {
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new file store: %v", err)
+	}
+	h := NewHandler("test", tempStore)
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+
+	sessionID := createHistorySessionForHandlerTest(t, h, conn, "codex-resume-command")
+	record, err := h.SessionStore.GetSession(context.Background(), sessionID)
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	record.Projection = session.NormalizeProjectionSnapshot(data.ProjectionSnapshot{
+		Runtime: data.SessionRuntime{
+			Command:          "/usr/local/bin/codex resume thread-command",
+			CWD:              "/tmp/project",
+			PermissionMode:   "auto",
+			CodexSandboxMode: "workspace-write",
+			ResumeSessionID:  "thread-command",
+		},
+	})
+	if _, err := h.SessionStore.SaveProjection(context.Background(), sessionID, record.Projection); err != nil {
+		t.Fatalf("save projection: %v", err)
+	}
+
+	if err := conn.WriteJSON(protocol.SessionResumeRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_resume"},
+		SessionID:   sessionID,
+	}); err != nil {
+		t.Fatalf("write session_resume request: %v", err)
+	}
+
+	_ = readUntilSessionHistory(t, conn)
+	runtimeEntry := h.runtimeSessions.Ensure(sessionID)
+	if runtimeEntry == nil || runtimeEntry.service == nil {
+		t.Fatal("expected runtime service")
+	}
+	if got := runtimeEntry.service.RuntimeSnapshot().ActiveMeta.CodexSandboxMode; got != "workspace-write" {
+		t.Fatalf("expected stored codex sandbox mode, got %q", got)
+	}
+	if got := runtimeEntry.service.RuntimeSnapshot().ActiveMeta.PermissionMode; got != "auto" {
+		t.Fatalf("expected stored codex permission mode, got %q", got)
+	}
+	updated, err := h.SessionStore.GetSession(context.Background(), sessionID)
+	if err != nil {
+		t.Fatalf("get updated session: %v", err)
+	}
+	if got := updated.Projection.Runtime.CodexSandboxMode; got != "workspace-write" {
+		t.Fatalf("expected persisted codex sandbox mode, got %#v", updated.Projection.Runtime)
+	}
+	if got := updated.Projection.Runtime.PermissionMode; got != "auto" {
+		t.Fatalf("expected persisted codex permission mode, got %#v", updated.Projection.Runtime)
+	}
+}
+
 func TestHandlerSessionResumeReturnsBoundedHistoryWindow(t *testing.T) {
 	h := newTestHandler()
 	tempStore, err := data.NewFileStore(t.TempDir())
@@ -2711,6 +2835,43 @@ func TestHandlerExecFlow(t *testing.T) {
 		t.Fatalf("expected closed session event, got %#v", event)
 	}
 	requireAgentState(t, readUntilType(t, conn, protocol.EventTypeAgentState), "IDLE", false)
+}
+
+func TestHandlerExecPreservesCodexSandboxMode(t *testing.T) {
+	ptyRunner := newSwitchableStubRunner()
+
+	h := newTestHandler()
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	h.SessionStore = tempStore
+	h.NewPtyRunner = func() engine.Runner { return ptyRunner }
+
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+	_ = createHistorySessionForHandlerTest(t, h, conn, "exec-codex-sandbox")
+
+	if err := conn.WriteJSON(protocol.ExecRequestEvent{
+		ClientEvent:    protocol.ClientEvent{Action: "exec"},
+		Command:        "codex",
+		Mode:           "pty",
+		PermissionMode: "bypassPermissions",
+		RuntimeMeta: protocol.RuntimeMeta{
+			Engine:           "codex",
+			CodexSandboxMode: "danger-full-access",
+		},
+	}); err != nil {
+		t.Fatalf("write exec request: %v", err)
+	}
+	ptyRunner.WaitStarted(t)
+
+	if got := ptyRunner.req.RuntimeMeta.CodexSandboxMode; got != "danger-full-access" {
+		t.Fatalf("codex sandbox mode: %q", got)
+	}
+	if got := ptyRunner.req.PermissionMode; got != "bypassPermissions" {
+		t.Fatalf("permission mode: %q", got)
+	}
 }
 
 func TestHandlerRuntimeProcessListReturnsActiveTree(t *testing.T) {
@@ -7265,13 +7426,14 @@ func TestHandlerCompactRestartsLoadedCodexMirrorSession(t *testing.T) {
 		RawTerminalByStream: map[string]string{"stdout": "", "stderr": ""},
 		LogEntries:          record.Projection.LogEntries,
 		Runtime: data.SessionRuntime{
-			ResumeSessionID: threadID,
-			Command:         "codex resume " + threadID,
-			Engine:          "codex",
-			CWD:             projectDir,
-			PermissionMode:  "default",
-			ClaudeLifecycle: "resumable",
-			Source:          "codex-native",
+			ResumeSessionID:  threadID,
+			Command:          "codex resume " + threadID,
+			Engine:           "codex",
+			CWD:              projectDir,
+			PermissionMode:   "default",
+			CodexSandboxMode: "danger-full-access",
+			ClaudeLifecycle:  "resumable",
+			Source:           "codex-native",
 		},
 		Controller: session.ControllerSnapshot{
 			SessionID:       record.Summary.ID,
@@ -7280,12 +7442,13 @@ func TestHandlerCompactRestartsLoadedCodexMirrorSession(t *testing.T) {
 			ResumeSession:   threadID,
 			ClaudeLifecycle: "resumable",
 			ActiveMeta: protocol.RuntimeMeta{
-				ResumeSessionID: threadID,
-				Command:         "codex resume " + threadID,
-				Engine:          "codex",
-				CWD:             projectDir,
-				PermissionMode:  "default",
-				ClaudeLifecycle: "resumable",
+				ResumeSessionID:  threadID,
+				Command:          "codex resume " + threadID,
+				Engine:           "codex",
+				CWD:              projectDir,
+				PermissionMode:   "default",
+				CodexSandboxMode: "danger-full-access",
+				ClaudeLifecycle:  "resumable",
 			},
 		},
 	}); err != nil {
@@ -7324,6 +7487,9 @@ func TestHandlerCompactRestartsLoadedCodexMirrorSession(t *testing.T) {
 	resumed.WaitStarted(t)
 	if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(resumed.lastReq.Command)), "codex resume "+strings.ToLower(threadID)) {
 		t.Fatalf("expected codex resume command on compact restore, got %q", resumed.lastReq.Command)
+	}
+	if got := resumed.lastReq.RuntimeMeta.CodexSandboxMode; got != "danger-full-access" {
+		t.Fatalf("expected codex sandbox on compact restore, got %q", got)
 	}
 }
 
