@@ -1,6 +1,6 @@
 {
   "name": "@justprove/mobilevc",
-  "version": "0.2.12",
+  "version": "0.2.13",
   "description": "Claude Code mobile workspace launcher with precompiled MobileVC backend binaries.",
   "license": "MIT",
   "type": "commonjs",

@@ -386,11 +386,7 @@ func reconnectAgent(conn *websocket.Conn, req agentReconnectRequest) error {
 }
 
 func localAgentName() string {
-	name, err := os.Hostname()
-	if err != nil || strings.TrimSpace(name) == "" {
-		return runtime.GOOS
-	}
-	return strings.TrimSpace(name)
+	return "MobileVC Backend"
 }
 
 func writeControlJSON(conn *websocket.Conn, frame any) error {
