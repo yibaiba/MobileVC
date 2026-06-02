@@ -45,16 +45,19 @@ func newShellCommand(ctx context.Context, command string, mode Mode) *exec.Cmd {
 			}
 			cmd := exec.CommandContext(ctx, spec.gitBash, "-lc", strings.Join(wrappedParts, " "))
 			cmd.Env = shellEnvironment(spec, command)
+			hideCommandWindow(cmd)
 			return cmd
 		}
 		args := append([]string{cliEntry}, claudeCommandArgs(command)...)
 		cmd := exec.CommandContext(ctx, nodeEntry, args...)
 		cmd.Env = shellEnvironment(spec, command)
+		hideCommandWindow(cmd)
 		return cmd
 	}
 	preparedCommand := prepareShellCommand(command, spec, mode)
 	cmd := exec.CommandContext(ctx, spec.path, append(spec.args, preparedCommand)...)
 	cmd.Env = shellEnvironment(spec, command)
+	hideCommandWindow(cmd)
 	return cmd
 }
 
@@ -95,6 +98,7 @@ func newClaudeStreamCommand(ctx context.Context, command string, resumeSessionID
 		args = appendPermissionMode(args, permissionMode)
 		cmd := exec.CommandContext(ctx, nodeEntry, args...)
 		cmd.Env = shellEnvironment(spec, command)
+		hideCommandWindow(cmd)
 		return cmd
 	}
 	preparedCommand := buildClaudeStreamJSONCommand(command)
@@ -104,6 +108,7 @@ func newClaudeStreamCommand(ctx context.Context, command string, resumeSessionID
 	preparedCommand = appendPermissionModeToCommand(preparedCommand, permissionMode)
 	cmd := exec.CommandContext(ctx, spec.path, append(spec.args, preparedCommand)...)
 	cmd.Env = shellEnvironment(spec, command)
+	hideCommandWindow(cmd)
 	return cmd
 }
 
@@ -133,6 +138,7 @@ func newClaudePromptCommand(ctx context.Context, command string, prompt string, 
 		args = append(args, prompt)
 		cmd := exec.CommandContext(ctx, nodeEntry, args...)
 		cmd.Env = shellEnvironment(spec, command)
+		hideCommandWindow(cmd)
 		return cmd
 	}
 	preparedCommand := buildClaudePromptCommand(command, prompt, resumeSessionID)
@@ -148,6 +154,7 @@ func newClaudePromptCommand(ctx context.Context, command string, prompt string, 
 	}
 	cmd := exec.CommandContext(ctx, spec.path, append(spec.args, preparedCommand)...)
 	cmd.Env = shellEnvironment(spec, command)
+	hideCommandWindow(cmd)
 	return cmd
 }
 

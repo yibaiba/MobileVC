@@ -397,6 +397,7 @@ func fetchModelsFromNativeCLI(cwd, currentModel string) ([]protocol.RuntimeInfoI
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "claude", "/model")
+	hideCommandWindow(cmd)
 	if strings.TrimSpace(cwd) != "" {
 		cmd.Dir = cwd
 	}

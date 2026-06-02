@@ -288,6 +288,7 @@ class SessionController extends ChangeNotifier {
   final Map<String, DateTime> _sessionDeltaLastRequestedAt =
       <String, DateTime>{};
   bool _fileListLoading = false;
+  Timer? _fileListLoadingTimeout;
   bool _fileReading = false;
   bool _fileSaving = false;
   bool _relayDeviceListLoading = false;
@@ -1554,6 +1555,7 @@ class SessionController extends ChangeNotifier {
     _adbWebRtcStartTimeout?.cancel();
     _reconnectTimer?.cancel();
     _connectionHealthTimer?.cancel();
+    _fileListLoadingTimeout?.cancel();
     _lanReturnProbeTimer?.cancel();
     _pendingOutboundRetryTimer?.cancel();
     _sessionLoadingTimeout?.cancel();
@@ -1722,6 +1724,15 @@ class SessionController extends ChangeNotifier {
     }
     if (refreshList && (!samePath || _currentDirectoryItems.isEmpty)) {
       _fileListLoading = true;
+      _fileListLoadingTimeout?.cancel();
+      _fileListLoadingTimeout = Timer(const Duration(seconds: 12), () {
+        if (!_fileListLoading) {
+          return;
+        }
+        _fileListLoading = false;
+        _pushSystem('file', '文件列表加载超时，请检查 Host 是否可达或点击刷新重试');
+        notifyListeners();
+      });
       _service.send(
           {'action': 'fs_list', if (nextPath.isNotEmpty) 'path': nextPath});
     }
@@ -3625,6 +3636,15 @@ class SessionController extends ChangeNotifier {
   void requestFileList([String? path]) {
     final target = (path ?? effectiveCwd).trim();
     _fileListLoading = true;
+    _fileListLoadingTimeout?.cancel();
+    _fileListLoadingTimeout = Timer(const Duration(seconds: 12), () {
+      if (!_fileListLoading) {
+        return;
+      }
+      _fileListLoading = false;
+      _pushSystem('file', '文件列表加载超时，请检查 Host 是否可达或点击刷新重试');
+      notifyListeners();
+    });
     _service.send({'action': 'fs_list', if (target.isNotEmpty) 'path': target});
     notifyListeners();
   }
@@ -5708,6 +5728,11 @@ class SessionController extends ChangeNotifier {
         _connectionStage = SessionConnectionStage.ready;
         _connectionMessage = '已连接';
         _sessionRuntimeAlive = result.runtimeAlive;
+        final resumedState = result.runtimeState.trim().toUpperCase();
+        if (_isIdleLikeState(resumedState) || resumedState == 'WAIT_INPUT') {
+          _pendingAiLaunchAwaitingInput = false;
+          _checkAndClearExecutionState(resumedState);
+        }
         if (!result.runtimeAlive) {
           _clearStoppingState();
         }
@@ -5925,6 +5950,8 @@ class SessionController extends ChangeNotifier {
         _syncDerivedState();
         break;
       case ErrorEvent error:
+        _fileListLoadingTimeout?.cancel();
+        _fileListLoadingTimeout = null;
         _fileListLoading = false;
         _fileReading = false;
         _fileSaving = false;
@@ -6085,6 +6112,8 @@ class SessionController extends ChangeNotifier {
         _pushDebug('收到 interaction_request', _debugReviewStateSummary());
         break;
       case FSListResultEvent fsList:
+        _fileListLoadingTimeout?.cancel();
+        _fileListLoadingTimeout = null;
         _fileListLoading = false;
         _currentDirectoryPath = fsList.currentPath.trim().isEmpty
             ? effectiveCwd
@@ -7822,6 +7851,9 @@ class SessionController extends ChangeNotifier {
     if (_isDuplicateAssistantTimelineItem(item)) {
       return;
     }
+    if (_isDuplicateRestoredTimelineItem(item)) {
+      return;
+    }
     if (_shouldMergeIntoPreviousTimelineItem(item)) {
       final previous = _timeline.removeLast();
       _timelineItemIds.remove(previous.id);
@@ -7905,6 +7937,23 @@ class SessionController extends ChangeNotifier {
       }
     }
     return false;
+  }
+
+  bool _isDuplicateRestoredTimelineItem(TimelineItem item) {
+    if (item.animateBody) {
+      return false;
+    }
+    final body = item.body.trim();
+    if (body.isEmpty || item.attachments.isNotEmpty) {
+      return false;
+    }
+    final kind = item.kind.trim();
+    final stream = item.stream.trim();
+    return _timeline.any((previous) =>
+        !previous.animateBody &&
+        previous.kind.trim() == kind &&
+        previous.stream.trim() == stream &&
+        previous.body.trim() == body);
   }
 
   String _mergedTimelineKind(TimelineItem previous, TimelineItem next) {
@@ -9560,8 +9609,16 @@ class SessionController extends ChangeNotifier {
         shouldShowReviewChoices ||
         hasPendingPlanQuestions ||
         _pendingAiLaunchAwaitingInput;
+    final hasDefinitiveIdleOrWaitingState = _isIdleLikeState(agentState) ||
+        agentState == 'WAIT_INPUT' ||
+        _isIdleLikeState(sessionState) ||
+        sessionState == 'WAIT_INPUT' ||
+        awaitInput ||
+        _isClaudePendingReadyForInput;
+    final runtimeAliveImpliesRunning =
+        _sessionRuntimeAlive && !hasDefinitiveIdleOrWaitingState;
     final hasRealRunningSignal = _executionActive ||
-        _sessionRuntimeAlive ||
+        runtimeAliveImpliesRunning ||
         agentState == 'THINKING' ||
         agentState == 'RECOVERING' ||
         sessionState == 'THINKING' ||

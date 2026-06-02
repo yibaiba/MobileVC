@@ -18,24 +18,31 @@ const (
 )
 
 type peerConn struct {
-	conn     *websocket.Conn
-	role     peerRole
-	remote   string
-	queue    chan any
-	stop     chan struct{}
-	done     chan struct{}
-	stopOnce sync.Once
-	writeMu  sync.Mutex
+	conn        *websocket.Conn
+	role        peerRole
+	remote      string
+	userAgent   string
+	system      string
+	deviceName  string
+	connectedAt time.Time
+	queue       chan any
+	stop        chan struct{}
+	done        chan struct{}
+	stopOnce    sync.Once
+	writeMu     sync.Mutex
 }
 
-func newPeerConn(conn *websocket.Conn, role peerRole, remote string, queueSize int) *peerConn {
+func newPeerConn(conn *websocket.Conn, role peerRole, remote string, queueSize int, userAgent string) *peerConn {
 	return &peerConn{
-		conn:   conn,
-		role:   role,
-		remote: remote,
-		queue:  make(chan any, queueSize),
-		stop:   make(chan struct{}),
-		done:   make(chan struct{}),
+		conn:        conn,
+		role:        role,
+		remote:      remote,
+		userAgent:   userAgent,
+		system:      inferSystem(userAgent, ""),
+		connectedAt: time.Now().UTC(),
+		queue:       make(chan any, queueSize),
+		stop:        make(chan struct{}),
+		done:        make(chan struct{}),
 	}
 }
 

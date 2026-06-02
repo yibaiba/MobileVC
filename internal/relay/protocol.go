@@ -66,6 +66,8 @@ type AgentRegisterFrame struct {
 	PairingSecretHash        string              `json:"pairingSecretHash"`
 	AgentReconnectSecretHash string              `json:"agentReconnectSecretHash"`
 	PairingExpiresAt         int64               `json:"pairingExpiresAt"`
+	AgentName                string              `json:"agentName,omitempty"`
+	AgentSystem              string              `json:"agentSystem,omitempty"`
 	Capabilities             *e2ee.CapabilitySet `json:"capabilities,omitempty"`
 }
 
@@ -80,6 +82,8 @@ type AgentReconnectFrame struct {
 	Version              int    `json:"version"`
 	SessionID            string `json:"sessionId"`
 	AgentReconnectSecret string `json:"agentReconnectSecret"`
+	AgentName            string `json:"agentName,omitempty"`
+	AgentSystem          string `json:"agentSystem,omitempty"`
 }
 
 type ClientPairFrame struct {
@@ -96,6 +100,7 @@ type ClientReconnectFrame struct {
 	SessionID             string `json:"sessionId"`
 	ClientID              string `json:"clientId"`
 	ClientReconnectSecret string `json:"clientReconnectSecret"`
+	DeviceName            string `json:"deviceName,omitempty"`
 }
 
 type ClientPairedFrame struct {

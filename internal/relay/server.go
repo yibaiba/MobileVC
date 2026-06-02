@@ -98,6 +98,9 @@ func NewServer(cfg Config) (*Server, error) {
 func (s *Server) Handler(version string) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.healthz)
+	mux.HandleFunc("/", s.dashboard)
+	mux.HandleFunc("/dashboard", s.dashboard)
+	mux.HandleFunc("/stats", s.stats)
 	mux.HandleFunc("/version", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = fmt.Fprintf(w, `{"version":%q}`, version)

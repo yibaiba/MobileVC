@@ -246,6 +246,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
     final scheme = theme.colorScheme;
     final isLight = theme.brightness == Brightness.light;
     final keyboardInset = MediaQuery.viewInsetsOf(context).bottom;
+    final compactToolbar = MediaQuery.sizeOf(context).width < 430;
     return Scaffold(
       key: _scaffoldKey,
       drawer: Drawer(
@@ -455,46 +456,92 @@ class _SessionHomePageState extends State<SessionHomePage> {
                             connected: controller.connected,
                             label: controller.activeTransportLabel,
                           ),
-                          IconButton(
-                            onPressed: controller.currentDiffContext == null
-                                ? null
-                                : () => _openDiff(context),
-                            tooltip: 'Diff',
-                            icon: Badge.count(
-                              isLabelVisible: controller.pendingDiffCount > 0,
-                              count: controller.pendingDiffCount > 0
-                                  ? controller.pendingDiffCount
-                                  : 1,
-                              child: const Icon(Icons.difference_outlined),
+                          if (!compactToolbar) ...[
+                            IconButton(
+                              onPressed: controller.currentDiffContext == null
+                                  ? null
+                                  : () => _openDiff(context),
+                              tooltip: 'Diff',
+                              icon: Badge.count(
+                                isLabelVisible: controller.pendingDiffCount > 0,
+                                count: controller.pendingDiffCount > 0
+                                    ? controller.pendingDiffCount
+                                    : 1,
+                                child: const Icon(Icons.difference_outlined),
+                              ),
                             ),
-                          ),
-                          IconButton(
-                            onPressed: () => _openAdbDebug(context),
-                            tooltip: 'ADB 调试',
-                            icon: Badge(
-                              isLabelVisible: controller.adbStreaming ||
-                                  controller.adbWebRtcStarting,
-                              child: const Icon(Icons.phone_android_outlined),
+                            IconButton(
+                              onPressed: () => _openAdbDebug(context),
+                              tooltip: 'ADB 调试',
+                              icon: Badge(
+                                isLabelVisible: controller.adbStreaming ||
+                                    controller.adbWebRtcStarting,
+                                child: const Icon(Icons.phone_android_outlined),
+                              ),
                             ),
-                          ),
-                          IconButton(
-                            onPressed: () => _openVoiceCall(context),
-                            tooltip: '语音通话',
-                            icon: const Icon(Icons.call_outlined),
-                          ),
+                            IconButton(
+                              onPressed: () => _openVoiceCall(context),
+                              tooltip: '语音通话',
+                              icon: const Icon(Icons.call_outlined),
+                            ),
+                            IconButton(
+                              onPressed: widget.onToggleTheme,
+                              tooltip:
+                                  widget.darkModeEnabled ? '切换浅色模式' : '切换深色模式',
+                              icon: Icon(
+                                widget.darkModeEnabled
+                                    ? Icons.light_mode_outlined
+                                    : Icons.dark_mode_outlined,
+                              ),
+                            ),
+                          ] else
+                            PopupMenuButton<String>(
+                              tooltip: '更多',
+                              icon: const Icon(Icons.more_vert_rounded),
+                              onSelected: (value) {
+                                switch (value) {
+                                  case 'diff':
+                                    if (controller.currentDiffContext != null) {
+                                      _openDiff(context);
+                                    }
+                                    break;
+                                  case 'adb':
+                                    _openAdbDebug(context);
+                                    break;
+                                  case 'voice':
+                                    _openVoiceCall(context);
+                                    break;
+                                  case 'theme':
+                                    widget.onToggleTheme?.call();
+                                    break;
+                                }
+                              },
+                              itemBuilder: (context) => [
+                                PopupMenuItem(
+                                  value: 'diff',
+                                  enabled:
+                                      controller.currentDiffContext != null,
+                                  child: const Text('Diff'),
+                                ),
+                                const PopupMenuItem(
+                                  value: 'adb',
+                                  child: Text('ADB 调试'),
+                                ),
+                                const PopupMenuItem(
+                                  value: 'voice',
+                                  child: Text('语音通话'),
+                                ),
+                                PopupMenuItem(
+                                  value: 'theme',
+                                  child: Text(widget.darkModeEnabled
+                                      ? '切换浅色模式'
+                                      : '切换深色模式'),
+                                ),
+                              ],
+                            ),
                           IconButton(
                             onPressed: () => _openStatusDetails(context),
                             icon: const Icon(Icons.dashboard_outlined),
-                          ),
-                          IconButton(
-                            onPressed: widget.onToggleTheme,
-                            tooltip:
-                                widget.darkModeEnabled ? '切换浅色模式' : '切换深色模式',
-                            icon: Icon(
-                              widget.darkModeEnabled
-                                  ? Icons.light_mode_outlined
-                                  : Icons.dark_mode_outlined,
-                            ),
                           ),
                           IconButton(
                             onPressed: () => _openConnectionConfig(context),

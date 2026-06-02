@@ -58,6 +58,8 @@ func newSessionState(peer *peerConn, raw []byte, cfg Config) (*sessionState, err
 		pairFailuresByRemote: map[string]int{},
 		devices:              map[string]*deviceState{},
 	}
+	peer.deviceName = strings.TrimSpace(frame.AgentName)
+	peer.system = inferSystem(peer.userAgent, strings.TrimSpace(frame.AgentSystem+" "+frame.AgentName))
 	if state.id == "" || state.pairingHash == "" || state.agentReconnectHash == "" {
 		return nil, errors.New("missing agent registration fields")
 	}
@@ -103,6 +105,8 @@ func (s *Server) reconnectAgent(peer *peerConn, raw []byte) (string, error) {
 	staleClient := state.client
 	staleClientID := state.clientID
 	state.agent = peer
+	peer.deviceName = strings.TrimSpace(frame.AgentName)
+	peer.system = inferSystem(peer.userAgent, strings.TrimSpace(frame.AgentSystem+" "+frame.AgentName))
 	state.agentDisconnectedAt = time.Time{}
 	state.client = nil
 	state.clientID = ""
@@ -165,6 +169,7 @@ func (s *Server) pairClient(peer *peerConn, raw []byte, remote string) (string, 
 	pairingHash := state.pairingHash
 	state.client = peer
 	state.clientID = clientID
+	peer.system = inferSystem(peer.userAgent, frame.DeviceName)
 	state.clientReconnectHash = SecretHash(clientReconnectSecret)
 	state.pairingHash = ""
 	state.pairingConsumed = true
@@ -207,6 +212,10 @@ func (s *Server) reconnectClient(peer *peerConn, raw []byte) (string, string, er
 	previousClientID := state.clientID
 	state.client = peer
 	state.clientID = device.ClientID
+	if strings.TrimSpace(frame.DeviceName) != "" {
+		device.Name = strings.TrimSpace(frame.DeviceName)
+	}
+	peer.system = inferSystem(peer.userAgent, device.Name)
 	device.LastSeenAt = time.Now().UTC()
 	sessionID := state.id
 	clientID := device.ClientID

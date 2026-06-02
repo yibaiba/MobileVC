@@ -28,7 +28,7 @@ func (s *Server) handleAgent(w http.ResponseWriter, r *http.Request) {
 		logx.Warn("relay", "agent upgrade failed: remote=%s err=%v", r.RemoteAddr, err)
 		return
 	}
-	go s.agentLoop(newPeerConn(conn, roleAgent, remote, s.cfg.ForwardQueueSize))
+	go s.agentLoop(newPeerConn(conn, roleAgent, remote, s.cfg.ForwardQueueSize, r.UserAgent()))
 }
 
 func (s *Server) handleClient(w http.ResponseWriter, r *http.Request) {
@@ -43,7 +43,7 @@ func (s *Server) handleClient(w http.ResponseWriter, r *http.Request) {
 		logx.Warn("relay", "client upgrade failed: remote=%s err=%v", r.RemoteAddr, err)
 		return
 	}
-	go s.clientLoop(newPeerConn(conn, roleClient, remote, s.cfg.ForwardQueueSize))
+	go s.clientLoop(newPeerConn(conn, roleClient, remote, s.cfg.ForwardQueueSize, r.UserAgent()))
 }
 
 func (s *Server) agentLoop(peer *peerConn) {

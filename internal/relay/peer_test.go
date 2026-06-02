@@ -15,7 +15,7 @@ func TestPeerStopDoesNotWaitForPingInterval(t *testing.T) {
 	serverConn, clientConn := newPeerTestConns(t)
 	defer clientConn.Close()
 
-	peer := newPeerConn(serverConn, roleAgent, "127.0.0.1", 1)
+	peer := newPeerConn(serverConn, roleAgent, "127.0.0.1", 1, "")
 	go peer.StartWriter(time.Hour)
 
 	started := time.Now()
@@ -28,7 +28,7 @@ func TestPeerStopDoesNotWaitForPingInterval(t *testing.T) {
 func TestPeerConfigurePongAllowsFirstPingInterval(t *testing.T) {
 	serverConn, clientConn := newPeerTestConns(t)
 	defer clientConn.Close()
-	peer := newPeerConn(serverConn, roleAgent, "127.0.0.1", 1)
+	peer := newPeerConn(serverConn, roleAgent, "127.0.0.1", 1, "")
 
 	peer.ConfigurePong(40 * time.Millisecond)
 	if err := peer.ReadJSON(&ControlFrame{}); err == nil {

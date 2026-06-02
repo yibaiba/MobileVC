@@ -1103,6 +1103,7 @@ class MobileVcWsService {
         'version': 1,
         'sessionId': relaySessionId,
         'pairingSecret': relayPairingSecret,
+        'deviceName': _defaultRelayDeviceName(),
       };
     }
     if (relayClientId.trim().isNotEmpty &&
@@ -1113,6 +1114,7 @@ class MobileVcWsService {
         'sessionId': relaySessionId,
         'clientId': relayClientId,
         'clientReconnectSecret': relayClientReconnectSecret,
+        'deviceName': _defaultRelayDeviceName(),
       };
     }
     return <String, dynamic>{
@@ -1120,6 +1122,7 @@ class MobileVcWsService {
       'version': 1,
       'sessionId': relaySessionId,
       'pairingSecret': relayPairingSecret,
+      'deviceName': _defaultRelayDeviceName(),
     };
   }
 

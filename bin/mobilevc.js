@@ -1251,15 +1251,19 @@ async function detectLanHost() {
   const interfaces = os.networkInterfaces();
   const wifi = [];
   const wired = [];
+  const privateLan = [];
   const other = [];
 
   for (const [name, entries] of Object.entries(interfaces)) {
     if (!entries) continue;
+    if (isVirtualNetworkInterfaceName(name)) {
+      continue;
+    }
     for (const entry of entries) {
       if (!entry || entry.family !== 'IPv4' || entry.internal) {
         continue;
       }
-      if (isLinkLocalIpv4(entry.address)) {
+      if (isLinkLocalIpv4(entry.address) || isVpnLikeIpv4(entry.address)) {
         continue;
       }
 
@@ -1268,17 +1272,34 @@ async function detectLanHost() {
         wifi.push(entry.address);
       } else if (/^(en|eth)/.test(lowered)) {
         wired.push(entry.address);
+      } else if (isPrivateLanIpv4(entry.address)) {
+        privateLan.push(entry.address);
       } else {
         other.push(entry.address);
       }
     }
   }
 
-  return wifi[0] || wired[0] || other[0] || null;
+  return wifi[0] || wired[0] || privateLan[0] || other[0] || null;
 }
 
 function isLinkLocalIpv4(address) {
   return /^169\.254\./.test(address);
+}
+
+function isVirtualNetworkInterfaceName(name) {
+  const lowered = String(name || '').toLowerCase();
+  return /(tailscale|utun|tun|tap|wg|wireguard|zerotier|clash|mihomo|sing-box|v2ray|vpn|ppp|docker|br-|veth|vmware|virtualbox|hyper-v|wintun|loopback)/.test(lowered);
+}
+
+function isPrivateLanIpv4(address) {
+  return /^192\.168\./.test(address) ||
+    /^172\.(1[6-9]|2\d|3[0-1])\./.test(address) ||
+    /^10\./.test(address);
+}
+
+function isVpnLikeIpv4(address) {
+  return /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(address);
 }
 
 function promptInput(question, silent = false) {

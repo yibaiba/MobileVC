@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -345,6 +346,8 @@ func registerAgent(conn *websocket.Conn, req agentRegisterRequest) error {
 		PairingSecretHash:        relay.SecretHash(req.PairSecret),
 		AgentReconnectSecretHash: relay.SecretHash(req.ReconnectSecret),
 		PairingExpiresAt:         req.ExpiresAt.Unix(),
+		AgentName:                localAgentName(),
+		AgentSystem:              runtime.GOOS,
 		Capabilities:             &req.Capabilities,
 	}
 	if err := writeControlJSON(conn, frame); err != nil {
@@ -366,6 +369,8 @@ func reconnectAgent(conn *websocket.Conn, req agentReconnectRequest) error {
 		Version:              relay.Version,
 		SessionID:            req.SessionID,
 		AgentReconnectSecret: req.ReconnectSecret,
+		AgentName:            localAgentName(),
+		AgentSystem:          runtime.GOOS,
 	}
 	if err := writeControlJSON(conn, frame); err != nil {
 		return fmt.Errorf("send relay agent reconnect: %w", err)
@@ -378,6 +383,14 @@ func reconnectAgent(conn *websocket.Conn, req agentReconnectRequest) error {
 		return errAgentReconnectRejected
 	}
 	return nil
+}
+
+func localAgentName() string {
+	name, err := os.Hostname()
+	if err != nil || strings.TrimSpace(name) == "" {
+		return runtime.GOOS
+	}
+	return strings.TrimSpace(name)
 }
 
 func writeControlJSON(conn *websocket.Conn, frame any) error {

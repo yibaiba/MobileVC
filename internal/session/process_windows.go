@@ -27,6 +27,7 @@ type winProcessRecord struct {
 
 func listAllProcesses(ctx context.Context) (map[int]protocol.RuntimeProcessItem, map[int][]int, error) {
 	cmd := exec.CommandContext(ctx, "powershell", "-NoProfile", "-NonInteractive", "-Command", winProcessScript)
+	hideCommandWindow(cmd)
 	output, err := cmd.Output()
 	if err != nil {
 		return nil, nil, fmt.Errorf("list processes: %w", err)
