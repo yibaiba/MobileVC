@@ -56,6 +56,52 @@ type stubRunner struct {
 	contextUsageErr            error
 }
 
+type failingWriteClientConn struct {
+	writeErr  error
+	closedCh  chan struct{}
+	closeOnce sync.Once
+}
+
+func newFailingWriteClientConn(writeErr error) *failingWriteClientConn {
+	return &failingWriteClientConn{
+		writeErr: writeErr,
+		closedCh: make(chan struct{}),
+	}
+}
+
+func (c *failingWriteClientConn) ReadJSON(any) error {
+	<-c.closedCh
+	return errors.New("client closed")
+}
+
+func (c *failingWriteClientConn) WriteJSON(any) error {
+	return c.writeErr
+}
+
+func (c *failingWriteClientConn) Close() error {
+	c.closeOnce.Do(func() {
+		close(c.closedCh)
+	})
+	return nil
+}
+
+func (c *failingWriteClientConn) RemoteAddr() string {
+	return "test-failing-write"
+}
+
+func (c *failingWriteClientConn) Origin() string {
+	return "test"
+}
+
+func (c *failingWriteClientConn) closed() bool {
+	select {
+	case <-c.closedCh:
+		return true
+	default:
+		return false
+	}
+}
+
 func newStubRunner(events ...any) *stubRunner {
 	return &stubRunner{
 		events:                    events,
@@ -86,6 +132,46 @@ func newNonInteractiveHoldingStubRunner(events ...any) *stubRunner {
 	stub.interactive = false
 	stub.hasPendingPermission = true
 	return stub
+}
+
+func TestGatewayWriterPrioritizesClientActionAck(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	writeCh := make(chan any, gatewayWriteQueueSize)
+	priorityWriteCh := make(chan any, gatewayPriorityWriteQueueSize)
+	normalEvent := protocol.NewLogEvent("session-1", "queued output", "stdout")
+	ackEvent := protocol.NewClientActionAckEvent("session-1", "ai_turn", "action-1", "accepted", false)
+
+	writeCh <- normalEvent
+	enqueueGatewayWrite(ctx, writeCh, priorityWriteCh, ackEvent)
+
+	next, ok := nextGatewayWriterEvent(ctx, writeCh, priorityWriteCh)
+	if !ok {
+		t.Fatal("writer queue returned closed")
+	}
+	if _, ok := next.(protocol.ClientActionAckEvent); !ok {
+		t.Fatalf("expected client action ack to be written first, got %#v", next)
+	}
+}
+
+func TestServeClientConnClosesWhenWriterFails(t *testing.T) {
+	h := NewHandler("token", nil)
+	client := newFailingWriteClientConn(errors.New("write failed"))
+	done := make(chan struct{})
+
+	go func() {
+		h.ServeClientConn(context.Background(), client)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("ServeClientConn did not return after writer failure")
+	}
+	if !client.closed() {
+		t.Fatal("writer failure did not close client connection")
+	}
 }
 
 func (s *stubRunner) Run(ctx context.Context, req engine.ExecRequest, sink engine.EventSink) error {
@@ -798,6 +884,83 @@ func readUntilType(t *testing.T, conn *websocket.Conn, want string) map[string]a
 	}
 	t.Fatalf("did not receive %s event", want)
 	return nil
+}
+
+func readUntilReviewFileStatus(t *testing.T, conn *websocket.Conn, fileID, status string) map[string]any {
+	t.Helper()
+	for i := 0; i < 20; i++ {
+		event := readUntilType(t, conn, protocol.EventTypeReviewState)
+		file := reviewStateFile(event, fileID)
+		if file != nil && file["reviewStatus"] == status {
+			return event
+		}
+	}
+	t.Fatalf("did not receive review_state for file %q with status %q", fileID, status)
+	return nil
+}
+
+func reviewStateFile(event map[string]any, fileID string) map[string]any {
+	groups, ok := event["groups"].([]any)
+	if !ok {
+		return nil
+	}
+	for _, group := range groups {
+		groupMap, ok := group.(map[string]any)
+		if !ok {
+			continue
+		}
+		files, ok := groupMap["files"].([]any)
+		if !ok {
+			continue
+		}
+		for _, file := range files {
+			fileMap, ok := file.(map[string]any)
+			if ok && (fileMap["id"] == fileID || fileMap["path"] == fileID) {
+				return fileMap
+			}
+		}
+	}
+	return nil
+}
+
+func waitForPersistedReviewFile(t *testing.T, h *Handler, sessionID, fileID string) data.ProjectionSnapshot {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	var last data.ProjectionSnapshot
+	for time.Now().Before(deadline) {
+		record, err := h.SessionStore.GetSession(context.Background(), sessionID)
+		if err != nil {
+			t.Fatalf("get session: %v", err)
+		}
+		last = record.Projection
+		for _, diff := range record.Projection.Diffs {
+			if diff.ContextID == fileID || diff.Path == fileID {
+				return record.Projection
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("did not persist review file %q, last projection: %#v", fileID, last)
+	return last
+}
+
+func waitForPersistedPermissionMode(t *testing.T, store data.Store, sessionID, mode string) data.SessionRecord {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	var last data.SessionRecord
+	for time.Now().Before(deadline) {
+		record, err := store.GetSession(context.Background(), sessionID)
+		if err != nil {
+			t.Fatalf("get session projection: %v", err)
+		}
+		last = record
+		if record.Projection.Runtime.PermissionMode == mode {
+			return record
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("expected persisted permission mode %q, got %#v", mode, last.Projection.Runtime)
+	return last
 }
 
 func assertNoEventType(t *testing.T, conn *websocket.Conn, want string, timeout time.Duration) {
@@ -5602,6 +5765,7 @@ func TestHandlerReviewDecisionUpdatesProjectionAndReviewState(t *testing.T) {
 	ptyRunner.WaitStarted(t)
 	_ = readUntilType(t, conn, protocol.EventTypePromptRequest)
 	_ = readUntilType(t, conn, protocol.EventTypeFileDiff)
+	_ = waitForPersistedReviewFile(t, h, sessionID, "hhh.txt")
 
 	if err := conn.WriteJSON(protocol.ReviewDecisionRequestEvent{
 		ClientEvent:    protocol.ClientEvent{Action: "review_decision"},
@@ -5622,7 +5786,7 @@ func TestHandlerReviewDecisionUpdatesProjectionAndReviewState(t *testing.T) {
 	case <-time.After(200 * time.Millisecond):
 	}
 
-	reviewState := readUntilType(t, conn, protocol.EventTypeReviewState)
+	reviewState := readUntilReviewFileStatus(t, conn, "hhh.txt", "accepted")
 	groups, ok := reviewState["groups"].([]any)
 	if !ok || len(groups) != 1 {
 		t.Fatalf("expected one review group, got %#v", reviewState)
@@ -5681,6 +5845,8 @@ func TestHandlerSetPermissionModeUpdatesRunner(t *testing.T) {
 		t.Fatalf("write exec request: %v", err)
 	}
 	ptyRunner.WaitStarted(t)
+	_ = readUntilType(t, conn, protocol.EventTypePromptRequest)
+	_ = waitForPersistedPermissionMode(t, tempStore, sessionID, "auto")
 
 	if err := conn.WriteJSON(protocol.PermissionModeUpdateRequestEvent{ClientEvent: protocol.ClientEvent{Action: "set_permission_mode"}, PermissionMode: "default"}); err != nil {
 		t.Fatalf("write permission mode request: %v", err)
@@ -5703,10 +5869,7 @@ func TestHandlerSetPermissionModeUpdatesRunner(t *testing.T) {
 	if ptyRunner.lastPermissionMode != "default" {
 		t.Fatalf("expected runner permission mode to update, got %q", ptyRunner.lastPermissionMode)
 	}
-	record, err := tempStore.GetSession(context.Background(), sessionID)
-	if err != nil {
-		t.Fatalf("get session projection: %v", err)
-	}
+	record := waitForPersistedPermissionMode(t, tempStore, sessionID, "default")
 	if record.Projection.Runtime.PermissionMode != "default" {
 		t.Fatalf("expected persisted permission mode default, got %#v", record.Projection.Runtime)
 	}

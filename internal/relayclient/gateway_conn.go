@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
@@ -37,7 +38,6 @@ type gatewayConn struct {
 	closeCh       chan struct{}
 	closeOnce     sync.Once
 	e2eeReadyCh   chan struct{}
-	e2eeReadyOnce sync.Once
 	e2ee          *agentE2EEHandshakeHandler
 	stream        *e2ee.MobileVCStreamCodec
 	streamHS      string
@@ -53,6 +53,7 @@ type readResult struct {
 }
 
 const relayReadQueueSize = 8
+const relayWriteTimeout = 10 * time.Second
 
 func newGatewayConn(conn *websocket.Conn, sessionID string) *gatewayConn {
 	return newGatewayConnWithE2EE(conn, sessionID, nil)
@@ -242,13 +243,17 @@ func (c *gatewayConn) activateE2EEStream(handshakeID string) error {
 	c.mu.Lock()
 	c.stream = codec
 	c.streamHS = handshakeID
+	c.closeE2EEReadyLocked()
 	c.mu.Unlock()
-	c.e2eeReadyOnce.Do(func() {
-		if c.e2eeReadyCh != nil {
-			close(c.e2eeReadyCh)
-		}
-	})
 	return nil
+}
+
+func (c *gatewayConn) closeE2EEReadyLocked() {
+	if c.e2eeReadyCh == nil {
+		return
+	}
+	close(c.e2eeReadyCh)
+	c.e2eeReadyCh = nil
 }
 
 func (c *gatewayConn) sendReadResult(result readResult) {
@@ -722,13 +727,16 @@ func (c *gatewayConn) activateAttachedClient(clientID string) {
 		c.streamHS = ""
 		c.deviceID = ""
 		c.tunnelSend = e2ee.NewTunnelCounterState()
+		c.closeE2EEReadyLocked()
 		c.e2eeReadyCh = make(chan struct{})
-		c.e2eeReadyOnce = sync.Once{}
 	}
 	c.mu.Unlock()
 
 	if resetE2EE {
 		c.cancelFileDownloads()
+	}
+	if c.e2ee != nil {
+		c.e2ee.resetHandshakes()
 	}
 }
 
@@ -795,7 +803,17 @@ func (c *gatewayConn) writeForward(payload []byte) error {
 func (c *gatewayConn) writeControl(frame any) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.conn.WriteJSON(frame)
+	return c.writeJSONLocked(frame)
+}
+
+func (c *gatewayConn) writeJSONLocked(frame any) error {
+	if err := c.conn.SetWriteDeadline(time.Now().Add(relayWriteTimeout)); err != nil {
+		return err
+	}
+	if err := c.conn.WriteJSON(frame); err != nil {
+		return err
+	}
+	return c.conn.SetWriteDeadline(time.Time{})
 }
 
 func (c *gatewayConn) plaintextForwardEnvelope(payload []byte) relay.ForwardEnvelope {
@@ -860,7 +878,7 @@ func (c *gatewayConn) tryWriteEncryptedForward(payload []byte, readyCh chan stru
 	if err != nil {
 		return false, fmt.Errorf("%s: %w", relay.CodeE2EEDecryptFailed, err)
 	}
-	return true, c.conn.WriteJSON(relay.ForwardEnvelope(frame))
+	return true, c.writeJSONLocked(relay.ForwardEnvelope(frame))
 }
 
 func (c *gatewayConn) writeEncryptedTunnelFrame(codec *e2ee.MobileVCStreamCodec, frame e2ee.TunnelFrame) error {

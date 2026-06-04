@@ -36,6 +36,8 @@ const sessionListCacheTTL = 1500 * time.Millisecond
 const clientActionDedupeTTL = 24 * time.Hour
 const clientActionDedupeLimit = 500
 const sessionResumeHistoryLimit = 120
+const gatewayWriteQueueSize = 128
+const gatewayPriorityWriteQueueSize = 32
 
 func sessionHistoryWindowLimit(requested int) int {
 	if requested <= 0 {
@@ -236,6 +238,41 @@ type gatewayWriteRequest struct {
 	done  chan error
 }
 
+func enqueueGatewayWrite(ctx context.Context, writeCh chan<- any, priorityWriteCh chan<- any, event any) {
+	targetCh := writeCh
+	if isPriorityGatewayEvent(event) {
+		targetCh = priorityWriteCh
+	}
+	session.Enqueue(ctx, targetCh, event)
+}
+
+func isPriorityGatewayEvent(event any) bool {
+	switch payload := event.(type) {
+	case protocol.ClientActionAckEvent:
+		return true
+	case gatewayWriteRequest:
+		return isPriorityGatewayEvent(payload.event)
+	default:
+		return false
+	}
+}
+
+func nextGatewayWriterEvent(ctx context.Context, writeCh <-chan any, priorityWriteCh <-chan any) (any, bool) {
+	select {
+	case event, ok := <-priorityWriteCh:
+		return event, ok
+	default:
+	}
+	select {
+	case <-ctx.Done():
+		return nil, false
+	case event, ok := <-priorityWriteCh:
+		return event, ok
+	case event, ok := <-writeCh:
+		return event, ok
+	}
+}
+
 type relayE2EEClientConn interface {
 	RelayE2EEInfo() RelayE2EEInfo
 }
@@ -269,7 +306,10 @@ func (c *websocketClientConn) WriteJSON(v any) error {
 	if err := c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
 		return err
 	}
-	return c.conn.WriteJSON(v)
+	if err := c.conn.WriteJSON(v); err != nil {
+		return err
+	}
+	return c.conn.SetWriteDeadline(time.Time{})
 }
 
 func (c *websocketClientConn) Close() error       { return c.conn.Close() }
@@ -333,8 +373,20 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 	}
 	runtimeSvc := newDetachedRuntimeService()
 	var activeRuntimeSession *runtimeSession // nil for detached service, set when Attach() succeeds
-	writeCh := make(chan any, 128)
+	writeCh := make(chan any, gatewayWriteQueueSize)
+	priorityWriteCh := make(chan any, gatewayPriorityWriteQueueSize)
 	writeErrCh := make(chan error, 1)
+	signalWriterFailure := func(err error) {
+		if err == nil {
+			return
+		}
+		select {
+		case writeErrCh <- err:
+		default:
+		}
+		cancel()
+		_ = client.Close()
+	}
 	var writerWG sync.WaitGroup
 	writerWG.Add(1)
 	go func() {
@@ -343,42 +395,32 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			if recovered := recover(); recovered != nil {
 				stack := logx.StackTrace()
 				logx.Error("ws", "writer panic recovered: connectionID=%s sessionID=%s remoteAddr=%s panic=%v\n%s", connectionID, selectedSessionID, remoteAddr, recovered, stack)
-				select {
-				case writeErrCh <- fmt.Errorf("writer panic: %v", recovered):
-				default:
-				}
+				signalWriterFailure(fmt.Errorf("writer panic: %v", recovered))
 			}
 		}()
 		for {
-			select {
-			case <-ctx.Done():
+			event, ok := nextGatewayWriterEvent(ctx, writeCh, priorityWriteCh)
+			if !ok {
 				return
-			case event, ok := <-writeCh:
-				if !ok {
-					return
-				}
-				payload := event
-				var done chan error
-				if req, ok := event.(gatewayWriteRequest); ok {
-					payload = req.event
-					done = req.done
-				}
-				if err := client.WriteJSON(payload); err != nil {
-					if done != nil {
-						done <- err
-						close(done)
-					}
-					logx.Error("ws", "write websocket event failed: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
-					select {
-					case writeErrCh <- err:
-					default:
-					}
-					return
-				}
+			}
+			payload := event
+			var done chan error
+			if req, ok := event.(gatewayWriteRequest); ok {
+				payload = req.event
+				done = req.done
+			}
+			if err := client.WriteJSON(payload); err != nil {
 				if done != nil {
-					done <- nil
+					done <- err
 					close(done)
 				}
+				logx.Error("ws", "write websocket event failed: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
+				signalWriterFailure(err)
+				return
+			}
+			if done != nil {
+				done <- nil
+				close(done)
 			}
 		}
 	}()
@@ -551,14 +593,19 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 	}
 
 	emit := func(event any) {
-		session.Enqueue(ctx, writeCh, event)
+		enqueueGatewayWrite(ctx, writeCh, priorityWriteCh, event)
 	}
 	emitAndWait := func(event any) error {
 		done := make(chan error, 1)
+		req := gatewayWriteRequest{event: event, done: done}
+		targetCh := writeCh
+		if isPriorityGatewayEvent(req) {
+			targetCh = priorityWriteCh
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case writeCh <- gatewayWriteRequest{event: event, done: done}:
+		case targetCh <- req:
 		}
 		select {
 		case err := <-done:
@@ -2535,6 +2582,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			service.UpdatePermissionModeForEngine(modeEvent.PermissionMode, engineName)
 			effectivePermissionMode := service.ControllerSnapshot().ActiveMeta.PermissionMode
 			if strings.TrimSpace(effectivePermissionMode) != "" {
+				projection = buildProjectionSnapshotFor(selectedSessionID)
 				projection.Runtime.PermissionMode = effectivePermissionMode
 				if effectivePermissionMode == "auto" || effectivePermissionMode == "bypassPermissions" {
 					projection = session.ApplyAutoReviewAcceptanceToProjection(projection)

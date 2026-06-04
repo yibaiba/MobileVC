@@ -1,14 +1,17 @@
 package relayclient
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -90,6 +93,38 @@ func TestGatewayConnWritesCurrentClientID(t *testing.T) {
 	}
 	if env.ClientID != "rc_attached" {
 		t.Fatalf("written client id: got %q", env.ClientID)
+	}
+}
+
+func TestGatewayConnProductionWriteSetsWriteDeadline(t *testing.T) {
+	serverConn, clientConn, trackedConn := newTrackedRelayClientTestConns(t)
+	defer serverConn.Close()
+	t.Cleanup(func() { _ = clientConn.Close() })
+	trackedConn.resetWriteDeadlines()
+
+	attachCh := make(chan struct{})
+	close(attachCh)
+	gateway := &gatewayConn{
+		conn:      clientConn,
+		sessionID: "rs_gateway",
+		clientID:  "rc_attached",
+		attachCh:  attachCh,
+		readDone:  make(chan struct{}),
+		closeCh:   make(chan struct{}),
+	}
+
+	if err := gateway.WriteJSON(map[string]string{"event": "ready"}); err != nil {
+		t.Fatalf("write gateway event: %v", err)
+	}
+	if !trackedConn.sawNonZeroWriteDeadline() {
+		t.Fatal("runtime relay write did not set a non-zero write deadline")
+	}
+	var outbound relay.ForwardEnvelope
+	if err := serverConn.ReadJSON(&outbound); err != nil {
+		t.Fatalf("read outbound frame: %v", err)
+	}
+	if outbound.ClientID != "rc_attached" {
+		t.Fatalf("unexpected outbound client id: %#v", outbound)
 	}
 }
 
@@ -467,6 +502,76 @@ func TestGatewayConnResetsE2EEWhenClientReattaches(t *testing.T) {
 	}
 	if secondPlain["event"] != "after-reattach" {
 		t.Fatalf("unexpected second plaintext: %#v", secondPlain)
+	}
+}
+
+func TestGatewayConnReattachWakesOldE2EEReadyWaiters(t *testing.T) {
+	oldReadyCh := make(chan struct{})
+	gateway := &gatewayConn{
+		sessionID:   "rs_gateway",
+		attachCh:    make(chan struct{}),
+		readDone:    make(chan struct{}),
+		closeCh:     make(chan struct{}),
+		e2eeReadyCh: oldReadyCh,
+		e2ee:        &agentE2EEHandshakeHandler{},
+		stream:      &e2ee.MobileVCStreamCodec{},
+		streamHS:    "hs_old",
+		tunnelSend:  e2ee.NewTunnelCounterState(),
+		downloads:   map[uint64]*fileDownloadStream{},
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- gateway.waitE2EEReady(oldReadyCh)
+	}()
+
+	gateway.activateAttachedClient("rc_attached")
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("old e2ee ready waiter returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("reattach did not wake waiters on old e2ee ready channel")
+	}
+	nextReadyCh, err := gateway.currentE2EEReadyCh()
+	if err != nil {
+		t.Fatalf("current e2ee ready channel: %v", err)
+	}
+	if nextReadyCh == oldReadyCh {
+		t.Fatal("reattach kept old e2ee ready channel")
+	}
+}
+
+func TestGatewayConnRejectsPendingHandshakeAfterReattach(t *testing.T) {
+	serverConn, clientConn := newRelayClientTestConns(t)
+	defer serverConn.Close()
+	handshake, clientEphemeral := testPairingHandshakeHandler(t)
+	gateway := newGatewayConnWithE2EE(clientConn, "rs_gateway", handshake)
+	t.Cleanup(func() { _ = gateway.Close() })
+
+	if err := serverConn.WriteJSON(relay.ClientAttachedFrame{
+		Type: relay.TypeClientAttached, Version: relay.Version,
+		SessionID: "rs_gateway", ClientID: "rc_attached",
+	}); err != nil {
+		t.Fatalf("write attached: %v", err)
+	}
+	proof := startGatewayE2EEHandshakeProof(t, serverConn, clientEphemeral, "rc_attached", "hs_stale")
+	if err := serverConn.WriteJSON(relay.ClientAttachedFrame{
+		Type: relay.TypeClientAttached, Version: relay.Version,
+		SessionID: "rs_gateway", ClientID: "rc_attached",
+	}); err != nil {
+		t.Fatalf("write reattached: %v", err)
+	}
+	if err := serverConn.WriteJSON(proof); err != nil {
+		t.Fatalf("write stale proof: %v", err)
+	}
+	var result relay.E2EEAgentResultFrame
+	if err := serverConn.ReadJSON(&result); err != nil {
+		t.Fatalf("read stale proof result: %v", err)
+	}
+	if result.OK || result.ErrorCode != relay.CodeE2EEHandshakeFailed {
+		t.Fatalf("expected stale proof to fail after reattach, got %#v", result)
 	}
 }
 
@@ -1272,6 +1377,53 @@ func driveGatewayE2EEHandshake(t *testing.T, serverConn *websocket.Conn, clientE
 	return driveGatewayE2EEHandshakeWithIDs(t, serverConn, clientEphemeral, "rc_attached", "hs_pairing")
 }
 
+func startGatewayE2EEHandshakeProof(
+	t *testing.T,
+	serverConn *websocket.Conn,
+	clientEphemeral *e2ee.EphemeralKeyPair,
+	clientID string,
+	handshakeID string,
+) relay.E2EEClientProofFrame {
+	t.Helper()
+	capabilities := e2ee.ProductionCapabilities()
+	clientHello := relay.E2EEClientHelloFrame{
+		Type: relay.TypeClientE2EEHello, Version: relay.Version,
+		SessionID: "rs_gateway", ClientID: clientID, HandshakeID: handshakeID,
+		Kind: e2ee.HandshakeKindPairing, Capabilities: &capabilities,
+		ClientEphemeralPublicKey: e2ee.EncodeFrameBytes(clientEphemeral.PublicKey),
+	}
+	if err := serverConn.WriteJSON(clientHello); err != nil {
+		t.Fatalf("write client hello: %v", err)
+	}
+	var agentHello relay.E2EEAgentHelloFrame
+	if err := serverConn.ReadJSON(&agentHello); err != nil {
+		t.Fatalf("read agent hello: %v", err)
+	}
+	agentMaterial, err := e2ee.ValidateAgentHelloFrame(agentHello)
+	if err != nil {
+		t.Fatalf("validate agent hello: %v", err)
+	}
+	input := capabilities.ApplyToHandshake(e2ee.HandshakeInput{
+		Kind:                     e2ee.HandshakeKindPairing,
+		SessionID:                "rs_gateway",
+		ClientID:                 clientID,
+		HandshakeID:              handshakeID,
+		ClientEphemeralPublicKey: clientEphemeral.PublicKey,
+		NodeEphemeralPublicKey:   agentMaterial.NodeEphemeralPublicKey,
+		NodeIdentityPublicKey:    agentMaterial.NodeIdentityPublicKey,
+	})
+	transcript, err := e2ee.HandshakeTranscript(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return relay.E2EEClientProofFrame{
+		Type: relay.TypeClientE2EEProof, Version: relay.Version,
+		SessionID: "rs_gateway", ClientID: clientID, HandshakeID: handshakeID,
+		Kind:         e2ee.HandshakeKindPairing,
+		PairingProof: e2ee.EncodeFrameBytes(e2ee.PairingProof("pair-secret-128-bit-minimum", transcript)),
+	}
+}
+
 func driveGatewayE2EEHandshakeWithIDs(
 	t *testing.T,
 	serverConn *websocket.Conn,
@@ -1423,6 +1575,77 @@ func newRelayClientTestConns(t *testing.T) (*websocket.Conn, *websocket.Conn) {
 		t.Fatal("relayclient websocket was not accepted")
 	}
 	return nil, nil
+}
+
+func newTrackedRelayClientTestConns(t *testing.T) (*websocket.Conn, *websocket.Conn, *trackingConn) {
+	t.Helper()
+	accepted := make(chan *websocket.Conn, 1)
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade tracked relayclient test: %v", err)
+			return
+		}
+		accepted <- conn
+	}))
+	t.Cleanup(server.Close)
+
+	var tracked *trackingConn
+	dialer := websocket.Dialer{
+		NetDialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			conn, err := (&net.Dialer{}).DialContext(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			tracked = &trackingConn{Conn: conn}
+			return tracked, nil
+		},
+	}
+	client, _, err := dialer.Dial("ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	if err != nil {
+		t.Fatalf("dial tracked relayclient test: %v", err)
+	}
+	if tracked == nil {
+		t.Fatal("tracked relayclient connection was not installed")
+	}
+	select {
+	case serverConn := <-accepted:
+		return serverConn, client, tracked
+	case <-time.After(time.Second):
+		t.Fatal("tracked relayclient websocket was not accepted")
+	}
+	return nil, nil, nil
+}
+
+type trackingConn struct {
+	net.Conn
+	mu                 sync.Mutex
+	writeDeadlineCalls int
+	nonZeroWriteCalls  int
+}
+
+func (c *trackingConn) SetWriteDeadline(t time.Time) error {
+	c.mu.Lock()
+	c.writeDeadlineCalls++
+	if !t.IsZero() {
+		c.nonZeroWriteCalls++
+	}
+	c.mu.Unlock()
+	return c.Conn.SetWriteDeadline(t)
+}
+
+func (c *trackingConn) resetWriteDeadlines() {
+	c.mu.Lock()
+	c.writeDeadlineCalls = 0
+	c.nonZeroWriteCalls = 0
+	c.mu.Unlock()
+}
+
+func (c *trackingConn) sawNonZeroWriteDeadline() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.nonZeroWriteCalls > 0
 }
 
 func testRelayForward(clientID string) relay.ForwardEnvelope {
