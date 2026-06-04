@@ -154,6 +154,64 @@ func TestGatewayWriterPrioritizesClientActionAck(t *testing.T) {
 	}
 }
 
+func TestGatewayWriterPrioritizesPong(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	writeCh := make(chan any, gatewayWriteQueueSize)
+	priorityWriteCh := make(chan any, gatewayPriorityWriteQueueSize)
+	normalEvent := protocol.NewLogEvent("session-1", "queued output", "stdout")
+	pongEvent := map[string]any{
+		"type":      "pong",
+		"sessionId": "session-1",
+		"pingId":    "ping-1",
+	}
+
+	writeCh <- normalEvent
+	enqueueGatewayWrite(ctx, writeCh, priorityWriteCh, pongEvent)
+
+	next, ok := nextGatewayWriterEvent(ctx, writeCh, priorityWriteCh)
+	if !ok {
+		t.Fatal("writer queue returned closed")
+	}
+	pong, ok := next.(map[string]any)
+	if !ok || pong["type"] != "pong" || pong["pingId"] != "ping-1" {
+		t.Fatalf("expected pong to be written first, got %#v", next)
+	}
+}
+
+func TestGatewayWriterPrioritizesHeartbeatSnapshot(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	writeCh := make(chan any, gatewayWriteQueueSize)
+	priorityWriteCh := make(chan any, gatewayPriorityWriteQueueSize)
+	normalEvent := protocol.NewLogEvent("session-1", "queued output", "stdout")
+	snapshot := protocol.NewTaskSnapshotEvent(
+		"session-1",
+		"IDLE",
+		"Task idle (heartbeat)",
+		false,
+		false,
+		"",
+		"",
+		"",
+		0,
+		time.Time{},
+		protocol.RuntimeMeta{},
+	)
+
+	writeCh <- normalEvent
+	enqueueGatewayWrite(ctx, writeCh, priorityWriteCh, snapshot)
+
+	next, ok := nextGatewayWriterEvent(ctx, writeCh, priorityWriteCh)
+	if !ok {
+		t.Fatal("writer queue returned closed")
+	}
+	got, ok := next.(protocol.TaskSnapshotEvent)
+	if !ok || got.Message != "Task idle (heartbeat)" {
+		t.Fatalf("expected heartbeat snapshot to be written first, got %#v", next)
+	}
+}
+
 func TestServeClientConnClosesWhenWriterFails(t *testing.T) {
 	h := NewHandler("token", nil)
 	client := newFailingWriteClientConn(errors.New("write failed"))

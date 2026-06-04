@@ -183,9 +183,10 @@ Future<void> _servePairingE2eeRelay(
         if (decoded['type'] == 'ping') {
           socket.add(jsonEncode(await relayCodec.encodeJson(
             messageId: 'msg_server_ack',
-            payload: const <String, dynamic>{
+            payload: <String, dynamic>{
               'type': 'pong',
               'sessionId': 'session-test',
+              'pingId': (decoded['pingId'] ?? '').toString(),
             },
           )));
         }
@@ -315,9 +316,10 @@ Future<void> _serveReconnectE2eeRelay({
         if (decoded['type'] == 'ping') {
           socket.add(jsonEncode(await relayCodec.encodeJson(
             messageId: 'msg_reconnect_ack',
-            payload: const <String, dynamic>{
+            payload: <String, dynamic>{
               'type': 'pong',
               'sessionId': 'session-reconnect',
+              'pingId': (decoded['pingId'] ?? '').toString(),
             },
           )));
         }
@@ -2200,6 +2202,67 @@ void main() {
       expect(resentTurns.length, greaterThanOrEqualTo(2));
       expect(controller.timeline.where((item) => item.body == '有心跳但无确认'),
           hasLength(1));
+    });
+
+    test('relay health monitor requires matching pong before miss reconnect',
+        () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(
+        service: service,
+        connectionHealthInterval: const Duration(milliseconds: 40),
+        maxMissedHealthPongs: 2,
+      );
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.saveConfig(const AppConfig(
+        connectionMode: 'relay',
+        relayUrl: 'wss://relay.example.test',
+        relaySessionId: 'rs_test',
+        relayClientId: 'rc_test',
+        relayClientReconnectSecret: 'reconnect_secret',
+      ));
+      await controller.connect();
+      service.sentPayloads.clear();
+      service.emit(
+        SessionCreatedEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-health',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_created'},
+          summary: const SessionSummary(id: 'session-health', title: 'Relay'),
+        ),
+      );
+      await _flushEvents();
+
+      await Future<void>.delayed(const Duration(milliseconds: 45));
+      await _flushEvents();
+      final firstPing = service.sentPayloads.singleWhere(
+        (payload) => payload['action'] == 'ping',
+      );
+      final firstPingId = firstPing['pingId'] as String;
+      expect(firstPingId, isNotEmpty);
+
+      service.emit(PongEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 30)),
+        sessionId: 'session-health',
+        runtimeMeta: const RuntimeMeta(),
+        raw: {'type': 'pong', 'pingId': firstPingId},
+        pingId: firstPingId,
+      ));
+      await _flushEvents();
+      await Future<void>.delayed(const Duration(milliseconds: 45));
+      await _flushEvents();
+
+      expect(service.disconnectCalls, 0);
+      expect(controller.connected, isTrue);
+
+      await Future<void>.delayed(const Duration(milliseconds: 130));
+      await _flushEvents();
+
+      expect(service.disconnectCalls, greaterThanOrEqualTo(1));
+      expect(service.connectCalls, greaterThanOrEqualTo(2));
+      expect(controller.connectionStage, isNot(SessionConnectionStage.failed));
     });
 
     test('relay reconnect uses persisted client credentials', () async {

@@ -22,29 +22,31 @@ import (
 )
 
 var errRelayTunnelFrameConsumed = fmt.Errorf("relay encrypted tunnel frame consumed")
+var errRelayReadQueueFull = fmt.Errorf("relay gateway read queue full")
 
 type gatewayConn struct {
-	conn          *websocket.Conn
-	sessionID     string
-	downloadRoots []string
-	routePolicy   relay.SelectedRoutePolicy
-	clientID      string
-	mu            sync.Mutex
-	attachCh      chan struct{}
-	attachOnce    sync.Once
-	readCh        chan readResult
-	readDone      chan struct{}
-	readErr       error
-	closeCh       chan struct{}
-	closeOnce     sync.Once
-	e2eeReadyCh   chan struct{}
-	e2ee          *agentE2EEHandshakeHandler
-	stream        *e2ee.MobileVCStreamCodec
-	streamHS      string
-	deviceID      string
-	tunnelSend    *e2ee.TunnelCounterState
-	downloadsMu   sync.Mutex
-	downloads     map[uint64]*fileDownloadStream
+	conn             *websocket.Conn
+	sessionID        string
+	downloadRoots    []string
+	routePolicy      relay.SelectedRoutePolicy
+	clientID         string
+	mu               sync.Mutex
+	attachCh         chan struct{}
+	attachOnce       sync.Once
+	readCh           chan readResult
+	readDone         chan struct{}
+	readErr          error
+	closeCh          chan struct{}
+	closeOnce        sync.Once
+	e2eeReadyCh      chan struct{}
+	e2ee             *agentE2EEHandshakeHandler
+	stream           *e2ee.MobileVCStreamCodec
+	streamHS         string
+	deviceID         string
+	tunnelSend       *e2ee.TunnelCounterState
+	downloadsMu      sync.Mutex
+	downloads        map[uint64]*fileDownloadStream
+	readQueueTimeout time.Duration
 }
 
 type readResult struct {
@@ -54,6 +56,7 @@ type readResult struct {
 
 const relayReadQueueSize = 8
 const relayWriteTimeout = 10 * time.Second
+const relayReadQueueTimeout = 5 * time.Second
 
 func newGatewayConn(conn *websocket.Conn, sessionID string) *gatewayConn {
 	return newGatewayConnWithE2EE(conn, sessionID, nil)
@@ -72,8 +75,9 @@ func newGatewayConnWithPolicy(conn *websocket.Conn, sessionID string, e2eeHandle
 		conn: conn, sessionID: sessionID, downloadRoots: append([]string(nil), roots...), routePolicy: policy,
 		attachCh: make(chan struct{}), readCh: make(chan readResult, relayReadQueueSize),
 		readDone: make(chan struct{}), closeCh: make(chan struct{}), e2ee: e2eeHandler,
-		tunnelSend: e2ee.NewTunnelCounterState(),
-		downloads:  map[uint64]*fileDownloadStream{},
+		tunnelSend:       e2ee.NewTunnelCounterState(),
+		downloads:        map[uint64]*fileDownloadStream{},
+		readQueueTimeout: relayReadQueueTimeout,
 	}
 	if e2eeHandler != nil {
 		gateway.e2eeReadyCh = make(chan struct{})
@@ -108,19 +112,25 @@ func (c *gatewayConn) readLoop() {
 		var raw map[string]any
 		if err := c.conn.ReadJSON(&raw); err != nil {
 			c.setReadError(err)
-			c.sendReadResult(readResult{err: err})
+			if !c.sendReadResult(readResult{err: err}) {
+				return
+			}
 			return
 		}
 		env, err := c.dispatchRawFrame(raw)
 		if err != nil {
 			c.setReadError(err)
-			c.sendReadResult(readResult{err: err})
+			if !c.sendReadResult(readResult{err: err}) {
+				return
+			}
 			return
 		}
 		if env == nil {
 			continue
 		}
-		c.sendReadResult(readResult{env: *env})
+		if !c.sendReadResult(readResult{env: *env}) {
+			return
+		}
 	}
 }
 
@@ -256,10 +266,22 @@ func (c *gatewayConn) closeE2EEReadyLocked() {
 	c.e2eeReadyCh = nil
 }
 
-func (c *gatewayConn) sendReadResult(result readResult) {
+func (c *gatewayConn) sendReadResult(result readResult) bool {
+	timeout := c.readQueueTimeout
+	if timeout <= 0 {
+		timeout = relayReadQueueTimeout
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 	select {
 	case c.readCh <- result:
+		return true
 	case <-c.closeCh:
+		return false
+	case <-timer.C:
+		c.setReadError(errRelayReadQueueFull)
+		_ = c.Close()
+		return false
 	}
 }
 

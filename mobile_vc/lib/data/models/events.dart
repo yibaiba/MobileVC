@@ -48,13 +48,17 @@ class PongEvent extends AppEvent {
     required super.sessionId,
     required super.runtimeMeta,
     required super.raw,
+    this.pingId = '',
   }) : super(type: 'pong');
+
+  final String pingId;
 
   factory PongEvent.fromJson(Map<String, dynamic> json) => PongEvent(
         timestamp: _tryReadTimestamp(json['ts']) ?? _readTimestamp(json),
         sessionId: (json['sessionId'] ?? '').toString(),
         runtimeMeta: RuntimeMeta.fromJson(json),
         raw: json,
+        pingId: (json['pingId'] ?? '').toString(),
       );
 }
 

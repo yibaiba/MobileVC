@@ -213,11 +213,16 @@ class SessionController extends ChangeNotifier {
     @visibleForTesting
     Duration outboundAckStaleTimeout = const Duration(seconds: 12),
     @visibleForTesting Duration? lanReturnProbeInterval,
+    @visibleForTesting Duration? connectionHealthInterval,
+    @visibleForTesting int maxMissedHealthPongs = _defaultMaxMissedHealthPongs,
   })  : _service = service ?? MobileVcWsService(),
         _outboundAckRetryDelay = outboundAckRetryDelay,
         _outboundAckStaleTimeout = outboundAckStaleTimeout,
         _lanReturnProbeInterval =
-            lanReturnProbeInterval ?? _defaultLanReturnProbeInterval {
+            lanReturnProbeInterval ?? _defaultLanReturnProbeInterval,
+        _connectionHealthInterval =
+            connectionHealthInterval ?? _defaultConnectionHealthInterval,
+        _maxMissedHealthPongs = maxMissedHealthPongs {
     _terminalExecutionsView = UnmodifiableListView(_terminalExecutions);
     _runtimeProcessesView = UnmodifiableListView(_runtimeProcesses);
     _codexModelCatalogView = UnmodifiableListView(_codexModelCatalog);
@@ -246,8 +251,9 @@ class SessionController extends ChangeNotifier {
   static const _prefsKey = 'mobilevc.app_config';
   static const _connectionIntentPrefsKey = 'mobilevc.connection_intent';
   static const int _maxForegroundReconnectAttempts = 4;
-  static const Duration _connectionHealthInterval = Duration(seconds: 10);
-  static const Duration _connectionSilenceTimeout = Duration(seconds: 45);
+  static const int _defaultMaxMissedHealthPongs = 2;
+  static const Duration _defaultConnectionHealthInterval =
+      Duration(seconds: 10);
   static const Duration _observedSessionSyncInterval = Duration(seconds: 3);
   static const Duration _sessionDeltaRequestCoalesceWindow =
       Duration(seconds: 2);
@@ -258,6 +264,8 @@ class SessionController extends ChangeNotifier {
   final Duration _outboundAckRetryDelay;
   final Duration _outboundAckStaleTimeout;
   final Duration _lanReturnProbeInterval;
+  final Duration _connectionHealthInterval;
+  final int _maxMissedHealthPongs;
   int get _historyWindowLimit =>
       AppConfig.parseHistoryWindowLimit(_config.historyWindowLimit);
 
@@ -274,7 +282,9 @@ class SessionController extends ChangeNotifier {
   Timer? _lanReturnProbeTimer;
   Timer? _observedSessionSyncTimer;
   Timer? _pendingOutboundRetryTimer;
-  DateTime? _lastServerEventAt;
+  int _connectionPingSequence = 0;
+  String _pendingHealthPingId = '';
+  int _missedHealthPongs = 0;
   final List<_PendingOutboundAction> _pendingOutboundActions =
       <_PendingOutboundAction>[];
   int _clientActionSequence = 0;
@@ -1692,6 +1702,7 @@ class SessionController extends ChangeNotifier {
     _connected = false;
     _connecting = false;
     _activeTransportPath = ActiveTransportPath.none;
+    _resetHealthPingState();
     _clearStoppingState();
     _connectionStage = SessionConnectionStage.disconnected;
     _latestError = null;
@@ -2442,6 +2453,8 @@ class SessionController extends ChangeNotifier {
       unawaited(_saveConnectionIntent(true));
       _connected = true;
       _reconnectAttempt = 0;
+      _resetHealthPingState();
+      _startConnectionHealthMonitor();
       _connectionStage = SessionConnectionStage.connected;
       _connectionMessage = '已连接';
       _autoSessionRequested = false;
@@ -2661,6 +2674,7 @@ class SessionController extends ChangeNotifier {
       );
       _activeTransportPath = ActiveTransportPath.lan;
       _connecting = false;
+      _resetHealthPingState();
       _lanReturnFailureCount = 0;
       _lanReturnProbeTimer?.cancel();
       _lanReturnProbeTimer = null;
@@ -2687,6 +2701,7 @@ class SessionController extends ChangeNotifier {
         _activeTransportPath = ActiveTransportPath.relay;
         _connected = true;
         _connecting = false;
+        _resetHealthPingState();
         _connectionStage = SessionConnectionStage.catchingUp;
         _connectionMessage = '已切回 Relay';
         _requestSessionResume(reason: 'lan_return_failed');
@@ -2710,6 +2725,7 @@ class SessionController extends ChangeNotifier {
     _stopAdbRefreshPolling();
     _connectionHealthTimer?.cancel();
     _connectionHealthTimer = null;
+    _resetHealthPingState();
     _lanReturnProbeTimer?.cancel();
     _lanReturnProbeTimer = null;
     _sessionLoadingTimeout?.cancel();
@@ -2752,7 +2768,6 @@ class SessionController extends ChangeNotifier {
     _sessionEventCursors.clear();
     _sessionDeltaKnown.clear();
     _visibleHistoryLogEntryKeys.clear();
-    _lastServerEventAt = null;
     _canResumeCurrentSession = false;
     _resumeRuntimeMeta = const RuntimeMeta();
     _contextWindowUsage = const ContextWindowUsage();
@@ -2823,6 +2838,7 @@ class SessionController extends ChangeNotifier {
     _connected = false;
     _connecting = false;
     _activeTransportPath = ActiveTransportPath.none;
+    _resetHealthPingState();
     _clearStoppingState();
     _isLoadingSession = false;
     _sessionListSyncedSinceConnect = false;
@@ -5461,10 +5477,13 @@ class SessionController extends ChangeNotifier {
   }
 
   void _handleEvent(AppEvent event) async {
-    _lastServerEventAt = DateTime.now();
     _trackSessionEventCursor(event);
     var needsDerivedSync = true;
     switch (event) {
+      case PongEvent pong:
+        needsDerivedSync = false;
+        _handleHealthPong(pong);
+        break;
       case ClientActionAckEvent ack:
         _handleClientActionAck(ack);
         break;
@@ -6536,9 +6555,6 @@ class SessionController extends ChangeNotifier {
         if (!state.running && !state.connected) {
           _adbWebRtcStarting = false;
         }
-        break;
-      case PongEvent _:
-        needsDerivedSync = false;
         break;
       case UnknownEvent unknown:
         needsDerivedSync = false;
@@ -9964,18 +9980,46 @@ class SessionController extends ChangeNotifier {
         (message.contains('heartbeat') || step.contains('heartbeat'));
   }
 
+  void _handleHealthPong(PongEvent pong) {
+    final pingId = pong.pingId.trim();
+    if (pingId.isEmpty || pingId != _pendingHealthPingId) {
+      return;
+    }
+    _pendingHealthPingId = '';
+    _missedHealthPongs = 0;
+  }
+
+  void _resetHealthPingState() {
+    _pendingHealthPingId = '';
+    _missedHealthPongs = 0;
+  }
+
   void _startConnectionHealthMonitor() {
     _connectionHealthTimer?.cancel();
     _connectionHealthTimer = Timer.periodic(_connectionHealthInterval, (_) {
       if (!_connected || _connecting || !_autoReconnectEnabled) {
         return;
       }
-      final lastSeen = _lastServerEventAt;
-      if (lastSeen != null &&
-          DateTime.now().difference(lastSeen) > _connectionSilenceTimeout) {
-        unawaited(_service.disconnect());
+      if (_pendingHealthPingId.isNotEmpty) {
+        _missedHealthPongs += 1;
+        if (_missedHealthPongs >= _maxMissedHealthPongs) {
+          unawaited(_service.disconnect());
+          _handleUnexpectedSocketDisconnect(
+              'Backend health pong timeout, reconnecting...');
+          return;
+        }
+        return;
+      }
+      final pingId = 'health-${++_connectionPingSequence}';
+      _pendingHealthPingId = pingId;
+      if (!_service.send({
+        'action': 'ping',
+        'sessionId': _selectedSessionId.trim(),
+        'pingId': pingId,
+        'ts': DateTime.now().millisecondsSinceEpoch,
+      })) {
         _handleUnexpectedSocketDisconnect(
-            'Connection timed out, reconnecting...');
+            'Backend health ping send failed, reconnecting...');
         return;
       }
       if (_config.connectionMode == ConnectionMode.auto.name &&
@@ -9983,11 +10027,6 @@ class SessionController extends ChangeNotifier {
           _canAttemptLanReturn()) {
         unawaited(_attemptLanReturn());
       }
-      _service.send({
-        'action': 'ping',
-        'sessionId': _selectedSessionId.trim(),
-        'ts': DateTime.now().millisecondsSinceEpoch,
-      });
     });
   }
 

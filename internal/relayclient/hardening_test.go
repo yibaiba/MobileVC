@@ -1104,13 +1104,40 @@ func TestGatewayConnCloseUnblocksFullReadQueueSend(t *testing.T) {
 	}
 	done := make(chan struct{})
 	go func() {
-		gateway.sendReadResult(readResult{})
+		if gateway.sendReadResult(readResult{}) {
+			t.Error("sendReadResult succeeded after gateway close")
+		}
 		close(done)
 	}()
 	select {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("sendReadResult stayed blocked after gateway close")
+	}
+}
+
+func TestGatewayConnFullReadQueueFailsExplicitly(t *testing.T) {
+	serverConn, clientConn := newRelayClientTestConns(t)
+	defer serverConn.Close()
+	gateway := &gatewayConn{
+		conn: clientConn, readCh: make(chan readResult, relayReadQueueSize),
+		closeCh:          make(chan struct{}),
+		readQueueTimeout: 10 * time.Millisecond,
+	}
+
+	for i := 0; i < relayReadQueueSize; i++ {
+		gateway.readCh <- readResult{}
+	}
+	if gateway.sendReadResult(readResult{}) {
+		t.Fatal("sendReadResult succeeded with a full read queue")
+	}
+	if err := gateway.readError(); err == nil || !strings.Contains(err.Error(), errRelayReadQueueFull.Error()) {
+		t.Fatalf("expected explicit read queue full error, got %v", err)
+	}
+	select {
+	case <-gateway.closeCh:
+	case <-time.After(time.Second):
+		t.Fatal("full read queue did not close the gateway")
 	}
 }
 

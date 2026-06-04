@@ -250,11 +250,36 @@ func isPriorityGatewayEvent(event any) bool {
 	switch payload := event.(type) {
 	case protocol.ClientActionAckEvent:
 		return true
+	case map[string]any:
+		return strings.TrimSpace(fmt.Sprint(payload["type"])) == "pong"
+	case protocol.TaskSnapshotEvent:
+		return isGatewayHealthSnapshot(payload)
+	case protocol.AIStatusEvent:
+		return isGatewayHealthAIStatus(payload)
 	case gatewayWriteRequest:
 		return isPriorityGatewayEvent(payload.event)
 	default:
 		return false
 	}
+}
+
+func isGatewayHealthSnapshot(event protocol.TaskSnapshotEvent) bool {
+	message := strings.TrimSpace(strings.ToLower(event.Message))
+	step := strings.TrimSpace(strings.ToLower(event.Step))
+	return message == "heartbeat" ||
+		message == "sync" ||
+		strings.Contains(message, "(heartbeat)") ||
+		strings.Contains(message, "(sync)") ||
+		step == "heartbeat" ||
+		step == "sync"
+}
+
+func isGatewayHealthAIStatus(event protocol.AIStatusEvent) bool {
+	phase := strings.TrimSpace(strings.ToLower(event.Phase))
+	label := strings.TrimSpace(strings.ToLower(event.Label))
+	return phase == "settled" ||
+		strings.Contains(label, "heartbeat") ||
+		strings.Contains(label, "sync")
 }
 
 func nextGatewayWriterEvent(ctx context.Context, writeCh <-chan any, priorityWriteCh <-chan any) (any, bool) {
@@ -1144,11 +1169,15 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			emit(protocol.NewSessionStateEvent(selectedSessionID, string(session.StateActive), "session selected"))
 			emitSessionList(sessionListFilterCWD)
 		case "ping":
-			emit(map[string]any{
+			pong := map[string]any{
 				"type":      "pong",
 				"sessionId": selectedSessionID,
 				"ts":        time.Now().UTC().Format(time.RFC3339Nano),
-			})
+			}
+			if pingID := strings.TrimSpace(fmt.Sprint(payload["pingId"])); pingID != "" && pingID != "<nil>" {
+				pong["pingId"] = pingID
+			}
+			emit(pong)
 			if snapshot := runtimeSvc.BuildTaskSnapshotEvent(selectedSessionID, taskCursorSnapshot(activeRuntimeSession), "heartbeat", false); snapshot != nil {
 				emit(*snapshot)
 				if status, ok := session.AIStatusEventForBackendEvent(selectedSessionID, runtimeSvc, buildProjectionSnapshotForService(selectedSessionID, runtimeSvc), *snapshot); ok {
