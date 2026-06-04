@@ -3,7 +3,6 @@ package relayclient
 import (
 	"context"
 	"errors"
-	"fmt"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -37,8 +36,7 @@ func serveWithReconnect(ctx context.Context, cfg Config, handler Handler, conn *
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		deadline := reconnectDeadline(cfg.AgentGracePeriod)
-		nextConn, err := reconnectWithinGrace(ctx, cfg, sessionID, reconnectSecret, deadline)
+		nextConn, err := reconnectUntilAccepted(ctx, cfg, sessionID, reconnectSecret)
 		if err != nil {
 			return err
 		}
@@ -46,9 +44,9 @@ func serveWithReconnect(ctx context.Context, cfg Config, handler Handler, conn *
 	}
 }
 
-func reconnectWithinGrace(ctx context.Context, cfg Config, sessionID string, reconnectSecret string, deadline time.Time) (*websocket.Conn, error) {
+func reconnectUntilAccepted(ctx context.Context, cfg Config, sessionID string, reconnectSecret string) (*websocket.Conn, error) {
 	backoff := normalizedBackoff(cfg.ReconnectBackoff)
-	for time.Now().Before(deadline) {
+	for {
 		conn, err := dialAgent(ctx, cfg.RelayURL)
 		if err == nil {
 			req := agentReconnectRequest{SessionID: sessionID, ReconnectSecret: reconnectSecret}
@@ -65,7 +63,6 @@ func reconnectWithinGrace(ctx context.Context, cfg Config, sessionID string, rec
 		}
 		backoff.Initial = nextBackoff(backoff)
 	}
-	return nil, fmt.Errorf("relay agent reconnect grace period expired")
 }
 
 func reconnectDeadline(grace time.Duration) time.Time {

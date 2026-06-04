@@ -12935,6 +12935,107 @@ void main() {
       );
     });
 
+    test('foreground stale resume_result does not overwrite running state',
+        () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-target',
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-target', title: 'history'),
+        runtimeAlive: true,
+        resumeRuntimeMeta: const RuntimeMeta(cwd: '/workspace'),
+      ));
+      await _flushEvents();
+
+      service.emit(SessionStateEvent(
+        timestamp: _timestamp.add(const Duration(seconds: 1)),
+        sessionId: 'session-target',
+        runtimeMeta: const RuntimeMeta(),
+        raw: const {'type': 'session_state'},
+        state: 'RUNNING',
+      ));
+      service.emit(SessionResumeResultEvent(
+        timestamp: _timestamp.add(const Duration(seconds: 2)),
+        sessionId: 'session-target',
+        runtimeMeta: const RuntimeMeta(),
+        raw: const {'type': 'session_resume_result'},
+        latestCursor: 2,
+        runtimeAlive: true,
+        runtimeState: 'RUNNING',
+      ));
+      await _flushEvents();
+      expect(controller.canStopCurrentRun, isTrue);
+
+      service.emit(SessionResumeResultEvent(
+        timestamp: _timestamp.add(const Duration(seconds: 3)),
+        sessionId: 'session-target',
+        runtimeMeta: const RuntimeMeta(),
+        raw: const {'type': 'session_resume_result'},
+        latestCursor: 1,
+        runtimeAlive: false,
+        runtimeState: 'IDLE',
+      ));
+      await _flushEvents();
+
+      expect(controller.canStopCurrentRun, isTrue);
+    });
+
+    test('permission approve immediately enables stop action', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-current', title: 'current'),
+        resumeRuntimeMeta: const RuntimeMeta(cwd: '/workspace'),
+      ));
+      service.emit(InteractionRequestEvent(
+        timestamp: _timestamp.add(const Duration(seconds: 1)),
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(
+          blockingKind: 'permission',
+          permissionRequestId: 'perm-1',
+          command: 'codex resume thread-1',
+          engine: 'codex',
+          cwd: '/workspace',
+        ),
+        raw: const {'type': 'interaction_request'},
+        kind: 'permission',
+        message: 'permission required',
+        options: const [
+          PromptOption(value: 'approve', label: 'approve'),
+          PromptOption(value: 'deny', label: 'deny'),
+        ],
+        contextId: 'perm-ctx',
+        resumeSessionId: 'thread-1',
+      ));
+      await _flushEvents();
+
+      expect(controller.hasPendingPermissionPrompt, isTrue);
+      expect(controller.canStopCurrentRun, isFalse);
+
+      controller.submitPromptOption('approve');
+      await _flushEvents();
+
+      final decisionPayload = service.sentPayloads.singleWhere(
+        (payload) => payload['action'] == 'permission_decision',
+      );
+      expect(decisionPayload['decision'], 'approve');
+      expect(controller.hasPendingPermissionPrompt, isFalse);
+      expect(controller.canStopCurrentRun, isTrue);
+    });
+
     test('stale session_delta 不会把旧历史追加到当前最新消息后面', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);
