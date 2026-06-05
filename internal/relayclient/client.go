@@ -122,7 +122,7 @@ func runRegisteredSession(ctx context.Context, cfg Config, handler Handler, emit
 		} else if err == nil || ctx.Err() != nil {
 			return err
 		} else {
-			logx.Warn("relay", "saved relay session reconnect failed; registering new relay session: %v", err)
+			return err
 		}
 	}
 	pairingSecret, err := relay.NewSecret()
@@ -187,12 +187,11 @@ func runRegisteredSession(ctx context.Context, cfg Config, handler Handler, emit
 }
 
 func runSavedSession(ctx context.Context, cfg Config, handler Handler, saved agentSessionState) error {
-	conn, err := reconnectWithinGrace(
+	conn, err := reconnectUntilAccepted(
 		ctx,
 		cfg,
 		saved.SessionID,
 		saved.ReconnectSecret,
-		time.Now().Add(cfg.AgentGracePeriod),
 	)
 	if err != nil {
 		return err

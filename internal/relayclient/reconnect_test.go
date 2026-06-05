@@ -49,6 +49,39 @@ func TestReconnectDeadlineStartsFromCurrentDisconnect(t *testing.T) {
 	}
 }
 
+func TestReconnectUntilAcceptedDoesNotExpireAtAgentGrace(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := reconnectUntilAccepted(ctx, Config{
+			RelayURL:         "ws://127.0.0.1:1",
+			AgentGracePeriod: time.Millisecond,
+			ReconnectBackoff: ReconnectBackoff{
+				Initial: time.Millisecond,
+				Max:     time.Millisecond,
+			},
+		}, "rs_saved", "agent-reconnect-secret")
+		errCh <- err
+	}()
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("reconnect returned before context cancellation: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	cancel()
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected context cancellation, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("reconnect did not stop after context cancellation")
+	}
+}
+
 func TestRunRegistersNewSessionAfterRotate(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

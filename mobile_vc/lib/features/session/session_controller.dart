@@ -44,6 +44,17 @@ enum SessionConnectionStage {
   failed,
 }
 
+enum _RuntimeUiPhase {
+  disconnected,
+  catchingUp,
+  idle,
+  running,
+  waitingInput,
+  blocked,
+  stopping,
+  observing,
+}
+
 class ActionNeededSignal {
   const ActionNeededSignal({
     required this.id,
@@ -1066,60 +1077,49 @@ class SessionController extends ChangeNotifier {
   }
 
   bool get isSessionBusy {
-    if (_isLoadingSession) {
-      return true;
-    }
-    if (_connectionStage == SessionConnectionStage.catchingUp) {
-      return true;
-    }
-    if (!_connected) {
-      return false;
-    }
-    if (awaitInput) {
-      return false;
-    }
-    if (_isClaudePendingReadyForInput) {
-      return false;
-    }
-    final agentState = (_agentState?.state ?? '').trim().toUpperCase();
-    if (agentState == 'THINKING' ||
-        agentState == 'RECOVERING' ||
-        agentState == 'RUNNING_TOOL') {
-      return true;
-    }
-    final sessionState = (_sessionState?.state ?? '').trim().toUpperCase();
-    if (sessionState == 'THINKING' || sessionState == 'RUNNING_TOOL') {
-      return true;
-    }
-    if (sessionState != 'RUNNING') {
-      return false;
-    }
-    if (_hasRunningTerminalExecution) {
-      return true;
-    }
-    final runningKey = _runtimeExecutionKey(
-      _sessionState?.runtimeMeta ??
-          _agentState?.runtimeMeta ??
-          const RuntimeMeta(),
-    );
-    if (runningKey.isEmpty) {
-      return true;
-    }
-    return runningKey != _lastAssistantReplyExecutionKey ||
-        _isDefinitiveAgentState(agentState, sessionState) ||
-        _executionActive;
+    final phase = _runtimeUiPhase;
+    return phase == _RuntimeUiPhase.catchingUp ||
+        phase == _RuntimeUiPhase.running ||
+        phase == _RuntimeUiPhase.stopping;
   }
 
   bool get canStopCurrentRun {
-    if (!connected) {
-      return false;
+    return _runtimeUiPhase == _RuntimeUiPhase.running;
+  }
+
+  _RuntimeUiPhase get _runtimeUiPhase {
+    if (_isLoadingSession ||
+        _connectionStage == SessionConnectionStage.catchingUp) {
+      return _RuntimeUiPhase.catchingUp;
+    }
+    if (!_connected) {
+      return _RuntimeUiPhase.disconnected;
     }
     if (_isStopping) {
-      return false;
+      return _RuntimeUiPhase.stopping;
     }
     if (isObservingRemoteActiveSession) {
-      return false;
+      return _RuntimeUiPhase.observing;
     }
+    if (_isSubmitting) {
+      return _RuntimeUiPhase.running;
+    }
+    if (hasVisiblePrompt ||
+        shouldShowReviewChoices ||
+        hasPendingPlanQuestions ||
+        hasPendingPermissionPrompt) {
+      return _RuntimeUiPhase.blocked;
+    }
+    if (awaitInput || _isClaudePendingReadyForInput) {
+      return _RuntimeUiPhase.waitingInput;
+    }
+    if (_runtimeHasRunningSignal) {
+      return _RuntimeUiPhase.running;
+    }
+    return _RuntimeUiPhase.idle;
+  }
+
+  bool get _runtimeHasRunningSignal {
     if (_hasRunningTerminalExecution) {
       return true;
     }
@@ -1133,15 +1133,16 @@ class SessionController extends ChangeNotifier {
     if (sessionState == 'THINKING' || sessionState == 'RUNNING_TOOL') {
       return true;
     }
-    if (awaitInput || _isClaudePendingReadyForInput) {
-      if (!_isSubmitting) {
-        return false;
-      }
-    }
-    if (_isSubmitting) {
+    if (!_selectedSessionExternalNative && _executionActive) {
       return true;
     }
-    if (!_selectedSessionExternalNative && _executionActive) {
+    final hasDefinitiveIdleOrWaitingState = _isIdleLikeState(agentState) ||
+        agentState == 'WAIT_INPUT' ||
+        _isIdleLikeState(sessionState) ||
+        sessionState == 'WAIT_INPUT' ||
+        awaitInput ||
+        _isClaudePendingReadyForInput;
+    if (_sessionRuntimeAlive && !hasDefinitiveIdleOrWaitingState) {
       return true;
     }
     if (sessionState != 'RUNNING') {
@@ -2128,6 +2129,7 @@ class SessionController extends ChangeNotifier {
       message: '思考中',
       command: command.isNotEmpty ? command : meta.command,
     );
+    _executionActive = true;
     _sessionRuntimeAlive = true;
     _syncDerivedState();
   }
@@ -5071,7 +5073,11 @@ class SessionController extends ChangeNotifier {
         'targetType': decisionMeta.targetType,
       };
       _applyCodexSandboxModeForRuntimeMeta(payload, decisionMeta);
-      _service.send(payload);
+      final sent = _service.send(payload);
+      if (sent && selection.decision == 'approve') {
+        _beginUserSubmission();
+        _markLocalSubmissionRunning(command: decisionMeta.command);
+      }
       _clearPermissionBlockingState();
       _syncDerivedState();
       notifyListeners();
@@ -5162,7 +5168,11 @@ class SessionController extends ChangeNotifier {
       'targetType': decisionMeta.targetType,
     };
     _applyCodexSandboxModeForRuntimeMeta(payload, decisionMeta);
-    _service.send(payload);
+    final sent = _service.send(payload);
+    if (sent && selection.decision == 'approve') {
+      _beginUserSubmission();
+      _markLocalSubmissionRunning(command: decisionMeta.command);
+    }
     _clearPermissionBlockingState();
     _syncDerivedState();
     notifyListeners();
@@ -5740,6 +5750,9 @@ class SessionController extends ChangeNotifier {
         }
         if (result.sessionId.trim().isNotEmpty) {
           final previous = _sessionEventCursors[result.sessionId.trim()] ?? 0;
+          if (previous > 0 && result.latestCursor < previous) {
+            break;
+          }
           if (result.latestCursor > previous) {
             _sessionEventCursors[result.sessionId.trim()] = result.latestCursor;
           }
@@ -6834,6 +6847,12 @@ class SessionController extends ChangeNotifier {
     if (!_isSessionRecoveryEventForActiveSession(delta.sessionId)) {
       return;
     }
+    final deltaSessionId = delta.sessionId.trim();
+    final previousDeltaCursor = _sessionEventCursors[deltaSessionId] ?? 0;
+    if (previousDeltaCursor > 0 &&
+        delta.latest.eventCursor < previousDeltaCursor) {
+      return;
+    }
     _connectionStage = SessionConnectionStage.ready;
     if (!hasPendingPermissionPrompt) {
       _connectionMessage = 'Syncing latest progress...';
@@ -6870,10 +6889,9 @@ class SessionController extends ChangeNotifier {
       _continuedSameSessionId = '';
     }
     if (delta.latest.eventCursor > 0) {
-      final sessionId = delta.sessionId.trim();
-      final previous = _sessionEventCursors[sessionId] ?? 0;
+      final previous = _sessionEventCursors[deltaSessionId] ?? 0;
       if (delta.latest.eventCursor > previous) {
-        _sessionEventCursors[sessionId] = delta.latest.eventCursor;
+        _sessionEventCursors[deltaSessionId] = delta.latest.eventCursor;
       }
     }
     final appendLogEntries = _sortedHistoryLogEntries(delta.appendLogEntries);
