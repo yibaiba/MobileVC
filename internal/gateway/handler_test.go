@@ -1155,6 +1155,15 @@ func (s *switchableStubRunner) WaitClosed(t *testing.T) {
 	}
 }
 
+func (s *switchableStubRunner) AssertNotClosed(t *testing.T, timeout time.Duration) {
+	t.Helper()
+	select {
+	case <-s.closed:
+		t.Fatal("runner was closed")
+	case <-time.After(timeout):
+	}
+}
+
 func readInitialSessionID(t *testing.T, conn *websocket.Conn) string {
 	t.Helper()
 	first, second := readInitialEvents(t, conn)
@@ -1297,6 +1306,25 @@ func waitForPersistedPermissionMode(t *testing.T, store data.Store, sessionID, m
 	return last
 }
 
+func waitForPersistedSessionText(t *testing.T, store data.Store, sessionID, want string) data.SessionRecord {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	var last data.SessionRecord
+	for time.Now().Before(deadline) {
+		record, err := store.GetSession(context.Background(), sessionID)
+		if err != nil {
+			t.Fatalf("get session projection: %v", err)
+		}
+		last = record
+		if containsText(sessionLogTexts(record), want) {
+			return record
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("expected persisted text %q, got %#v", want, sessionLogTexts(last))
+	return last
+}
+
 func assertNoEventType(t *testing.T, conn *websocket.Conn, want string, timeout time.Duration) {
 	t.Helper()
 	if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
@@ -1401,6 +1429,23 @@ func sessionLogTexts(record data.SessionRecord) []string {
 func containsText(items []string, want string) bool {
 	for _, item := range items {
 		if strings.Contains(item, want) {
+			return true
+		}
+	}
+	return false
+}
+
+func historyEventContainsText(event map[string]any, want string) bool {
+	entries, ok := event["logEntries"].([]any)
+	if !ok {
+		return false
+	}
+	for _, raw := range entries {
+		entry, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if strings.Contains(fmt.Sprint(entry["message"], entry["text"]), want) {
 			return true
 		}
 	}
@@ -3396,7 +3441,7 @@ func TestHandlerSessionLoadDoesNotReplayRunningStateWithoutResume(t *testing.T) 
 	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 }
 
-func TestHandlerReconnectReattachesRunningSessionRuntime(t *testing.T) {
+func TestHandlerSessionResumeReattachesRunningRuntimeAfterDisconnect(t *testing.T) {
 	runnerStub := newSwitchableStubRunner()
 	h := newTestHandler()
 	tempStore, err := data.NewFileStore(t.TempDir())
@@ -3430,27 +3475,48 @@ func TestHandlerReconnectReattachesRunningSessionRuntime(t *testing.T) {
 	case <-time.After(150 * time.Millisecond):
 	}
 
+	runnerStub.Emit(protocol.ApplyRuntimeMeta(
+		protocol.NewLogEvent("ignored", "background output before resume", "stdout"),
+		protocol.RuntimeMeta{Engine: "claude"},
+	))
+	waitForPersistedSessionText(t, h.SessionStore, sessionID, "background output before resume")
+
 	conn2 := newTestConn(t, h)
 	_, _ = readInitialEvents(t, conn2)
-	if err := conn2.WriteJSON(protocol.SessionLoadRequestEvent{
-		ClientEvent: protocol.ClientEvent{Action: "session_load"},
-		SessionID:   sessionID,
+	if err := conn2.WriteJSON(protocol.SessionResumeRequestEvent{
+		ClientEvent:         protocol.ClientEvent{Action: "session_resume"},
+		SessionID:           sessionID,
+		LastSeenEventCursor: 0,
 	}); err != nil {
-		t.Fatalf("write session_load request: %v", err)
+		t.Fatalf("write session_resume request: %v", err)
 	}
 
 	history := readUntilSessionHistory(t, conn2)
 	if history["sessionId"] != sessionID {
 		t.Fatalf("expected session history for %s, got %#v", sessionID, history)
 	}
-	_ = readUntilType(t, conn2, protocol.EventTypeReviewState)
-	agentState := readUntilType(t, conn2, protocol.EventTypeAgentState)
-	requireAgentState(t, agentState, "THINKING", false)
+	if history["runtimeAlive"] != true {
+		t.Fatalf("expected runtimeAlive=true in resume history, got %#v", history)
+	}
+	if !historyEventContainsText(history, "background output before resume") {
+		t.Fatalf("expected background output in resume history, got %#v", history)
+	}
+	notice := readUntilType(t, conn2, protocol.EventTypeSessionResumeNotice)
+	if notice["msg"] != "background output before resume" {
+		t.Fatalf("expected resume notice for background output, got %#v", notice)
+	}
+	result := readUntilType(t, conn2, protocol.EventTypeSessionResumeResult)
+	if result["runtimeAlive"] != true {
+		t.Fatalf("expected runtimeAlive=true in resume result, got %#v", result)
+	}
+	if result["reattaching"] != true {
+		t.Fatalf("expected resume result to mark reattaching, got %#v", result)
+	}
 
 	runnerStub.Emit(protocol.NewLogEvent("ignored", "live output after reconnect", "stdout"))
-	logEvent := readUntilType(t, conn2, protocol.EventTypeLog)
-	if logEvent["msg"] != "live output after reconnect" {
-		t.Fatalf("expected live log after reconnect, got %#v", logEvent)
+	liveLogEvent := readUntilType(t, conn2, protocol.EventTypeLog)
+	if liveLogEvent["msg"] != "live output after reconnect" {
+		t.Fatalf("expected live log after reconnect, got %#v", liveLogEvent)
 	}
 
 	if entry := h.runtimeSessions.Ensure(sessionID); entry != nil {
@@ -8526,7 +8592,7 @@ func TestHandlerSessionDeleteCurrentSessionCleansRuntimeAndFallsBack(t *testing.
 	if sessionB == "" || sessionB == sessionA {
 		t.Fatalf("expected distinct session B id, got %q", sessionB)
 	}
-	firstRunner.WaitClosed(t)
+	firstRunner.AssertNotClosed(t, 10*time.Millisecond)
 
 	if err := conn.WriteJSON(protocol.ExecRequestEvent{ClientEvent: protocol.ClientEvent{Action: "exec"}, Command: "claude", Mode: "pty"}); err != nil {
 		t.Fatalf("write exec request for session B: %v", err)
@@ -8534,6 +8600,9 @@ func TestHandlerSessionDeleteCurrentSessionCleansRuntimeAndFallsBack(t *testing.
 	runnerB.WaitStarted(t)
 	requireAgentState(t, readUntilType(t, conn, protocol.EventTypeAgentState), "THINKING", false)
 
+	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("refresh read deadline before delete: %v", err)
+	}
 	if err := conn.WriteJSON(protocol.SessionDeleteRequestEvent{ClientEvent: protocol.ClientEvent{Action: "session_delete"}, SessionID: sessionB}); err != nil {
 		t.Fatalf("write session delete request: %v", err)
 	}
@@ -8999,15 +9068,12 @@ func TestHandlerSessionLoadKeepsOldRunnerEventsInOriginalSessionProjection(t *te
 	if sessionB == "" || sessionB == sessionA {
 		t.Fatalf("expected new session id, got %q", sessionB)
 	}
-	firstRunner.WaitClosed(t)
+	firstRunner.AssertNotClosed(t, 10*time.Millisecond)
 
 	firstRunner.Emit(protocol.NewLogEvent("ignored", "late output from session A", "stdout"))
 	firstRunner.Emit(protocol.NewStepUpdateEvent("ignored", "late step from session A", "running", "internal/ws/handler.go", "reading", "claude"))
 
-	recordA, err := h.SessionStore.GetSession(context.Background(), sessionA)
-	if err != nil {
-		t.Fatalf("get session A: %v", err)
-	}
+	recordA := waitForPersistedSessionText(t, h.SessionStore, sessionA, "late output from session A")
 	recordB, err := h.SessionStore.GetSession(context.Background(), sessionB)
 	if err != nil {
 		t.Fatalf("get session B: %v", err)
@@ -9026,7 +9092,7 @@ func TestHandlerSessionLoadKeepsOldRunnerEventsInOriginalSessionProjection(t *te
 	}
 }
 
-func TestHandlerSessionLoadCleansUpPreviousRuntime(t *testing.T) {
+func TestHandlerSessionLoadDetachesPreviousRuntimeWithoutStoppingIt(t *testing.T) {
 	runnerA := newSwitchableStubRunner()
 	firstRunner := runnerA
 	runnerB := newSwitchableStubRunner()
@@ -9085,7 +9151,7 @@ func TestHandlerSessionLoadCleansUpPreviousRuntime(t *testing.T) {
 	if sessionB == "" || sessionB == sessionA {
 		t.Fatalf("expected new session id, got %q", sessionB)
 	}
-	firstRunner.WaitClosed(t)
+	firstRunner.AssertNotClosed(t, 10*time.Millisecond)
 
 	if err := conn.WriteJSON(protocol.ExecRequestEvent{
 		ClientEvent: protocol.ClientEvent{Action: "exec"},
@@ -9110,5 +9176,13 @@ func TestHandlerSessionLoadCleansUpPreviousRuntime(t *testing.T) {
 	if history["sessionId"] != sessionA {
 		t.Fatalf("expected session history for session A, got %#v", history)
 	}
-	runnerB.WaitClosed(t)
+	runnerB.AssertNotClosed(t, 10*time.Millisecond)
+
+	runnerB.Emit(protocol.NewLogEvent("ignored", "background output from session B", "stdout"))
+	recordB := waitForPersistedSessionText(t, h.SessionStore, sessionB, "background output from session B")
+	textsB := sessionLogTexts(recordB)
+	if !containsText(textsB, "background output from session B") {
+		t.Fatalf("expected background output in session B projection, got %#v", textsB)
+	}
+	assertNoEventType(t, conn, protocol.EventTypeLog, 150*time.Millisecond)
 }

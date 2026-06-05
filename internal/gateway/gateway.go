@@ -902,7 +902,12 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 		}(selectedSessionID, serial, interval)
 	}
 
-	switchRuntimeSession := func(sessionID string) {
+	type runtimeSwitchReleaseMode int
+	const (
+		runtimeSwitchDetachPrevious runtimeSwitchReleaseMode = iota
+		runtimeSwitchCleanupPrevious
+	)
+	switchRuntimeSession := func(sessionID string, releaseMode runtimeSwitchReleaseMode) {
 		logx.Info("ws", "switch runtime session: connectionID=%s previousSessionID=%s nextSessionID=%s remoteAddr=%s", connectionID, selectedSessionID, sessionID, remoteAddr)
 		nextSessionID := strings.TrimSpace(sessionID)
 		previousSessionID := strings.TrimSpace(selectedSessionID)
@@ -916,7 +921,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			return
 		}
 		if previousSessionID != "" {
-			h.runtimeSessions.Release(previousSessionID, connectionID, true)
+			h.runtimeSessions.Release(previousSessionID, connectionID, releaseMode == runtimeSwitchCleanupPrevious)
 		} else if previousRuntimeSvc != nil {
 			previousRuntimeSvc.Cleanup()
 		}
@@ -938,7 +943,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 		targetSessionID := strings.TrimSpace(firstNonEmptyString(req.SessionID, selectedSessionID))
 		if targetSessionID != "" {
 			if targetSessionID != strings.TrimSpace(selectedSessionID) {
-				switchRuntimeSession(targetSessionID)
+				switchRuntimeSession(targetSessionID, runtimeSwitchDetachPrevious)
 			}
 			return targetSessionID, runtimeSvc
 		}
@@ -950,7 +955,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 		if matchedSessionID == "" || matchedRuntime == nil {
 			return "", runtimeSvc
 		}
-		switchRuntimeSession(matchedSessionID)
+		switchRuntimeSession(matchedSessionID, runtimeSwitchDetachPrevious)
 		return matchedSessionID, runtimeSvc
 	}
 
@@ -1264,7 +1269,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 					}
 				}
 			}
-			switchRuntimeSession(created.ID)
+			switchRuntimeSession(created.ID, runtimeSwitchDetachPrevious)
 			emit(protocol.NewSessionCreatedEvent(selectedSessionID, toProtocolSummary(created)))
 			emit(protocol.NewSessionStateEvent(selectedSessionID, string(session.StateActive), "session selected"))
 			emitSessionList(sessionListFilterCWD)
@@ -1336,7 +1341,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			}
 			// Merge any new events from Claude CLI JSONL (if this session was continued in CLI).
 			// Switch runtime first so merge sees the correct ActiveSession.
-			switchRuntimeSession(record.Summary.ID)
+			switchRuntimeSession(record.Summary.ID, runtimeSwitchDetachPrevious)
 			trace.Step("switch_runtime")
 			if !activeRuntimeLoad && !isNativeMirrorSessionID(record.Summary.ID) {
 				record = mergeClaudeJSONLToRecord(ctx, h.SessionStore, record, runtimeSvc)
@@ -1537,7 +1542,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			// Merge any new events from Claude CLI JSONL.
 			// Switch runtime session first so mergeClaudeJSONLToRecord can
 			// check the correct ActiveSession when deciding ownership upgrades.
-			switchRuntimeSession(record.Summary.ID)
+			switchRuntimeSession(record.Summary.ID, runtimeSwitchDetachPrevious)
 			sessionRuntime := h.runtimeSessions.Ensure(record.Summary.ID)
 			// Re-bind PTY runner output sink to new connection after reconnect.
 			resumeEmitAndPersist := emitAndPersistFor(selectedSessionID)
@@ -1673,9 +1678,14 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				emit(protocol.NewErrorEvent(selectedSessionID, "session store unavailable", ""))
 				continue
 			}
-			record, err := h.SessionStore.GetSession(ctx, req.SessionID)
+			deletedSessionID := strings.TrimSpace(req.SessionID)
+			if deletedSessionID == "" {
+				emit(protocol.NewErrorEventWithCode(selectedSessionID, "session ID is required", "", "session_delete_failed"))
+				continue
+			}
+			record, err := h.SessionStore.GetSession(ctx, deletedSessionID)
 			if err != nil {
-				logx.Warn("ws", "delete session lookup failed: connectionID=%s sessionID=%s requestedSessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, req.SessionID, remoteAddr, err)
+				logx.Warn("ws", "delete session lookup failed: connectionID=%s sessionID=%s requestedSessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, deletedSessionID, remoteAddr, err)
 				emit(protocol.NewErrorEventWithCode(selectedSessionID, err.Error(), "", "session_delete_failed"))
 				continue
 			}
@@ -1683,13 +1693,13 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				emit(protocol.NewErrorEventWithCode(selectedSessionID, "Codex 原生会话仅支持恢复，不支持在 MobileVC 内删除", "", "session_delete_failed"))
 				continue
 			}
-			if err := h.SessionStore.DeleteSession(ctx, req.SessionID); err != nil {
-				logx.Warn("ws", "delete session failed: connectionID=%s sessionID=%s requestedSessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, req.SessionID, remoteAddr, err)
+			if err := h.SessionStore.DeleteSession(ctx, deletedSessionID); err != nil {
+				logx.Warn("ws", "delete session failed: connectionID=%s sessionID=%s requestedSessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, deletedSessionID, remoteAddr, err)
 				emit(protocol.NewErrorEventWithCode(selectedSessionID, err.Error(), "", "session_delete_failed"))
 				continue
 			}
 			invalidateSessionListCache()
-			deletingCurrent := req.SessionID == selectedSessionID
+			deletingCurrent := deletedSessionID == strings.TrimSpace(selectedSessionID)
 			items := emitSessionList(sessionListFilterCWD)
 			if !deletingCurrent {
 				continue
@@ -1699,12 +1709,13 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				if isExternalNativeSessionSummary(item) {
 					continue
 				}
-				if strings.TrimSpace(item.ID) != "" {
-					fallbackSessionID = item.ID
+				itemID := strings.TrimSpace(item.ID)
+				if itemID != "" && itemID != deletedSessionID {
+					fallbackSessionID = itemID
 					break
 				}
 			}
-			switchRuntimeSession(fallbackSessionID)
+			switchRuntimeSession(fallbackSessionID, runtimeSwitchCleanupPrevious)
 			if fallbackSessionID == "" {
 				emitEmptySessionState()
 				continue
@@ -1977,7 +1988,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				continue
 			}
 			if sessionID != strings.TrimSpace(selectedSessionID) {
-				switchRuntimeSession(sessionID)
+				switchRuntimeSession(sessionID, runtimeSwitchDetachPrevious)
 			}
 			if !ackClientAction(sessionID, "ai_turn", aiReq.ClientEvent) {
 				logx.Info("ws", "duplicate client action ignored: connectionID=%s sessionID=%s remoteAddr=%s action=ai_turn clientActionID=%s", connectionID, sessionID, remoteAddr, aiReq.ClientActionID)
@@ -2169,7 +2180,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				continue
 			}
 			if sessionID != strings.TrimSpace(selectedSessionID) {
-				switchRuntimeSession(sessionID)
+				switchRuntimeSession(sessionID, runtimeSwitchDetachPrevious)
 			}
 			if !ackClientAction(sessionID, "exec", reqEvent.ClientEvent) {
 				logx.Info("ws", "duplicate client action ignored: connectionID=%s sessionID=%s remoteAddr=%s action=exec clientActionID=%s", connectionID, sessionID, remoteAddr, reqEvent.ClientActionID)
@@ -2256,7 +2267,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				continue
 			}
 			if sessionID != strings.TrimSpace(selectedSessionID) {
-				switchRuntimeSession(sessionID)
+				switchRuntimeSession(sessionID, runtimeSwitchDetachPrevious)
 			}
 			if !ackClientAction(sessionID, "input", inputEvent.ClientEvent) {
 				logx.Info("ws", "duplicate client action ignored: connectionID=%s sessionID=%s remoteAddr=%s action=input clientActionID=%s", connectionID, sessionID, remoteAddr, inputEvent.ClientActionID)
@@ -3038,7 +3049,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				continue
 			}
 			if sessionID != strings.TrimSpace(selectedSessionID) {
-				switchRuntimeSession(sessionID)
+				switchRuntimeSession(sessionID, runtimeSwitchDetachPrevious)
 			}
 			service := runtimeSvc
 			emitAndPersist := emitAndPersistFor(sessionID)
@@ -3067,7 +3078,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				continue
 			}
 			if targetSessionID != strings.TrimSpace(selectedSessionID) {
-				switchRuntimeSession(targetSessionID)
+				switchRuntimeSession(targetSessionID, runtimeSwitchDetachPrevious)
 			}
 			emitAndPersist := emitAndPersistFor(targetSessionID)
 			sessionRuntime, service := runtimeForSession(targetSessionID)

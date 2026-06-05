@@ -463,6 +463,7 @@ func (r *runtimeSessionRegistry) Release(sessionID, listenerID string, cleanupIf
 			entry.releaseTimer = nil
 		}
 		r.mu.Unlock()
+		entry.shutdownSink()
 		entry.service.Cleanup()
 		if r.onCleanup != nil {
 			r.onCleanup(sessionID)
