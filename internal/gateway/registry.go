@@ -463,11 +463,7 @@ func (r *runtimeSessionRegistry) Release(sessionID, listenerID string, cleanupIf
 			entry.releaseTimer = nil
 		}
 		r.mu.Unlock()
-		entry.shutdownSink()
-		entry.service.Cleanup()
-		if r.onCleanup != nil {
-			r.onCleanup(sessionID)
-		}
+		r.cleanupEntry(sessionID, entry)
 		return
 	}
 	if entry.releaseTimer != nil {
@@ -477,6 +473,26 @@ func (r *runtimeSessionRegistry) Release(sessionID, listenerID string, cleanupIf
 		r.cleanupIfOrphaned(sessionID, entry)
 	})
 	r.mu.Unlock()
+}
+
+func (r *runtimeSessionRegistry) CleanupSession(sessionID string) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return
+	}
+	r.mu.Lock()
+	entry, ok := r.sessions[sessionID]
+	if !ok {
+		r.mu.Unlock()
+		return
+	}
+	delete(r.sessions, sessionID)
+	if entry.releaseTimer != nil {
+		entry.releaseTimer.Stop()
+		entry.releaseTimer = nil
+	}
+	r.mu.Unlock()
+	r.cleanupEntry(sessionID, entry)
 }
 
 func (r *runtimeSessionRegistry) cleanupIfOrphaned(sessionID string, target *runtimeSession) {
@@ -494,11 +510,7 @@ func (r *runtimeSessionRegistry) cleanupIfOrphaned(sessionID string, target *run
 	delete(r.sessions, sessionID)
 	current.releaseTimer = nil
 	r.mu.Unlock()
-	current.shutdownSink()
-	current.service.Cleanup()
-	if r.onCleanup != nil {
-		r.onCleanup(sessionID)
-	}
+	r.cleanupEntry(sessionID, current)
 }
 
 func (r *runtimeSessionRegistry) CleanupAll() {
@@ -518,13 +530,22 @@ func (r *runtimeSessionRegistry) CleanupAll() {
 	}
 	r.mu.Unlock()
 	for i, entry := range entries {
-		entry.shutdownSink()
-		if entry.service != nil {
-			entry.service.Cleanup()
+		if i < len(sessionIDs) {
+			r.cleanupEntry(sessionIDs[i], entry)
 		}
-		if r.onCleanup != nil && i < len(sessionIDs) {
-			r.onCleanup(sessionIDs[i])
-		}
+	}
+}
+
+func (r *runtimeSessionRegistry) cleanupEntry(sessionID string, entry *runtimeSession) {
+	if entry == nil {
+		return
+	}
+	entry.shutdownSink()
+	if entry.service != nil {
+		entry.service.Cleanup()
+	}
+	if r.onCleanup != nil {
+		r.onCleanup(sessionID)
 	}
 }
 

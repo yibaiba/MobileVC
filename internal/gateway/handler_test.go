@@ -8640,6 +8640,90 @@ func TestHandlerSessionDeleteCurrentSessionCleansRuntimeAndFallsBack(t *testing.
 	}
 }
 
+func TestHandlerSessionDeleteBackgroundRunningSessionCleansRuntime(t *testing.T) {
+	runnerA := newSwitchableStubRunner()
+	firstRunner := runnerA
+	h := newTestHandler()
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	h.SessionStore = tempStore
+	h.NewPtyRunner = func() engine.Runner {
+		if runnerA != nil {
+			r := runnerA
+			runnerA = nil
+			return r
+		}
+		return newSwitchableStubRunner()
+	}
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+
+	if err := conn.WriteJSON(protocol.SessionCreateRequestEvent{ClientEvent: protocol.ClientEvent{Action: "session_create"}, Title: "session-a"}); err != nil {
+		t.Fatalf("write initial session create request: %v", err)
+	}
+	createdA := readUntilSessionCreated(t, conn)
+	_ = readUntilType(t, conn, protocol.EventTypeSessionListResult)
+	summaryA, ok := createdA["summary"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected summary payload, got %#v", createdA)
+	}
+	sessionA, _ := summaryA["id"].(string)
+	if sessionA == "" {
+		t.Fatalf("expected session A id, got %#v", createdA)
+	}
+
+	if err := conn.WriteJSON(protocol.ExecRequestEvent{ClientEvent: protocol.ClientEvent{Action: "exec"}, Command: "claude", Mode: "pty"}); err != nil {
+		t.Fatalf("write exec request: %v", err)
+	}
+	firstRunner.WaitStarted(t)
+	requireAgentState(t, readUntilType(t, conn, protocol.EventTypeAgentState), "THINKING", false)
+
+	if err := conn.WriteJSON(protocol.SessionCreateRequestEvent{ClientEvent: protocol.ClientEvent{Action: "session_create"}, Title: "session-b"}); err != nil {
+		t.Fatalf("write session create request: %v", err)
+	}
+	createdB := readUntilSessionCreated(t, conn)
+	_ = readUntilType(t, conn, protocol.EventTypeSessionListResult)
+	summaryB, ok := createdB["summary"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected summary payload, got %#v", createdB)
+	}
+	sessionB, _ := summaryB["id"].(string)
+	if sessionB == "" || sessionB == sessionA {
+		t.Fatalf("expected distinct session B id, got %q", sessionB)
+	}
+	firstRunner.AssertNotClosed(t, 10*time.Millisecond)
+
+	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("refresh read deadline before delete: %v", err)
+	}
+	if err := conn.WriteJSON(protocol.SessionDeleteRequestEvent{ClientEvent: protocol.ClientEvent{Action: "session_delete"}, SessionID: sessionA}); err != nil {
+		t.Fatalf("write session delete request: %v", err)
+	}
+	listEvent := readUntilType(t, conn, protocol.EventTypeSessionListResult)
+	items, ok := listEvent["items"].([]any)
+	if !ok {
+		t.Fatalf("expected session list items, got %#v", listEvent)
+	}
+	for _, raw := range items {
+		item, _ := raw.(map[string]any)
+		if item["id"] == sessionA {
+			t.Fatalf("expected deleted background session removed from list, got %#v", items)
+		}
+	}
+	firstRunner.WaitClosed(t)
+	if entry := h.runtimeSessions.Get(sessionA); entry != nil {
+		t.Fatalf("expected deleted background runtime removed, got %#v", entry)
+	}
+	if _, err := h.SessionStore.GetSession(context.Background(), sessionA); err == nil {
+		t.Fatal("expected deleted background session lookup to fail")
+	}
+
+	firstRunner.Emit(protocol.NewLogEvent("ignored", "late output from deleted session A", "stdout"))
+	assertNoEventType(t, conn, protocol.EventTypeLog, 150*time.Millisecond)
+}
+
 func TestHandlerSessionDeleteFallbackReturnsBoundedHistoryWindow(t *testing.T) {
 	runnerA := newSwitchableStubRunner()
 	runnerB := newSwitchableStubRunner()

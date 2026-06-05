@@ -1693,13 +1693,14 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				emit(protocol.NewErrorEventWithCode(selectedSessionID, "Codex 原生会话仅支持恢复，不支持在 MobileVC 内删除", "", "session_delete_failed"))
 				continue
 			}
+			deletingCurrent := deletedSessionID == strings.TrimSpace(selectedSessionID)
 			if err := h.SessionStore.DeleteSession(ctx, deletedSessionID); err != nil {
 				logx.Warn("ws", "delete session failed: connectionID=%s sessionID=%s requestedSessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, deletedSessionID, remoteAddr, err)
 				emit(protocol.NewErrorEventWithCode(selectedSessionID, err.Error(), "", "session_delete_failed"))
 				continue
 			}
+			h.runtimeSessions.CleanupSession(deletedSessionID)
 			invalidateSessionListCache()
-			deletingCurrent := deletedSessionID == strings.TrimSpace(selectedSessionID)
 			items := emitSessionList(sessionListFilterCWD)
 			if !deletingCurrent {
 				continue
@@ -1715,7 +1716,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 					break
 				}
 			}
-			switchRuntimeSession(fallbackSessionID, runtimeSwitchCleanupPrevious)
+			switchRuntimeSession(fallbackSessionID, runtimeSwitchDetachPrevious)
 			if fallbackSessionID == "" {
 				emitEmptySessionState()
 				continue
