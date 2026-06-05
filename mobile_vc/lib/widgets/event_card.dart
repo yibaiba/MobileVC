@@ -1102,16 +1102,23 @@ class _TypewriterMarkdownState extends State<_TypewriterMarkdown> {
         oldWidget.item.body != widget.item.body) {
       _timer?.cancel();
       final previousBody = _lastBody;
+      final sameItem = oldWidget.item.id == widget.item.id;
       _lastBody = widget.item.body;
       final cached = _revealedTextCache[widget.item.id] ?? '';
       if (cached.isNotEmpty) {
         _visibleText =
             cached.length > widget.item.body.length ? widget.item.body : cached;
-      } else if (widget.item.body.startsWith(previousBody) &&
-          _visibleText.isNotEmpty) {
-        if (_visibleText.length > widget.item.body.length) {
-          _visibleText = widget.item.body;
+        if (sameItem &&
+            widget.item.body.startsWith(previousBody) &&
+            _visibleText.length < previousBody.length) {
+          _visibleText = previousBody;
         }
+      } else if (sameItem &&
+          widget.item.body.startsWith(previousBody) &&
+          _visibleText.isNotEmpty) {
+        _visibleText = previousBody.length > widget.item.body.length
+            ? widget.item.body
+            : previousBody;
       } else {
         _visibleText = _initialVisibleText(widget.item.body);
       }

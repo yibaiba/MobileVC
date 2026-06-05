@@ -438,7 +438,21 @@ class _ChatTimelineState extends State<ChatTimeline> {
     if (items.isEmpty) {
       return '';
     }
-    return '${items.first.id}\n${items.last.id}\n${items.length}';
+    return '${items.first.id}\n${_timelineLayoutFingerprint(items.last)}\n${items.length}';
+  }
+
+  String _timelineLayoutFingerprint(TimelineItem item) {
+    return [
+      item.id,
+      item.kind,
+      item.title.hashCode,
+      item.body.length,
+      item.body.hashCode,
+      item.status.hashCode,
+      item.trigger.hashCode,
+      item.attachments.length,
+      item.codexSteps.length,
+    ].join('\n');
   }
 
   bool _shouldHidePassiveReadyPrompt(PromptRequestEvent prompt) {

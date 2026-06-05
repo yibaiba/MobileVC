@@ -31,6 +31,43 @@ void main() {
     expect(markdown.selectable, isFalse);
   });
 
+  testWidgets('markdown typewriter advances when same item body extends',
+      (tester) async {
+    final baseItem = TimelineItem(
+      id: 'stream-md-1',
+      kind: 'markdown',
+      timestamp: DateTime(2026, 4, 4, 12),
+      body: '正在生成回复。',
+    );
+    final expandedItem = baseItem.copyWith(
+      body: '正在生成回复。新增内容应该立即参与布局刷新。',
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: EventCard(item: baseItem),
+        ),
+      ),
+    );
+    await tester.pump(const Duration(milliseconds: 80));
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: EventCard(item: expandedItem),
+        ),
+      ),
+    );
+
+    final markdown = tester.widget<MarkdownBody>(find.byType(MarkdownBody));
+    expect(markdown.data, startsWith(baseItem.body));
+
+    await tester.pump(const Duration(milliseconds: 80));
+    final advanced = tester.widget<MarkdownBody>(find.byType(MarkdownBody));
+    expect(advanced.data.length, greaterThan(baseItem.body.length));
+  });
+
   testWidgets('compaction marker renders loading state', (tester) async {
     await tester.pumpWidget(
       MaterialApp(

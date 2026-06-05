@@ -8100,6 +8100,10 @@ class SessionController extends ChangeNotifier {
     if (next.isEmpty) {
       return previous;
     }
+    final deduped = _dedupeMergedTimelineBodies(previous, next);
+    if (deduped != null) {
+      return deduped;
+    }
     if (_continuesMarkdownLink(previous, next)) {
       return '$previous$next';
     }
@@ -8114,6 +8118,71 @@ class SessionController extends ChangeNotifier {
       return '$previous $next';
     }
     return '$previous$next';
+  }
+
+  String? _dedupeMergedTimelineBodies(String previous, String next) {
+    final previousTrimmed = previous.trim();
+    final nextTrimmed = next.trim();
+    if (previousTrimmed.isEmpty || nextTrimmed.isEmpty) {
+      return null;
+    }
+    if (previousTrimmed == nextTrimmed) {
+      return previous;
+    }
+    if (nextTrimmed.startsWith(previousTrimmed)) {
+      return _restoreOuterWhitespace(next, nextTrimmed);
+    }
+    if (previousTrimmed.startsWith(nextTrimmed)) {
+      return previous;
+    }
+    final normalizedPrevious = _normalizeAssistantReplyForDedupe(previous);
+    final normalizedNext = _normalizeAssistantReplyForDedupe(next);
+    if (normalizedNext == normalizedPrevious) {
+      return previous;
+    }
+    if (normalizedNext.startsWith(normalizedPrevious)) {
+      return next;
+    }
+    final overlap = _timelineBodyOverlapLength(previous, next);
+    if (overlap > 0) {
+      return previous + next.substring(overlap);
+    }
+    return null;
+  }
+
+  String _restoreOuterWhitespace(String next, String nextTrimmed) {
+    final leading = RegExp(r'^\s*').stringMatch(next) ?? '';
+    final trailing = RegExp(r'\s*$').stringMatch(next) ?? '';
+    if (leading.isNotEmpty || trailing.isNotEmpty) {
+      return '$leading$nextTrimmed$trailing';
+    }
+    return next;
+  }
+
+  String _normalizeAssistantReplyForDedupe(String value) {
+    return value.trim().split(RegExp(r'\s+')).where((part) {
+      return part.isNotEmpty;
+    }).join(' ');
+  }
+
+  int _timelineBodyOverlapLength(String previous, String next) {
+    final maxOverlap =
+        previous.length < next.length ? previous.length : next.length;
+    for (var length = maxOverlap; length > 0; length--) {
+      final candidate = next.substring(0, length);
+      if (previous.endsWith(candidate) &&
+          _isSafeTimelineBodyOverlap(candidate)) {
+        return length;
+      }
+    }
+    return 0;
+  }
+
+  bool _isSafeTimelineBodyOverlap(String value) {
+    if (value.length >= 4) {
+      return true;
+    }
+    return RegExp(r'^[\s.,!?;:，。！？；：]+$').hasMatch(value);
   }
 
   List<TimelineAttachment> _mergeTimelineAttachments(

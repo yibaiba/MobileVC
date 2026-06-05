@@ -7994,6 +7994,56 @@ void main() {
       );
     });
 
+    test('codex 最终完整回复会覆盖已合并流式片段而不是重复拼接', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      const meta = RuntimeMeta(
+        command: 'codex',
+        engine: 'codex',
+        executionId: 'exec-codex-final-1',
+        contextId: 'turn-final-1',
+      );
+      service.emit(
+        LogEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-1',
+          runtimeMeta: meta,
+          raw: const {'type': 'log'},
+          message: '已修复 relay 重连问题，',
+          stream: 'stdout',
+        ),
+      );
+      service.emit(
+        LogEvent(
+          timestamp: _timestamp.add(const Duration(milliseconds: 120)),
+          sessionId: 'session-1',
+          runtimeMeta: meta,
+          raw: const {'type': 'log'},
+          message: '并补充了回归测试。',
+          stream: 'stdout',
+        ),
+      );
+      service.emit(
+        LogEvent(
+          timestamp: _timestamp.add(const Duration(milliseconds: 240)),
+          sessionId: 'session-1',
+          runtimeMeta: meta,
+          raw: const {'type': 'log'},
+          message: '已修复 relay 重连问题，并补充了回归测试。',
+          stream: 'stdout',
+        ),
+      );
+      await _flushEvents();
+
+      final markdownItems =
+          controller.timeline.where((item) => item.kind == 'markdown').toList();
+      expect(markdownItems, hasLength(1));
+      expect(markdownItems.single.body, '已修复 relay 重连问题，并补充了回归测试。');
+    });
+
     test('codex 单行总结式回复不会再被误判为 terminal 输出', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);

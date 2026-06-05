@@ -349,4 +349,74 @@ void main() {
       scrollableState.position.maxScrollExtent,
     );
   });
+
+  testWidgets('最后一条流式消息内容变长但 id 不变时自动滚到底部', (tester) async {
+    final baseItems = List<TimelineItem>.generate(
+      18,
+      (index) => TimelineItem(
+        id: 'stream-$index',
+        kind: 'markdown',
+        timestamp: DateTime(2026, 1, 1, 0, index),
+        body: index == 17 ? '正在生成回复...' : '历史消息 $index',
+        animateBody: false,
+      ),
+    );
+    final expandedItems = [
+      ...baseItems.take(17),
+      baseItems.last.copyWith(
+        body: List<String>.generate(
+          48,
+          (index) => '流式回复新增内容第 $index 行，需要列表保持在底部。',
+        ).join('\n'),
+      ),
+    ];
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SizedBox(
+            height: 320,
+            child: ChatTimeline(
+              sessionId: 'stream-session',
+              bottomPadding: 24,
+              items: baseItems,
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.pump();
+
+    final scrollableState =
+        tester.state<ScrollableState>(find.byType(Scrollable));
+    final initialMaxScrollExtent = scrollableState.position.maxScrollExtent;
+    expect(scrollableState.position.pixels, initialMaxScrollExtent);
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SizedBox(
+            height: 320,
+            child: ChatTimeline(
+              sessionId: 'stream-session',
+              bottomPadding: 24,
+              items: expandedItems,
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.pump();
+
+    expect(
+      scrollableState.position.maxScrollExtent,
+      greaterThan(initialMaxScrollExtent),
+    );
+    expect(
+      scrollableState.position.pixels,
+      scrollableState.position.maxScrollExtent,
+    );
+  });
 }
