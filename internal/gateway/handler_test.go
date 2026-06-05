@@ -54,6 +54,9 @@ type stubRunner struct {
 	contextUsage               protocol.ContextWindowUsage
 	contextUsageOK             bool
 	contextUsageErr            error
+	compactStarted             chan struct{}
+	compactRelease             chan struct{}
+	compactErr                 error
 }
 
 type failingWriteClientConn struct {
@@ -110,6 +113,13 @@ func newStubRunner(events ...any) *stubRunner {
 		permissionResponseWriteCh: make(chan string, 8),
 		closedCh:                  make(chan struct{}, 1),
 	}
+}
+
+func newBlockingCompactStubRunner() *stubRunner {
+	stub := newInteractiveHoldingStubRunner()
+	stub.compactStarted = make(chan struct{})
+	stub.compactRelease = make(chan struct{})
+	return stub
 }
 
 func newHoldingStubRunner(events ...any) *stubRunner {
@@ -366,6 +376,57 @@ func (s *stubRunner) ContextWindowUsage(ctx context.Context) (protocol.ContextWi
 	return s.contextUsage, s.contextUsageOK, nil
 }
 
+func (s *stubRunner) Compact(ctx context.Context) error {
+	s.mu.Lock()
+	started := s.compactStarted
+	release := s.compactRelease
+	err := s.compactErr
+	s.mu.Unlock()
+	if started == nil || release == nil {
+		return engine.ErrInputNotSupported
+	}
+	select {
+	case <-started:
+	default:
+		close(started)
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-release:
+		return err
+	}
+}
+
+func (s *stubRunner) WaitCompactStarted(t *testing.T) {
+	t.Helper()
+	s.mu.Lock()
+	started := s.compactStarted
+	s.mu.Unlock()
+	if started == nil {
+		t.Fatal("runner is not configured to block compact")
+	}
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("compact did not start")
+	}
+}
+
+func (s *stubRunner) ReleaseCompact() {
+	s.mu.Lock()
+	release := s.compactRelease
+	s.mu.Unlock()
+	if release == nil {
+		return
+	}
+	select {
+	case <-release:
+	default:
+		close(release)
+	}
+}
+
 type writeOnlyStubRunner struct {
 	base *stubRunner
 }
@@ -411,6 +472,64 @@ type countingStore struct {
 	listCalls  int
 	upsertErr  error
 	upsertSeen []string
+}
+
+type blockingSkillSyncStore struct {
+	data.Store
+	mu                 sync.Mutex
+	syncingSaveStarted chan struct{}
+	syncingSaveRelease chan struct{}
+	syncingSaveCount   int
+}
+
+func newBlockingSkillSyncStore(store data.Store) *blockingSkillSyncStore {
+	return &blockingSkillSyncStore{
+		Store:              store,
+		syncingSaveStarted: make(chan struct{}),
+		syncingSaveRelease: make(chan struct{}),
+	}
+}
+
+func (s *blockingSkillSyncStore) SaveSkillCatalogSnapshot(ctx context.Context, snapshot data.SkillCatalogSnapshot) error {
+	if snapshot.Meta.SyncState != data.CatalogSyncStateSyncing {
+		return s.Store.SaveSkillCatalogSnapshot(ctx, snapshot)
+	}
+	s.mu.Lock()
+	s.syncingSaveCount++
+	count := s.syncingSaveCount
+	s.mu.Unlock()
+	if count == 1 {
+		close(s.syncingSaveStarted)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-s.syncingSaveRelease:
+		}
+	}
+	return s.Store.SaveSkillCatalogSnapshot(ctx, snapshot)
+}
+
+func (s *blockingSkillSyncStore) WaitSyncingSaveStarted(t *testing.T) {
+	t.Helper()
+	select {
+	case <-s.syncingSaveStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("skill sync did not reach syncing save")
+	}
+}
+
+func (s *blockingSkillSyncStore) ReleaseSyncingSave() {
+	select {
+	case <-s.syncingSaveRelease:
+	default:
+		close(s.syncingSaveRelease)
+	}
+}
+
+func (s *blockingSkillSyncStore) SyncingSaveCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.syncingSaveCount
 }
 
 func (s *countingStore) CreateSession(ctx context.Context, title string) (data.SessionSummary, error) {
@@ -941,6 +1060,33 @@ func readUntilType(t *testing.T, conn *websocket.Conn, want string) map[string]a
 		}
 	}
 	t.Fatalf("did not receive %s event", want)
+	return nil
+}
+
+func readUntilClientActionAck(t *testing.T, conn *websocket.Conn, action, clientActionID string) map[string]any {
+	t.Helper()
+	for i := 0; i < 40; i++ {
+		event := readEventMap(t, conn)
+		if event["type"] != protocol.EventTypeClientActionAck {
+			continue
+		}
+		if event["action"] == action && event["clientActionId"] == clientActionID {
+			return event
+		}
+	}
+	t.Fatalf("did not receive client_action_ack action=%s clientActionID=%s", action, clientActionID)
+	return nil
+}
+
+func readUntilPongID(t *testing.T, conn *websocket.Conn, pingID string) map[string]any {
+	t.Helper()
+	for i := 0; i < 40; i++ {
+		event := readEventMap(t, conn)
+		if event["type"] == "pong" && event["pingId"] == pingID {
+			return event
+		}
+	}
+	t.Fatalf("did not receive pong pingID=%s", pingID)
 	return nil
 }
 
@@ -1908,6 +2054,105 @@ func TestHandlerSkillCatalogLifecycle(t *testing.T) {
 	}
 	if !foundAgentSkill {
 		t.Fatalf("expected shared agent skill, got %#v", syncedItems)
+	}
+}
+
+func TestHandlerSkillSyncPullAckAndPingWhileSyncBlocks(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	writeTestFile(t,
+		filepath.Join(homeDir, ".claude", "skills", "blocked-sync-skill", "SKILL.md"),
+		"---\nname: blocked-sync-skill\ndescription: Blocking sync fixture.\n---\n# Blocking Sync Skill\n\nUse this fixture.\n",
+	)
+	fileStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	blockingStore := newBlockingSkillSyncStore(fileStore)
+	h := newTestHandler()
+	h.SessionStore = blockingStore
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+	sessionID := createHistorySessionForHandlerTest(t, h, conn, "skill-sync-ack-session")
+
+	if err := conn.WriteJSON(protocol.ClientEvent{
+		Action:         "skill_sync_pull",
+		ClientActionID: "skill-sync-blocking",
+	}); err != nil {
+		t.Fatalf("write skill_sync_pull request: %v", err)
+	}
+	ack := readUntilClientActionAck(t, conn, "skill_sync_pull", "skill-sync-blocking")
+	if ack["duplicate"] == true {
+		t.Fatalf("expected first skill sync ack to be accepted, got %#v", ack)
+	}
+	blockingStore.WaitSyncingSaveStarted(t)
+
+	if err := conn.WriteJSON(map[string]any{"action": "ping", "pingId": "during-skill-sync"}); err != nil {
+		t.Fatalf("write ping request: %v", err)
+	}
+	pong := readUntilPongID(t, conn, "during-skill-sync")
+	if pong["sessionId"] != sessionID {
+		t.Fatalf("expected pong for loaded session %q, got %#v", sessionID, pong)
+	}
+
+	blockingStore.ReleaseSyncingSave()
+	_ = readUntilType(t, conn, protocol.EventTypeSkillSyncResult)
+	result := readUntilType(t, conn, protocol.EventTypeCatalogSyncResult)
+	if result["domain"] != "skill" || result["success"] != true {
+		t.Fatalf("unexpected skill sync result: %#v", result)
+	}
+}
+
+func TestHandlerSkillSyncPullDuplicateClientActionDoesNotStartSecondSync(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	writeTestFile(t,
+		filepath.Join(homeDir, ".claude", "skills", "duplicate-sync-skill", "SKILL.md"),
+		"---\nname: duplicate-sync-skill\ndescription: Duplicate sync fixture.\n---\n# Duplicate Sync Skill\n\nUse this fixture.\n",
+	)
+	fileStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	blockingStore := newBlockingSkillSyncStore(fileStore)
+	h := newTestHandler()
+	h.SessionStore = blockingStore
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+	_ = createHistorySessionForHandlerTest(t, h, conn, "skill-sync-duplicate-session")
+
+	request := protocol.ClientEvent{
+		Action:         "skill_sync_pull",
+		ClientActionID: "skill-sync-repeat",
+	}
+	if err := conn.WriteJSON(request); err != nil {
+		t.Fatalf("write first skill_sync_pull request: %v", err)
+	}
+	firstAck := readUntilClientActionAck(t, conn, "skill_sync_pull", "skill-sync-repeat")
+	if firstAck["duplicate"] == true {
+		t.Fatalf("expected first sync ack to be accepted, got %#v", firstAck)
+	}
+	blockingStore.WaitSyncingSaveStarted(t)
+
+	if err := conn.WriteJSON(request); err != nil {
+		t.Fatalf("write duplicate skill_sync_pull request: %v", err)
+	}
+	duplicateAck := readUntilClientActionAck(t, conn, "skill_sync_pull", "skill-sync-repeat")
+	if duplicateAck["duplicate"] != true {
+		t.Fatalf("expected duplicate sync ack, got %#v", duplicateAck)
+	}
+	if got := blockingStore.SyncingSaveCount(); got != 1 {
+		t.Fatalf("expected one skill sync to start, got %d", got)
+	}
+
+	blockingStore.ReleaseSyncingSave()
+	_ = readUntilType(t, conn, protocol.EventTypeSkillSyncResult)
+	result := readUntilType(t, conn, protocol.EventTypeCatalogSyncResult)
+	if result["domain"] != "skill" || result["success"] != true {
+		t.Fatalf("unexpected skill sync result: %#v", result)
+	}
+	if got := blockingStore.SyncingSaveCount(); got != 1 {
+		t.Fatalf("expected duplicate request not to start another sync, got %d", got)
 	}
 }
 
@@ -5415,6 +5660,7 @@ func TestHandlerPlanDecisionWritesDecisionPayloadToRunner(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("did not receive plan payload")
 	}
+	closeConnAndCleanupRuntime(t, conn, h, ptyRunner)
 }
 
 func TestHandlerPermissionDecisionWithoutRunnerReturnsError(t *testing.T) {
@@ -6294,6 +6540,106 @@ func TestHandlerCompactActionRequiresLoadedSession(t *testing.T) {
 	event := readUntilType(t, conn, protocol.EventTypeCompactResult)
 	if event["accepted"] != false {
 		t.Fatalf("expected compact rejection, got %#v", event)
+	}
+}
+
+func TestHandlerCompactDoesNotBlockPingPong(t *testing.T) {
+	runner := newBlockingCompactStubRunner()
+	h := newTestHandler()
+	h.NewPtyRunner = func() engine.Runner { return runner }
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	h.SessionStore = tempStore
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+	sessionID := createHistorySessionForHandlerTest(t, h, conn, "compact-ping-session")
+
+	if err := conn.WriteJSON(protocol.ExecRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "exec", SessionID: sessionID, ClientActionID: "exec-compact-ping"},
+		Command:     "claude",
+		Mode:        "pty",
+	}); err != nil {
+		t.Fatalf("write exec request: %v", err)
+	}
+	_ = readUntilClientActionAck(t, conn, "exec", "exec-compact-ping")
+	requireAgentState(t, readUntilType(t, conn, protocol.EventTypeAgentState), "THINKING", false)
+	runner.WaitStarted(t)
+
+	if err := conn.WriteJSON(protocol.CompactRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "compact", SessionID: sessionID, ClientActionID: "compact-blocking"},
+	}); err != nil {
+		t.Fatalf("write compact request: %v", err)
+	}
+	_ = readUntilClientActionAck(t, conn, "compact", "compact-blocking")
+	runner.WaitCompactStarted(t)
+
+	if err := conn.WriteJSON(map[string]any{"action": "ping", "pingId": "during-compact"}); err != nil {
+		t.Fatalf("write ping request: %v", err)
+	}
+	pong := readUntilPongID(t, conn, "during-compact")
+	if pong["sessionId"] != sessionID {
+		t.Fatalf("expected pong for loaded session %q, got %#v", sessionID, pong)
+	}
+
+	runner.ReleaseCompact()
+	compact := readUntilType(t, conn, protocol.EventTypeCompactResult)
+	if compact["accepted"] != true {
+		t.Fatalf("expected compact success after release, got %#v", compact)
+	}
+}
+
+func TestHandlerCompactRejectsConcurrentSameSessionRequest(t *testing.T) {
+	runner := newBlockingCompactStubRunner()
+	h := newTestHandler()
+	h.NewPtyRunner = func() engine.Runner { return runner }
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	h.SessionStore = tempStore
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+	sessionID := createHistorySessionForHandlerTest(t, h, conn, "compact-busy-session")
+
+	if err := conn.WriteJSON(protocol.ExecRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "exec", SessionID: sessionID, ClientActionID: "exec-compact-busy"},
+		Command:     "claude",
+		Mode:        "pty",
+	}); err != nil {
+		t.Fatalf("write exec request: %v", err)
+	}
+	_ = readUntilClientActionAck(t, conn, "exec", "exec-compact-busy")
+	requireAgentState(t, readUntilType(t, conn, protocol.EventTypeAgentState), "THINKING", false)
+	runner.WaitStarted(t)
+
+	if err := conn.WriteJSON(protocol.CompactRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "compact", SessionID: sessionID, ClientActionID: "compact-first"},
+	}); err != nil {
+		t.Fatalf("write first compact request: %v", err)
+	}
+	_ = readUntilClientActionAck(t, conn, "compact", "compact-first")
+	runner.WaitCompactStarted(t)
+
+	if err := conn.WriteJSON(protocol.CompactRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "compact", SessionID: sessionID, ClientActionID: "compact-second"},
+	}); err != nil {
+		t.Fatalf("write second compact request: %v", err)
+	}
+	_ = readUntilClientActionAck(t, conn, "compact", "compact-second")
+	busy := readUntilType(t, conn, protocol.EventTypeCompactResult)
+	if busy["accepted"] != false {
+		t.Fatalf("expected concurrent compact rejection, got %#v", busy)
+	}
+	if msg, _ := busy["error"].(string); !strings.Contains(msg, "already running") {
+		t.Fatalf("expected busy error, got %#v", busy)
+	}
+
+	runner.ReleaseCompact()
+	success := readUntilType(t, conn, protocol.EventTypeCompactResult)
+	if success["accepted"] != true {
+		t.Fatalf("expected first compact success after release, got %#v", success)
 	}
 }
 

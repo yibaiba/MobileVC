@@ -178,6 +178,10 @@ type Handler struct {
 	runtimeSessions  *runtimeSessionRegistry
 	relayDeviceConns *relayDeviceConnectionRegistry
 
+	skillLauncherMu sync.RWMutex
+	asyncActionsMu  sync.Mutex
+	asyncActions    map[string]struct{}
+
 	muProgressPush   sync.Mutex
 	lastProgressPush map[string]time.Time
 }
@@ -195,6 +199,7 @@ func NewHandler(authToken string, sessionStore data.Store) *Handler {
 		SessionStore:     sessionStore,
 		PushService:      &push.NoopService{},
 		relayDeviceConns: newRelayDeviceConnectionRegistry(),
+		asyncActions:     make(map[string]struct{}),
 		lastProgressPush: make(map[string]time.Time),
 		Upgrader: websocket.Upgrader{
 			ReadBufferSize:  1024,
@@ -223,6 +228,101 @@ func NewHandler(authToken string, sessionStore data.Store) *Handler {
 		sessionStore.UpsertSession(ctx, record)
 	})
 	return handler
+}
+
+func (h *Handler) currentSkillLauncher() *skills.Launcher {
+	if h == nil {
+		return nil
+	}
+	h.skillLauncherMu.RLock()
+	defer h.skillLauncherMu.RUnlock()
+	return h.SkillLauncher
+}
+
+func (h *Handler) replaceSkillLauncher(launcher *skills.Launcher) {
+	if h == nil {
+		return
+	}
+	h.skillLauncherMu.Lock()
+	h.SkillLauncher = launcher
+	h.skillLauncherMu.Unlock()
+}
+
+type gatewayAsyncActionOptions struct {
+	Action       string
+	SessionID    string
+	ConnectionID string
+	RemoteAddr   string
+	OnBusy       func()
+	OnPanic      func(any, string)
+	Run          func()
+}
+
+func (h *Handler) tryStartAsyncAction(ctx context.Context, opts gatewayAsyncActionOptions) bool {
+	if h == nil || opts.Run == nil {
+		return false
+	}
+	key := gatewayAsyncActionKey(opts.Action, opts.SessionID)
+	if key == "" {
+		return false
+	}
+	h.asyncActionsMu.Lock()
+	if h.asyncActions == nil {
+		h.asyncActions = make(map[string]struct{})
+	}
+	if _, exists := h.asyncActions[key]; exists {
+		h.asyncActionsMu.Unlock()
+		if opts.OnBusy != nil {
+			opts.OnBusy()
+		}
+		return false
+	}
+	h.asyncActions[key] = struct{}{}
+	h.asyncActionsMu.Unlock()
+
+	go func() {
+		defer func() {
+			h.asyncActionsMu.Lock()
+			delete(h.asyncActions, key)
+			h.asyncActionsMu.Unlock()
+		}()
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				stack := logx.StackTrace()
+				logx.Error(
+					"ws",
+					"async action panic recovered: connectionID=%s sessionID=%s remoteAddr=%s action=%s panic=%v\n%s",
+					opts.ConnectionID,
+					opts.SessionID,
+					opts.RemoteAddr,
+					opts.Action,
+					recovered,
+					stack,
+				)
+				if opts.OnPanic != nil {
+					opts.OnPanic(recovered, stack)
+				}
+			}
+		}()
+		if ctx.Err() != nil {
+			return
+		}
+		opts.Run()
+	}()
+	return true
+}
+
+func gatewayAsyncActionKey(action, sessionID string) string {
+	action = strings.TrimSpace(action)
+	sessionID = strings.TrimSpace(sessionID)
+	if action == "" || sessionID == "" {
+		return ""
+	}
+	return action + "\x00" + sessionID
+}
+
+func catalogAsyncScopeKey() string {
+	return "catalog"
 }
 
 type ClientConn interface {
@@ -962,7 +1062,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 						emitSessionEvent(protocol.NewErrorEvent(runtimeSessionID, err.Error(), ""))
 						return
 					}
-					h.SkillLauncher = skills.NewLauncher(h.SessionStore)
+					h.replaceSkillLauncher(skills.NewLauncher(h.SessionStore))
 					eventCtx, eventCancel = sessionProjectionContext()
 					emitSkillCatalogResult(emitSessionEvent, h.SessionStore, eventCtx, runtimeSessionID)
 					eventCancel()
@@ -1775,44 +1875,39 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
 				continue
 			}
-			h.SkillLauncher = skills.NewLauncher(h.SessionStore)
+			h.replaceSkillLauncher(skills.NewLauncher(h.SessionStore))
 			emitSkillCatalogResult(emit, h.SessionStore, ctx, selectedSessionID)
 		case "skill_sync_pull":
 			if h.SessionStore == nil {
 				emit(protocol.NewErrorEvent(selectedSessionID, "session store unavailable", ""))
 				continue
 			}
-			sourceOfTruth := resolveCatalogSourceOfTruth(h.SessionStore, ctx, selectedSessionID)
-			snapshot, err := h.SessionStore.GetSkillCatalogSnapshot(ctx)
-			if err != nil {
-				emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
+			sessionID := strings.TrimSpace(selectedSessionID)
+			if !ackClientAction(sessionID, "skill_sync_pull", clientEvent) {
+				logx.Info("ws", "duplicate client action ignored: connectionID=%s sessionID=%s remoteAddr=%s action=skill_sync_pull clientActionID=%s", connectionID, sessionID, remoteAddr, clientEvent.ClientActionID)
 				continue
 			}
-			snapshot.Meta.SourceOfTruth = sourceOfTruth
-			snapshot.Meta.SyncState = data.CatalogSyncStateSyncing
-			snapshot.Meta.LastError = ""
-			if err := h.SessionStore.SaveSkillCatalogSnapshot(ctx, snapshot); err != nil {
-				emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
+			if !h.tryStartAsyncAction(ctx, gatewayAsyncActionOptions{
+				Action:       "skill_sync_pull",
+				SessionID:    catalogAsyncScopeKey(),
+				ConnectionID: connectionID,
+				RemoteAddr:   remoteAddr,
+				OnBusy: func() {
+					message := "skill catalog sync is already running"
+					emit(protocol.NewCatalogSyncResultEvent(sessionID, string(data.CatalogDomainSkill), false, message, protocol.CatalogMetadata{}))
+					emit(protocol.NewErrorEvent(sessionID, message, ""))
+				},
+				OnPanic: func(any, string) {
+					message := "internal server error"
+					emit(protocol.NewCatalogSyncResultEvent(sessionID, string(data.CatalogDomainSkill), false, message, protocol.CatalogMetadata{}))
+					emit(protocol.NewErrorEvent(sessionID, message, ""))
+				},
+				Run: func() {
+					h.runSkillSyncPull(ctx, sessionID, emit)
+				},
+			}) {
 				continue
 			}
-			emit(protocol.NewCatalogSyncStatusEvent(selectedSessionID, string(data.CatalogDomainSkill), toProtocolCatalogMetadata(snapshot.Meta)))
-			if err := syncExternalSkills(h.SessionStore, ctx, sourceOfTruth); err != nil {
-				snapshot.Meta.SyncState = data.CatalogSyncStateFailed
-				snapshot.Meta.LastError = err.Error()
-				_ = h.SessionStore.SaveSkillCatalogSnapshot(ctx, snapshot)
-				emit(protocol.NewCatalogSyncResultEvent(selectedSessionID, string(data.CatalogDomainSkill), false, err.Error(), toProtocolCatalogMetadata(snapshot.Meta)))
-				emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
-				continue
-			}
-			h.SkillLauncher = skills.NewLauncher(h.SessionStore)
-			updatedSnapshot, err := h.SessionStore.GetSkillCatalogSnapshot(ctx)
-			if err != nil {
-				emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
-				continue
-			}
-			emit(protocol.NewSkillSyncResultEvent(selectedSessionID, "skill 同步完成"))
-			emit(protocol.NewCatalogSyncResultEvent(selectedSessionID, string(data.CatalogDomainSkill), true, "skill 同步完成", toProtocolCatalogMetadata(updatedSnapshot.Meta)))
-			emitSkillCatalogResult(emit, h.SessionStore, ctx, selectedSessionID)
 		case "memory_list":
 			emitMemoryListResult(emit, h.SessionStore, ctx, selectedSessionID)
 		case "memory_sync_pull":
@@ -1826,37 +1921,33 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				emit(protocol.NewErrorEvent(selectedSessionID, "session store unavailable", ""))
 				continue
 			}
-			sourceOfTruth := resolveCatalogSourceOfTruth(h.SessionStore, ctx, selectedSessionID)
-			snapshot, err := h.SessionStore.GetMemoryCatalogSnapshot(ctx)
-			if err != nil {
-				emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
+			sessionID := strings.TrimSpace(selectedSessionID)
+			if !ackClientAction(sessionID, "memory_sync_pull", req.ClientEvent) {
+				logx.Info("ws", "duplicate client action ignored: connectionID=%s sessionID=%s remoteAddr=%s action=memory_sync_pull clientActionID=%s", connectionID, sessionID, remoteAddr, req.ClientActionID)
 				continue
 			}
-			snapshot.Meta.SourceOfTruth = sourceOfTruth
-			snapshot.Meta.SyncState = data.CatalogSyncStateSyncing
-			snapshot.Meta.LastError = ""
-			if err := h.SessionStore.SaveMemoryCatalogSnapshot(ctx, snapshot); err != nil {
-				emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
+			syncCWD := resolveCatalogSyncCWD(h.SessionStore, ctx, sessionID, firstNonEmptyString(req.CWD, sessionListFilterCWD))
+			if !h.tryStartAsyncAction(ctx, gatewayAsyncActionOptions{
+				Action:       "memory_sync_pull",
+				SessionID:    catalogAsyncScopeKey(),
+				ConnectionID: connectionID,
+				RemoteAddr:   remoteAddr,
+				OnBusy: func() {
+					message := "memory catalog sync is already running"
+					emit(protocol.NewCatalogSyncResultEvent(sessionID, string(data.CatalogDomainMemory), false, message, protocol.CatalogMetadata{}))
+					emit(protocol.NewErrorEvent(sessionID, message, ""))
+				},
+				OnPanic: func(any, string) {
+					message := "internal server error"
+					emit(protocol.NewCatalogSyncResultEvent(sessionID, string(data.CatalogDomainMemory), false, message, protocol.CatalogMetadata{}))
+					emit(protocol.NewErrorEvent(sessionID, message, ""))
+				},
+				Run: func() {
+					h.runMemorySyncPull(ctx, sessionID, syncCWD, connectionID, remoteAddr, emit)
+				},
+			}) {
 				continue
 			}
-			emit(protocol.NewCatalogSyncStatusEvent(selectedSessionID, string(data.CatalogDomainMemory), toProtocolCatalogMetadata(snapshot.Meta)))
-			syncCWD := resolveCatalogSyncCWD(h.SessionStore, ctx, selectedSessionID, firstNonEmptyString(req.CWD, sessionListFilterCWD))
-			logx.Info("ws", "memory sync pull: connectionID=%s sessionID=%s remoteAddr=%s syncCWD=%q sourceOfTruth=%s", connectionID, selectedSessionID, remoteAddr, syncCWD, sourceOfTruth)
-			if err := syncExternalMemories(h.SessionStore, ctx, syncCWD, sourceOfTruth); err != nil {
-				snapshot.Meta.SyncState = data.CatalogSyncStateFailed
-				snapshot.Meta.LastError = err.Error()
-				_ = h.SessionStore.SaveMemoryCatalogSnapshot(ctx, snapshot)
-				emit(protocol.NewCatalogSyncResultEvent(selectedSessionID, string(data.CatalogDomainMemory), false, err.Error(), toProtocolCatalogMetadata(snapshot.Meta)))
-				emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
-				continue
-			}
-			updatedSnapshot, err := h.SessionStore.GetMemoryCatalogSnapshot(ctx)
-			if err != nil {
-				emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
-				continue
-			}
-			emit(protocol.NewCatalogSyncResultEvent(selectedSessionID, string(data.CatalogDomainMemory), true, "memory 同步完成", toProtocolCatalogMetadata(updatedSnapshot.Meta)))
-			emitMemoryListResult(emit, h.SessionStore, ctx, selectedSessionID)
 		case "memory_upsert":
 			var req protocol.MemoryRequestEvent
 			if err := json.Unmarshal(payloadBytes, &req); err != nil {
@@ -2627,7 +2718,8 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid skill request: %v", err), ""))
 				continue
 			}
-			if h.SkillLauncher == nil {
+			skillLauncher := h.currentSkillLauncher()
+			if skillLauncher == nil {
 				logx.Error("ws", "skill launcher unavailable: connectionID=%s sessionID=%s remoteAddr=%s", connectionID, selectedSessionID, remoteAddr)
 				emit(protocol.NewErrorEvent(selectedSessionID, "skill launcher is unavailable", ""))
 				continue
@@ -2643,7 +2735,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			sessionID := selectedSessionID
 			_, service := runtimeForSession(sessionID)
 			emitAndPersist := emitAndPersistFor(sessionID)
-			if err := executeSkillRequest(ctx, sessionID, skillEvent, sessionContext, service, h.SkillLauncher, emitAndPersist); err != nil {
+			if err := executeSkillRequest(ctx, sessionID, skillEvent, sessionContext, service, skillLauncher, emitAndPersist); err != nil {
 				logx.Error("ws", "execute skill request failed: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, sessionID, remoteAddr, err)
 				emit(protocol.NewErrorEvent(sessionID, err.Error(), ""))
 			}
@@ -2948,7 +3040,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			}
 			service := runtimeSvc
 			emitAndPersist := emitAndPersistFor(sessionID)
-			if err := handleSlashCommand(ctx, sessionID, slashReq, sessionContext, service, h.SkillLauncher, emitAndPersist); err != nil {
+			if err := handleSlashCommand(ctx, sessionID, slashReq, sessionContext, service, h.currentSkillLauncher(), emitAndPersist); err != nil {
 				logx.Error("ws", "handle slash command failed: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, sessionID, remoteAddr, err)
 				emit(protocol.NewErrorEvent(sessionID, err.Error(), ""))
 			}
@@ -2986,12 +3078,30 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				PermissionMode:   compactReq.PermissionMode,
 				CodexSandboxMode: compactReq.CodexSandboxMode,
 			})
-			if err := service.Compact(ctx, targetSessionID, compactMeta, emitAndPersist); err != nil {
-				logx.Error("ws", "handle compact failed: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, targetSessionID, remoteAddr, err)
-				emit(protocol.NewCompactResultEvent(targetSessionID, false, err.Error()))
+			if !h.tryStartAsyncAction(ctx, gatewayAsyncActionOptions{
+				Action:       "compact",
+				SessionID:    targetSessionID,
+				ConnectionID: connectionID,
+				RemoteAddr:   remoteAddr,
+				OnBusy: func() {
+					message := "compact is already running for this session"
+					logx.Warn("ws", "reject concurrent compact: connectionID=%s sessionID=%s remoteAddr=%s", connectionID, targetSessionID, remoteAddr)
+					emit(protocol.NewCompactResultEvent(targetSessionID, false, message))
+				},
+				OnPanic: func(any, string) {
+					emit(protocol.NewCompactResultEvent(targetSessionID, false, "internal server error"))
+				},
+				Run: func() {
+					if err := service.Compact(ctx, targetSessionID, compactMeta, emitAndPersist); err != nil {
+						logx.Error("ws", "handle compact failed: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, targetSessionID, remoteAddr, err)
+						emit(protocol.NewCompactResultEvent(targetSessionID, false, err.Error()))
+						return
+					}
+					emit(protocol.NewCompactResultEvent(targetSessionID, true, ""))
+				},
+			}) {
 				continue
 			}
-			emit(protocol.NewCompactResultEvent(targetSessionID, true, ""))
 		case "fs_list":
 			var fsListReq protocol.FSListRequestEvent
 			if err := json.Unmarshal(payloadBytes, &fsListReq); err != nil {
@@ -3463,6 +3573,46 @@ func syncExternalSkills(sessionStore data.Store, ctx context.Context, sourceOfTr
 	return sessionStore.SaveSkillCatalogSnapshot(ctx, snapshot)
 }
 
+func (h *Handler) runSkillSyncPull(ctx context.Context, sessionID string, emit func(any)) {
+	if h == nil || h.SessionStore == nil {
+		emit(protocol.NewErrorEvent(sessionID, "session store unavailable", ""))
+		return
+	}
+	sourceOfTruth := resolveCatalogSourceOfTruth(h.SessionStore, ctx, sessionID)
+	snapshot, err := h.SessionStore.GetSkillCatalogSnapshot(ctx)
+	if err != nil {
+		emit(protocol.NewErrorEvent(sessionID, err.Error(), ""))
+		return
+	}
+	snapshot.Meta.SourceOfTruth = sourceOfTruth
+	snapshot.Meta.SyncState = data.CatalogSyncStateSyncing
+	snapshot.Meta.LastError = ""
+	if err := h.SessionStore.SaveSkillCatalogSnapshot(ctx, snapshot); err != nil {
+		emit(protocol.NewErrorEvent(sessionID, err.Error(), ""))
+		return
+	}
+	emit(protocol.NewCatalogSyncStatusEvent(sessionID, string(data.CatalogDomainSkill), toProtocolCatalogMetadata(snapshot.Meta)))
+	if err := syncExternalSkills(h.SessionStore, ctx, sourceOfTruth); err != nil {
+		snapshot.Meta.SyncState = data.CatalogSyncStateFailed
+		snapshot.Meta.LastError = err.Error()
+		if saveErr := h.SessionStore.SaveSkillCatalogSnapshot(ctx, snapshot); saveErr != nil {
+			logx.Error("ws", "save failed skill sync state failed: sessionID=%s err=%v", sessionID, saveErr)
+		}
+		emit(protocol.NewCatalogSyncResultEvent(sessionID, string(data.CatalogDomainSkill), false, err.Error(), toProtocolCatalogMetadata(snapshot.Meta)))
+		emit(protocol.NewErrorEvent(sessionID, err.Error(), ""))
+		return
+	}
+	h.replaceSkillLauncher(skills.NewLauncher(h.SessionStore))
+	updatedSnapshot, err := h.SessionStore.GetSkillCatalogSnapshot(ctx)
+	if err != nil {
+		emit(protocol.NewErrorEvent(sessionID, err.Error(), ""))
+		return
+	}
+	emit(protocol.NewSkillSyncResultEvent(sessionID, "skill 同步完成"))
+	emit(protocol.NewCatalogSyncResultEvent(sessionID, string(data.CatalogDomainSkill), true, "skill 同步完成", toProtocolCatalogMetadata(updatedSnapshot.Meta)))
+	emitSkillCatalogResult(emit, h.SessionStore, ctx, sessionID)
+}
+
 func upsertMemoryItem(sessionStore data.Store, ctx context.Context, item protocol.MemoryItem, cwd string) error {
 	if sessionStore == nil {
 		return fmt.Errorf("session store unavailable")
@@ -3600,6 +3750,45 @@ func syncExternalMemories(sessionStore data.Store, ctx context.Context, cwd stri
 	snapshot.Meta.LastError = ""
 	snapshot.Meta.VersionToken = fmt.Sprintf("memory-%d", now.UnixNano())
 	return sessionStore.SaveMemoryCatalogSnapshot(ctx, snapshot)
+}
+
+func (h *Handler) runMemorySyncPull(ctx context.Context, sessionID, syncCWD, connectionID, remoteAddr string, emit func(any)) {
+	if h == nil || h.SessionStore == nil {
+		emit(protocol.NewErrorEvent(sessionID, "session store unavailable", ""))
+		return
+	}
+	sourceOfTruth := resolveCatalogSourceOfTruth(h.SessionStore, ctx, sessionID)
+	snapshot, err := h.SessionStore.GetMemoryCatalogSnapshot(ctx)
+	if err != nil {
+		emit(protocol.NewErrorEvent(sessionID, err.Error(), ""))
+		return
+	}
+	snapshot.Meta.SourceOfTruth = sourceOfTruth
+	snapshot.Meta.SyncState = data.CatalogSyncStateSyncing
+	snapshot.Meta.LastError = ""
+	if err := h.SessionStore.SaveMemoryCatalogSnapshot(ctx, snapshot); err != nil {
+		emit(protocol.NewErrorEvent(sessionID, err.Error(), ""))
+		return
+	}
+	emit(protocol.NewCatalogSyncStatusEvent(sessionID, string(data.CatalogDomainMemory), toProtocolCatalogMetadata(snapshot.Meta)))
+	logx.Info("ws", "memory sync pull: connectionID=%s sessionID=%s remoteAddr=%s syncCWD=%q sourceOfTruth=%s", connectionID, sessionID, remoteAddr, syncCWD, sourceOfTruth)
+	if err := syncExternalMemories(h.SessionStore, ctx, syncCWD, sourceOfTruth); err != nil {
+		snapshot.Meta.SyncState = data.CatalogSyncStateFailed
+		snapshot.Meta.LastError = err.Error()
+		if saveErr := h.SessionStore.SaveMemoryCatalogSnapshot(ctx, snapshot); saveErr != nil {
+			logx.Error("ws", "save failed memory sync state failed: sessionID=%s err=%v", sessionID, saveErr)
+		}
+		emit(protocol.NewCatalogSyncResultEvent(sessionID, string(data.CatalogDomainMemory), false, err.Error(), toProtocolCatalogMetadata(snapshot.Meta)))
+		emit(protocol.NewErrorEvent(sessionID, err.Error(), ""))
+		return
+	}
+	updatedSnapshot, err := h.SessionStore.GetMemoryCatalogSnapshot(ctx)
+	if err != nil {
+		emit(protocol.NewErrorEvent(sessionID, err.Error(), ""))
+		return
+	}
+	emit(protocol.NewCatalogSyncResultEvent(sessionID, string(data.CatalogDomainMemory), true, "memory 同步完成", toProtocolCatalogMetadata(updatedSnapshot.Meta)))
+	emitMemoryListResult(emit, h.SessionStore, ctx, sessionID)
 }
 
 func resolveCatalogSyncCWD(sessionStore data.Store, ctx context.Context, sessionID, fallbackCWD string) string {

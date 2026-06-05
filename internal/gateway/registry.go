@@ -98,11 +98,13 @@ func (s *runtimeSession) EnsureBufferedSinkWithProcessor(processor func(any)) fu
 		s.sinkFn = processor
 	}
 	if s.sinkCh == nil {
-		s.sinkCh = make(chan any, defaultRuntimeSessionSinkBufferSize)
-		s.sinkDone = make(chan struct{})
+		ch := make(chan any, defaultRuntimeSessionSinkBufferSize)
+		done := make(chan struct{})
+		s.sinkCh = ch
+		s.sinkDone = done
 		go func() {
-			defer close(s.sinkDone)
-			for event := range s.sinkCh {
+			defer close(done)
+			for event := range ch {
 				s.emitBufferedEvent(event)
 			}
 		}()

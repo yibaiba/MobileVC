@@ -568,8 +568,6 @@ func (r *PtyRunner) Write(ctx context.Context, data []byte) error {
 			return nil
 		}
 	}
-
-	return errors.New("no active pty session")
 }
 
 func sendLazyReadyPrompt(sink EventSink, req ExecRequest) {
