@@ -12493,6 +12493,79 @@ void main() {
       expect(group.body, contains('- **functions.exec_command**'));
     });
 
+    test('普通运行时事件游标不会提前标记 session_delta 已追上', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'codex-thread:observe',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'session_history', 'eventCursor': 1},
+        summary: const SessionSummary(
+          id: 'codex-thread:observe',
+          title: 'Native Codex',
+          source: 'codex-native',
+          external: true,
+          runtime: RuntimeMeta(command: 'codex', engine: 'codex'),
+        ),
+        logEntryTotal: 1,
+        logEntries: const [
+          HistoryLogEntry(
+            kind: 'markdown',
+            message: '已有回复',
+            timestamp: '2026-05-27T05:20:00Z',
+          ),
+        ],
+        resumeRuntimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+      ));
+      await _flushEvents();
+
+      service.emit(AIStatusEvent(
+        timestamp: _timestamp.add(const Duration(seconds: 1)),
+        sessionId: 'codex-thread:observe',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'ai_status', 'eventCursor': 8},
+        label: '处理中',
+        visible: true,
+      ));
+      await _flushEvents();
+
+      service.sentPayloads.clear();
+      controller.continueSameSessionFromPhone();
+      await _flushEvents();
+
+      final deltaPayload = service.sentPayloads.singleWhere(
+        (payload) =>
+            payload['action'] == 'session_delta_get' &&
+            payload['sessionId'] == 'codex-thread:observe',
+      );
+      final known = deltaPayload['known'] as Map<String, dynamic>;
+      expect(
+        known['eventCursor'],
+        1,
+        reason:
+            'AI/status/task cursors are resume replay cursors, not proof that '
+            'history/diff/terminal delta counters have caught up.',
+      );
+      expect(known['logEntryCount'], 1);
+
+      final resumePayload = service.sentPayloads.singleWhere(
+        (payload) =>
+            payload['action'] == 'session_resume' &&
+            payload['sessionId'] == 'codex-thread:observe',
+      );
+      expect(
+        resumePayload['lastSeenEventCursor'],
+        8,
+        reason:
+            'The socket replay cursor should still advance for resume replay.',
+      );
+    });
+
     test('session_history 会把 Codex 子智能体事件整理成可见状态', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);

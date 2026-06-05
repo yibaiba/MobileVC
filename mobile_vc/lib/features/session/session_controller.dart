@@ -3038,7 +3038,7 @@ class SessionController extends ChangeNotifier {
       return known;
     }
     return SessionDeltaKnown(
-      eventCursor: _sessionEventCursors[normalized] ?? 0,
+      eventCursor: 0,
       logEntryCount: 0,
       diffCount: 0,
       terminalExecutionCount: 0,
@@ -10085,18 +10085,6 @@ class SessionController extends ChangeNotifier {
     final previous = _sessionEventCursors[sessionId] ?? 0;
     if (cursor > previous) {
       _sessionEventCursors[sessionId] = cursor;
-      // 同步更新 delta known 的游标，避免轮询重复拉取已收内容
-      final known = _sessionDeltaKnown[sessionId];
-      if (known != null && cursor > known.eventCursor) {
-        _sessionDeltaKnown[sessionId] = SessionDeltaKnown(
-          eventCursor: cursor,
-          logEntryCount: known.logEntryCount,
-          diffCount: known.diffCount,
-          terminalExecutionCount: known.terminalExecutionCount,
-          terminalStdoutLength: known.terminalStdoutLength,
-          terminalStderrLength: known.terminalStderrLength,
-        );
-      }
     }
   }
 
