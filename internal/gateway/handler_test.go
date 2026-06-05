@@ -482,11 +482,43 @@ type blockingSkillSyncStore struct {
 	syncingSaveCount   int
 }
 
+type blockingFinalSkillSyncStore struct {
+	data.Store
+	mu               sync.Mutex
+	finalSaveStarted chan struct{}
+	finalSaveRelease chan struct{}
+	finalSaveCount   int
+}
+
+type blockingFinalMemorySyncStore struct {
+	data.Store
+	mu               sync.Mutex
+	finalSaveStarted chan struct{}
+	finalSaveRelease chan struct{}
+	finalSaveCount   int
+}
+
 func newBlockingSkillSyncStore(store data.Store) *blockingSkillSyncStore {
 	return &blockingSkillSyncStore{
 		Store:              store,
 		syncingSaveStarted: make(chan struct{}),
 		syncingSaveRelease: make(chan struct{}),
+	}
+}
+
+func newBlockingFinalSkillSyncStore(store data.Store) *blockingFinalSkillSyncStore {
+	return &blockingFinalSkillSyncStore{
+		Store:            store,
+		finalSaveStarted: make(chan struct{}),
+		finalSaveRelease: make(chan struct{}),
+	}
+}
+
+func newBlockingFinalMemorySyncStore(store data.Store) *blockingFinalMemorySyncStore {
+	return &blockingFinalMemorySyncStore{
+		Store:            store,
+		finalSaveStarted: make(chan struct{}),
+		finalSaveRelease: make(chan struct{}),
 	}
 }
 
@@ -509,12 +541,68 @@ func (s *blockingSkillSyncStore) SaveSkillCatalogSnapshot(ctx context.Context, s
 	return s.Store.SaveSkillCatalogSnapshot(ctx, snapshot)
 }
 
+func (s *blockingFinalSkillSyncStore) SaveSkillCatalogSnapshot(ctx context.Context, snapshot data.SkillCatalogSnapshot) error {
+	if snapshot.Meta.SyncState != data.CatalogSyncStateSynced {
+		return s.Store.SaveSkillCatalogSnapshot(ctx, snapshot)
+	}
+	s.mu.Lock()
+	s.finalSaveCount++
+	count := s.finalSaveCount
+	s.mu.Unlock()
+	if count == 1 {
+		close(s.finalSaveStarted)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-s.finalSaveRelease:
+		}
+	}
+	return s.Store.SaveSkillCatalogSnapshot(ctx, snapshot)
+}
+
+func (s *blockingFinalMemorySyncStore) SaveMemoryCatalogSnapshot(ctx context.Context, snapshot data.MemoryCatalogSnapshot) error {
+	if snapshot.Meta.SyncState != data.CatalogSyncStateSynced {
+		return s.Store.SaveMemoryCatalogSnapshot(ctx, snapshot)
+	}
+	s.mu.Lock()
+	s.finalSaveCount++
+	count := s.finalSaveCount
+	s.mu.Unlock()
+	if count == 1 {
+		close(s.finalSaveStarted)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-s.finalSaveRelease:
+		}
+	}
+	return s.Store.SaveMemoryCatalogSnapshot(ctx, snapshot)
+}
+
 func (s *blockingSkillSyncStore) WaitSyncingSaveStarted(t *testing.T) {
 	t.Helper()
 	select {
 	case <-s.syncingSaveStarted:
 	case <-time.After(5 * time.Second):
 		t.Fatal("skill sync did not reach syncing save")
+	}
+}
+
+func (s *blockingFinalSkillSyncStore) WaitFinalSaveStarted(t *testing.T) {
+	t.Helper()
+	select {
+	case <-s.finalSaveStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("skill sync did not reach final save")
+	}
+}
+
+func (s *blockingFinalMemorySyncStore) WaitFinalSaveStarted(t *testing.T) {
+	t.Helper()
+	select {
+	case <-s.finalSaveStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("memory sync did not reach final save")
 	}
 }
 
@@ -526,10 +614,38 @@ func (s *blockingSkillSyncStore) ReleaseSyncingSave() {
 	}
 }
 
+func (s *blockingFinalSkillSyncStore) ReleaseFinalSave() {
+	select {
+	case <-s.finalSaveRelease:
+	default:
+		close(s.finalSaveRelease)
+	}
+}
+
+func (s *blockingFinalMemorySyncStore) ReleaseFinalSave() {
+	select {
+	case <-s.finalSaveRelease:
+	default:
+		close(s.finalSaveRelease)
+	}
+}
+
 func (s *blockingSkillSyncStore) SyncingSaveCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.syncingSaveCount
+}
+
+func (s *blockingFinalSkillSyncStore) FinalSaveCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.finalSaveCount
+}
+
+func (s *blockingFinalMemorySyncStore) FinalSaveCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.finalSaveCount
 }
 
 func (s *countingStore) CreateSession(ctx context.Context, title string) (data.SessionSummary, error) {
@@ -1088,6 +1204,20 @@ func readUntilPongID(t *testing.T, conn *websocket.Conn, pingID string) map[stri
 	}
 	t.Fatalf("did not receive pong pingID=%s", pingID)
 	return nil
+}
+
+func waitRuntimeSessionDetached(t *testing.T, h *Handler, sessionID string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if h == nil || h.runtimeSessions == nil || !h.runtimeSessions.HasActiveConnection(sessionID) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("runtime session %q still has an active connection", sessionID)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 func readUntilReviewFileStatus(t *testing.T, conn *websocket.Conn, fileID, status string) map[string]any {
@@ -2156,6 +2286,53 @@ func TestHandlerSkillSyncPullDuplicateClientActionDoesNotStartSecondSync(t *test
 	}
 }
 
+func TestHandlerSkillSyncPullFinalStateSurvivesDisconnect(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	writeTestFile(t,
+		filepath.Join(homeDir, ".claude", "skills", "disconnect-sync-skill", "SKILL.md"),
+		"---\nname: disconnect-sync-skill\ndescription: Disconnect sync fixture.\n---\n# Disconnect Sync Skill\n\nUse this fixture.\n",
+	)
+	fileStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	blockingStore := newBlockingFinalSkillSyncStore(fileStore)
+	h := newTestHandler()
+	h.SessionStore = blockingStore
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+	sessionID := createHistorySessionForHandlerTest(t, h, conn, "skill-sync-disconnect-session")
+
+	if err := conn.WriteJSON(protocol.ClientEvent{Action: "skill_sync_pull"}); err != nil {
+		t.Fatalf("write skill_sync_pull request: %v", err)
+	}
+	blockingStore.WaitFinalSaveStarted(t)
+	if err := conn.Close(); err != nil {
+		t.Fatalf("close websocket: %v", err)
+	}
+	waitRuntimeSessionDetached(t, h, sessionID)
+	blockingStore.ReleaseFinalSave()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		snapshot, err := fileStore.GetSkillCatalogSnapshot(context.Background())
+		if err != nil {
+			t.Fatalf("get skill catalog snapshot: %v", err)
+		}
+		if snapshot.Meta.SyncState == data.CatalogSyncStateSynced {
+			if got := blockingStore.FinalSaveCount(); got != 1 {
+				t.Fatalf("expected one final skill sync save, got %d", got)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected disconnected skill sync to finish, got meta %#v", snapshot.Meta)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 func TestHandlerSkillCatalogLifecycleUsesCodexSkillsForCodexSession(t *testing.T) {
 	homeDir := t.TempDir()
 	t.Setenv("HOME", homeDir)
@@ -2551,6 +2728,72 @@ func TestHandlerMemorySyncPullEmitsCatalogLifecycle(t *testing.T) {
 	}
 	if !foundLocal || !foundExternal {
 		t.Fatalf("expected both local and external memories, got %#v", items)
+	}
+}
+
+func TestHandlerMemorySyncPullFinalStateSurvivesDisconnect(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	projectRoot := filepath.Join(homeDir, "workspace", "disconnect-project")
+	projectChild := filepath.Join(projectRoot, "mobile_vc")
+	if err := os.MkdirAll(projectChild, 0o755); err != nil {
+		t.Fatalf("mkdir project child: %v", err)
+	}
+	memoryDir := filepath.Join(
+		homeDir,
+		".claude",
+		"projects",
+		encodeClaudeProjectPath(projectRoot),
+		"memory",
+	)
+	writeTestFile(t,
+		filepath.Join(memoryDir, "disconnect_notes.md"),
+		"# Disconnect Notes\n\nRemember that memory sync finishes after disconnect.\n",
+	)
+
+	fileStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	blockingStore := newBlockingFinalMemorySyncStore(fileStore)
+	h := newTestHandler()
+	h.SessionStore = blockingStore
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+	sessionID := createHistorySessionForHandlerTest(t, h, conn, "memory-sync-disconnect-session")
+	if _, err := fileStore.SaveProjection(context.Background(), sessionID, data.ProjectionSnapshot{
+		RawTerminalByStream: map[string]string{"stdout": "", "stderr": ""},
+		Runtime:             data.SessionRuntime{CWD: projectChild},
+	}); err != nil {
+		t.Fatalf("save projection: %v", err)
+	}
+
+	if err := conn.WriteJSON(protocol.MemoryRequestEvent{ClientEvent: protocol.ClientEvent{Action: "memory_sync_pull"}}); err != nil {
+		t.Fatalf("write memory_sync_pull request: %v", err)
+	}
+	blockingStore.WaitFinalSaveStarted(t)
+	if err := conn.Close(); err != nil {
+		t.Fatalf("close websocket: %v", err)
+	}
+	waitRuntimeSessionDetached(t, h, sessionID)
+	blockingStore.ReleaseFinalSave()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		snapshot, err := fileStore.GetMemoryCatalogSnapshot(context.Background())
+		if err != nil {
+			t.Fatalf("get memory catalog snapshot: %v", err)
+		}
+		if snapshot.Meta.SyncState == data.CatalogSyncStateSynced {
+			if got := blockingStore.FinalSaveCount(); got != 1 {
+				t.Fatalf("expected one final memory sync save, got %d", got)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected disconnected memory sync to finish, got meta %#v", snapshot.Meta)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 

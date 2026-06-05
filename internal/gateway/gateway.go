@@ -1887,7 +1887,8 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				logx.Info("ws", "duplicate client action ignored: connectionID=%s sessionID=%s remoteAddr=%s action=skill_sync_pull clientActionID=%s", connectionID, sessionID, remoteAddr, clientEvent.ClientActionID)
 				continue
 			}
-			if !h.tryStartAsyncAction(ctx, gatewayAsyncActionOptions{
+			workCtx := context.WithoutCancel(ctx)
+			if !h.tryStartAsyncAction(workCtx, gatewayAsyncActionOptions{
 				Action:       "skill_sync_pull",
 				SessionID:    catalogAsyncScopeKey(),
 				ConnectionID: connectionID,
@@ -1903,7 +1904,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 					emit(protocol.NewErrorEvent(sessionID, message, ""))
 				},
 				Run: func() {
-					h.runSkillSyncPull(ctx, sessionID, emit)
+					h.runSkillSyncPull(workCtx, sessionID, emit)
 				},
 			}) {
 				continue
@@ -1927,7 +1928,8 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				continue
 			}
 			syncCWD := resolveCatalogSyncCWD(h.SessionStore, ctx, sessionID, firstNonEmptyString(req.CWD, sessionListFilterCWD))
-			if !h.tryStartAsyncAction(ctx, gatewayAsyncActionOptions{
+			workCtx := context.WithoutCancel(ctx)
+			if !h.tryStartAsyncAction(workCtx, gatewayAsyncActionOptions{
 				Action:       "memory_sync_pull",
 				SessionID:    catalogAsyncScopeKey(),
 				ConnectionID: connectionID,
@@ -1943,7 +1945,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 					emit(protocol.NewErrorEvent(sessionID, message, ""))
 				},
 				Run: func() {
-					h.runMemorySyncPull(ctx, sessionID, syncCWD, connectionID, remoteAddr, emit)
+					h.runMemorySyncPull(workCtx, sessionID, syncCWD, connectionID, remoteAddr, emit)
 				},
 			}) {
 				continue
