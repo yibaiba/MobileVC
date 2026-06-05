@@ -13009,6 +13009,7 @@ void main() {
       service.emit(SessionHistoryEvent(
         timestamp: _timestamp,
         sessionId: 'session-target',
+        runtimeMeta: const RuntimeMeta(),
         raw: const {'type': 'session_history'},
         summary: const SessionSummary(id: 'session-target', title: 'history'),
         runtimeAlive: true,
@@ -13059,6 +13060,7 @@ void main() {
       service.emit(SessionHistoryEvent(
         timestamp: _timestamp,
         sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(),
         raw: const {'type': 'session_history'},
         summary: const SessionSummary(id: 'session-current', title: 'current'),
         resumeRuntimeMeta: const RuntimeMeta(cwd: '/workspace'),

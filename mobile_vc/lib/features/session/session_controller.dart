@@ -1080,7 +1080,8 @@ class SessionController extends ChangeNotifier {
     final phase = _runtimeUiPhase;
     return phase == _RuntimeUiPhase.catchingUp ||
         phase == _RuntimeUiPhase.running ||
-        phase == _RuntimeUiPhase.stopping;
+        phase == _RuntimeUiPhase.stopping ||
+        (phase == _RuntimeUiPhase.observing && _runtimeHasRunningSignal);
   }
 
   bool get canStopCurrentRun {
@@ -1098,9 +1099,6 @@ class SessionController extends ChangeNotifier {
     if (_isStopping) {
       return _RuntimeUiPhase.stopping;
     }
-    if (isObservingRemoteActiveSession) {
-      return _RuntimeUiPhase.observing;
-    }
     if (_isSubmitting) {
       return _RuntimeUiPhase.running;
     }
@@ -1112,6 +1110,9 @@ class SessionController extends ChangeNotifier {
     }
     if (awaitInput || _isClaudePendingReadyForInput) {
       return _RuntimeUiPhase.waitingInput;
+    }
+    if (isObservingRemoteActiveSession) {
+      return _RuntimeUiPhase.observing;
     }
     if (_runtimeHasRunningSignal) {
       return _RuntimeUiPhase.running;
@@ -1142,6 +1143,9 @@ class SessionController extends ChangeNotifier {
         sessionState == 'WAIT_INPUT' ||
         awaitInput ||
         _isClaudePendingReadyForInput;
+    if (agentState == 'WAIT_INPUT') {
+      return false;
+    }
     if (_sessionRuntimeAlive && !hasDefinitiveIdleOrWaitingState) {
       return true;
     }
@@ -2052,6 +2056,17 @@ class SessionController extends ChangeNotifier {
     }
     _isSubmitting = false;
     _isSubmittingBaselineKey = '';
+  }
+
+  bool _shouldEndUserSubmissionForAwaitingRuntime(RuntimeMeta meta) {
+    if (!_isSubmitting) {
+      return false;
+    }
+    final key = _runtimeExecutionKey(meta);
+    if (_isSubmittingBaselineKey.isEmpty) {
+      return key.isNotEmpty;
+    }
+    return key.isNotEmpty && key != _isSubmittingBaselineKey;
   }
 
   bool _shouldEndUserSubmissionForAiStatus(AIStatusEvent status) {
@@ -5891,6 +5906,10 @@ class SessionController extends ChangeNotifier {
             agent.runtimeMeta,
             finishedAt: agent.timestamp,
           );
+          if (agent.awaitInput &&
+              _shouldEndUserSubmissionForAwaitingRuntime(agent.runtimeMeta)) {
+            _endUserSubmissionProtection();
+          }
         }
         if ((_isIdleLikeState(agent.state) || agent.awaitInput) &&
             !_shouldPreserveBlockingPrompt()) {
