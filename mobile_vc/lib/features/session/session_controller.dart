@@ -268,6 +268,10 @@ class SessionController extends ChangeNotifier {
   static const Duration _observedSessionSyncInterval = Duration(seconds: 3);
   static const Duration _sessionDeltaRequestCoalesceWindow =
       Duration(seconds: 2);
+  static const Duration _sessionUpdatedPullDebounce =
+      Duration(milliseconds: 350);
+  static const Duration _sessionUpdatedDeltaRequestCoalesceWindow =
+      Duration(milliseconds: 750);
   static const Duration _defaultLanReturnProbeInterval = Duration(seconds: 20);
   static const Duration _lanReturnCooldown = Duration(seconds: 30);
   final MobileVcWsService _service;
@@ -293,6 +297,7 @@ class SessionController extends ChangeNotifier {
   Timer? _lanReturnProbeTimer;
   Timer? _observedSessionSyncTimer;
   Timer? _pendingOutboundRetryTimer;
+  Timer? _sessionUpdatedPullTimer;
   int _connectionPingSequence = 0;
   String _pendingHealthPingId = '';
   int _missedHealthPongs = 0;
@@ -308,6 +313,11 @@ class SessionController extends ChangeNotifier {
       <String, SessionDeltaKnown>{};
   final Map<String, DateTime> _sessionDeltaLastRequestedAt =
       <String, DateTime>{};
+  final Map<String, int> _sessionUpdatedListGenerations = <String, int>{};
+  final Map<String, int> _sessionUpdatedCursors = <String, int>{};
+  bool _sessionUpdatedListDirty = false;
+  String _sessionUpdatedDeltaSessionId = '';
+  String _sessionUpdatedDeltaReason = '';
   bool _fileListLoading = false;
   Timer? _fileListLoadingTimeout;
   bool _fileReading = false;
@@ -1577,6 +1587,7 @@ class SessionController extends ChangeNotifier {
     _postHistoryBootstrapTimer?.cancel();
     _aiStatusHideDebounce?.cancel();
     _activityHideDebounce?.cancel();
+    _sessionUpdatedPullTimer?.cancel();
     await _subscription?.cancel();
     await _adbWebRtc.dispose();
     await _service.dispose();
@@ -2749,6 +2760,7 @@ class SessionController extends ChangeNotifier {
     _sessionLoadingTimeout = null;
     _postHistoryBootstrapTimer?.cancel();
     _postHistoryBootstrapTimer = null;
+    _clearSessionUpdatedPullState();
     await _adbWebRtc.stop();
     await _service.disconnect();
     _connected = false;
@@ -2864,6 +2876,7 @@ class SessionController extends ChangeNotifier {
     _clearDeferredFirstInput();
     _sessionEventCursors.clear();
     _sessionDeltaKnown.clear();
+    _clearSessionUpdatedPullState();
     if (!preserveRuntimeForRelayRecovery) {
       _clearRuntimeContextAfterDisconnect();
     }
@@ -5759,6 +5772,9 @@ class SessionController extends ChangeNotifier {
       case SessionDeltaEvent delta:
         _handleSessionDelta(delta);
         break;
+      case SessionUpdatedEvent updated:
+        _handleSessionUpdated(updated);
+        break;
       case SessionResumeResultEvent result:
         if (!_eventTargetsCurrentSession(result.sessionId)) {
           break;
@@ -7075,6 +7091,106 @@ class SessionController extends ChangeNotifier {
       return left.$1.compareTo(right.$1);
     });
     return indexed.map((entry) => entry.$2).toList(growable: false);
+  }
+
+  void _handleSessionUpdated(SessionUpdatedEvent event) {
+    final updatedSessionId = event.sessionId.trim();
+    if (updatedSessionId.isEmpty || !_connected || _connecting) {
+      return;
+    }
+    final previousGeneration =
+        _sessionUpdatedListGenerations[updatedSessionId] ?? 0;
+    final previousCursor = _sessionUpdatedCursors[updatedSessionId] ?? 0;
+    if (event.generation > 0 && event.generation < previousGeneration) {
+      return;
+    }
+    var shouldRefreshList =
+        event.generation <= 0 || event.generation > previousGeneration;
+    var shouldRefreshDelta = false;
+    if (event.generation > previousGeneration) {
+      _sessionUpdatedListGenerations[updatedSessionId] = event.generation;
+    }
+    if (updatedSessionId == _selectedSessionId.trim()) {
+      shouldRefreshDelta = event.eventCursor <= 0 ||
+          previousCursor <= 0 ||
+          event.eventCursor > previousCursor;
+    }
+    if (event.eventCursor > previousCursor) {
+      _sessionUpdatedCursors[updatedSessionId] = event.eventCursor;
+    }
+    if (!shouldRefreshList && !shouldRefreshDelta) {
+      return;
+    }
+    if (shouldRefreshList) {
+      _sessionUpdatedListDirty = true;
+    }
+    if (shouldRefreshDelta) {
+      _sessionUpdatedDeltaSessionId = updatedSessionId;
+      _sessionUpdatedDeltaReason = event.reason.trim().isNotEmpty
+          ? 'session_updated:${event.reason.trim()}'
+          : 'session_updated';
+    }
+    _scheduleSessionUpdatedPull();
+  }
+
+  void _scheduleSessionUpdatedPull([
+    Duration delay = _sessionUpdatedPullDebounce,
+  ]) {
+    if (!_connected || _connecting) {
+      return;
+    }
+    if (_sessionUpdatedPullTimer != null) {
+      return;
+    }
+    _sessionUpdatedPullTimer = Timer(delay, () {
+      _sessionUpdatedPullTimer = null;
+      _flushSessionUpdatedPull();
+    });
+  }
+
+  void _flushSessionUpdatedPull() {
+    if (!_connected || _connecting) {
+      _clearSessionUpdatedPullState();
+      return;
+    }
+    if (_sessionUpdatedListDirty) {
+      _sessionUpdatedListDirty = false;
+      requestSessionList();
+    }
+    final deltaSessionId = _sessionUpdatedDeltaSessionId.trim();
+    var clearDeltaPull = true;
+    if (deltaSessionId.isNotEmpty &&
+        deltaSessionId == _selectedSessionId.trim()) {
+      final now = DateTime.now();
+      final lastRequestedAt = _sessionDeltaLastRequestedAt[deltaSessionId];
+      if (lastRequestedAt == null ||
+          now.difference(lastRequestedAt) >=
+              _sessionUpdatedDeltaRequestCoalesceWindow) {
+        _requestSessionDelta(
+          reason: _sessionUpdatedDeltaReason,
+          force: true,
+        );
+      } else {
+        clearDeltaPull = false;
+        final remaining = _sessionUpdatedDeltaRequestCoalesceWindow -
+            now.difference(lastRequestedAt);
+        _scheduleSessionUpdatedPull(remaining);
+      }
+    }
+    if (clearDeltaPull) {
+      _sessionUpdatedDeltaSessionId = '';
+      _sessionUpdatedDeltaReason = '';
+    }
+  }
+
+  void _clearSessionUpdatedPullState() {
+    _sessionUpdatedPullTimer?.cancel();
+    _sessionUpdatedPullTimer = null;
+    _sessionUpdatedListDirty = false;
+    _sessionUpdatedDeltaSessionId = '';
+    _sessionUpdatedDeltaReason = '';
+    _sessionUpdatedListGenerations.clear();
+    _sessionUpdatedCursors.clear();
   }
 
   DateTime? _historyLogEntryTimestamp(HistoryLogEntry entry) {

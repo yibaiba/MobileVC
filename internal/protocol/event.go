@@ -39,6 +39,7 @@ const (
 	EventTypeSessionHistory            = "session_history"
 	EventTypeSessionHistoryPage        = "session_history_page"
 	EventTypeSessionDelta              = "session_delta"
+	EventTypeSessionUpdated            = "session_updated"
 	EventTypeReviewState               = "review_state"
 	EventTypeSkillCatalogResult        = "skill_catalog_result"
 	EventTypeMemoryListResult          = "memory_list_result"
@@ -718,6 +719,13 @@ type SessionDeltaEvent struct {
 	RuntimeAlive        bool                `json:"runtimeAlive,omitempty"`
 	ResumeRuntimeMeta   RuntimeMeta         `json:"resumeRuntimeMeta,omitempty"`
 	RequiresFullSync    bool                `json:"requiresFullSync,omitempty"`
+}
+
+type SessionUpdatedEvent struct {
+	Event
+	Generation  uint64 `json:"generation,omitempty"`
+	EventCursor int64  `json:"eventCursor,omitempty"`
+	Reason      string `json:"reason,omitempty"`
 }
 
 type SessionHistoryPageEvent struct {
@@ -1460,6 +1468,15 @@ func NewSessionDeltaEvent(sessionID string, summary SessionSummary, base, latest
 	}
 }
 
+func NewSessionUpdatedEvent(sessionID string, generation uint64, eventCursor int64, reason string) SessionUpdatedEvent {
+	return SessionUpdatedEvent{
+		Event:       NewBaseEvent(EventTypeSessionUpdated, sessionID),
+		Generation:  generation,
+		EventCursor: eventCursor,
+		Reason:      strings.TrimSpace(reason),
+	}
+}
+
 func NewSessionHistoryPageEvent(sessionID string, logEntries []HistoryLogEntry, logEntryStart, logEntryTotal int, resumeRuntimeMeta RuntimeMeta) SessionHistoryPageEvent {
 	return SessionHistoryPageEvent{
 		Event:             NewBaseEvent(EventTypeSessionHistoryPage, sessionID),
@@ -1843,6 +1860,9 @@ func ApplyRuntimeMeta(event any, meta RuntimeMeta) any {
 	case SessionDeltaEvent:
 		e.RuntimeMeta = MergeRuntimeMeta(e.RuntimeMeta, meta)
 		return e
+	case SessionUpdatedEvent:
+		e.RuntimeMeta = MergeRuntimeMeta(e.RuntimeMeta, meta)
+		return e
 	case SessionResumeResultEvent:
 		e.RuntimeMeta = MergeRuntimeMeta(e.RuntimeMeta, meta)
 		return e
@@ -1965,6 +1985,9 @@ func ApplyEventCursor(event any, cursor int64) any {
 		e.EventCursor = cursor
 		return e
 	case SessionDeltaEvent:
+		e.EventCursor = cursor
+		return e
+	case SessionUpdatedEvent:
 		e.EventCursor = cursor
 		return e
 	case SessionResumeResultEvent:

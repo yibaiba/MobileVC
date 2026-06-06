@@ -1609,6 +1609,37 @@ class SessionDeltaEvent extends AppEvent {
       );
 }
 
+class SessionUpdatedEvent extends AppEvent {
+  const SessionUpdatedEvent({
+    required super.timestamp,
+    required super.sessionId,
+    required super.runtimeMeta,
+    required super.raw,
+    this.generation = 0,
+    this.eventCursor = 0,
+    this.reason = '',
+  }) : super(type: 'session_updated');
+
+  final int generation;
+  final int eventCursor;
+  final String reason;
+
+  factory SessionUpdatedEvent.fromJson(Map<String, dynamic> json) =>
+      SessionUpdatedEvent(
+        timestamp: _readTimestamp(json),
+        sessionId: (json['sessionId'] ?? '').toString(),
+        runtimeMeta: RuntimeMeta.fromJson(json),
+        raw: json,
+        generation: (json['generation'] as num?)?.toInt() ??
+            int.tryParse((json['generation'] ?? '').toString()) ??
+            0,
+        eventCursor: (json['eventCursor'] as num?)?.toInt() ??
+            int.tryParse((json['eventCursor'] ?? '').toString()) ??
+            0,
+        reason: (json['reason'] ?? '').toString(),
+      );
+}
+
 class SessionResumeResultEvent extends AppEvent {
   const SessionResumeResultEvent({
     required super.timestamp,

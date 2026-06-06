@@ -509,6 +509,16 @@ type blockingProjectionSaveStore struct {
 	saveCount   int
 }
 
+type failOnceProjectionSaveStore struct {
+	data.Store
+	mu        sync.Mutex
+	saveCount int
+}
+
+type projectionSaveOnlyStore struct {
+	data.Store
+}
+
 func newBlockingSkillSyncStore(store data.Store) *blockingSkillSyncStore {
 	return &blockingSkillSyncStore{
 		Store:              store,
@@ -524,6 +534,10 @@ func newBlockingProjectionSaveStore(store data.Store) *blockingProjectionSaveSto
 		saveRelease: make(chan struct{}),
 		saveDone:    make(chan struct{}),
 	}
+}
+
+func newFailOnceProjectionSaveStore(store data.Store) *failOnceProjectionSaveStore {
+	return &failOnceProjectionSaveStore{Store: store}
 }
 
 func newBlockingFinalSkillSyncStore(store data.Store) *blockingFinalSkillSyncStore {
@@ -620,6 +634,25 @@ func (s *blockingProjectionSaveStore) SaveProjectionWithOptions(ctx context.Cont
 	return saveProjectionWithOptions(s.Store, ctx, sessionID, projection, opts...)
 }
 
+func (s *failOnceProjectionSaveStore) SaveProjection(ctx context.Context, sessionID string, projection data.ProjectionSnapshot) (data.SessionSummary, error) {
+	return s.SaveProjectionWithOptions(ctx, sessionID, projection)
+}
+
+func (s *failOnceProjectionSaveStore) SaveProjectionWithOptions(ctx context.Context, sessionID string, projection data.ProjectionSnapshot, opts ...data.ProjectionSaveOption) (data.SessionSummary, error) {
+	s.mu.Lock()
+	s.saveCount++
+	count := s.saveCount
+	s.mu.Unlock()
+	if count == 1 {
+		return data.SessionSummary{}, fmt.Errorf("injected projection save failure")
+	}
+	return saveProjectionWithOptions(s.Store, ctx, sessionID, projection, opts...)
+}
+
+func (s *projectionSaveOnlyStore) SaveProjection(ctx context.Context, sessionID string, projection data.ProjectionSnapshot) (data.SessionSummary, error) {
+	return s.Store.SaveProjection(ctx, sessionID, projection)
+}
+
 func (s *blockingSkillSyncStore) WaitSyncingSaveStarted(t *testing.T) {
 	t.Helper()
 	select {
@@ -681,6 +714,12 @@ func (s *blockingProjectionSaveStore) WaitSaveDone(t *testing.T) {
 	}
 }
 
+func (s *failOnceProjectionSaveStore) SaveCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.saveCount
+}
+
 func (s *blockingFinalSkillSyncStore) ReleaseFinalSave() {
 	select {
 	case <-s.finalSaveRelease:
@@ -732,6 +771,10 @@ func (s *countingStore) UpsertSession(ctx context.Context, record data.SessionRe
 
 func (s *countingStore) SaveProjection(ctx context.Context, sessionID string, projection data.ProjectionSnapshot) (data.SessionSummary, error) {
 	return s.inner.SaveProjection(ctx, sessionID, projection)
+}
+
+func (s *countingStore) SaveProjectionWithOptions(ctx context.Context, sessionID string, projection data.ProjectionSnapshot, opts ...data.ProjectionSaveOption) (data.SessionSummary, error) {
+	return saveProjectionWithOptions(s.inner, ctx, sessionID, projection, opts...)
 }
 
 func (s *countingStore) GetSession(ctx context.Context, sessionID string) (data.SessionRecord, error) {
@@ -1530,6 +1573,18 @@ func historyEventContainsText(event map[string]any, want string) bool {
 	if !ok {
 		return false
 	}
+	return eventEntriesContainText(entries, want)
+}
+
+func deltaEventContainsText(event map[string]any, want string) bool {
+	entries, ok := event["appendLogEntries"].([]any)
+	if !ok {
+		return false
+	}
+	return eventEntriesContainText(entries, want)
+}
+
+func eventEntriesContainText(entries []any, want string) bool {
 	for _, raw := range entries {
 		entry, ok := raw.(map[string]any)
 		if !ok {
@@ -3614,6 +3669,279 @@ func TestHandlerSessionResumeReattachesRunningRuntimeAfterDisconnect(t *testing.
 	}
 }
 
+func TestHandlerSessionDeltaReadsLiveProjectionAfterDisconnectWhilePersistenceIsBlocked(t *testing.T) {
+	runnerStub := newSwitchableStubRunner()
+	h := newTestHandler()
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	blockingStore := newBlockingProjectionSaveStore(tempStore)
+	h.SessionStore = blockingStore
+	h.NewPtyRunner = func() engine.Runner { return runnerStub }
+
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+	sessionID := createHistorySessionForHandlerTest(t, h, conn, "live-projection-delta")
+
+	if err := conn.WriteJSON(protocol.ExecRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "exec"},
+		Command:     "claude",
+		Mode:        "pty",
+	}); err != nil {
+		t.Fatalf("write exec request: %v", err)
+	}
+	runnerStub.WaitStarted(t)
+	requireAgentState(t, readUntilType(t, conn, protocol.EventTypeAgentState), "THINKING", false)
+
+	if err := conn.Close(); err != nil {
+		t.Fatalf("close first connection: %v", err)
+	}
+	waitRuntimeSessionDetached(t, h, sessionID)
+
+	runnerStub.Emit(protocol.ApplyRuntimeMeta(
+		protocol.NewLogEvent(sessionID, "live output before disk save", "stdout"),
+		protocol.RuntimeMeta{Engine: "claude"},
+	))
+	blockingStore.WaitSaveStarted(t)
+
+	conn2 := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn2)
+	if err := conn2.WriteJSON(protocol.SessionResumeRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_resume"},
+		SessionID:   sessionID,
+	}); err != nil {
+		t.Fatalf("write session_resume request: %v", err)
+	}
+	_ = readUntilSessionHistory(t, conn2)
+	_ = readUntilType(t, conn2, protocol.EventTypeSessionResumeResult)
+
+	if err := conn2.WriteJSON(protocol.SessionDeltaRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_delta_get"},
+		SessionID:   sessionID,
+		Known: protocol.SessionDeltaKnown{
+			LogEntryCount: 0,
+		},
+		Reason: "live_projection_regression",
+	}); err != nil {
+		t.Fatalf("write session_delta_get request: %v", err)
+	}
+	delta := readUntilType(t, conn2, protocol.EventTypeSessionDelta)
+	if !deltaEventContainsText(delta, "live output before disk save") {
+		t.Fatalf("expected live projection output in delta before save release, got %#v", delta)
+	}
+
+	blockingStore.ReleaseSave()
+	blockingStore.WaitSaveDone(t)
+	waitForPersistedSessionText(t, h.SessionStore, sessionID, "live output before disk save")
+
+	if entry := h.runtimeSessions.Ensure(sessionID); entry != nil {
+		entry.service.Cleanup()
+	}
+}
+
+func TestRuntimeBufferedSinkDoesNotRunDetachedProcessorInline(t *testing.T) {
+	runtimeSession := newRuntimeSession(session.NewService("session-buffered", session.Dependencies{}))
+	processorStarted := make(chan struct{})
+	releaseProcessor := make(chan struct{})
+	processorDone := make(chan struct{})
+	sink := runtimeSession.EnsureBufferedSinkWithProcessor(func(any) {
+		close(processorStarted)
+		<-releaseProcessor
+		close(processorDone)
+	})
+
+	done := make(chan struct{})
+	go func() {
+		sink(protocol.NewLogEvent("session-buffered", "background output", "stdout"))
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("detached runtime sink blocked on processor")
+	}
+	select {
+	case <-processorStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("detached runtime processor did not receive event")
+	}
+	close(releaseProcessor)
+	select {
+	case <-processorDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("detached runtime processor did not finish")
+	}
+	runtimeSession.shutdownSink()
+}
+
+func TestHandlerPublishesSessionUpdatedAcrossConnections(t *testing.T) {
+	runnerStub := newSwitchableStubRunner()
+	h := newTestHandler()
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	h.SessionStore = tempStore
+	h.NewPtyRunner = func() engine.Runner { return runnerStub }
+
+	connA := newTestConn(t, h)
+	_ = connA.SetReadDeadline(time.Now().Add(30 * time.Second))
+	_, _ = readInitialEvents(t, connA)
+	sessionID := createHistorySessionForHandlerTest(t, h, connA, "freshness-source")
+
+	connB := newTestConn(t, h)
+	_ = connB.SetReadDeadline(time.Now().Add(30 * time.Second))
+	_, _ = readInitialEvents(t, connB)
+	otherSessionID := createHistorySessionForHandlerTest(t, h, connB, "freshness-observer")
+	if otherSessionID == sessionID {
+		t.Fatal("expected distinct observer session")
+	}
+
+	if err := connA.WriteJSON(protocol.ExecRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "exec"},
+		Command:     "claude",
+		Mode:        "pty",
+	}); err != nil {
+		t.Fatalf("write exec request: %v", err)
+	}
+	runnerStub.WaitStarted(t)
+	requireAgentState(t, readUntilType(t, connA, protocol.EventTypeAgentState), "THINKING", false)
+
+	runnerStub.Emit(protocol.ApplyRuntimeMeta(
+		protocol.NewLogEvent(sessionID, "freshness hint output", "stdout"),
+		protocol.RuntimeMeta{Engine: "claude"},
+	))
+	updated := readUntilType(t, connB, protocol.EventTypeSessionUpdated)
+	if updated["sessionId"] != sessionID {
+		t.Fatalf("expected cross-connection session_updated for %q, got %#v", sessionID, updated)
+	}
+	if generation, _ := updated["generation"].(float64); generation <= 0 {
+		t.Fatalf("expected positive generation, got %#v", updated)
+	}
+
+	if entry := h.runtimeSessions.Ensure(sessionID); entry != nil {
+		entry.service.Cleanup()
+	}
+}
+
+func TestHandlerProjectionPersistRetriesLatestSnapshotAfterFailure(t *testing.T) {
+	h := newTestHandler()
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	store := newFailOnceProjectionSaveStore(tempStore)
+	h.SessionStore = store
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+	sessionID := createHistorySessionForHandlerTest(t, h, conn, "retry-projection")
+
+	sink := h.runtimeEventSinkForSession(sessionID, func(any) {})
+	sink(protocol.ApplyRuntimeMeta(
+		protocol.NewLogEvent(sessionID, "retry eventually persists latest", "stdout"),
+		protocol.RuntimeMeta{Engine: "claude"},
+	))
+
+	waitForPersistedSessionText(t, h.SessionStore, sessionID, "retry eventually persists latest")
+	if saves := store.SaveCount(); saves < 2 {
+		t.Fatalf("expected projection persistence retry, saves=%d", saves)
+	}
+}
+
+func TestHandlerProjectionPersistRetryDoesNotDuplicateClaudeJSONL(t *testing.T) {
+	homeDir := t.TempDir()
+	projectDir := filepath.Join(homeDir, "workspace", "ClaudeProject")
+	if err := os.MkdirAll(projectDir, 0o755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
+	}
+	t.Setenv("HOME", homeDir)
+	t.Setenv("USERPROFILE", homeDir)
+	t.Setenv("HOMEDRIVE", "")
+	t.Setenv("HOMEPATH", "")
+
+	h := newTestHandler()
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	store := newFailOnceProjectionSaveStore(tempStore)
+	h.SessionStore = store
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+	sessionID := createHistorySessionForHandlerTest(t, h, conn, "retry-jsonl")
+
+	record, err := h.SessionStore.GetSession(context.Background(), sessionID)
+	if err != nil {
+		t.Fatalf("get created session: %v", err)
+	}
+	record.Summary.Runtime.CWD = projectDir
+	record.Summary.ClaudeSessionUUID = "retry-jsonl-claude"
+	record.Projection.Runtime = data.SessionRuntime{
+		ResumeSessionID: record.Summary.ClaudeSessionUUID,
+		Command:         "claude --resume " + record.Summary.ClaudeSessionUUID,
+		Engine:          "claude",
+		CWD:             projectDir,
+		Source:          "mobilevc",
+	}
+	if _, err := h.SessionStore.UpsertSession(context.Background(), record); err != nil {
+		t.Fatalf("upsert mobilevc claude session: %v", err)
+	}
+	h.projectionWriter.updateMeta(h.SessionStore, record)
+
+	sink := h.runtimeEventSinkForSession(sessionID, func(any) {})
+	logEvent := protocol.NewLogEvent(sessionID, "retry jsonl assistant once", "stdout")
+	logEvent.RuntimeMeta = protocol.RuntimeMeta{
+		Engine: "claude",
+		Source: "claude/assistant",
+	}
+	sink(logEvent)
+
+	persisted := waitForPersistedSessionText(t, h.SessionStore, sessionID, "retry jsonl assistant once")
+	if persisted.Summary.JSONLSyncEntryCount != 1 {
+		t.Fatalf("expected jsonl sync count to persist after retry, got %d", persisted.Summary.JSONLSyncEntryCount)
+	}
+	projectsDir, err := claudesync.ClaudeProjectsDir()
+	if err != nil {
+		t.Fatalf("resolve claude projects dir: %v", err)
+	}
+	filePath := filepath.Join(projectsDir, claudesync.EncodeCWDToProjectDir(projectDir), record.Summary.ClaudeSessionUUID+".jsonl")
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		t.Fatalf("read claude jsonl: %v", err)
+	}
+	if count := strings.Count(string(content), "retry jsonl assistant once"); count != 1 {
+		t.Fatalf("expected retry to write claude jsonl text once, count=%d content=%s", count, string(content))
+	}
+	if saves := store.SaveCount(); saves < 2 {
+		t.Fatalf("expected projection persistence retry, saves=%d", saves)
+	}
+}
+
+func TestSaveProjectionWithOptionsRequiresOptionStoreWhenOptionsPresent(t *testing.T) {
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	summary, err := tempStore.CreateSession(context.Background(), "projection-options")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	wrapped := &projectionSaveOnlyStore{Store: tempStore}
+	if _, err := saveProjectionWithOptions(wrapped, context.Background(), summary.ID, data.ProjectionSnapshot{
+		LogEntries: []data.SnapshotLogEntry{{Kind: "markdown", Message: "plain save"}},
+	}); err != nil {
+		t.Fatalf("expected plain save without options to remain supported: %v", err)
+	}
+	_, err = saveProjectionWithOptions(wrapped, context.Background(), summary.ID, data.ProjectionSnapshot{
+		LogEntries: []data.SnapshotLogEntry{{Kind: "markdown", Message: "option save"}},
+	}, data.WithJSONLSyncEntryCount(1))
+	if err == nil || !strings.Contains(err.Error(), "ProjectionOptionStore") {
+		t.Fatalf("expected explicit ProjectionOptionStore error, got %v", err)
+	}
+}
+
 func TestHandlerReviewStateGetReturnsProjectionGroups(t *testing.T) {
 	h := newTestHandler()
 	tempStore, err := data.NewFileStore(t.TempDir())
@@ -4528,7 +4856,7 @@ func TestHandlerPtyInputFlowSendsPushWhenTokenRegistered(t *testing.T) {
 		t.Fatal("did not receive input payload")
 	}
 
-	requireAgentState(t, readEventMap(t, conn), "THINKING", false)
+	requireAgentState(t, readUntilType(t, conn, protocol.EventTypeAgentState), "THINKING", false)
 }
 
 func TestHandlerPtyInputFlow(t *testing.T) {
@@ -4576,7 +4904,7 @@ func TestHandlerPtyInputFlow(t *testing.T) {
 		t.Fatal("did not receive input payload")
 	}
 
-	requireAgentState(t, readEventMap(t, conn), "THINKING", false)
+	requireAgentState(t, readUntilType(t, conn, protocol.EventTypeAgentState), "THINKING", false)
 }
 
 func TestHandlerEmitsAgentStateForToolEventsAndFinish(t *testing.T) {
@@ -7353,6 +7681,73 @@ func TestHandlerSessionCreateInvalidatesSessionListCache(t *testing.T) {
 		}
 	}
 	t.Fatalf("expected created session %q in invalidated list, got %#v", sessionID, items)
+}
+
+func TestHandlerSessionListGenerationInvalidatesCacheAcrossConnections(t *testing.T) {
+	h := newTestHandler()
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	counting := &countingStore{inner: tempStore}
+	h.SessionStore = counting
+
+	connA := newTestConn(t, h)
+	_ = connA.SetReadDeadline(time.Now().Add(30 * time.Second))
+	_, _ = readInitialEvents(t, connA)
+	_ = readUntilType(t, connA, protocol.EventTypeSessionListResult)
+
+	if err := connA.WriteJSON(protocol.SessionListRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_list"},
+		CWD:         "",
+	}); err != nil {
+		t.Fatalf("write first session_list request: %v", err)
+	}
+	_ = readUntilType(t, connA, protocol.EventTypeSessionListResult)
+	afterWarm := counting.listCallCount()
+
+	connB := newTestConn(t, h)
+	_ = connB.SetReadDeadline(time.Now().Add(30 * time.Second))
+	_, _ = readInitialEvents(t, connB)
+	_ = readUntilType(t, connB, protocol.EventTypeSessionListResult)
+	if err := connB.WriteJSON(protocol.SessionCreateRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_create"},
+		Title:       "cross-connection-created",
+	}); err != nil {
+		t.Fatalf("write session_create on second connection: %v", err)
+	}
+	created := readUntilSessionCreated(t, connB)
+	summary, ok := created["summary"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected summary payload, got %#v", created)
+	}
+	sessionID, _ := summary["id"].(string)
+	if sessionID == "" {
+		t.Fatalf("expected created session id, got %#v", created)
+	}
+	_ = readUntilType(t, connB, protocol.EventTypeSessionListResult)
+
+	if err := connA.WriteJSON(protocol.SessionListRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_list"},
+		CWD:         "",
+	}); err != nil {
+		t.Fatalf("write cached connection session_list request: %v", err)
+	}
+	listEvent := readUntilType(t, connA, protocol.EventTypeSessionListResult)
+	if afterRefresh := counting.listCallCount(); afterRefresh <= afterWarm {
+		t.Fatalf("expected cross-connection generation bump to rescan, calls before=%d after=%d", afterWarm, afterRefresh)
+	}
+	items, ok := listEvent["items"].([]any)
+	if !ok {
+		t.Fatalf("expected session list items, got %#v", listEvent)
+	}
+	for _, raw := range items {
+		item, _ := raw.(map[string]any)
+		if item["id"] == sessionID {
+			return
+		}
+	}
+	t.Fatalf("expected created session %q in refreshed first-connection list, got %#v", sessionID, items)
 }
 
 func TestHandlerSessionListMergesNativeCodexSessionsByCWD(t *testing.T) {

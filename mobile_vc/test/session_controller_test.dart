@@ -6472,6 +6472,202 @@ void main() {
       expect(sessionListRequest, isNot(contains('cwd')));
     });
 
+    test('session_updated 会合并刷新列表和当前会话 delta', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(
+        SessionCreatedEvent(
+          timestamp: _timestamp,
+          sessionId: 'conn-1',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_created'},
+          summary: const SessionSummary(
+            id: 'session-fresh',
+            title: 'Fresh',
+            ownership: 'mobilevc',
+          ),
+        ),
+      );
+      await _flushEvents();
+      service.sentPayloads.clear();
+
+      service.emit(SessionUpdatedEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-fresh',
+        runtimeMeta: const RuntimeMeta(),
+        raw: const {'type': 'session_updated'},
+        generation: 4,
+        eventCursor: 10,
+        reason: 'projection_persisted',
+      ));
+      service.emit(SessionUpdatedEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 1)),
+        sessionId: 'session-fresh',
+        runtimeMeta: const RuntimeMeta(),
+        raw: const {'type': 'session_updated'},
+        generation: 4,
+        eventCursor: 9,
+        reason: 'projection_persisted',
+      ));
+      service.emit(SessionUpdatedEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 2)),
+        sessionId: 'session-fresh',
+        runtimeMeta: const RuntimeMeta(),
+        raw: const {'type': 'session_updated'},
+        generation: 5,
+        eventCursor: 11,
+        reason: 'projection_persisted',
+      ));
+      await Future<void>.delayed(const Duration(milliseconds: 450));
+
+      final listRequests = service.sentPayloads
+          .where((payload) => payload['action'] == 'session_list')
+          .toList();
+      final deltaRequests = service.sentPayloads
+          .where((payload) => payload['action'] == 'session_delta_get')
+          .toList();
+      expect(listRequests, hasLength(1));
+      expect(deltaRequests, hasLength(1));
+      expect(deltaRequests.single['sessionId'], 'session-fresh');
+      expect(deltaRequests.single['reason'],
+          'session_updated:projection_persisted');
+    });
+
+    test('session_updated delta 被节流时会保留尾部刷新', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(
+        SessionCreatedEvent(
+          timestamp: _timestamp,
+          sessionId: 'conn-1',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_created'},
+          summary: const SessionSummary(
+            id: 'session-fresh',
+            title: 'Fresh',
+            ownership: 'mobilevc',
+          ),
+        ),
+      );
+      await _flushEvents();
+      service.sentPayloads.clear();
+
+      service.emit(SessionUpdatedEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-fresh',
+        runtimeMeta: const RuntimeMeta(),
+        raw: const {'type': 'session_updated'},
+        generation: 4,
+        eventCursor: 10,
+        reason: 'projection_persisted',
+      ));
+      await Future<void>.delayed(const Duration(milliseconds: 450));
+      expect(
+        service.sentPayloads
+            .where((payload) => payload['action'] == 'session_delta_get'),
+        hasLength(1),
+      );
+
+      service.emit(SessionUpdatedEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 1)),
+        sessionId: 'session-fresh',
+        runtimeMeta: const RuntimeMeta(),
+        raw: const {'type': 'session_updated'},
+        generation: 5,
+        eventCursor: 11,
+        reason: 'projection_persisted',
+      ));
+      await Future<void>.delayed(const Duration(milliseconds: 450));
+      expect(
+        service.sentPayloads
+            .where((payload) => payload['action'] == 'session_delta_get'),
+        hasLength(1),
+      );
+
+      await Future<void>.delayed(const Duration(milliseconds: 450));
+      final deltaRequests = service.sentPayloads
+          .where((payload) => payload['action'] == 'session_delta_get')
+          .toList();
+      expect(deltaRequests, hasLength(2));
+      expect(
+          deltaRequests.last['reason'], 'session_updated:projection_persisted');
+    });
+
+    test('session_updated 同一 generation 的新 cursor 只刷新当前会话 delta', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(
+        SessionCreatedEvent(
+          timestamp: _timestamp,
+          sessionId: 'conn-1',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_created'},
+          summary: const SessionSummary(
+            id: 'session-fresh',
+            title: 'Fresh',
+            ownership: 'mobilevc',
+          ),
+        ),
+      );
+      await _flushEvents();
+      service.sentPayloads.clear();
+
+      service.emit(SessionUpdatedEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-fresh',
+        runtimeMeta: const RuntimeMeta(),
+        raw: const {'type': 'session_updated'},
+        generation: 7,
+        eventCursor: 20,
+        reason: 'projection_persisted',
+      ));
+      await Future<void>.delayed(const Duration(milliseconds: 450));
+      expect(
+        service.sentPayloads
+            .where((payload) => payload['action'] == 'session_list'),
+        hasLength(1),
+      );
+      expect(
+        service.sentPayloads
+            .where((payload) => payload['action'] == 'session_delta_get'),
+        hasLength(1),
+      );
+
+      service.emit(SessionUpdatedEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 1)),
+        sessionId: 'session-fresh',
+        runtimeMeta: const RuntimeMeta(),
+        raw: const {'type': 'session_updated'},
+        generation: 7,
+        eventCursor: 21,
+        reason: 'projection_persisted',
+      ));
+      await Future<void>.delayed(const Duration(milliseconds: 900));
+
+      expect(
+        service.sentPayloads
+            .where((payload) => payload['action'] == 'session_list'),
+        hasLength(1),
+      );
+      final deltaRequests = service.sentPayloads
+          .where((payload) => payload['action'] == 'session_delta_get')
+          .toList();
+      expect(deltaRequests, hasLength(2));
+      expect(deltaRequests.last['sessionId'], 'session-fresh');
+    });
+
     test('loadSessionFromSummary 会先切换到会话 cwd 再加载', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);
