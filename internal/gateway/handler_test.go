@@ -3449,10 +3449,6 @@ func TestHandlerSessionContextUpdateAndRestore(t *testing.T) {
 	if !ok || len(historyMemory) != 2 {
 		t.Fatalf("expected restored enabledMemoryIds, got %#v", historyContext)
 	}
-	reviewState := readUntilType(t, conn, protocol.EventTypeReviewState)
-	if reviewState["type"] != protocol.EventTypeReviewState {
-		t.Fatalf("expected review_state after session_load, got %#v", reviewState)
-	}
 }
 
 func TestHandlerSessionLoadRestoresAgentStateFromProjection(t *testing.T) {
@@ -3514,7 +3510,6 @@ func TestHandlerSessionLoadRestoresAgentStateFromProjection(t *testing.T) {
 	if history["sessionId"] != sessionID {
 		t.Fatalf("expected session history for %q, got %#v", sessionID, history)
 	}
-	_ = readUntilType(t, conn, protocol.EventTypeReviewState)
 	agentState := readUntilType(t, conn, protocol.EventTypeAgentState)
 	requireAgentState(t, agentState, "WAIT_INPUT", true)
 	if agentState["resumeSessionId"] != "thread-restore" {
@@ -3573,7 +3568,6 @@ func TestHandlerSessionLoadDoesNotReplayRunningStateWithoutResume(t *testing.T) 
 	}
 
 	_ = readUntilSessionHistory(t, conn)
-	_ = readUntilType(t, conn, protocol.EventTypeReviewState)
 	event := readUntilType(t, conn, protocol.EventTypeSessionState)
 	if event["state"] != string(session.StateActive) {
 		t.Fatalf("expected active session state after history load, got %#v", event)
@@ -8348,7 +8342,6 @@ func TestHandlerSessionLoadMirrorsNativeCodexSession(t *testing.T) {
 	if !foundAssistant {
 		t.Fatalf("expected assistant markdown entry mirrored from rollout, got %#v", entries)
 	}
-	_ = readUntilType(t, conn, protocol.EventTypeReviewState)
 	agentState := readUntilType(t, conn, protocol.EventTypeAgentState)
 	requireAgentState(t, agentState, "IDLE", false)
 	if agentState["claudeLifecycle"] != "resumable" {
@@ -8790,6 +8783,106 @@ func TestHandlerSessionDeltaOversizedPayloadRequiresFullSync(t *testing.T) {
 	requireLatestLogEntryCount(t, delta, len(record.Projection.LogEntries))
 }
 
+func TestHandlerSessionProjectionHydrationActions(t *testing.T) {
+	h := newTestHandler()
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	h.SessionStore = tempStore
+	now := time.Date(2026, 6, 6, 18, 0, 0, 0, time.UTC)
+	record := data.SessionRecord{
+		Summary: data.SessionSummary{
+			ID:        "hydration-session",
+			Title:     "Hydration",
+			CreatedAt: now,
+			UpdatedAt: now,
+		},
+		Projection: data.ProjectionSnapshot{
+			LogEntries:          []data.SnapshotLogEntry{{Kind: "markdown", Message: "visible"}},
+			RawTerminalByStream: map[string]string{"stdout": "0123456789", "stderr": "err012"},
+			Diffs: []session.DiffContext{
+				{ContextID: "diff-1", Path: "a.go", Diff: "aaa"},
+				{ContextID: "diff-2", Path: "b.go", Diff: "bbb", GroupID: "g"},
+			},
+			CurrentDiff: &session.DiffContext{ContextID: "diff-2", Path: "b.go", Diff: "bbb", GroupID: "g"},
+			TerminalExecutions: []data.TerminalExecution{
+				{ExecutionID: "exec-1", Command: "first", Stdout: "old"},
+				{ExecutionID: "exec-2", Command: "second", Stdout: "new"},
+			},
+		},
+	}
+	if _, err := h.SessionStore.UpsertSession(context.Background(), record); err != nil {
+		t.Fatalf("upsert session: %v", err)
+	}
+
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+	if err := conn.WriteJSON(protocol.SessionLoadRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_load"},
+		SessionID:   record.Summary.ID,
+		Limit:       1,
+	}); err != nil {
+		t.Fatalf("write session_load request: %v", err)
+	}
+	history := readUntilSessionHistory(t, conn)
+	if _, ok := history["rawTerminalByStream"]; ok {
+		t.Fatalf("session_history should not include raw terminal payload: %#v", history)
+	}
+	if _, ok := history["terminalExecutions"]; ok {
+		t.Fatalf("session_history should not include terminal executions: %#v", history)
+	}
+	if _, ok := history["diffs"]; ok {
+		t.Fatalf("session_history should not include diff payload: %#v", history)
+	}
+
+	if err := conn.WriteJSON(protocol.SessionTerminalRangeRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_terminal_range_get"},
+		SessionID:   record.Summary.ID,
+		Stream:      "stdout",
+		Start:       2,
+		Limit:       4,
+	}); err != nil {
+		t.Fatalf("write session_terminal_range_get request: %v", err)
+	}
+	terminal := readUntilType(t, conn, protocol.EventTypeSessionTerminalRange)
+	if terminal["content"] != "2345" || intFromJSONNumber(terminal["start"]) != 2 || intFromJSONNumber(terminal["end"]) != 6 {
+		t.Fatalf("unexpected terminal range event: %#v", terminal)
+	}
+
+	if err := conn.WriteJSON(protocol.SessionDiffPageRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_diff_page_get"},
+		SessionID:   record.Summary.ID,
+		Before:      2,
+		Limit:       1,
+	}); err != nil {
+		t.Fatalf("write session_diff_page_get request: %v", err)
+	}
+	diffPage := readUntilType(t, conn, protocol.EventTypeSessionDiffPage)
+	diffs, _ := diffPage["diffs"].([]any)
+	if intFromJSONNumber(diffPage["diffStart"]) != 1 || len(diffs) != 1 {
+		t.Fatalf("unexpected diff page event: %#v", diffPage)
+	}
+
+	if err := conn.WriteJSON(protocol.SessionTerminalExecutionPageRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_terminal_execution_page_get"},
+		SessionID:   record.Summary.ID,
+		Before:      2,
+		Limit:       1,
+	}); err != nil {
+		t.Fatalf("write session_terminal_execution_page_get request: %v", err)
+	}
+	execPage := readUntilType(t, conn, protocol.EventTypeSessionTerminalExecPage)
+	executions, _ := execPage["terminalExecutions"].([]any)
+	if intFromJSONNumber(execPage["executionStart"]) != 1 || len(executions) != 1 {
+		t.Fatalf("unexpected terminal execution page event: %#v", execPage)
+	}
+	execution, _ := executions[0].(map[string]any)
+	if execution["stdout"] != nil {
+		t.Fatalf("expected terminal execution output stripped by default, got %#v", execution)
+	}
+}
+
 func newOversizedGatewayPayloadRecord(sessionID string, entryCount, messageBytes int) data.SessionRecord {
 	now := time.Date(2026, 6, 6, 17, 10, 0, 0, time.UTC)
 	entries := make([]data.SnapshotLogEntry, entryCount)
@@ -8954,7 +9047,6 @@ func TestHandlerSessionLoadPreservesCodexMirrorOverlayButDropsStaleCachedLogs(t 
 		t.Fatalf("expected cached waiting_input lifecycle on history, got %#v", resumeMeta)
 	}
 
-	_ = readUntilType(t, conn, protocol.EventTypeReviewState)
 	agentState := readUntilType(t, conn, protocol.EventTypeAgentState)
 	if agentState["state"] != "WAIT_INPUT" {
 		t.Fatalf("expected restored WAIT_INPUT state, got %#v", agentState)
@@ -9039,7 +9131,6 @@ func TestHandlerCompactRestartsLoadedCodexMirrorSession(t *testing.T) {
 		t.Fatalf("write session load request: %v", err)
 	}
 	_ = readUntilSessionHistory(t, conn)
-	_ = readUntilType(t, conn, protocol.EventTypeReviewState)
 	_ = readUntilType(t, conn, protocol.EventTypeAgentState)
 
 	if err := conn.WriteJSON(protocol.CompactRequestEvent{
@@ -9159,7 +9250,6 @@ func TestHandlerCompactLoadedCodexMirrorIgnoresStaleClaudeRuntimeCache(t *testin
 	if got := strings.ToLower(strings.TrimSpace(fmt.Sprint(resumeMeta["command"]))); !strings.HasPrefix(got, "codex") {
 		t.Fatalf("expected native codex command after stale cache sanitize, got %#v", resumeMeta)
 	}
-	_ = readUntilType(t, conn, protocol.EventTypeReviewState)
 	_ = readUntilType(t, conn, protocol.EventTypeAgentState)
 
 	if err := conn.WriteJSON(protocol.CompactRequestEvent{
@@ -9213,7 +9303,6 @@ func TestHandlerSessionDeleteRejectsNativeCodexMirror(t *testing.T) {
 		t.Fatalf("write session load request: %v", err)
 	}
 	_ = readUntilSessionHistory(t, conn)
-	_ = readUntilType(t, conn, protocol.EventTypeReviewState)
 
 	if err := conn.WriteJSON(protocol.SessionDeleteRequestEvent{
 		ClientEvent: protocol.ClientEvent{Action: "session_delete"},
@@ -9593,7 +9682,6 @@ func TestHandlerSessionDeltaRefreshesNativeCodexMirror(t *testing.T) {
 		t.Fatalf("write session_load request: %v", err)
 	}
 	_ = readUntilSessionHistory(t, conn)
-	_ = readUntilType(t, conn, protocol.EventTypeReviewState)
 	_ = readUntilType(t, conn, protocol.EventTypeAgentState)
 
 	file, err := os.OpenFile(rolloutPath, os.O_APPEND|os.O_WRONLY, 0)

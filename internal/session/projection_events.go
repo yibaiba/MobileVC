@@ -2,6 +2,7 @@ package session
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"time"
 
@@ -12,6 +13,15 @@ import (
 type DeltaCursorSnapshot struct {
 	LatestCursor int64
 }
+
+const (
+	terminalRangeDefaultLimit         = 64 * 1024
+	terminalRangeMaxLimit             = 512 * 1024
+	diffPageDefaultLimit              = 25
+	diffPageMaxLimit                  = 100
+	terminalExecutionPageDefaultLimit = 50
+	terminalExecutionPageMaxLimit     = 100
+)
 
 func ToProtocolSummary(item data.SessionSummary) protocol.SessionSummary {
 	return protocol.SessionSummary{
@@ -296,11 +306,11 @@ func SessionHistoryWindowEventFromRecordWithPayloadLimit(record data.SessionReco
 func SessionHistoryWindowEventFromRecordWithCursorAndPayloadLimit(record data.SessionRecord, runtimeAlive bool, limit int, cursor DeltaCursorSnapshot, maxPayloadBytes int) protocol.SessionHistoryEvent {
 	projection := NormalizeProjectionSnapshot(record.Projection)
 	window := snapshotLogEntryWindow(projection.LogEntries, len(projection.LogEntries), limit)
-	event := sessionHistoryWindowEventFromProjection(record, projection, window, runtimeAlive, cursor)
+	event := lightweightSessionHistoryWindowEventFromProjection(record, projection, window, runtimeAlive, cursor)
 	if fitsProtocolPayloadBudget(event, maxPayloadBytes) {
 		return event
 	}
-	return shrinkSessionHistoryEventToPayloadBudget(record, projection, window, runtimeAlive, cursor, maxPayloadBytes)
+	return shrinkSessionHistoryEventToPayloadBudget(event, window, maxPayloadBytes)
 }
 
 func sessionHistoryWindowEventFromProjection(record data.SessionRecord, projection data.ProjectionSnapshot, window snapshotLogWindow, runtimeAlive bool, cursor DeltaCursorSnapshot) protocol.SessionHistoryEvent {
@@ -340,6 +350,17 @@ func sessionHistoryWindowEventFromProjection(record data.SessionRecord, projecti
 	return event
 }
 
+func lightweightSessionHistoryWindowEventFromProjection(record data.SessionRecord, projection data.ProjectionSnapshot, window snapshotLogWindow, runtimeAlive bool, cursor DeltaCursorSnapshot) protocol.SessionHistoryEvent {
+	event := sessionHistoryWindowEventFromProjection(record, projection, window, runtimeAlive, cursor)
+	event.Diffs = nil
+	event.CurrentDiff = nil
+	event.ReviewGroups = nil
+	event.ActiveReviewGroup = nil
+	event.RawTerminalByStream = nil
+	event.TerminalExecutions = nil
+	return event
+}
+
 func SessionHistoryPageEventFromRecord(record data.SessionRecord, before, limit int) protocol.SessionHistoryPageEvent {
 	projection := NormalizeProjectionSnapshot(record.Projection)
 	window := snapshotLogEntryWindow(projection.LogEntries, before, limit)
@@ -354,6 +375,88 @@ func SessionHistoryPageEventFromRecordWithPayloadLimit(record data.SessionRecord
 		return event
 	}
 	return shrinkSessionHistoryPageEventToPayloadBudget(record, projection, window, maxPayloadBytes)
+}
+
+func SessionTerminalRangeEventFromRecordWithPayloadLimit(record data.SessionRecord, stream string, start, limit int, cursor DeltaCursorSnapshot, maxPayloadBytes int) (protocol.SessionTerminalRangeEvent, error) {
+	projection := NormalizeProjectionSnapshot(record.Projection)
+	normalizedStream, err := normalizeTerminalStream(stream)
+	if err != nil {
+		return protocol.SessionTerminalRangeEvent{}, err
+	}
+	content := projection.RawTerminalByStream[normalizedStream]
+	total := len(content)
+	if start < 0 {
+		start = 0
+	}
+	if start > total {
+		start = total
+	}
+	limit = boundedPositiveLimit(limit, terminalRangeDefaultLimit, terminalRangeMaxLimit)
+	end := start + limit
+	if end > total {
+		end = total
+	}
+	event := protocol.NewSessionTerminalRangeEvent(
+		record.Summary.ID,
+		normalizedStream,
+		start,
+		end,
+		total,
+		content[start:end],
+		sessionDeltaKnownFromProjection(projection, cursor),
+	)
+	if fitsProtocolPayloadBudget(event, maxPayloadBytes) {
+		return event, nil
+	}
+	event.Content = ""
+	event.End = start
+	event.PayloadLimited = true
+	event.PayloadLimitReason = "payload_budget_exceeded"
+	event.SuggestedLimit = suggestedTerminalRangeLimit(maxPayloadBytes)
+	return event, nil
+}
+
+func SessionDiffPageEventFromRecordWithPayloadLimit(record data.SessionRecord, before, limit int, cursor DeltaCursorSnapshot, maxPayloadBytes int) protocol.SessionDiffPageEvent {
+	projection := NormalizeProjectionSnapshot(record.Projection)
+	limit = boundedPositiveLimit(limit, diffPageDefaultLimit, diffPageMaxLimit)
+	window := diffWindowForProjection(projection.Diffs, before, limit)
+	event := sessionDiffPageEventFromProjection(record, projection, window, cursor)
+	if fitsProtocolPayloadBudget(event, maxPayloadBytes) {
+		return event
+	}
+	markSessionDiffPagePayloadLimited(&event, "payload_budget_exceeded")
+	event = shrinkSessionDiffPageToPayloadBudget(event, window, projection, cursor, maxPayloadBytes)
+	if fitsProtocolPayloadBudget(event, maxPayloadBytes) {
+		return event
+	}
+	event.Diffs = stripHistoryContextBodies(event.Diffs)
+	event.CurrentDiff = stripHistoryContextBody(event.CurrentDiff)
+	event.ReviewGroups = stripReviewGroupBodies(event.ReviewGroups)
+	if event.ActiveReviewGroup != nil {
+		stripped := stripReviewGroupBodies([]protocol.ReviewGroup{*event.ActiveReviewGroup})
+		if len(stripped) > 0 {
+			event.ActiveReviewGroup = &stripped[0]
+		}
+	}
+	return event
+}
+
+func SessionTerminalExecutionPageEventFromRecordWithPayloadLimit(record data.SessionRecord, before, limit int, includeOutput bool, cursor DeltaCursorSnapshot, maxPayloadBytes int) protocol.SessionTerminalExecutionPageEvent {
+	projection := NormalizeProjectionSnapshot(record.Projection)
+	limit = boundedPositiveLimit(limit, terminalExecutionPageDefaultLimit, terminalExecutionPageMaxLimit)
+	window := terminalExecutionWindowForProjection(projection.TerminalExecutions, before, limit)
+	event := sessionTerminalExecutionPageEventFromProjection(record, projection, window, includeOutput, cursor)
+	if fitsProtocolPayloadBudget(event, maxPayloadBytes) {
+		return event
+	}
+	markSessionTerminalExecutionPagePayloadLimited(&event, "payload_budget_exceeded")
+	event = shrinkSessionTerminalExecutionPageToPayloadBudget(event, window, includeOutput, projection, cursor, maxPayloadBytes)
+	if fitsProtocolPayloadBudget(event, maxPayloadBytes) {
+		return event
+	}
+	event.TerminalExecutions = stripTerminalExecutionOutput(event.TerminalExecutions)
+	event.IncludeOutput = false
+	return event
 }
 
 func sessionHistoryPageEventFromProjection(record data.SessionRecord, projection data.ProjectionSnapshot, window snapshotLogWindow) protocol.SessionHistoryPageEvent {
@@ -375,23 +478,40 @@ func sessionHistoryPageEventFromProjection(record data.SessionRecord, projection
 	)
 }
 
-func shrinkSessionHistoryEventToPayloadBudget(record data.SessionRecord, projection data.ProjectionSnapshot, window snapshotLogWindow, runtimeAlive bool, cursor DeltaCursorSnapshot, maxPayloadBytes int) protocol.SessionHistoryEvent {
-	event := sessionHistoryWindowEventFromProjection(record, projection, window, runtimeAlive, cursor)
+func sessionDiffPageEventFromProjection(record data.SessionRecord, projection data.ProjectionSnapshot, window snapshotDiffWindow, cursor DeltaCursorSnapshot) protocol.SessionDiffPageEvent {
+	pageDiffs := protocolDiffContextsFromDiffs(window.entries)
+	currentDiff := protocolCurrentDiffForPage(projection.CurrentDiff, window.entries)
+	reviewGroups := protocolReviewGroupsFromDiffs(window.entries)
+	activeReviewGroup := protocolActiveReviewGroupForPage(projection.ActiveReviewGroup, reviewGroups)
+	return protocol.NewSessionDiffPageEvent(
+		record.Summary.ID,
+		pageDiffs,
+		window.start,
+		len(projection.Diffs),
+		reviewGroups,
+		activeReviewGroup,
+		currentDiff,
+		sessionDeltaKnownFromProjection(projection, cursor),
+	)
+}
+
+func sessionTerminalExecutionPageEventFromProjection(record data.SessionRecord, projection data.ProjectionSnapshot, window snapshotTerminalExecutionWindow, includeOutput bool, cursor DeltaCursorSnapshot) protocol.SessionTerminalExecutionPageEvent {
+	executions := protocolTerminalExecutions(window.entries)
+	if !includeOutput {
+		executions = stripTerminalExecutionOutput(executions)
+	}
+	return protocol.NewSessionTerminalExecutionPageEvent(
+		record.Summary.ID,
+		executions,
+		window.start,
+		len(projection.TerminalExecutions),
+		includeOutput,
+		sessionDeltaKnownFromProjection(projection, cursor),
+	)
+}
+
+func shrinkSessionHistoryEventToPayloadBudget(event protocol.SessionHistoryEvent, window snapshotLogWindow, maxPayloadBytes int) protocol.SessionHistoryEvent {
 	markSessionHistoryPayloadLimited(&event, "payload_budget_exceeded")
-	event = shrinkSessionHistoryEntriesToPayloadBudget(event, window, maxPayloadBytes)
-	if fitsProtocolPayloadBudget(event, maxPayloadBytes) {
-		return event
-	}
-	event.RawTerminalByStream = nil
-	event.TerminalExecutions = nil
-	event = shrinkSessionHistoryEntriesToPayloadBudget(event, window, maxPayloadBytes)
-	if fitsProtocolPayloadBudget(event, maxPayloadBytes) {
-		return event
-	}
-	event.Diffs = nil
-	event.CurrentDiff = nil
-	event.ReviewGroups = nil
-	event.ActiveReviewGroup = nil
 	event = shrinkSessionHistoryEntriesToPayloadBudget(event, window, maxPayloadBytes)
 	if fitsProtocolPayloadBudget(event, maxPayloadBytes) {
 		return event
@@ -513,8 +633,28 @@ func markSessionHistoryPagePayloadLimited(event *protocol.SessionHistoryPageEven
 	event.PayloadLimitReason = strings.TrimSpace(reason)
 }
 
+func markSessionDiffPagePayloadLimited(event *protocol.SessionDiffPageEvent, reason string) {
+	event.PayloadLimited = true
+	event.PayloadLimitReason = strings.TrimSpace(reason)
+}
+
+func markSessionTerminalExecutionPagePayloadLimited(event *protocol.SessionTerminalExecutionPageEvent, reason string) {
+	event.PayloadLimited = true
+	event.PayloadLimitReason = strings.TrimSpace(reason)
+}
+
 type snapshotLogWindow struct {
 	entries []data.SnapshotLogEntry
+	start   int
+}
+
+type snapshotDiffWindow struct {
+	entries []DiffContext
+	start   int
+}
+
+type snapshotTerminalExecutionWindow struct {
+	entries []data.TerminalExecution
 	start   int
 }
 
@@ -534,6 +674,141 @@ func snapshotLogEntryWindow(entries []data.SnapshotLogEntry, before, limit int) 
 		entries: append([]data.SnapshotLogEntry(nil), entries[start:before]...),
 		start:   start,
 	}
+}
+
+func diffWindowForProjection(entries []DiffContext, before, limit int) snapshotDiffWindow {
+	total := len(entries)
+	if before <= 0 || before > total {
+		before = total
+	}
+	if limit <= 0 || limit >= before {
+		return snapshotDiffWindow{
+			entries: append([]DiffContext(nil), entries[:before]...),
+			start:   0,
+		}
+	}
+	start := before - limit
+	return snapshotDiffWindow{
+		entries: append([]DiffContext(nil), entries[start:before]...),
+		start:   start,
+	}
+}
+
+func terminalExecutionWindowForProjection(entries []data.TerminalExecution, before, limit int) snapshotTerminalExecutionWindow {
+	total := len(entries)
+	if before <= 0 || before > total {
+		before = total
+	}
+	if limit <= 0 || limit >= before {
+		return snapshotTerminalExecutionWindow{
+			entries: append([]data.TerminalExecution(nil), entries[:before]...),
+			start:   0,
+		}
+	}
+	start := before - limit
+	return snapshotTerminalExecutionWindow{
+		entries: append([]data.TerminalExecution(nil), entries[start:before]...),
+		start:   start,
+	}
+}
+
+func shrinkSessionDiffPageToPayloadBudget(event protocol.SessionDiffPageEvent, window snapshotDiffWindow, projection data.ProjectionSnapshot, cursor DeltaCursorSnapshot, maxPayloadBytes int) protocol.SessionDiffPageEvent {
+	entries, start := shrinkDiffWindowEntries(window, func(candidate snapshotDiffWindow) bool {
+		candidateEvent := sessionDiffPageEventFromProjection(
+			data.SessionRecord{Summary: data.SessionSummary{ID: event.SessionID}, Projection: projection},
+			projection,
+			candidate,
+			cursor,
+		)
+		candidateEvent.PayloadLimited = event.PayloadLimited
+		candidateEvent.PayloadLimitReason = event.PayloadLimitReason
+		return fitsProtocolPayloadBudget(candidateEvent, maxPayloadBytes)
+	})
+	event.Diffs = protocolDiffContextsFromDiffs(entries)
+	event.DiffStart = start
+	event.HasMoreBefore = start > 0
+	event.ReviewGroups = protocolReviewGroupsFromDiffs(entries)
+	event.ActiveReviewGroup = protocolActiveReviewGroupForPage(projection.ActiveReviewGroup, event.ReviewGroups)
+	event.CurrentDiff = protocolCurrentDiffForPage(projection.CurrentDiff, entries)
+	return event
+}
+
+func shrinkSessionTerminalExecutionPageToPayloadBudget(event protocol.SessionTerminalExecutionPageEvent, window snapshotTerminalExecutionWindow, includeOutput bool, projection data.ProjectionSnapshot, cursor DeltaCursorSnapshot, maxPayloadBytes int) protocol.SessionTerminalExecutionPageEvent {
+	entries, start := shrinkTerminalExecutionWindowEntries(window, func(candidate snapshotTerminalExecutionWindow) bool {
+		candidateEvent := sessionTerminalExecutionPageEventFromProjection(
+			data.SessionRecord{Summary: data.SessionSummary{ID: event.SessionID}, Projection: projection},
+			projection,
+			candidate,
+			includeOutput,
+			cursor,
+		)
+		candidateEvent.PayloadLimited = event.PayloadLimited
+		candidateEvent.PayloadLimitReason = event.PayloadLimitReason
+		return fitsProtocolPayloadBudget(candidateEvent, maxPayloadBytes)
+	})
+	event.TerminalExecutions = protocolTerminalExecutions(entries)
+	if !includeOutput {
+		event.TerminalExecutions = stripTerminalExecutionOutput(event.TerminalExecutions)
+	}
+	event.ExecutionStart = start
+	event.HasMoreBefore = start > 0
+	return event
+}
+
+func shrinkDiffWindowEntries(window snapshotDiffWindow, fits func(snapshotDiffWindow) bool) ([]DiffContext, int) {
+	if len(window.entries) == 0 {
+		return nil, window.start
+	}
+	before := window.start + len(window.entries)
+	low, high := 0, len(window.entries)
+	best := 0
+	for low <= high {
+		count := (low + high) / 2
+		start := before - count
+		candidate := snapshotDiffWindow{
+			entries: append([]DiffContext(nil), window.entries[len(window.entries)-count:]...),
+			start:   start,
+		}
+		if fits(candidate) {
+			best = count
+			low = count + 1
+			continue
+		}
+		high = count - 1
+	}
+	start := before - best
+	if best == 0 {
+		return nil, start
+	}
+	return append([]DiffContext(nil), window.entries[len(window.entries)-best:]...), start
+}
+
+func shrinkTerminalExecutionWindowEntries(window snapshotTerminalExecutionWindow, fits func(snapshotTerminalExecutionWindow) bool) ([]data.TerminalExecution, int) {
+	if len(window.entries) == 0 {
+		return nil, window.start
+	}
+	before := window.start + len(window.entries)
+	low, high := 0, len(window.entries)
+	best := 0
+	for low <= high {
+		count := (low + high) / 2
+		start := before - count
+		candidate := snapshotTerminalExecutionWindow{
+			entries: append([]data.TerminalExecution(nil), window.entries[len(window.entries)-count:]...),
+			start:   start,
+		}
+		if fits(candidate) {
+			best = count
+			low = count + 1
+			continue
+		}
+		high = count - 1
+	}
+	start := before - best
+	if best == 0 {
+		return nil, start
+	}
+	return append([]data.TerminalExecution(nil), window.entries[len(window.entries)-best:]...), start
 }
 
 func SessionDeltaEventFromRecord(record data.SessionRecord, known protocol.SessionDeltaKnown, cursor DeltaCursorSnapshot, runtimeAlive bool) protocol.SessionDeltaEvent {
@@ -568,76 +843,29 @@ func SessionDeltaEventFromRecordWithPayloadLimit(record data.SessionRecord, know
 	}
 	appendEntries := append([]protocol.HistoryLogEntry(nil), allEntries[startLog:]...)
 
-	allDiffs := ProtocolDiffContexts(projection.Diffs)
-	startDiff := known.DiffCount
-	diffReset := false
-	if latestCursor > 0 && known.EventCursor >= latestCursor {
-		startDiff = len(allDiffs)
-	}
-	if startDiff < 0 || startDiff > len(allDiffs) {
-		startDiff = 0
-		diffReset = known.DiffCount != 0
-	}
-	upsertDiffs := append([]protocol.HistoryContext(nil), allDiffs[startDiff:]...)
-	if startDiff == len(allDiffs) && (projection.CurrentDiff != nil || len(projection.ReviewGroups) > 0 || projection.ActiveReviewGroup != nil) {
-		upsertDiffs = append([]protocol.HistoryContext(nil), allDiffs...)
-	}
-
-	rawTerminalByStream := make(map[string]string)
 	stdout := projection.RawTerminalByStream["stdout"]
 	stderr := projection.RawTerminalByStream["stderr"]
-	stdoutStart := known.TerminalStdoutLength
-	stdoutReset := false
-	if latestCursor > 0 && known.EventCursor >= latestCursor {
-		stdoutStart = len(stdout)
-	}
-	if stdoutStart < 0 || stdoutStart > len(stdout) {
-		stdoutStart = 0
-		stdoutReset = known.TerminalStdoutLength != 0
-	}
-	stderrStart := known.TerminalStderrLength
-	stderrReset := false
-	if latestCursor > 0 && known.EventCursor >= latestCursor {
-		stderrStart = len(stderr)
-	}
-	if stderrStart < 0 || stderrStart > len(stderr) {
-		stderrStart = 0
-		stderrReset = known.TerminalStderrLength != 0
-	}
-	if stdoutStart < len(stdout) {
-		rawTerminalByStream["stdout"] = stdout[stdoutStart:]
-	}
-	if stderrStart < len(stderr) {
-		rawTerminalByStream["stderr"] = stderr[stderrStart:]
-	}
-
 	allExecutions := protocolTerminalExecutions(projection.TerminalExecutions)
-	executions, terminalExecutionReset := terminalExecutionsForDelta(terminalExecutionDeltaInput{
-		all:                   allExecutions,
-		knownCount:            known.TerminalExecutionCount,
-		cursorCaughtUp:        latestCursor > 0 && known.EventCursor >= latestCursor,
-		entries:               appendEntries,
-		terminalOutputChanged: stdoutStart < len(stdout) || stderrStart < len(stderr),
-	})
+	allDiffs := ProtocolDiffContexts(projection.Diffs)
 	latest.DiffCount = len(allDiffs)
 	latest.TerminalExecutionCount = len(allExecutions)
 	latest.TerminalStdoutLength = len(stdout)
 	latest.TerminalStderrLength = len(stderr)
-	requiresFullSync := logReset || diffReset || stdoutReset || stderrReset || terminalExecutionReset
+	requiresFullSync := logReset
 	event := protocol.NewSessionDeltaEvent(
 		record.Summary.ID,
 		ToProtocolSummary(record.Summary),
 		known,
 		latest,
 		appendEntries,
-		upsertDiffs,
+		nil,
 		ProtocolDiffContext(projection.CurrentDiff),
-		ProtocolReviewGroups(projection.ReviewGroups),
-		ProtocolReviewGroup(projection.ActiveReviewGroup),
+		nil,
+		nil,
 		HistoryContextFromSnapshot(projection.CurrentStep),
 		HistoryContextFromSnapshot(projection.LatestError),
-		rawTerminalByStream,
-		executions,
+		nil,
+		nil,
 		ToProtocolContextWindowUsage(projection.ContextWindowUsage),
 		ToProtocolSessionContext(projection.SessionContext),
 		ToProtocolCatalogMetadata(projection.SkillCatalogMeta),
@@ -783,6 +1011,141 @@ func terminalExecutionStillRunning(item protocol.TerminalExecution) bool {
 	return strings.TrimSpace(item.ExecutionID) != "" &&
 		strings.TrimSpace(item.FinishedAt) == "" &&
 		item.ExitCode == nil
+}
+
+func normalizeTerminalStream(stream string) (string, error) {
+	switch strings.TrimSpace(strings.ToLower(stream)) {
+	case "", "stdout":
+		return "stdout", nil
+	case "stderr":
+		return "stderr", nil
+	default:
+		return "", fmt.Errorf("unsupported terminal stream %q", stream)
+	}
+}
+
+func boundedPositiveLimit(limit, defaultLimit, maxLimit int) int {
+	if limit <= 0 {
+		limit = defaultLimit
+	}
+	if maxLimit > 0 && limit > maxLimit {
+		return maxLimit
+	}
+	return limit
+}
+
+func suggestedTerminalRangeLimit(maxPayloadBytes int) int {
+	if maxPayloadBytes <= 0 {
+		return terminalRangeDefaultLimit
+	}
+	limit := maxPayloadBytes / 2
+	if limit <= 0 {
+		return 1
+	}
+	if limit > terminalRangeMaxLimit {
+		return terminalRangeMaxLimit
+	}
+	return limit
+}
+
+func protocolDiffContextsFromDiffs(diffs []DiffContext) []protocol.HistoryContext {
+	if len(diffs) == 0 {
+		return nil
+	}
+	result := make([]protocol.HistoryContext, 0, len(diffs))
+	for _, diff := range diffs {
+		if ctx := ProtocolDiffContext(&diff); ctx != nil {
+			result = append(result, *ctx)
+		}
+	}
+	return result
+}
+
+func protocolReviewGroupsFromDiffs(diffs []DiffContext) []protocol.ReviewGroup {
+	return ProtocolReviewGroups(RebuildReviewGroups(diffs))
+}
+
+func protocolCurrentDiffForPage(current *DiffContext, page []DiffContext) *protocol.HistoryContext {
+	if current == nil {
+		return nil
+	}
+	for _, item := range page {
+		if snapshotDiffMatches(item, current.ContextID, current.Path) {
+			return ProtocolDiffContext(&item)
+		}
+	}
+	return nil
+}
+
+func protocolActiveReviewGroupForPage(active *ReviewGroup, groups []protocol.ReviewGroup) *protocol.ReviewGroup {
+	if len(groups) == 0 {
+		return nil
+	}
+	activeID := ""
+	if active != nil {
+		activeID = strings.TrimSpace(active.ID)
+	}
+	if activeID != "" {
+		for i := range groups {
+			if strings.TrimSpace(groups[i].ID) == activeID {
+				return &groups[i]
+			}
+		}
+	}
+	return &groups[0]
+}
+
+func stripTerminalExecutionOutput(items []protocol.TerminalExecution) []protocol.TerminalExecution {
+	if len(items) == 0 {
+		return nil
+	}
+	result := make([]protocol.TerminalExecution, 0, len(items))
+	for _, item := range items {
+		item.Stdout = ""
+		item.Stderr = ""
+		result = append(result, item)
+	}
+	return result
+}
+
+func stripHistoryContextBodies(items []protocol.HistoryContext) []protocol.HistoryContext {
+	if len(items) == 0 {
+		return nil
+	}
+	result := make([]protocol.HistoryContext, 0, len(items))
+	for i := range items {
+		item := items[i]
+		item.Diff = ""
+		item.Stack = ""
+		item.Code = ""
+		result = append(result, item)
+	}
+	return result
+}
+
+func stripHistoryContextBody(item *protocol.HistoryContext) *protocol.HistoryContext {
+	if item == nil {
+		return nil
+	}
+	copy := *item
+	copy.Diff = ""
+	copy.Stack = ""
+	copy.Code = ""
+	return &copy
+}
+
+func stripReviewGroupBodies(items []protocol.ReviewGroup) []protocol.ReviewGroup {
+	if len(items) == 0 {
+		return nil
+	}
+	result := make([]protocol.ReviewGroup, 0, len(items))
+	for _, group := range items {
+		for i := range group.Files {
+			group.Files[i].Diff = ""
+		}
+		result = append(result, group)
+	}
+	return result
 }
 
 func RestoredAgentStateEventFromRecord(record data.SessionRecord, hasActiveRunner bool, externalNativeActive bool) *protocol.AgentStateEvent {

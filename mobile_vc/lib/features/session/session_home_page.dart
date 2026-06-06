@@ -1749,6 +1749,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
   }
 
   Future<void> _openDiff(BuildContext context) async {
+    controller.requestDiffPage();
     await showModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
@@ -2369,6 +2370,7 @@ class _SessionHomePageState extends State<SessionHomePage> {
   }
 
   Future<void> _openLogs(BuildContext context) async {
+    controller.requestTerminalHydration();
     controller.requestRuntimeProcessList();
     await showModalBottomSheet<void>(
       context: context,

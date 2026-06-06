@@ -349,7 +349,7 @@ func TestSessionHistoryPageEventFromRecordReturnsEarlierWindow(t *testing.T) {
 	}
 }
 
-func TestSessionDeltaEventFromRecord_FullDeliveryWhenKnownEmpty(t *testing.T) {
+func TestSessionDeltaEventFromRecord_LightweightWhenKnownEmpty(t *testing.T) {
 	record := data.SessionRecord{
 		Summary: data.SessionSummary{ID: "s1"},
 		Projection: data.ProjectionSnapshot{
@@ -372,8 +372,8 @@ func TestSessionDeltaEventFromRecord_FullDeliveryWhenKnownEmpty(t *testing.T) {
 	if len(got.AppendLogEntries) != 2 {
 		t.Errorf("expected 2 log entries, got %d", len(got.AppendLogEntries))
 	}
-	if got.RawTerminalByStream["stdout"] != "stdout-content" {
-		t.Errorf("expected terminal content delivered, got %q", got.RawTerminalByStream["stdout"])
+	if len(got.RawTerminalByStream) != 0 {
+		t.Errorf("expected terminal content to stay lazy-loaded, got %+v", got.RawTerminalByStream)
 	}
 	if got.ContextWindowUsage.TokensUsed != 300 ||
 		got.ContextWindowUsage.TokenLimit != 1000 {
@@ -381,6 +381,9 @@ func TestSessionDeltaEventFromRecord_FullDeliveryWhenKnownEmpty(t *testing.T) {
 	}
 	if got.Latest.LogEntryCount != 2 {
 		t.Errorf("latest log entry count: %d", got.Latest.LogEntryCount)
+	}
+	if got.Latest.TerminalStdoutLength != len("stdout-content") {
+		t.Errorf("latest terminal stdout length: %d", got.Latest.TerminalStdoutLength)
 	}
 }
 
@@ -471,15 +474,15 @@ func TestSessionHistoryWindowEventFromRecordWithPayloadLimitShrinksEntries(t *te
 			Runtime: data.SessionRuntime{Command: "claude"},
 		},
 	}
-	full := SessionHistoryWindowEventFromRecord(record, false, 3)
-	fullBytes, err := json.Marshal(full)
+	lightweight := SessionHistoryWindowEventFromRecordWithPayloadLimit(record, false, 3, 0)
+	lightweightBytes, err := json.Marshal(lightweight)
 	if err != nil {
-		t.Fatalf("marshal full history: %v", err)
+		t.Fatalf("marshal lightweight history: %v", err)
 	}
 
-	got := SessionHistoryWindowEventFromRecordWithPayloadLimit(record, false, 3, len(fullBytes)-10)
+	got := SessionHistoryWindowEventFromRecordWithPayloadLimit(record, false, 3, len(lightweightBytes)-10)
 
-	if len(got.LogEntries) >= len(full.LogEntries) {
+	if len(got.LogEntries) >= len(lightweight.LogEntries) {
 		t.Fatalf("expected shrunken history window, got %d entries", len(got.LogEntries))
 	}
 	if got.LogEntryTotal != 3 || !got.HasMoreBefore {
@@ -489,12 +492,12 @@ func TestSessionHistoryWindowEventFromRecordWithPayloadLimitShrinksEntries(t *te
 	if err != nil {
 		t.Fatalf("marshal shrunken history: %v", err)
 	}
-	if len(encoded) > len(fullBytes)-10 {
-		t.Fatalf("history payload still exceeds budget: got %d budget %d", len(encoded), len(fullBytes)-10)
+	if len(encoded) > len(lightweightBytes)-10 {
+		t.Fatalf("history payload still exceeds budget: got %d budget %d", len(encoded), len(lightweightBytes)-10)
 	}
 }
 
-func TestSessionHistoryWindowEventFromRecordWithPayloadLimitDropsLargeTerminalPayload(t *testing.T) {
+func TestSessionHistoryWindowEventFromRecordOmitsLazyTerminalPayload(t *testing.T) {
 	record := data.SessionRecord{
 		Summary: data.SessionSummary{ID: "s1"},
 		Projection: data.ProjectionSnapshot{
@@ -519,11 +522,8 @@ func TestSessionHistoryWindowEventFromRecordWithPayloadLimitDropsLargeTerminalPa
 
 	got := SessionHistoryWindowEventFromRecordWithCursorAndPayloadLimit(record, false, 1, DeltaCursorSnapshot{LatestCursor: 9}, budget)
 
-	if !got.PayloadLimited {
-		t.Fatalf("expected payloadLimited history")
-	}
-	if got.PayloadLimitReason == "" {
-		t.Fatalf("expected payload limit reason")
+	if got.PayloadLimited {
+		t.Fatalf("expected lazy terminal omission without payload limiting")
 	}
 	if len(got.RawTerminalByStream) != 0 {
 		t.Fatalf("expected raw terminal payload to be dropped, got %+v", got.RawTerminalByStream)
@@ -694,7 +694,7 @@ func TestSessionDeltaEventFromRecordWithPayloadLimitUsesMaxAppendEntriesForEmpty
 	}
 }
 
-func TestSessionDeltaEventFromRecord_RespectsKnownTerminalExecutionCount(t *testing.T) {
+func TestSessionDeltaEventFromRecord_LeavesTerminalExecutionsLazyLoaded(t *testing.T) {
 	record := data.SessionRecord{
 		Summary: data.SessionSummary{ID: "s1"},
 		Projection: data.ProjectionSnapshot{
@@ -710,8 +710,8 @@ func TestSessionDeltaEventFromRecord_RespectsKnownTerminalExecutionCount(t *test
 	if got.Latest.TerminalExecutionCount != 2 {
 		t.Fatalf("latest terminal execution count: %d", got.Latest.TerminalExecutionCount)
 	}
-	if len(got.TerminalExecutions) != 1 || got.TerminalExecutions[0].ExecutionID != "exec-2" {
-		t.Fatalf("expected only new terminal execution, got %+v", got.TerminalExecutions)
+	if len(got.TerminalExecutions) != 0 {
+		t.Fatalf("expected terminal executions to stay lazy-loaded, got %+v", got.TerminalExecutions)
 	}
 }
 
@@ -737,8 +737,8 @@ func TestSessionDeltaEventFromRecord_IncludesUpdatedExecutionForAppendedLog(t *t
 	if len(got.AppendLogEntries) != 1 || got.AppendLogEntries[0].Phase != "finished" {
 		t.Fatalf("expected appended finished log, got %+v", got.AppendLogEntries)
 	}
-	if len(got.TerminalExecutions) != 1 || got.TerminalExecutions[0].FinishedAt == "" {
-		t.Fatalf("expected updated terminal execution, got %+v", got.TerminalExecutions)
+	if len(got.TerminalExecutions) != 0 {
+		t.Fatalf("expected terminal execution details to stay lazy-loaded, got %+v", got.TerminalExecutions)
 	}
 }
 
@@ -762,15 +762,12 @@ func TestSessionDeltaEventFromRecord_IncludesRunningExecutionsWhenTerminalOutput
 	if got.RequiresFullSync {
 		t.Fatalf("expected incremental terminal output delta, got full sync")
 	}
-	if len(got.TerminalExecutions) != 2 {
-		t.Fatalf("expected running executions to be refreshed, got %+v", got.TerminalExecutions)
-	}
-	if got.TerminalExecutions[0].ExecutionID != "exec-1" || got.TerminalExecutions[1].ExecutionID != "exec-2" {
-		t.Fatalf("unexpected execution order: %+v", got.TerminalExecutions)
+	if len(got.TerminalExecutions) != 0 || len(got.RawTerminalByStream) != 0 {
+		t.Fatalf("expected terminal payloads to stay lazy-loaded, executions=%+v raw=%+v", got.TerminalExecutions, got.RawTerminalByStream)
 	}
 }
 
-func TestSessionDeltaEventFromRecord_KnownTerminalExecutionExceedsLatestRequiresFullSync(t *testing.T) {
+func TestSessionDeltaEventFromRecord_KnownTerminalExecutionExceedsLatestDoesNotFullSync(t *testing.T) {
 	record := data.SessionRecord{
 		Summary: data.SessionSummary{ID: "s1"},
 		Projection: data.ProjectionSnapshot{
@@ -782,11 +779,95 @@ func TestSessionDeltaEventFromRecord_KnownTerminalExecutionExceedsLatestRequires
 	}
 	known := protocol.SessionDeltaKnown{TerminalExecutionCount: 100}
 	got := SessionDeltaEventFromRecord(record, known, DeltaCursorSnapshot{}, false)
-	if !got.RequiresFullSync {
-		t.Fatalf("expected full sync when known terminal execution count is invalid")
+	if got.RequiresFullSync {
+		t.Fatalf("terminal execution mismatches should be resolved through lazy execution page hydration")
 	}
 	if len(got.TerminalExecutions) != 0 {
 		t.Fatalf("expected invalid delta base to avoid full terminal execution delivery, got %+v", got.TerminalExecutions)
+	}
+}
+
+func TestSessionTerminalRangeEventFromRecordWithPayloadLimitReturnsRange(t *testing.T) {
+	record := data.SessionRecord{
+		Summary: data.SessionSummary{ID: "s1"},
+		Projection: data.ProjectionSnapshot{
+			RawTerminalByStream: map[string]string{"stdout": "0123456789"},
+			Runtime:             data.SessionRuntime{Command: "claude"},
+		},
+	}
+
+	got, err := SessionTerminalRangeEventFromRecordWithPayloadLimit(record, "stdout", 2, 4, DeltaCursorSnapshot{LatestCursor: 7}, 0)
+	if err != nil {
+		t.Fatalf("terminal range: %v", err)
+	}
+	if got.Stream != "stdout" || got.Start != 2 || got.End != 6 || got.Total != 10 || got.Content != "2345" {
+		t.Fatalf("unexpected terminal range: %+v", got)
+	}
+	if got.Latest.EventCursor != 7 || got.Latest.TerminalStdoutLength != 10 {
+		t.Fatalf("latest metadata not preserved: %+v", got.Latest)
+	}
+}
+
+func TestSessionTerminalRangeEventFromRecordWithPayloadLimitRejectsInvalidStream(t *testing.T) {
+	record := data.SessionRecord{Summary: data.SessionSummary{ID: "s1"}}
+	if _, err := SessionTerminalRangeEventFromRecordWithPayloadLimit(record, "stdin", 0, 1, DeltaCursorSnapshot{}, 0); err == nil {
+		t.Fatal("expected invalid stream error")
+	}
+}
+
+func TestSessionDiffPageEventFromRecordWithPayloadLimitReturnsBoundedPage(t *testing.T) {
+	record := data.SessionRecord{
+		Summary: data.SessionSummary{ID: "s1"},
+		Projection: data.ProjectionSnapshot{
+			Diffs: []DiffContext{
+				{ContextID: "diff-1", Path: "a.go", Diff: "a"},
+				{ContextID: "diff-2", Path: "b.go", Diff: "b", GroupID: "g"},
+				{ContextID: "diff-3", Path: "c.go", Diff: "c", GroupID: "g"},
+			},
+			CurrentDiff: &DiffContext{ContextID: "diff-3", Path: "c.go", Diff: "c", GroupID: "g"},
+			Runtime:     data.SessionRuntime{Command: "claude"},
+		},
+	}
+
+	got := SessionDiffPageEventFromRecordWithPayloadLimit(record, 3, 2, DeltaCursorSnapshot{LatestCursor: 8}, 0)
+	if got.DiffStart != 1 || got.DiffTotal != 3 || !got.HasMoreBefore {
+		t.Fatalf("unexpected diff page metadata: %+v", got)
+	}
+	if len(got.Diffs) != 2 || got.Diffs[0].ID != "diff-2" || got.Diffs[1].ID != "diff-3" {
+		t.Fatalf("unexpected diff page entries: %+v", got.Diffs)
+	}
+	if got.CurrentDiff == nil || got.CurrentDiff.ID != "diff-3" {
+		t.Fatalf("expected current diff on page, got %+v", got.CurrentDiff)
+	}
+	if got.Latest.EventCursor != 8 || got.Latest.DiffCount != 3 {
+		t.Fatalf("latest metadata not preserved: %+v", got.Latest)
+	}
+}
+
+func TestSessionTerminalExecutionPageEventFromRecordWithPayloadLimitStripsOutputByDefault(t *testing.T) {
+	record := data.SessionRecord{
+		Summary: data.SessionSummary{ID: "s1"},
+		Projection: data.ProjectionSnapshot{
+			TerminalExecutions: []data.TerminalExecution{
+				{ExecutionID: "exec-1", Command: "first", Stdout: "old"},
+				{ExecutionID: "exec-2", Command: "second", Stdout: "new"},
+			},
+			Runtime: data.SessionRuntime{Command: "claude"},
+		},
+	}
+
+	got := SessionTerminalExecutionPageEventFromRecordWithPayloadLimit(record, 2, 1, false, DeltaCursorSnapshot{LatestCursor: 9}, 0)
+	if got.ExecutionStart != 1 || got.ExecutionTotal != 2 || !got.HasMoreBefore {
+		t.Fatalf("unexpected execution page metadata: %+v", got)
+	}
+	if len(got.TerminalExecutions) != 1 || got.TerminalExecutions[0].ExecutionID != "exec-2" {
+		t.Fatalf("unexpected execution page entries: %+v", got.TerminalExecutions)
+	}
+	if got.TerminalExecutions[0].Stdout != "" {
+		t.Fatalf("expected output stripped by default, got %+v", got.TerminalExecutions[0])
+	}
+	if got.Latest.EventCursor != 9 || got.Latest.TerminalExecutionCount != 2 {
+		t.Fatalf("latest metadata not preserved: %+v", got.Latest)
 	}
 }
 

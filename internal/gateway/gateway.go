@@ -1592,6 +1592,39 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 		return loadStoredSessionRecordForRequest(targetSessionID)
 	}
 
+	loadSelectedProjectionRecord := func(requestedSessionID string) (data.SessionRecord, *runtimeSession, error) {
+		targetSessionID := strings.TrimSpace(requestedSessionID)
+		if targetSessionID == "" {
+			targetSessionID = strings.TrimSpace(selectedSessionID)
+		}
+		if targetSessionID == "" {
+			return data.SessionRecord{}, nil, fmt.Errorf("session ID is required")
+		}
+		if targetSessionID != strings.TrimSpace(selectedSessionID) {
+			return data.SessionRecord{}, nil, fmt.Errorf("session %s is not selected", targetSessionID)
+		}
+		record, err := loadSessionDeltaRecord(targetSessionID)
+		if err != nil {
+			return data.SessionRecord{}, nil, err
+		}
+		updateProjectionMeta(record)
+		sessionRuntime, sessionRuntimeSvc := runtimeForSession(record.Summary.ID)
+		if !isNativeMirrorSessionID(record.Summary.ID) {
+			record = mergeClaudeJSONLToRecord(ctx, h.SessionStore, record, sessionRuntimeSvc)
+			updateProjectionMeta(record)
+		}
+		freshProjection := session.NormalizeProjectionSnapshot(record.Projection)
+		runtimeProjection := h.mergeActiveLiveProjection(record.Summary.ID, finalizeProjectionSnapshotForService(record.Summary.ID, sessionRuntimeSvc, freshProjection))
+		if isNativeMirrorSessionID(record.Summary.ID) {
+			record.Projection = mergeProjectionWithOptionalRuntime(freshProjection, runtimeProjection, sessionRuntimeSvc, record.Summary.ID)
+		} else {
+			record.Projection = runtimeProjection
+		}
+		record.Summary.Runtime = record.Projection.Runtime
+		cacheProjection(record.Summary.ID, record.Projection, false)
+		return record, sessionRuntime, nil
+	}
+
 	persistProjection := func(sessionID string, snapshot data.ProjectionSnapshot, force bool) {
 		if h.SessionStore == nil || strings.TrimSpace(sessionID) == "" {
 			if h.SessionStore == nil {
@@ -1946,7 +1979,6 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				} else {
 					updateProjectionMeta(record)
 					emit(session.SessionHistoryWindowEventFromRecordWithCursorAndPayloadLimit(record, sessionRecordRuntimeAlive(record, runtimeSvc), sessionResumeHistoryLimit, deltaCursorSnapshot(activeRuntimeSession), gatewayRelaySafePayloadBudgetBytes))
-					emitReviewStateFromProjection(emit, selectedSessionID, record.Projection)
 				}
 			}
 		}
@@ -2188,7 +2220,6 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			emit(session.SessionHistoryWindowEventFromRecordWithCursorAndPayloadLimit(record, loadRuntimeAlive, loadHistoryLimit, deltaCursorSnapshot(loadSessionRuntime), gatewayRelaySafePayloadBudgetBytes))
 			trace.Step("emit_history")
 			emitContextWindowUsageIfAvailable(record.Summary.ID, runtimeSvc)
-			emitReviewStateFromProjection(emit, selectedSessionID, record.Projection)
 			if restored := restoredAgentStateEventFromRecord(record, loadRuntimeAlive); restored != nil {
 				emit(*restored)
 				if status, ok := session.AIStatusEventForBackendEvent(record.Summary.ID, runtimeSvc, record.Projection, *restored); ok {
@@ -2245,6 +2276,71 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			pageHistoryLimit := sessionHistoryWindowLimit(req.Limit)
 			pageEvent := session.SessionHistoryPageEventFromRecordWithPayloadLimit(record, req.Before, pageHistoryLimit, gatewayRelaySafePayloadBudgetBytes)
 			logx.Info("ws", "session history page response: connectionID=%s sessionID=%s remoteAddr=%s before=%d limit=%d start=%d total=%d entries=%d", connectionID, record.Summary.ID, remoteAddr, req.Before, pageHistoryLimit, pageEvent.LogEntryStart, pageEvent.LogEntryTotal, len(pageEvent.LogEntries))
+			emit(pageEvent)
+		case "session_terminal_range_get":
+			var req protocol.SessionTerminalRangeRequestEvent
+			if err := json.Unmarshal(payloadBytes, &req); err != nil {
+				logx.Warn("ws", "invalid session_terminal_range_get request: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
+				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid session_terminal_range_get request: %v", err), ""))
+				continue
+			}
+			if h.SessionStore == nil {
+				emit(protocol.NewErrorEvent(selectedSessionID, "session store unavailable", ""))
+				continue
+			}
+			record, sessionRuntime, err := loadSelectedProjectionRecord(req.SessionID)
+			if err != nil {
+				logx.Warn("ws", "session terminal range failed: connectionID=%s sessionID=%s requestedSessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, req.SessionID, remoteAddr, err)
+				emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
+				continue
+			}
+			rangeEvent, err := session.SessionTerminalRangeEventFromRecordWithPayloadLimit(record, req.Stream, req.Start, req.Limit, deltaCursorSnapshot(sessionRuntime), gatewayRelaySafePayloadBudgetBytes)
+			if err != nil {
+				logx.Warn("ws", "session terminal range invalid stream: connectionID=%s sessionID=%s requestedSessionID=%s stream=%q remoteAddr=%s err=%v", connectionID, selectedSessionID, req.SessionID, req.Stream, remoteAddr, err)
+				emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
+				continue
+			}
+			logx.Info("ws", "session terminal range response: connectionID=%s sessionID=%s remoteAddr=%s stream=%s start=%d end=%d total=%d payloadLimited=%v", connectionID, record.Summary.ID, remoteAddr, rangeEvent.Stream, rangeEvent.Start, rangeEvent.End, rangeEvent.Total, rangeEvent.PayloadLimited)
+			emit(rangeEvent)
+		case "session_diff_page_get":
+			var req protocol.SessionDiffPageRequestEvent
+			if err := json.Unmarshal(payloadBytes, &req); err != nil {
+				logx.Warn("ws", "invalid session_diff_page_get request: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
+				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid session_diff_page_get request: %v", err), ""))
+				continue
+			}
+			if h.SessionStore == nil {
+				emit(protocol.NewErrorEvent(selectedSessionID, "session store unavailable", ""))
+				continue
+			}
+			record, sessionRuntime, err := loadSelectedProjectionRecord(req.SessionID)
+			if err != nil {
+				logx.Warn("ws", "session diff page failed: connectionID=%s sessionID=%s requestedSessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, req.SessionID, remoteAddr, err)
+				emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
+				continue
+			}
+			pageEvent := session.SessionDiffPageEventFromRecordWithPayloadLimit(record, req.Before, req.Limit, deltaCursorSnapshot(sessionRuntime), gatewayRelaySafePayloadBudgetBytes)
+			logx.Info("ws", "session diff page response: connectionID=%s sessionID=%s remoteAddr=%s before=%d limit=%d start=%d total=%d diffs=%d payloadLimited=%v", connectionID, record.Summary.ID, remoteAddr, req.Before, req.Limit, pageEvent.DiffStart, pageEvent.DiffTotal, len(pageEvent.Diffs), pageEvent.PayloadLimited)
+			emit(pageEvent)
+		case "session_terminal_execution_page_get":
+			var req protocol.SessionTerminalExecutionPageRequestEvent
+			if err := json.Unmarshal(payloadBytes, &req); err != nil {
+				logx.Warn("ws", "invalid session_terminal_execution_page_get request: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
+				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid session_terminal_execution_page_get request: %v", err), ""))
+				continue
+			}
+			if h.SessionStore == nil {
+				emit(protocol.NewErrorEvent(selectedSessionID, "session store unavailable", ""))
+				continue
+			}
+			record, sessionRuntime, err := loadSelectedProjectionRecord(req.SessionID)
+			if err != nil {
+				logx.Warn("ws", "session terminal execution page failed: connectionID=%s sessionID=%s requestedSessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, req.SessionID, remoteAddr, err)
+				emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
+				continue
+			}
+			pageEvent := session.SessionTerminalExecutionPageEventFromRecordWithPayloadLimit(record, req.Before, req.Limit, req.IncludeOutput, deltaCursorSnapshot(sessionRuntime), gatewayRelaySafePayloadBudgetBytes)
+			logx.Info("ws", "session terminal execution page response: connectionID=%s sessionID=%s remoteAddr=%s before=%d limit=%d start=%d total=%d executions=%d includeOutput=%v payloadLimited=%v", connectionID, record.Summary.ID, remoteAddr, req.Before, req.Limit, pageEvent.ExecutionStart, pageEvent.ExecutionTotal, len(pageEvent.TerminalExecutions), pageEvent.IncludeOutput, pageEvent.PayloadLimited)
 			emit(pageEvent)
 		case "register_push_token":
 			var req protocol.RegisterPushTokenRequestEvent
@@ -2332,7 +2428,6 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			metrics := projectionMetrics(record.Projection)
 			logx.Info("ws", "session delta response: connectionID=%s sessionID=%s remoteAddr=%s reason=%q runtimeAlive=%v canResume=%v requiresFullSync=%v logEntries=%d diffs=%d stdoutBytes=%d stderrBytes=%d", connectionID, record.Summary.ID, remoteAddr, req.Reason, runtimeAlive, sessionRuntime != nil && runtimeAlive, deltaEvent.RequiresFullSync, metrics.logEntries, metrics.diffs, metrics.stdoutBytes, metrics.stderrBytes)
 			emit(deltaEvent)
-			emitReviewStateFromProjection(emit, selectedSessionID, record.Projection)
 			if snapshot := sessionRuntimeSvc.BuildTaskSnapshotEvent(record.Summary.ID, taskCursorSnapshot(sessionRuntime), "delta", true); snapshot != nil {
 				emit(*snapshot)
 				if status, ok := session.AIStatusEventForBackendEvent(record.Summary.ID, sessionRuntimeSvc, record.Projection, *snapshot); ok {
@@ -2413,7 +2508,6 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			emit(session.SessionHistoryWindowEventFromRecordWithCursorAndPayloadLimit(record, runtimeAlive, resumeHistoryLimit, deltaCursorSnapshot(sessionRuntime), gatewayRelaySafePayloadBudgetBytes))
 			emitContextWindowUsageIfAvailable(record.Summary.ID, runtimeSvc)
 			logx.Info("ws", "session history emitted: sessionID=%s runtimeAlive=%v ownership=%s limit=%d", record.Summary.ID, runtimeAlive, record.Summary.Ownership, resumeHistoryLimit)
-			emitReviewStateFromProjection(emit, selectedSessionID, record.Projection)
 			restoredState := ""
 			var restoredAgentEvent *protocol.AgentStateEvent
 			if restored := restoredAgentStateEventFromRecord(record, runtimeAlive); restored != nil {
@@ -2553,7 +2647,6 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			record.Summary.Runtime = record.Projection.Runtime
 			cacheProjection(record.Summary.ID, record.Projection, false)
 			emit(session.SessionHistoryWindowEventFromRecordWithCursorAndPayloadLimit(record, sessionRecordRuntimeAlive(record, runtimeSvc), sessionResumeHistoryLimit, deltaCursorSnapshot(activeRuntimeSession), gatewayRelaySafePayloadBudgetBytes))
-			emitReviewStateFromProjection(emit, selectedSessionID, record.Projection)
 			if restored := restoredAgentStateEventFromRecord(record, sessionRecordRuntimeAlive(record, runtimeSvc)); restored != nil {
 				emit(*restored)
 			}

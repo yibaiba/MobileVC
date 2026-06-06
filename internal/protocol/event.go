@@ -39,6 +39,9 @@ const (
 	EventTypeSessionHistory            = "session_history"
 	EventTypeSessionHistoryPage        = "session_history_page"
 	EventTypeSessionDelta              = "session_delta"
+	EventTypeSessionTerminalRange      = "session_terminal_range"
+	EventTypeSessionDiffPage           = "session_diff_page"
+	EventTypeSessionTerminalExecPage   = "session_terminal_execution_page"
 	EventTypeSessionUpdated            = "session_updated"
 	EventTypeReviewState               = "review_state"
 	EventTypeSkillCatalogResult        = "skill_catalog_result"
@@ -566,6 +569,32 @@ type SessionHistoryPageRequestEvent struct {
 	Limit     int    `json:"limit,omitempty"`
 }
 
+type SessionTerminalRangeRequestEvent struct {
+	ClientEvent
+	SessionID string `json:"sessionId"`
+	CWD       string `json:"cwd,omitempty"`
+	Stream    string `json:"stream,omitempty"`
+	Start     int    `json:"start,omitempty"`
+	Limit     int    `json:"limit,omitempty"`
+}
+
+type SessionDiffPageRequestEvent struct {
+	ClientEvent
+	SessionID string `json:"sessionId"`
+	CWD       string `json:"cwd,omitempty"`
+	Before    int    `json:"before,omitempty"`
+	Limit     int    `json:"limit,omitempty"`
+}
+
+type SessionTerminalExecutionPageRequestEvent struct {
+	ClientEvent
+	SessionID     string `json:"sessionId"`
+	CWD           string `json:"cwd,omitempty"`
+	Before        int    `json:"before,omitempty"`
+	Limit         int    `json:"limit,omitempty"`
+	IncludeOutput bool   `json:"includeOutput,omitempty"`
+}
+
 type SessionDeleteRequestEvent struct {
 	ClientEvent
 	SessionID string `json:"sessionId"`
@@ -742,6 +771,45 @@ type SessionHistoryPageEvent struct {
 	ResumeRuntimeMeta  RuntimeMeta       `json:"resumeRuntimeMeta,omitempty"`
 	PayloadLimited     bool              `json:"payloadLimited,omitempty"`
 	PayloadLimitReason string            `json:"payloadLimitReason,omitempty"`
+}
+
+type SessionTerminalRangeEvent struct {
+	Event
+	Stream             string            `json:"stream,omitempty"`
+	Start              int               `json:"start,omitempty"`
+	End                int               `json:"end,omitempty"`
+	Total              int               `json:"total,omitempty"`
+	Content            string            `json:"content,omitempty"`
+	Latest             SessionDeltaKnown `json:"latest,omitempty"`
+	PayloadLimited     bool              `json:"payloadLimited,omitempty"`
+	PayloadLimitReason string            `json:"payloadLimitReason,omitempty"`
+	SuggestedLimit     int               `json:"suggestedLimit,omitempty"`
+}
+
+type SessionDiffPageEvent struct {
+	Event
+	Diffs              []HistoryContext  `json:"diffs,omitempty"`
+	DiffStart          int               `json:"diffStart,omitempty"`
+	DiffTotal          int               `json:"diffTotal,omitempty"`
+	HasMoreBefore      bool              `json:"hasMoreBefore,omitempty"`
+	ReviewGroups       []ReviewGroup     `json:"reviewGroups,omitempty"`
+	ActiveReviewGroup  *ReviewGroup      `json:"activeReviewGroup,omitempty"`
+	CurrentDiff        *HistoryContext   `json:"currentDiff,omitempty"`
+	Latest             SessionDeltaKnown `json:"latest,omitempty"`
+	PayloadLimited     bool              `json:"payloadLimited,omitempty"`
+	PayloadLimitReason string            `json:"payloadLimitReason,omitempty"`
+}
+
+type SessionTerminalExecutionPageEvent struct {
+	Event
+	TerminalExecutions []TerminalExecution `json:"terminalExecutions,omitempty"`
+	ExecutionStart     int                 `json:"executionStart,omitempty"`
+	ExecutionTotal     int                 `json:"executionTotal,omitempty"`
+	HasMoreBefore      bool                `json:"hasMoreBefore,omitempty"`
+	IncludeOutput      bool                `json:"includeOutput,omitempty"`
+	Latest             SessionDeltaKnown   `json:"latest,omitempty"`
+	PayloadLimited     bool                `json:"payloadLimited,omitempty"`
+	PayloadLimitReason string              `json:"payloadLimitReason,omitempty"`
 }
 
 type SessionResumeResultEvent struct {
@@ -1495,6 +1563,44 @@ func NewSessionHistoryPageEvent(sessionID string, logEntries []HistoryLogEntry, 
 	}
 }
 
+func NewSessionTerminalRangeEvent(sessionID, stream string, start, end, total int, content string, latest SessionDeltaKnown) SessionTerminalRangeEvent {
+	return SessionTerminalRangeEvent{
+		Event:   NewBaseEvent(EventTypeSessionTerminalRange, sessionID),
+		Stream:  strings.TrimSpace(stream),
+		Start:   start,
+		End:     end,
+		Total:   total,
+		Content: content,
+		Latest:  latest,
+	}
+}
+
+func NewSessionDiffPageEvent(sessionID string, diffs []HistoryContext, diffStart, diffTotal int, reviewGroups []ReviewGroup, activeReviewGroup *ReviewGroup, currentDiff *HistoryContext, latest SessionDeltaKnown) SessionDiffPageEvent {
+	return SessionDiffPageEvent{
+		Event:             NewBaseEvent(EventTypeSessionDiffPage, sessionID),
+		Diffs:             diffs,
+		DiffStart:         diffStart,
+		DiffTotal:         diffTotal,
+		HasMoreBefore:     diffStart > 0,
+		ReviewGroups:      reviewGroups,
+		ActiveReviewGroup: activeReviewGroup,
+		CurrentDiff:       currentDiff,
+		Latest:            latest,
+	}
+}
+
+func NewSessionTerminalExecutionPageEvent(sessionID string, terminalExecutions []TerminalExecution, executionStart, executionTotal int, includeOutput bool, latest SessionDeltaKnown) SessionTerminalExecutionPageEvent {
+	return SessionTerminalExecutionPageEvent{
+		Event:              NewBaseEvent(EventTypeSessionTerminalExecPage, sessionID),
+		TerminalExecutions: terminalExecutions,
+		ExecutionStart:     executionStart,
+		ExecutionTotal:     executionTotal,
+		HasMoreBefore:      executionStart > 0,
+		IncludeOutput:      includeOutput,
+		Latest:             latest,
+	}
+}
+
 func NewSessionResumeResultEvent(sessionID string, latestCursor int64, runtimeAlive bool, runtimeState string, reattaching bool, replayedCount int, message string) SessionResumeResultEvent {
 	return SessionResumeResultEvent{
 		Event:         NewBaseEvent(EventTypeSessionResumeResult, sessionID),
@@ -1867,6 +1973,15 @@ func ApplyRuntimeMeta(event any, meta RuntimeMeta) any {
 	case SessionDeltaEvent:
 		e.RuntimeMeta = MergeRuntimeMeta(e.RuntimeMeta, meta)
 		return e
+	case SessionTerminalRangeEvent:
+		e.RuntimeMeta = MergeRuntimeMeta(e.RuntimeMeta, meta)
+		return e
+	case SessionDiffPageEvent:
+		e.RuntimeMeta = MergeRuntimeMeta(e.RuntimeMeta, meta)
+		return e
+	case SessionTerminalExecutionPageEvent:
+		e.RuntimeMeta = MergeRuntimeMeta(e.RuntimeMeta, meta)
+		return e
 	case SessionUpdatedEvent:
 		e.RuntimeMeta = MergeRuntimeMeta(e.RuntimeMeta, meta)
 		return e
@@ -1992,6 +2107,15 @@ func ApplyEventCursor(event any, cursor int64) any {
 		e.EventCursor = cursor
 		return e
 	case SessionDeltaEvent:
+		e.EventCursor = cursor
+		return e
+	case SessionTerminalRangeEvent:
+		e.EventCursor = cursor
+		return e
+	case SessionDiffPageEvent:
+		e.EventCursor = cursor
+		return e
+	case SessionTerminalExecutionPageEvent:
 		e.EventCursor = cursor
 		return e
 	case SessionUpdatedEvent:

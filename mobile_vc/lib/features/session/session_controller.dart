@@ -409,6 +409,11 @@ class SessionController extends ChangeNotifier {
   final Map<String, int> _historyLogEntryStartBySession = <String, int>{};
   final Map<String, int> _historyLogEntryTotalBySession = <String, int>{};
   final Set<String> _historyPageRequestsInFlight = <String>{};
+  final Set<String> _terminalRangeRequestsInFlight = <String>{};
+  final Set<String> _diffPageRequestsInFlight = <String>{};
+  final Set<String> _terminalExecutionPageRequestsInFlight = <String>{};
+  final Map<String, int> _diffPageStartBySession = <String, int>{};
+  final Map<String, int> _terminalExecutionPageStartBySession = <String, int>{};
   final List<ReviewGroup> _reviewGroups = [];
   final List<TerminalExecution> _terminalExecutions = [];
   final List<RuntimeProcessItem> _runtimeProcesses = [];
@@ -1060,6 +1065,9 @@ class SessionController extends ChangeNotifier {
       return;
     }
     _activeTerminalExecutionId = normalized;
+    requestTerminalExecutionPage(includeOutput: true);
+    requestTerminalRange('stdout');
+    requestTerminalRange('stderr');
     notifyListeners();
   }
 
@@ -2797,6 +2805,7 @@ class SessionController extends ChangeNotifier {
     _sessionEventCursors.clear();
     _sessionDeltaKnown.clear();
     _visibleHistoryLogEntryKeys.clear();
+    _clearProjectionHydrationState();
     _canResumeCurrentSession = false;
     _resumeRuntimeMeta = const RuntimeMeta();
     _contextWindowUsage = const ContextWindowUsage();
@@ -3067,6 +3076,14 @@ class SessionController extends ChangeNotifier {
         known.terminalExecutionCount == 0 &&
         known.terminalStdoutLength == 0 &&
         known.terminalStderrLength == 0;
+  }
+
+  void _clearProjectionHydrationState() {
+    _terminalRangeRequestsInFlight.clear();
+    _diffPageRequestsInFlight.clear();
+    _terminalExecutionPageRequestsInFlight.clear();
+    _diffPageStartBySession.clear();
+    _terminalExecutionPageStartBySession.clear();
   }
 
   Future<void> restoreSessionFromNotification(String sessionId) async {
@@ -3450,6 +3467,7 @@ class SessionController extends ChangeNotifier {
     _activeReviewDiffId = '';
     _clearTimelineItems();
     _visibleHistoryLogEntryKeys.clear();
+    _clearProjectionHydrationState();
     _terminalStdout = '';
     _terminalStderr = '';
     _activeTerminalExecutionId = '';
@@ -4017,7 +4035,107 @@ class SessionController extends ChangeNotifier {
   }
 
   void requestReviewState() {
-    _service.send({'action': 'review_state_get'});
+    requestDiffPage();
+  }
+
+  void requestDiffPage({int limit = 50, bool force = false}) {
+    final sessionId = _selectedSessionId.trim();
+    if (!_connected || _connecting || sessionId.isEmpty) {
+      return;
+    }
+    final known = _currentSessionDeltaKnown(sessionId);
+    final total = known.diffCount;
+    if (!force && total <= 0 && _recentDiffs.isEmpty) {
+      return;
+    }
+    final before = total > 0 ? total : _recentDiffs.length;
+    final key = '$sessionId:$before:$limit';
+    if (!force && _diffPageRequestsInFlight.contains(key)) {
+      return;
+    }
+    _diffPageRequestsInFlight.add(key);
+    _service.send({
+      'action': 'session_diff_page_get',
+      'sessionId': sessionId,
+      'cwd': effectiveCwd,
+      'before': before,
+      'limit': limit,
+    });
+  }
+
+  void requestTerminalHydration({bool force = false}) {
+    requestTerminalRange('stdout', force: force);
+    requestTerminalRange('stderr', force: force);
+    requestTerminalExecutionPage(force: force);
+  }
+
+  void requestTerminalRange(
+    String stream, {
+    int limit = 256 * 1024,
+    bool force = false,
+  }) {
+    final sessionId = _selectedSessionId.trim();
+    if (!_connected || _connecting || sessionId.isEmpty) {
+      return;
+    }
+    final normalizedStream =
+        stream.trim().toLowerCase() == 'stderr' ? 'stderr' : 'stdout';
+    final known = _currentSessionDeltaKnown(sessionId);
+    final currentLength = normalizedStream == 'stderr'
+        ? _terminalStderr.length
+        : _terminalStdout.length;
+    final total = normalizedStream == 'stderr'
+        ? known.terminalStderrLength
+        : known.terminalStdoutLength;
+    if (!force && total <= currentLength) {
+      return;
+    }
+    final key = '$sessionId:$normalizedStream:$currentLength:$limit';
+    if (!force && _terminalRangeRequestsInFlight.contains(key)) {
+      return;
+    }
+    _terminalRangeRequestsInFlight.add(key);
+    _service.send({
+      'action': 'session_terminal_range_get',
+      'sessionId': sessionId,
+      'cwd': effectiveCwd,
+      'stream': normalizedStream,
+      'start': currentLength,
+      'limit': limit,
+    });
+  }
+
+  void requestTerminalExecutionPage({
+    int limit = 50,
+    bool includeOutput = false,
+    bool force = false,
+  }) {
+    final sessionId = _selectedSessionId.trim();
+    if (!_connected || _connecting || sessionId.isEmpty) {
+      return;
+    }
+    final known = _currentSessionDeltaKnown(sessionId);
+    final total = known.terminalExecutionCount;
+    final activeNeedsOutput = includeOutput &&
+        (_resolvedActiveTerminalExecution()?.hasOutput == false ||
+            _terminalExecutions.isEmpty);
+    if (!force && !activeNeedsOutput && total <= _terminalExecutions.length) {
+      return;
+    }
+    final before = total > 0 ? total : _terminalExecutions.length;
+    final key = '$sessionId:$before:$limit:$includeOutput';
+    if (!force && _terminalExecutionPageRequestsInFlight.contains(key)) {
+      return;
+    }
+    _terminalExecutionPageRequestsInFlight.add(key);
+    _service.send({
+      'action': 'session_terminal_execution_page_get',
+      'sessionId': sessionId,
+      'cwd': effectiveCwd,
+      'before': before,
+      'limit': limit,
+      'includeOutput': includeOutput,
+    });
   }
 
   void requestTaskSnapshot() {
@@ -5689,6 +5807,12 @@ class SessionController extends ChangeNotifier {
           ..clear()
           ..addAll(history.terminalExecutions);
         _restoreTerminalLogs(history.rawTerminalByStream);
+        _diffPageStartBySession[resolvedHistorySummary.id] =
+            history.diffs.isEmpty ? history.latest.diffCount : 0;
+        _terminalExecutionPageStartBySession[resolvedHistorySummary.id] =
+            history.terminalExecutions.isEmpty
+                ? history.latest.terminalExecutionCount
+                : 0;
         final historyLatest = history.latest;
         if (_sessionDeltaKnownIsEmpty(historyLatest)) {
           _sessionDeltaKnown[resolvedHistorySummary.id] = SessionDeltaKnown(
@@ -5717,51 +5841,19 @@ class SessionController extends ChangeNotifier {
         if (history.currentDiff != null) {
           final current = _normalizeHistoryDiff(history.currentDiff!);
           _mergeRecentDiff(current);
-          _currentDiff = FileDiffEvent(
-            timestamp: DateTime.now(),
-            sessionId: resolvedHistorySummary.id,
-            runtimeMeta: history.resumeRuntimeMeta.merge(
-              RuntimeMeta(
-                contextId: current.id,
-                contextTitle: current.title,
-                targetPath: current.path,
-                targetDiff: current.diff,
-                targetTitle: current.title,
-                executionId: current.executionId,
-                groupId: current.groupId,
-                groupTitle: current.groupTitle,
-              ),
-            ),
-            raw: const {},
-            path: current.path,
-            title: current.title,
-            diff: current.diff,
-            lang: current.lang,
+          _currentDiff = _fileDiffFromHistoryContext(
+            resolvedHistorySummary.id,
+            current,
+            history.resumeRuntimeMeta,
           );
         } else {
           final resolved = _resolvedCurrentDiff();
           _currentDiff = resolved == null
               ? null
-              : FileDiffEvent(
-                  timestamp: DateTime.now(),
-                  sessionId: resolvedHistorySummary.id,
-                  runtimeMeta: history.resumeRuntimeMeta.merge(
-                    RuntimeMeta(
-                      contextId: resolved.id,
-                      contextTitle: resolved.title,
-                      targetPath: resolved.path,
-                      targetDiff: resolved.diff,
-                      targetTitle: resolved.title,
-                      executionId: resolved.executionId,
-                      groupId: resolved.groupId,
-                      groupTitle: resolved.groupTitle,
-                    ),
-                  ),
-                  raw: const {},
-                  path: resolved.path,
-                  title: resolved.title,
-                  diff: resolved.diff,
-                  lang: resolved.lang,
+              : _fileDiffFromHistoryContext(
+                  resolvedHistorySummary.id,
+                  resolved,
+                  history.resumeRuntimeMeta,
                 );
         }
         if (_matchesPendingSessionTarget(resolvedHistorySummary.id)) {
@@ -5790,6 +5882,15 @@ class SessionController extends ChangeNotifier {
         break;
       case SessionHistoryPageEvent page:
         _handleSessionHistoryPage(page);
+        break;
+      case SessionTerminalRangeEvent range:
+        _handleSessionTerminalRange(range);
+        break;
+      case SessionDiffPageEvent page:
+        _handleSessionDiffPage(page);
+        break;
+      case SessionTerminalExecutionPageEvent page:
+        _handleSessionTerminalExecutionPage(page);
         break;
       case SessionDeltaEvent delta:
         _handleSessionDelta(delta);
@@ -6984,26 +7085,10 @@ class SessionController extends ChangeNotifier {
     if (delta.currentDiff != null) {
       final current = _normalizeHistoryDiff(delta.currentDiff!);
       _mergeRecentDiff(current);
-      _currentDiff = FileDiffEvent(
-        timestamp: DateTime.now(),
-        sessionId: delta.sessionId,
-        runtimeMeta: delta.resumeRuntimeMeta.merge(
-          RuntimeMeta(
-            contextId: current.id,
-            contextTitle: current.title,
-            targetPath: current.path,
-            targetDiff: current.diff,
-            targetTitle: current.title,
-            executionId: current.executionId,
-            groupId: current.groupId,
-            groupTitle: current.groupTitle,
-          ),
-        ),
-        raw: const {},
-        path: current.path,
-        title: current.title,
-        diff: current.diff,
-        lang: current.lang,
+      _currentDiff = _fileDiffFromHistoryContext(
+        delta.sessionId,
+        current,
+        delta.resumeRuntimeMeta,
       );
     }
     _syncDerivedState();
@@ -7076,6 +7161,152 @@ class SessionController extends ChangeNotifier {
     );
     _syncDerivedState();
     notifyListeners();
+  }
+
+  void _handleSessionTerminalRange(SessionTerminalRangeEvent range) {
+    final sessionId = range.sessionId.trim();
+    final stream =
+        range.stream.trim().toLowerCase() == 'stderr' ? 'stderr' : 'stdout';
+    _terminalRangeRequestsInFlight.removeWhere(
+      (key) => key.startsWith('$sessionId:$stream:'),
+    );
+    if (!_eventTargetsCurrentSession(sessionId)) {
+      return;
+    }
+    if (!_sessionDeltaKnownIsEmpty(range.latest)) {
+      _sessionDeltaKnown[sessionId] = range.latest;
+    }
+    if (range.payloadLimited) {
+      _pushDebug(
+        'terminal range payload limited',
+        '${range.payloadLimitReason} suggested=${range.suggestedLimit}',
+      );
+      return;
+    }
+    final current = stream == 'stderr' ? _terminalStderr : _terminalStdout;
+    final next = _mergedTerminalRange(
+      current,
+      start: range.start,
+      end: range.end,
+      content: range.content,
+    );
+    if (next == null) {
+      _pushDebug(
+        'terminal range ignored',
+        'stream=$stream current=${current.length} start=${range.start} end=${range.end}',
+      );
+      return;
+    }
+    if (stream == 'stderr') {
+      _terminalStderr = next;
+    } else {
+      _terminalStdout = next;
+    }
+    _syncActiveTerminalExecution();
+    _syncDerivedState();
+    notifyListeners();
+  }
+
+  void _handleSessionDiffPage(SessionDiffPageEvent page) {
+    final sessionId = page.sessionId.trim();
+    _diffPageRequestsInFlight
+        .removeWhere((key) => key.startsWith('$sessionId:'));
+    if (!_eventTargetsCurrentSession(sessionId)) {
+      return;
+    }
+    if (!_sessionDeltaKnownIsEmpty(page.latest)) {
+      _sessionDeltaKnown[sessionId] = page.latest;
+    }
+    _diffPageStartBySession[sessionId] = page.diffStart;
+    for (final diff in page.diffs) {
+      _mergeRecentDiff(diff);
+    }
+    if (page.reviewGroups.isNotEmpty || page.activeReviewGroup != null) {
+      _reviewGroups
+        ..clear()
+        ..addAll(page.reviewGroups.map(_normalizeReviewGroup));
+      _activeReviewGroupId = page.activeReviewGroup?.id ?? '';
+      _syncReviewGroupsFromRecentDiffs();
+      _syncActiveReviewSelection();
+    }
+    if (page.currentDiff != null) {
+      final current = _normalizeHistoryDiff(page.currentDiff!);
+      _mergeRecentDiff(current);
+      _currentDiff = _fileDiffFromHistoryContext(
+        sessionId,
+        current,
+        page.runtimeMeta,
+      );
+    }
+    _syncDerivedState();
+    notifyListeners();
+  }
+
+  void _handleSessionTerminalExecutionPage(
+    SessionTerminalExecutionPageEvent page,
+  ) {
+    final sessionId = page.sessionId.trim();
+    _terminalExecutionPageRequestsInFlight
+        .removeWhere((key) => key.startsWith('$sessionId:'));
+    if (!_eventTargetsCurrentSession(sessionId)) {
+      return;
+    }
+    if (!_sessionDeltaKnownIsEmpty(page.latest)) {
+      _sessionDeltaKnown[sessionId] = page.latest;
+    }
+    _terminalExecutionPageStartBySession[sessionId] = page.executionStart;
+    _mergeTerminalExecutions(page.terminalExecutions);
+    _syncDerivedState();
+    notifyListeners();
+  }
+
+  String? _mergedTerminalRange(
+    String current, {
+    required int start,
+    required int end,
+    required String content,
+  }) {
+    if (start < 0 || end < start || end - start != content.length) {
+      return null;
+    }
+    if (start == current.length) {
+      return current + content;
+    }
+    if (start == 0 && end >= current.length) {
+      return content + current.substring(end);
+    }
+    if (start > current.length || end > current.length) {
+      return null;
+    }
+    return current.replaceRange(start, end, content);
+  }
+
+  FileDiffEvent _fileDiffFromHistoryContext(
+    String sessionId,
+    HistoryContext current,
+    RuntimeMeta meta,
+  ) {
+    return FileDiffEvent(
+      timestamp: DateTime.now(),
+      sessionId: sessionId,
+      runtimeMeta: meta.merge(
+        RuntimeMeta(
+          contextId: current.id,
+          contextTitle: current.title,
+          targetPath: current.path,
+          targetDiff: current.diff,
+          targetTitle: current.title,
+          executionId: current.executionId,
+          groupId: current.groupId,
+          groupTitle: current.groupTitle,
+        ),
+      ),
+      raw: const {},
+      path: current.path,
+      title: current.title,
+      diff: current.diff,
+      lang: current.lang,
+    );
   }
 
   void _prependHistoryTimelineEntries(
@@ -10614,10 +10845,43 @@ class SessionController extends ChangeNotifier {
       if (index == -1) {
         _terminalExecutions.add(next);
       } else {
-        _terminalExecutions[index] = next;
+        _terminalExecutions[index] =
+            _mergedTerminalExecution(_terminalExecutions[index], next);
       }
     }
     _syncActiveTerminalExecution();
+  }
+
+  TerminalExecution _mergedTerminalExecution(
+    TerminalExecution current,
+    TerminalExecution next,
+  ) {
+    return TerminalExecution(
+      executionId: next.executionId.trim().isNotEmpty
+          ? next.executionId
+          : current.executionId,
+      command: next.command.trim().isNotEmpty ? next.command : current.command,
+      cwd: next.cwd.trim().isNotEmpty ? next.cwd : current.cwd,
+      source: next.source.trim().isNotEmpty ? next.source : current.source,
+      sourceLabel: next.sourceLabel.trim().isNotEmpty
+          ? next.sourceLabel
+          : current.sourceLabel,
+      contextId:
+          next.contextId.trim().isNotEmpty ? next.contextId : current.contextId,
+      contextTitle: next.contextTitle.trim().isNotEmpty
+          ? next.contextTitle
+          : current.contextTitle,
+      groupId: next.groupId.trim().isNotEmpty ? next.groupId : current.groupId,
+      groupTitle: next.groupTitle.trim().isNotEmpty
+          ? next.groupTitle
+          : current.groupTitle,
+      startedAt: next.startedAt ?? current.startedAt,
+      completedAt: next.completedAt ?? current.completedAt,
+      running: next.running,
+      exitCode: next.exitCode ?? current.exitCode,
+      stdout: next.stdout.isNotEmpty ? next.stdout : current.stdout,
+      stderr: next.stderr.isNotEmpty ? next.stderr : current.stderr,
+    );
   }
 
   void _appendTerminalLogs(Map<String, String> rawTerminalByStream) {

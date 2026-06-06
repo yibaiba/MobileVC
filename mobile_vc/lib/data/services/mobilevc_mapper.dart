@@ -73,6 +73,12 @@ class MobileVcMapper {
         return SessionHistoryPageEvent.fromJson(json);
       case 'session_delta':
         return SessionDeltaEvent.fromJson(json);
+      case 'session_terminal_range':
+        return SessionTerminalRangeEvent.fromJson(json);
+      case 'session_diff_page':
+        return SessionDiffPageEvent.fromJson(json);
+      case 'session_terminal_execution_page':
+        return SessionTerminalExecutionPageEvent.fromJson(json);
       case 'session_updated':
         return SessionUpdatedEvent.fromJson(json);
       case 'session_resume_result':

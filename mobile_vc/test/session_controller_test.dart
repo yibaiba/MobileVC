@@ -7406,8 +7406,8 @@ void main() {
       );
       expect(
         service.sentPayloads
-            .where((item) => item['action'] == 'review_state_get'),
-        isNotEmpty,
+            .where((item) => item['action'] == 'session_diff_page_get'),
+        isEmpty,
       );
     });
 
@@ -9509,7 +9509,7 @@ void main() {
       expect(prompt.options, hasLength(3));
     });
 
-    test('connect 时会补发 session_context_get 和 review_state_get', () async {
+    test('connect 时会补发 session_context_get，但不主动拉取 diff page', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);
       await controller.initialize();
@@ -9530,7 +9530,8 @@ void main() {
           .whereType<String>()
           .toList();
       expect(actions, contains('session_context_get'));
-      expect(actions, contains('review_state_get'));
+      expect(actions, isNot(contains('review_state_get')));
+      expect(actions, isNot(contains('session_diff_page_get')));
     });
 
     test('review 决策后优先跳到同组下一个待审文件', () async {
@@ -13822,6 +13823,132 @@ void main() {
         controller.timeline.where((item) => item.body == '同一条原生历史回复').length,
         1,
       );
+    });
+
+    test('lazy hydration events merge terminal diff and execution state',
+        () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        logEntries: const [
+          HistoryLogEntry(kind: 'markdown', message: 'visible'),
+        ],
+        latest: const SessionDeltaKnown(
+          eventCursor: 3,
+          logEntryCount: 1,
+          diffCount: 2,
+          terminalExecutionCount: 1,
+          terminalStdoutLength: 10,
+          terminalStderrLength: 6,
+        ),
+        resumeRuntimeMeta: const RuntimeMeta(cwd: '/workspace'),
+      ));
+      await _flushEvents();
+
+      service.sentPayloads.clear();
+      controller.requestTerminalHydration();
+      controller.requestDiffPage();
+
+      expect(
+        service.sentPayloads.where(
+            (payload) => payload['action'] == 'session_terminal_range_get'),
+        hasLength(2),
+      );
+      expect(
+        service.sentPayloads.where((payload) =>
+            payload['action'] == 'session_terminal_execution_page_get'),
+        hasLength(1),
+      );
+      expect(
+        service.sentPayloads
+            .where((payload) => payload['action'] == 'session_diff_page_get'),
+        hasLength(1),
+      );
+
+      service.emit(SessionTerminalRangeEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 1)),
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_terminal_range'},
+        stream: 'stdout',
+        start: 0,
+        end: 10,
+        total: 10,
+        content: '0123456789',
+        latest: const SessionDeltaKnown(
+          eventCursor: 4,
+          logEntryCount: 1,
+          diffCount: 2,
+          terminalExecutionCount: 1,
+          terminalStdoutLength: 10,
+          terminalStderrLength: 6,
+        ),
+      ));
+      service.emit(SessionDiffPageEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 2)),
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_diff_page'},
+        diffStart: 1,
+        diffTotal: 2,
+        hasMoreBefore: true,
+        diffs: const [
+          HistoryContext(
+            id: 'diff-2',
+            type: 'diff',
+            path: '/workspace/a.dart',
+            title: 'a.dart',
+            diff: '+new',
+            pendingReview: true,
+            groupId: 'group-1',
+          ),
+        ],
+        reviewGroups: const [
+          ReviewGroup(id: 'group-1', title: 'Review', pendingCount: 1),
+        ],
+        activeReviewGroup:
+            const ReviewGroup(id: 'group-1', title: 'Review', pendingCount: 1),
+        currentDiff: const HistoryContext(
+          id: 'diff-2',
+          type: 'diff',
+          path: '/workspace/a.dart',
+          title: 'a.dart',
+          diff: '+new',
+          pendingReview: true,
+          groupId: 'group-1',
+        ),
+      ));
+      service.emit(SessionTerminalExecutionPageEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 3)),
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_terminal_execution_page'},
+        executionStart: 0,
+        executionTotal: 1,
+        terminalExecutions: const [
+          TerminalExecution(
+            executionId: 'exec-1',
+            command: 'go test',
+          ),
+        ],
+      ));
+      await _flushEvents();
+
+      expect(controller.terminalStdout, '0123456789');
+      expect(controller.terminalExecutions.single.executionId, 'exec-1');
+      expect(controller.currentDiffContext?.id, 'diff-2');
+      expect(controller.reviewGroups, hasLength(1));
+      expect(controller.timeline.where((item) => item.body == 'visible'),
+          hasLength(1));
     });
 
     test('loadSession 期间不属于目标的 stale history 仍会被丢弃', () async {
