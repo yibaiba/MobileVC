@@ -25,10 +25,18 @@ type FileStore struct {
 	memoryCatalogPath   string
 	permissionRulesPath string
 	pushTokensPath      string
+	sessionMetaCache    map[string]sessionRecordMeta
 }
 
 type fileIndex struct {
 	Sessions []SessionSummary `json:"sessions"`
+}
+
+type sessionRecordMeta struct {
+	Summary           SessionSummary
+	ClientActions     []ClientActionRecord
+	SessionContext    SessionContext
+	SessionContextSet bool
 }
 
 var (
@@ -50,6 +58,7 @@ func NewFileStore(baseDir string) (*FileStore, error) {
 		memoryCatalogPath:   filepath.Join(baseDir, "memory.catalog.json"),
 		permissionRulesPath: filepath.Join(baseDir, "permissions.rules.json"),
 		pushTokensPath:      filepath.Join(baseDir, "push_tokens.json"),
+		sessionMetaCache:    make(map[string]sessionRecordMeta),
 	}, nil
 }
 
@@ -89,6 +98,7 @@ func (s *FileStore) CreateSession(ctx context.Context, title string) (SessionSum
 	if err := s.writeSessionLocked(record); err != nil {
 		return SessionSummary{}, err
 	}
+	s.cacheSessionMetaLocked(record)
 	if err := s.writeIndexLocked(index); err != nil {
 		return SessionSummary{}, err
 	}
@@ -135,6 +145,7 @@ func (s *FileStore) UpsertSession(ctx context.Context, record SessionRecord) (Se
 	if err := s.writeSessionLocked(record); err != nil {
 		return SessionSummary{}, err
 	}
+	s.cacheSessionMetaLocked(record)
 	updated := false
 	for i := range index.Sessions {
 		if index.Sessions[i].ID == record.Summary.ID {
@@ -156,6 +167,10 @@ func (s *FileStore) UpsertSession(ctx context.Context, record SessionRecord) (Se
 }
 
 func (s *FileStore) SaveProjection(ctx context.Context, sessionID string, projection ProjectionSnapshot) (SessionSummary, error) {
+	return s.SaveProjectionWithOptions(ctx, sessionID, projection)
+}
+
+func (s *FileStore) SaveProjectionWithOptions(ctx context.Context, sessionID string, projection ProjectionSnapshot, opts ...ProjectionSaveOption) (SessionSummary, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	select {
@@ -163,9 +178,13 @@ func (s *FileStore) SaveProjection(ctx context.Context, sessionID string, projec
 		return SessionSummary{}, ctx.Err()
 	default:
 	}
-	record, err := s.readSessionLocked(sessionID)
-	if err != nil {
-		return SessionSummary{}, err
+	meta, ok := s.sessionMetaLocked(sessionID)
+	if !ok {
+		record, err := s.readSessionLocked(sessionID)
+		if err != nil {
+			return SessionSummary{}, err
+		}
+		meta = sessionMetaFromRecord(record)
 	}
 	now := time.Now().UTC()
 	if !projection.SessionContextSet {
@@ -174,15 +193,30 @@ func (s *FileStore) SaveProjection(ctx context.Context, sessionID string, projec
 			len(projection.SessionContext.EnabledMemoryIDs) > 0
 	}
 	if !projection.SessionContextSet {
-		projection.SessionContext = record.Projection.SessionContext
-		projection.SessionContextSet = record.Projection.SessionContext.Configured
+		projection.SessionContext = meta.SessionContext
+		projection.SessionContextSet = meta.SessionContextSet
+	}
+	record := SessionRecord{
+		Summary:       meta.Summary,
+		Projection:    projection,
+		ClientActions: append([]ClientActionRecord(nil), meta.ClientActions...),
 	}
 	record.Projection = normalizeProjection(projection)
 	record = normalizeSessionRecord(record)
 	record.Summary.UpdatedAt = now
+	saveOpts := ProjectionSaveOptions{}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&saveOpts)
+		}
+	}
+	if saveOpts.JSONLSyncEntryCount != nil {
+		record.Summary.JSONLSyncEntryCount = *saveOpts.JSONLSyncEntryCount
+	}
 	if err := s.writeSessionLocked(record); err != nil {
 		return SessionSummary{}, err
 	}
+	s.cacheSessionMetaLocked(record)
 	index, err := s.readIndexLocked()
 	if err != nil {
 		return SessionSummary{}, err
@@ -215,7 +249,12 @@ func (s *FileStore) GetSession(ctx context.Context, sessionID string) (SessionRe
 		return SessionRecord{}, ctx.Err()
 	default:
 	}
-	return s.readSessionLocked(sessionID)
+	record, err := s.readSessionLocked(sessionID)
+	if err != nil {
+		return SessionRecord{}, err
+	}
+	s.cacheSessionMetaLocked(record)
+	return record, nil
 }
 
 func (s *FileStore) ListSessions(ctx context.Context) ([]SessionSummary, error) {
@@ -266,6 +305,7 @@ func (s *FileStore) DeleteSession(ctx context.Context, sessionID string) error {
 	if err := s.writeIndexLocked(index); err != nil {
 		return err
 	}
+	delete(s.sessionMetaCache, sessionID)
 	return nil
 }
 
@@ -397,11 +437,11 @@ func (s *FileStore) readIndexLocked() (fileIndex, error) {
 }
 
 func (s *FileStore) writeIndexLocked(index fileIndex) error {
-	data, err := json.MarshalIndent(index, "", "  ")
+	data, err := json.Marshal(index)
 	if err != nil {
 		return fmt.Errorf("encode session index: %w", err)
 	}
-	return os.WriteFile(s.indexPath, data, 0o644)
+	return writeJSONFileAtomic(s.indexPath, data, 0o644)
 }
 
 func (s *FileStore) readSessionLocked(sessionID string) (SessionRecord, error) {
@@ -421,11 +461,45 @@ func (s *FileStore) readSessionLocked(sessionID string) (SessionRecord, error) {
 
 func (s *FileStore) writeSessionLocked(record SessionRecord) error {
 	record = normalizeSessionRecord(record)
-	data, err := json.MarshalIndent(record, "", "  ")
+	data, err := json.Marshal(record)
 	if err != nil {
 		return fmt.Errorf("encode session record: %w", err)
 	}
-	return os.WriteFile(s.sessionPath(record.Summary.ID), data, 0o644)
+	return writeJSONFileAtomic(s.sessionPath(record.Summary.ID), data, 0o644)
+}
+
+func writeJSONFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("create parent dir: %w", err)
+	}
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-")
+	if err != nil {
+		return fmt.Errorf("create temp file: %w", err)
+	}
+	tmpPath := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("write temp file: %w", err)
+	}
+	if err := tmp.Chmod(perm); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("chmod temp file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close temp file: %w", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("replace file: %w", err)
+	}
+	cleanup = false
+	return nil
 }
 
 func (s *FileStore) readSkillCatalogSnapshotLocked() (SkillCatalogSnapshot, error) {
@@ -490,11 +564,11 @@ func (s *FileStore) readJSONFileLocked(path string, target any, readErrLabel, de
 }
 
 func (s *FileStore) writeJSONFileLocked(path string, value any, encodeErrLabel string) error {
-	data, err := json.MarshalIndent(value, "", "  ")
+	data, err := json.Marshal(value)
 	if err != nil {
 		return fmt.Errorf("%s: %w", encodeErrLabel, err)
 	}
-	return os.WriteFile(path, data, 0o644)
+	return writeJSONFileAtomic(path, data, 0o644)
 }
 
 func (s *FileStore) sessionPath(sessionID string) string {
@@ -551,6 +625,7 @@ func (s *FileStore) MarkClientAction(ctx context.Context, sessionID string, reco
 	if err := s.writeSessionLocked(sessionRecord); err != nil {
 		return false, err
 	}
+	s.cacheSessionMetaLocked(sessionRecord)
 	return false, nil
 }
 
@@ -562,6 +637,41 @@ func filterOut(items []SessionSummary, id string) []SessionSummary {
 		}
 	}
 	return out
+}
+
+func sessionMetaFromRecord(record SessionRecord) sessionRecordMeta {
+	record = normalizeSessionRecord(record)
+	return sessionRecordMeta{
+		Summary:           record.Summary,
+		ClientActions:     append([]ClientActionRecord(nil), record.ClientActions...),
+		SessionContext:    record.Projection.SessionContext,
+		SessionContextSet: record.Projection.SessionContextSet || record.Projection.SessionContext.Configured,
+	}
+}
+
+func (s *FileStore) cacheSessionMetaLocked(record SessionRecord) {
+	if s.sessionMetaCache == nil {
+		s.sessionMetaCache = make(map[string]sessionRecordMeta)
+	}
+	meta := sessionMetaFromRecord(record)
+	sessionID := strings.TrimSpace(meta.Summary.ID)
+	if sessionID == "" {
+		return
+	}
+	s.sessionMetaCache[sessionID] = meta
+}
+
+func (s *FileStore) sessionMetaLocked(sessionID string) (sessionRecordMeta, bool) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" || s.sessionMetaCache == nil {
+		return sessionRecordMeta{}, false
+	}
+	meta, ok := s.sessionMetaCache[sessionID]
+	if !ok {
+		return sessionRecordMeta{}, false
+	}
+	meta.ClientActions = append([]ClientActionRecord(nil), meta.ClientActions...)
+	return meta, true
 }
 
 func normalizeProjection(projection ProjectionSnapshot) ProjectionSnapshot {

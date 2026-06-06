@@ -463,6 +463,8 @@ type localTestServer struct {
 	URL      string
 	server   *http.Server
 	listener net.Listener
+	done     chan struct{}
+	wg       sync.WaitGroup
 }
 
 type countingStore struct {
@@ -498,11 +500,29 @@ type blockingFinalMemorySyncStore struct {
 	finalSaveCount   int
 }
 
+type blockingProjectionSaveStore struct {
+	data.Store
+	mu          sync.Mutex
+	saveStarted chan struct{}
+	saveRelease chan struct{}
+	saveDone    chan struct{}
+	saveCount   int
+}
+
 func newBlockingSkillSyncStore(store data.Store) *blockingSkillSyncStore {
 	return &blockingSkillSyncStore{
 		Store:              store,
 		syncingSaveStarted: make(chan struct{}),
 		syncingSaveRelease: make(chan struct{}),
+	}
+}
+
+func newBlockingProjectionSaveStore(store data.Store) *blockingProjectionSaveStore {
+	return &blockingProjectionSaveStore{
+		Store:       store,
+		saveStarted: make(chan struct{}),
+		saveRelease: make(chan struct{}),
+		saveDone:    make(chan struct{}),
 	}
 }
 
@@ -579,6 +599,27 @@ func (s *blockingFinalMemorySyncStore) SaveMemoryCatalogSnapshot(ctx context.Con
 	return s.Store.SaveMemoryCatalogSnapshot(ctx, snapshot)
 }
 
+func (s *blockingProjectionSaveStore) SaveProjection(ctx context.Context, sessionID string, projection data.ProjectionSnapshot) (data.SessionSummary, error) {
+	return s.SaveProjectionWithOptions(ctx, sessionID, projection)
+}
+
+func (s *blockingProjectionSaveStore) SaveProjectionWithOptions(ctx context.Context, sessionID string, projection data.ProjectionSnapshot, opts ...data.ProjectionSaveOption) (data.SessionSummary, error) {
+	s.mu.Lock()
+	s.saveCount++
+	count := s.saveCount
+	s.mu.Unlock()
+	if count == 1 {
+		close(s.saveStarted)
+		defer close(s.saveDone)
+		select {
+		case <-ctx.Done():
+			return data.SessionSummary{}, ctx.Err()
+		case <-s.saveRelease:
+		}
+	}
+	return saveProjectionWithOptions(s.Store, ctx, sessionID, projection, opts...)
+}
+
 func (s *blockingSkillSyncStore) WaitSyncingSaveStarted(t *testing.T) {
 	t.Helper()
 	select {
@@ -606,11 +647,37 @@ func (s *blockingFinalMemorySyncStore) WaitFinalSaveStarted(t *testing.T) {
 	}
 }
 
+func (s *blockingProjectionSaveStore) WaitSaveStarted(t *testing.T) {
+	t.Helper()
+	select {
+	case <-s.saveStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("projection save did not start")
+	}
+}
+
 func (s *blockingSkillSyncStore) ReleaseSyncingSave() {
 	select {
 	case <-s.syncingSaveRelease:
 	default:
 		close(s.syncingSaveRelease)
+	}
+}
+
+func (s *blockingProjectionSaveStore) ReleaseSave() {
+	select {
+	case <-s.saveRelease:
+	default:
+		close(s.saveRelease)
+	}
+}
+
+func (s *blockingProjectionSaveStore) WaitSaveDone(t *testing.T) {
+	t.Helper()
+	select {
+	case <-s.saveDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("projection save did not finish")
 	}
 }
 
@@ -754,11 +821,26 @@ func (s *localTestServer) Close() {
 		return
 	}
 	if s.server != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		_ = s.server.Shutdown(ctx)
 		cancel()
 	}
 	_ = s.listener.Close()
+	handlerDone := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(handlerDone)
+	}()
+	select {
+	case <-handlerDone:
+	case <-time.After(2 * time.Second):
+	}
+	if s.done != nil {
+		select {
+		case <-s.done:
+		case <-time.After(2 * time.Second):
+		}
+	}
 }
 
 func newLocalHTTPServer(t *testing.T, handler http.Handler) *localTestServer {
@@ -767,15 +849,23 @@ func newLocalHTTPServer(t *testing.T, handler http.Handler) *localTestServer {
 	if err != nil {
 		t.Fatalf("listen test server: %v", err)
 	}
-	server := &http.Server{Handler: handler}
-	go func() {
-		_ = server.Serve(listener)
-	}()
+	done := make(chan struct{})
 	testServer := &localTestServer{
 		URL:      "http://" + listener.Addr().String(),
-		server:   server,
 		listener: listener,
+		done:     done,
 	}
+	wrappedHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		testServer.wg.Add(1)
+		defer testServer.wg.Done()
+		handler.ServeHTTP(w, r)
+	})
+	server := &http.Server{Handler: wrappedHandler}
+	testServer.server = server
+	go func() {
+		defer close(done)
+		_ = server.Serve(listener)
+	}()
 	t.Cleanup(testServer.Close)
 	return testServer
 }
@@ -783,18 +873,18 @@ func newLocalHTTPServer(t *testing.T, handler http.Handler) *localTestServer {
 func newTestConn(t *testing.T, h *Handler) *websocket.Conn {
 	t.Helper()
 	server := newLocalHTTPServer(t, h)
-	if h != nil && h.runtimeSessions != nil {
-		t.Cleanup(func() {
-			h.runtimeSessions.CleanupAll()
-		})
-	}
-
 	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/?token=test"
 	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
 	if err != nil {
 		t.Fatalf("dial websocket: %v", err)
 	}
-	t.Cleanup(func() { _ = conn.Close() })
+	t.Cleanup(func() {
+		_ = conn.Close()
+		server.Close()
+		if h != nil {
+			h.Close()
+		}
+	})
 	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	return conn
 }
@@ -802,12 +892,6 @@ func newTestConn(t *testing.T, h *Handler) *websocket.Conn {
 func dialTestConn(t *testing.T, h *Handler, origin string) (*websocket.Conn, *http.Response) {
 	t.Helper()
 	server := newLocalHTTPServer(t, h)
-	if h != nil && h.runtimeSessions != nil {
-		t.Cleanup(func() {
-			h.runtimeSessions.CleanupAll()
-		})
-	}
-
 	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/?token=test"
 	headers := http.Header{}
 	if origin != "" {
@@ -817,7 +901,13 @@ func dialTestConn(t *testing.T, h *Handler, origin string) (*websocket.Conn, *ht
 	if err != nil {
 		return nil, resp
 	}
-	t.Cleanup(func() { _ = conn.Close() })
+	t.Cleanup(func() {
+		_ = conn.Close()
+		server.Close()
+		if h != nil {
+			h.Close()
+		}
+	})
 	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	return conn, resp
 }
@@ -6897,6 +6987,43 @@ func TestHandlerCompactDoesNotBlockPingPong(t *testing.T) {
 	if compact["accepted"] != true {
 		t.Fatalf("expected compact success after release, got %#v", compact)
 	}
+}
+
+func TestHandlerProjectionSaveDoesNotBlockPingPong(t *testing.T) {
+	fileStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	blockingStore := newBlockingProjectionSaveStore(fileStore)
+	runner := newInteractiveHoldingStubRunner()
+	h := newTestHandler()
+	h.SessionStore = blockingStore
+	h.NewPtyRunner = func() engine.Runner { return runner }
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+	sessionID := createHistorySessionForHandlerTest(t, h, conn, "projection-save-ping-session")
+
+	if err := conn.WriteJSON(protocol.ExecRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "exec", SessionID: sessionID, ClientActionID: "exec-blocking-save"},
+		Command:     "claude",
+		Mode:        "pty",
+	}); err != nil {
+		t.Fatalf("write exec request: %v", err)
+	}
+	_ = readUntilClientActionAck(t, conn, "exec", "exec-blocking-save")
+	blockingStore.WaitSaveStarted(t)
+
+	if err := conn.WriteJSON(map[string]any{"action": "ping", "pingId": "during-projection-save"}); err != nil {
+		t.Fatalf("write ping request: %v", err)
+	}
+	pong := readUntilPongID(t, conn, "during-projection-save")
+	if pong["sessionId"] != sessionID {
+		t.Fatalf("expected pong for loaded session %q, got %#v", sessionID, pong)
+	}
+
+	blockingStore.ReleaseSave()
+	blockingStore.WaitSaveDone(t)
+	runner.WaitStarted(t)
 }
 
 func TestHandlerCompactRejectsConcurrentSameSessionRequest(t *testing.T) {

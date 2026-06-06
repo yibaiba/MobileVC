@@ -38,6 +38,9 @@ const clientActionDedupeLimit = 500
 const sessionResumeHistoryLimit = 120
 const gatewayWriteQueueSize = 128
 const gatewayPriorityWriteQueueSize = 32
+const projectionPersistFlushInterval = 350 * time.Millisecond
+const projectionPersistQueueSize = 64
+const projectionPersistTimeout = 10 * time.Second
 
 func sessionHistoryWindowLimit(requested int) int {
 	if requested <= 0 {
@@ -74,6 +77,40 @@ type sessionListCacheEntry struct {
 	cwd       string
 	createdAt time.Time
 	items     []data.SessionSummary
+}
+
+type projectionPersistRequest struct {
+	sessionID string
+	snapshot  data.ProjectionSnapshot
+	force     bool
+}
+
+type projectionPersistSessionMeta struct {
+	claudeSessionUUID   string
+	cwd                 string
+	jsonlSyncEntryCount int
+}
+
+type projectionPersistWorker struct {
+	ctx        context.Context
+	cancel     context.CancelFunc
+	store      data.Store
+	connection string
+	remoteAddr string
+	onPersist  func(sessionID string)
+
+	reqCh chan projectionPersistRequest
+	done  chan struct{}
+
+	mu      sync.Mutex
+	pending map[string]data.ProjectionSnapshot
+	meta    map[string]projectionPersistSessionMeta
+}
+
+type handlerProjectionWriter struct {
+	mu     sync.Mutex
+	store  data.Store
+	worker *projectionPersistWorker
 }
 
 func newSessionLoadTrace(connectionID, selectedSessionID, requestedSessionID, remoteAddr, reason string) *sessionLoadTrace {
@@ -141,6 +178,253 @@ func projectionMetrics(projection data.ProjectionSnapshot) projectionTraceMetric
 	}
 }
 
+func newProjectionPersistWorker(ctx context.Context, store data.Store, connectionID, remoteAddr string, onPersist func(string)) *projectionPersistWorker {
+	workerCtx, cancel := context.WithCancel(ctx)
+	w := &projectionPersistWorker{
+		ctx:        workerCtx,
+		cancel:     cancel,
+		store:      store,
+		connection: strings.TrimSpace(connectionID),
+		remoteAddr: strings.TrimSpace(remoteAddr),
+		onPersist:  onPersist,
+		reqCh:      make(chan projectionPersistRequest, projectionPersistQueueSize),
+		done:       make(chan struct{}),
+		pending:    make(map[string]data.ProjectionSnapshot),
+		meta:       make(map[string]projectionPersistSessionMeta),
+	}
+	go w.run()
+	return w
+}
+
+func (w *projectionPersistWorker) updateMeta(record data.SessionRecord) {
+	if w == nil {
+		return
+	}
+	sessionID := strings.TrimSpace(record.Summary.ID)
+	if sessionID == "" {
+		return
+	}
+	cwd := strings.TrimSpace(record.Summary.Runtime.CWD)
+	if cwd == "" {
+		cwd = strings.TrimSpace(record.Projection.Runtime.CWD)
+	}
+	w.mu.Lock()
+	w.meta[sessionID] = projectionPersistSessionMeta{
+		claudeSessionUUID:   strings.TrimSpace(record.Summary.ClaudeSessionUUID),
+		cwd:                 cwd,
+		jsonlSyncEntryCount: record.Summary.JSONLSyncEntryCount,
+	}
+	w.mu.Unlock()
+}
+
+func (w *projectionPersistWorker) enqueue(sessionID string, snapshot data.ProjectionSnapshot, force bool) {
+	if w == nil || w.store == nil || strings.TrimSpace(sessionID) == "" {
+		return
+	}
+	req := projectionPersistRequest{sessionID: strings.TrimSpace(sessionID), snapshot: snapshot, force: force}
+	select {
+	case w.reqCh <- req:
+		return
+	case <-w.ctx.Done():
+		return
+	default:
+		w.mergePending(req)
+		select {
+		case w.reqCh <- projectionPersistRequest{force: force}:
+		case <-w.ctx.Done():
+		default:
+		}
+	}
+}
+
+func (w *projectionPersistWorker) close() {
+	if w == nil {
+		return
+	}
+	w.drainQueued()
+	w.flushAll()
+	w.cancel()
+	select {
+	case <-w.done:
+	case <-time.After(projectionPersistTimeout):
+		logx.Warn("ws", "projection persist worker close timed out: connectionID=%s remoteAddr=%s", w.connection, w.remoteAddr)
+	}
+}
+
+func (w *projectionPersistWorker) run() {
+	defer close(w.done)
+	ticker := time.NewTicker(projectionPersistFlushInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case req := <-w.reqCh:
+			if strings.TrimSpace(req.sessionID) != "" {
+				w.mergePending(req)
+			}
+			if req.force {
+				w.flushAll()
+			}
+		case <-ticker.C:
+			w.flushAll()
+		case <-w.ctx.Done():
+			w.drainQueued()
+			w.flushAll()
+			return
+		}
+	}
+}
+
+func (w *projectionPersistWorker) mergePending(req projectionPersistRequest) {
+	sessionID := strings.TrimSpace(req.sessionID)
+	if sessionID == "" {
+		return
+	}
+	w.mu.Lock()
+	w.pending[sessionID] = req.snapshot
+	w.mu.Unlock()
+}
+
+func (w *projectionPersistWorker) drainQueued() {
+	for {
+		select {
+		case req := <-w.reqCh:
+			if strings.TrimSpace(req.sessionID) != "" {
+				w.mergePending(req)
+			}
+		default:
+			return
+		}
+	}
+}
+
+func (w *projectionPersistWorker) takePending() map[string]data.ProjectionSnapshot {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if len(w.pending) == 0 {
+		return nil
+	}
+	items := w.pending
+	w.pending = make(map[string]data.ProjectionSnapshot)
+	return items
+}
+
+func (w *projectionPersistWorker) flushAll() {
+	items := w.takePending()
+	for sessionID, snapshot := range items {
+		w.persist(sessionID, snapshot)
+	}
+}
+
+func (w *projectionPersistWorker) persist(sessionID string, snapshot data.ProjectionSnapshot) {
+	if w == nil || w.store == nil || strings.TrimSpace(sessionID) == "" {
+		return
+	}
+	newCount, opts := w.syncClaudeJSONL(sessionID, snapshot)
+	saveCtx, cancel := context.WithTimeout(context.Background(), projectionPersistTimeout)
+	defer cancel()
+	summary, err := saveProjectionWithOptions(w.store, saveCtx, sessionID, snapshot, opts...)
+	if err != nil {
+		logx.Error("ws", "save session projection failed: connectionID=%s sessionID=%s remoteAddr=%s err=%v", w.connection, sessionID, w.remoteAddr, err)
+		return
+	}
+	w.mu.Lock()
+	meta := w.meta[sessionID]
+	meta.claudeSessionUUID = strings.TrimSpace(summary.ClaudeSessionUUID)
+	if strings.TrimSpace(summary.Runtime.CWD) != "" {
+		meta.cwd = strings.TrimSpace(summary.Runtime.CWD)
+	}
+	if newCount > 0 {
+		meta.jsonlSyncEntryCount = newCount
+	} else {
+		meta.jsonlSyncEntryCount = summary.JSONLSyncEntryCount
+	}
+	w.meta[sessionID] = meta
+	w.mu.Unlock()
+	if w.onPersist != nil {
+		w.onPersist(sessionID)
+	}
+}
+
+func (w *projectionPersistWorker) syncClaudeJSONL(sessionID string, snapshot data.ProjectionSnapshot) (int, []data.ProjectionSaveOption) {
+	w.mu.Lock()
+	meta := w.meta[sessionID]
+	w.mu.Unlock()
+	csuuid := strings.TrimSpace(meta.claudeSessionUUID)
+	cwd := strings.TrimSpace(firstNonEmptyString(meta.cwd, snapshot.Runtime.CWD))
+	if csuuid == "" || cwd == "" {
+		return 0, nil
+	}
+	events, newCount := claudesync.ExtractJSONLEvents(snapshot.LogEntries, meta.jsonlSyncEntryCount)
+	if len(events) == 0 {
+		return 0, nil
+	}
+	if err := claudesync.WriteSessionToJSONL(cwd, csuuid, events); err != nil {
+		logx.Error("ws", "sync claude jsonl failed: sessionID=%s err=%v", sessionID, err)
+		return 0, nil
+	}
+	return newCount, []data.ProjectionSaveOption{data.WithJSONLSyncEntryCount(newCount)}
+}
+
+func saveProjectionWithOptions(store data.Store, ctx context.Context, sessionID string, snapshot data.ProjectionSnapshot, opts ...data.ProjectionSaveOption) (data.SessionSummary, error) {
+	if optionStore, ok := store.(data.ProjectionOptionStore); ok {
+		return optionStore.SaveProjectionWithOptions(ctx, sessionID, snapshot, opts...)
+	}
+	return store.SaveProjection(ctx, sessionID, snapshot)
+}
+
+func (w *handlerProjectionWriter) enqueue(store data.Store, sessionID string, snapshot data.ProjectionSnapshot, force bool, connectionID, remoteAddr string, onPersist func(string)) {
+	if w == nil || store == nil || strings.TrimSpace(sessionID) == "" {
+		return
+	}
+	worker := w.ensure(store, connectionID, remoteAddr, onPersist)
+	if worker == nil {
+		return
+	}
+	worker.enqueue(sessionID, snapshot, force)
+}
+
+func (w *handlerProjectionWriter) updateMeta(store data.Store, record data.SessionRecord, connectionID, remoteAddr string, onPersist func(string)) {
+	if w == nil || store == nil {
+		return
+	}
+	worker := w.ensure(store, connectionID, remoteAddr, onPersist)
+	if worker == nil {
+		return
+	}
+	worker.updateMeta(record)
+}
+
+func (w *handlerProjectionWriter) ensure(store data.Store, connectionID, remoteAddr string, onPersist func(string)) *projectionPersistWorker {
+	if w == nil || store == nil {
+		return nil
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.worker != nil && w.store == store {
+		return w.worker
+	}
+	if w.worker != nil {
+		w.worker.close()
+	}
+	w.store = store
+	w.worker = newProjectionPersistWorker(context.Background(), store, connectionID, remoteAddr, onPersist)
+	return w.worker
+}
+
+func (w *handlerProjectionWriter) close() {
+	if w == nil {
+		return
+	}
+	w.mu.Lock()
+	worker := w.worker
+	w.worker = nil
+	w.store = nil
+	w.mu.Unlock()
+	if worker != nil {
+		worker.close()
+	}
+}
+
 type secretLogPattern struct {
 	re          *regexp.Regexp
 	replacement string
@@ -177,6 +461,7 @@ type Handler struct {
 	NodeIdentity     *e2ee.NodeIdentityStore
 	runtimeSessions  *runtimeSessionRegistry
 	relayDeviceConns *relayDeviceConnectionRegistry
+	projectionWriter *handlerProjectionWriter
 
 	skillLauncherMu sync.RWMutex
 	asyncActionsMu  sync.Mutex
@@ -199,6 +484,7 @@ func NewHandler(authToken string, sessionStore data.Store) *Handler {
 		SessionStore:     sessionStore,
 		PushService:      &push.NoopService{},
 		relayDeviceConns: newRelayDeviceConnectionRegistry(),
+		projectionWriter: new(handlerProjectionWriter),
 		asyncActions:     make(map[string]struct{}),
 		lastProgressPush: make(map[string]time.Time),
 		Upgrader: websocket.Upgrader{
@@ -246,6 +532,18 @@ func (h *Handler) replaceSkillLauncher(launcher *skills.Launcher) {
 	h.skillLauncherMu.Lock()
 	h.SkillLauncher = launcher
 	h.skillLauncherMu.Unlock()
+}
+
+func (h *Handler) Close() {
+	if h == nil {
+		return
+	}
+	if h.runtimeSessions != nil {
+		h.runtimeSessions.CleanupAll()
+	}
+	if h.projectionWriter != nil {
+		h.projectionWriter.close()
+	}
 }
 
 type gatewayAsyncActionOptions struct {
@@ -559,6 +857,43 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 	invalidateSessionListCache := func() {
 		sessionListCache = sessionListCacheEntry{}
 	}
+	onProjectionPersist := func(string) {
+		invalidateSessionListCache()
+	}
+	var projectionCacheMu sync.Mutex
+	projectionCache := make(map[string]data.ProjectionSnapshot)
+	cacheProjection := func(sessionID string, projection data.ProjectionSnapshot, merge bool) data.ProjectionSnapshot {
+		sessionID = strings.TrimSpace(sessionID)
+		if sessionID == "" {
+			return session.NormalizeProjectionSnapshot(projection)
+		}
+		normalized := session.NormalizeProjectionSnapshot(projection)
+		projectionCacheMu.Lock()
+		if merge {
+			if current, ok := projectionCache[sessionID]; ok {
+				normalized = mergeProjectionSnapshotsForCache(current, normalized)
+			}
+		}
+		projectionCache[sessionID] = normalized
+		projectionCacheMu.Unlock()
+		return normalized
+	}
+	cachedProjection := func(sessionID string) (data.ProjectionSnapshot, bool) {
+		sessionID = strings.TrimSpace(sessionID)
+		if sessionID == "" {
+			return data.ProjectionSnapshot{}, false
+		}
+		projectionCacheMu.Lock()
+		projection, ok := projectionCache[sessionID]
+		projectionCacheMu.Unlock()
+		return projection, ok
+	}
+	updateProjectionMeta := func(record data.SessionRecord) {
+		if h.projectionWriter == nil {
+			return
+		}
+		h.projectionWriter.updateMeta(h.SessionStore, record, connectionID, remoteAddr, onProjectionPersist)
+	}
 
 	finalizeProjectionSnapshotForService := func(sessionID string, service *session.Service, loaded data.ProjectionSnapshot) data.ProjectionSnapshot {
 		projection := data.ProjectionSnapshot{
@@ -581,6 +916,10 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 		storeCtx, storeCancel := sessionProjectionContext()
 		defer storeCancel()
 		loaded := data.ProjectionSnapshot{}
+		if cached, ok := cachedProjection(sessionID); ok {
+			loaded = cached
+			return finalizeProjectionSnapshotForService(sessionID, service, loaded)
+		}
 		if service != nil {
 			runtimeSnapshot := service.RuntimeSnapshot()
 			if runtimeSnapshot.Running && strings.TrimSpace(runtimeSnapshot.ActiveSession) == strings.TrimSpace(sessionID) {
@@ -595,7 +934,10 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 	buildRuntimeProjectionSnapshotForService := func(sessionID string, service *session.Service) data.ProjectionSnapshot {
 		storeCtx, storeCancel := sessionProjectionContext()
 		defer storeCancel()
-		loaded := readProjectionFromSessionStoreRaw(h.SessionStore, storeCtx, sessionID, connectionID, remoteAddr)
+		loaded, ok := cachedProjection(sessionID)
+		if !ok {
+			loaded = readProjectionFromSessionStoreRaw(h.SessionStore, storeCtx, sessionID, connectionID, remoteAddr)
+		}
 		return finalizeProjectionSnapshotForService(sessionID, service, loaded)
 	}
 
@@ -688,22 +1030,25 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 		return loadStoredSessionRecordForRequest(targetSessionID)
 	}
 
-	persistProjectionFor := func(sessionID string, snapshot data.ProjectionSnapshot) {
+	persistProjection := func(sessionID string, snapshot data.ProjectionSnapshot, force bool) {
 		if h.SessionStore == nil || strings.TrimSpace(sessionID) == "" {
 			if h.SessionStore == nil {
 				logx.Warn("ws", "skip projection persistence because session store is unavailable: connectionID=%s sessionID=%s remoteAddr=%s", connectionID, sessionID, remoteAddr)
 			}
 			return
 		}
-		persistCtx, persistCancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer persistCancel()
-		if _, err := h.SessionStore.SaveProjection(persistCtx, sessionID, snapshot); err != nil {
-			logx.Error("ws", "save session projection failed: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, sessionID, remoteAddr, err)
-			return
+		merged := cacheProjection(sessionID, snapshot, true)
+		if h.projectionWriter != nil {
+			h.projectionWriter.enqueue(h.SessionStore, sessionID, merged, force, connectionID, remoteAddr, onProjectionPersist)
 		}
-		invalidateSessionListCache()
-		// Sync new user/assistant entries to Claude CLI JSONL.
-		syncSessionEntriesToClaudeJSONL(h.SessionStore, sessionID, snapshot)
+	}
+
+	persistProjectionFor := func(sessionID string, snapshot data.ProjectionSnapshot) {
+		persistProjection(sessionID, snapshot, false)
+	}
+
+	persistProjectionNow := func(sessionID string, snapshot data.ProjectionSnapshot) {
+		persistProjection(sessionID, snapshot, true)
 	}
 
 	lookupClaudeSessionUUID := func(sessionID string) string {
@@ -1140,6 +1485,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				if err != nil {
 					logx.Warn("ws", "initial session history restore skipped: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
 				} else {
+					updateProjectionMeta(record)
 					emit(session.SessionHistoryWindowEventFromRecord(record, sessionRecordRuntimeAlive(record, runtimeSvc), sessionResumeHistoryLimit))
 					emitReviewStateFromProjection(emit, selectedSessionID, record.Projection)
 				}
@@ -1266,8 +1612,12 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 					if _, err := h.SessionStore.UpsertSession(ctx, record); err == nil {
 						invalidateSessionListCache()
 						created = record.Summary
+						updateProjectionMeta(record)
 					}
 				}
+			}
+			if record, err := h.SessionStore.GetSession(ctx, created.ID); err == nil {
+				updateProjectionMeta(record)
 			}
 			switchRuntimeSession(created.ID, runtimeSwitchDetachPrevious)
 			emit(protocol.NewSessionCreatedEvent(selectedSessionID, toProtocolSummary(created)))
@@ -1339,12 +1689,14 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
 				continue
 			}
+			updateProjectionMeta(record)
 			// Merge any new events from Claude CLI JSONL (if this session was continued in CLI).
 			// Switch runtime first so merge sees the correct ActiveSession.
 			switchRuntimeSession(record.Summary.ID, runtimeSwitchDetachPrevious)
 			trace.Step("switch_runtime")
 			if !activeRuntimeLoad && !isNativeMirrorSessionID(record.Summary.ID) {
 				record = mergeClaudeJSONLToRecord(ctx, h.SessionStore, record, runtimeSvc)
+				updateProjectionMeta(record)
 				invalidateSessionListCache()
 			}
 			trace.Step("merge_claude_jsonl")
@@ -1360,6 +1712,8 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				}
 			}
 			record.Summary.Runtime = record.Projection.Runtime
+			updateProjectionMeta(record)
+			cacheProjection(record.Summary.ID, record.Projection, false)
 			runtimeSvc.SyncRuntimeMeta(protocol.RuntimeMeta{
 				Command:          record.Projection.Runtime.Command,
 				Engine:           record.Projection.Runtime.Engine,
@@ -1413,9 +1767,11 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
 				continue
 			}
+			updateProjectionMeta(record)
 			_, pageRuntimeSvc := runtimeForSession(record.Summary.ID)
 			if !isNativeMirrorSessionID(record.Summary.ID) {
 				record = mergeClaudeJSONLToRecord(ctx, h.SessionStore, record, pageRuntimeSvc)
+				updateProjectionMeta(record)
 			}
 			freshProjection := session.NormalizeProjectionSnapshot(record.Projection)
 			runtimeProjection := finalizeProjectionSnapshotForService(record.Summary.ID, pageRuntimeSvc, freshProjection)
@@ -1425,6 +1781,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				record.Projection = runtimeProjection
 			}
 			record.Summary.Runtime = record.Projection.Runtime
+			cacheProjection(record.Summary.ID, record.Projection, false)
 			pageHistoryLimit := sessionHistoryWindowLimit(req.Limit)
 			pageEvent := session.SessionHistoryPageEventFromRecord(record, req.Before, pageHistoryLimit)
 			logx.Info("ws", "session history page response: connectionID=%s sessionID=%s remoteAddr=%s before=%d limit=%d start=%d total=%d entries=%d", connectionID, record.Summary.ID, remoteAddr, req.Before, pageHistoryLimit, pageEvent.LogEntryStart, pageEvent.LogEntryTotal, len(pageEvent.LogEntries))
@@ -1495,9 +1852,11 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
 				continue
 			}
+			updateProjectionMeta(record)
 			sessionRuntime, sessionRuntimeSvc := runtimeForSession(record.Summary.ID)
 			if !isNativeMirrorSessionID(record.Summary.ID) {
 				record = mergeClaudeJSONLToRecord(ctx, h.SessionStore, record, sessionRuntimeSvc)
+				updateProjectionMeta(record)
 			}
 			freshProjection := session.NormalizeProjectionSnapshot(record.Projection)
 			runtimeProjection := finalizeProjectionSnapshotForService(record.Summary.ID, sessionRuntimeSvc, freshProjection)
@@ -1507,6 +1866,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				record.Projection = runtimeProjection
 			}
 			record.Summary.Runtime = record.Projection.Runtime
+			cacheProjection(record.Summary.ID, record.Projection, false)
 			runtimeAlive := sessionRecordRuntimeAlive(record, sessionRuntimeSvc)
 			deltaEvent := session.SessionDeltaEventFromRecord(record, req.Known, deltaCursorSnapshot(sessionRuntime), runtimeAlive)
 			metrics := projectionMetrics(record.Projection)
@@ -1539,6 +1899,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
 				continue
 			}
+			updateProjectionMeta(record)
 			// Merge any new events from Claude CLI JSONL.
 			// Switch runtime session first so mergeClaudeJSONLToRecord can
 			// check the correct ActiveSession when deciding ownership upgrades.
@@ -1549,6 +1910,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			runtimeSvc.SetSink(sessionRuntime.EnsureBufferedSinkWithProcessor(resumeEmitAndPersist))
 			if !isNativeMirrorSessionID(record.Summary.ID) {
 				record = mergeClaudeJSONLToRecord(ctx, h.SessionStore, record, runtimeSvc)
+				updateProjectionMeta(record)
 			}
 			augmentedProjection := session.NormalizeProjectionSnapshot(record.Projection)
 			runtimeProjection := buildProjectionSnapshotForService(record.Summary.ID, runtimeSvc)
@@ -1560,6 +1922,8 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			}
 			record.Projection = projection
 			record.Summary.Runtime = projection.Runtime
+			updateProjectionMeta(record)
+			cacheProjection(record.Summary.ID, record.Projection, false)
 			resumeMeta := protocol.MergeRuntimeMeta(protocol.RuntimeMeta{
 				Command:          projection.Runtime.Command,
 				Engine:           projection.Runtime.Engine,
@@ -1574,11 +1938,9 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				projection = updatedProjection
 				record.Projection = projection
 				record.Summary.Runtime = projection.Runtime
-				if _, err := h.SessionStore.SaveProjection(ctx, record.Summary.ID, record.Projection); err != nil {
-					logx.Error("ws", "persist session_resume runtime meta failed: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, record.Summary.ID, remoteAddr, err)
-					emit(protocol.NewErrorEvent(record.Summary.ID, fmt.Sprintf("persist session resume runtime meta: %v", err), ""))
-					continue
-				}
+				updateProjectionMeta(record)
+				cacheProjection(record.Summary.ID, record.Projection, false)
+				persistProjectionNow(record.Summary.ID, record.Projection)
 			}
 			runtimeAlive := sessionRecordRuntimeAlive(record, runtimeSvc)
 			if runtimeAlive && session.ShouldEmitResumeRecoveryStateEvent(runtimeSvc, projection, req.LastKnownRuntimeState) {
@@ -1729,6 +2091,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			}
 			record.Projection = buildProjectionSnapshotForService(record.Summary.ID, runtimeSvc)
 			record.Summary.Runtime = record.Projection.Runtime
+			cacheProjection(record.Summary.ID, record.Projection, false)
 			emit(session.SessionHistoryWindowEventFromRecord(record, sessionRecordRuntimeAlive(record, runtimeSvc), sessionResumeHistoryLimit))
 			emitReviewStateFromProjection(emit, selectedSessionID, record.Projection)
 			if restored := restoredAgentStateEventFromRecord(record, sessionRecordRuntimeAlive(record, runtimeSvc)); restored != nil {
@@ -1780,6 +2143,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 					emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
 					continue
 				}
+				cacheProjection(selectedSessionID, record.Projection, false)
 				invalidateSessionListCache()
 			}
 			emitPermissionRuleList(emit, h.SessionStore, ctx, selectedSessionID)
@@ -1811,6 +2175,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 					emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
 					continue
 				}
+				cacheProjection(selectedSessionID, record.Projection, false)
 				invalidateSessionListCache()
 			}
 			emitPermissionRuleList(emit, h.SessionStore, ctx, selectedSessionID)
@@ -1842,6 +2207,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 					emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
 					continue
 				}
+				cacheProjection(selectedSessionID, record.Projection, false)
 				invalidateSessionListCache()
 			}
 			emitPermissionRuleList(emit, h.SessionStore, ctx, selectedSessionID)
@@ -1872,6 +2238,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
 				continue
 			}
+			cacheProjection(selectedSessionID, record.Projection, false)
 			invalidateSessionListCache()
 			emit(protocol.NewSessionContextResultEvent(selectedSessionID, toProtocolSessionContext(record.Projection.SessionContext)))
 		case "skill_catalog_get":
@@ -2094,7 +2461,9 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			}
 			runnerInputText := strings.TrimRight(inputData, "\n")
 			if runnerInputText == "" {
-				appendUserProjectionEntry(h.SessionStore, ctx, sessionID, command, "命令", connectionID, remoteAddr, attachments)
+				if projectionWithUser, ok := appendUserProjectionEntry(projection, sessionID, command, "命令", connectionID, remoteAddr, attachments); ok {
+					persistProjectionNow(sessionID, projectionWithUser)
+				}
 				logx.Info("ws", "dispatch ai_turn execute: connectionID=%s sessionID=%s remoteAddr=%s command=%q cwd=%q permissionMode=%q", connectionID, sessionID, remoteAddr, command, cwd, permissionMode)
 				if err := service.Execute(ctx, sessionID, execReq, emitAndPersist); err != nil {
 					logx.Error("ws", "ai_turn execute failed: connectionID=%s sessionID=%s remoteAddr=%s command=%q err=%v", connectionID, sessionID, remoteAddr, command, err)
@@ -2161,7 +2530,9 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				emit(protocol.NewErrorEvent(sessionID, message, ""))
 				continue
 			}
-			appendUserProjectionEntry(h.SessionStore, ctx, sessionID, visibleUserText, "回复", connectionID, remoteAddr, attachments)
+			if projectionWithUser, ok := appendUserProjectionEntry(buildRuntimeProjectionSnapshotForService(sessionID, service), sessionID, visibleUserText, "回复", connectionID, remoteAddr, attachments); ok {
+				persistProjectionNow(sessionID, projectionWithUser)
+			}
 		case "exec":
 			var reqEvent protocol.ExecRequestEvent
 			if err := json.Unmarshal(payloadBytes, &reqEvent); err != nil {
@@ -2189,7 +2560,9 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			}
 			sessionRuntime, service := runtimeForSession(sessionID)
 			emitAndPersist := emitAndPersistFor(sessionID)
-			appendUserProjectionEntry(h.SessionStore, ctx, sessionID, reqEvent.Command, "命令", connectionID, remoteAddr, nil)
+			if projectionWithUser, ok := appendUserProjectionEntry(buildRuntimeProjectionSnapshotForService(sessionID, service), sessionID, reqEvent.Command, "命令", connectionID, remoteAddr, nil); ok {
+				persistProjectionNow(sessionID, projectionWithUser)
+			}
 			mode, err := session.ParseMode(reqEvent.Mode)
 			if err != nil {
 				logx.Warn("ws", "parse exec mode failed: connectionID=%s sessionID=%s remoteAddr=%s mode=%q err=%v", connectionID, sessionID, remoteAddr, reqEvent.Mode, err)
@@ -2284,7 +2657,9 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				}
 				permissionMode := session.NormalizePermissionModeForEngine(inputEvent.PermissionMode, promotedEngine)
 				logx.Info("ws", "promote input to exec: connectionID=%s sessionID=%s remoteAddr=%s action=input command=%q", connectionID, sessionID, remoteAddr, command)
-				appendUserProjectionEntry(h.SessionStore, ctx, sessionID, command, "命令", connectionID, remoteAddr, nil)
+				if projectionWithUser, ok := appendUserProjectionEntry(buildRuntimeProjectionSnapshotForService(sessionID, service), sessionID, command, "命令", connectionID, remoteAddr, nil); ok {
+					persistProjectionNow(sessionID, projectionWithUser)
+				}
 				if sessionRuntime != nil {
 					service.SetSink(sessionRuntime.EnsureBufferedSinkWithProcessor(emitAndPersist))
 				}
@@ -2462,7 +2837,9 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				logx.Warn("ws", "service send input failed: connectionID=%s sessionID=%s remoteAddr=%s action=input err=%v", connectionID, sessionID, remoteAddr, err)
 				emit(protocol.NewErrorEvent(sessionID, message, ""))
 			} else {
-				appendUserProjectionEntry(h.SessionStore, ctx, sessionID, strings.TrimRight(inputEvent.Data, "\n"), "回复", connectionID, remoteAddr, attachments)
+				if projectionWithUser, ok := appendUserProjectionEntry(buildRuntimeProjectionSnapshotForService(sessionID, service), sessionID, strings.TrimRight(inputEvent.Data, "\n"), "回复", connectionID, remoteAddr, attachments); ok {
+					persistProjectionNow(sessionID, projectionWithUser)
+				}
 			}
 		case "stop":
 			if strings.TrimSpace(selectedSessionID) == "" || selectedSessionID == connectionID {
@@ -2521,28 +2898,30 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 					}
 				}
 			}
-			appendUserProjectionEntry(h.SessionStore, ctx, sessionID, strings.TrimSpace(permissionEvent.PromptMessage), "权限决策", connectionID, remoteAddr, nil)
+			if projectionWithUser, ok := appendUserProjectionEntry(projection, sessionID, strings.TrimSpace(permissionEvent.PromptMessage), "权限决策", connectionID, remoteAddr, nil); ok {
+				persistProjectionNow(sessionID, projectionWithUser)
+				projection = projectionWithUser
+			}
 			scope := strings.TrimSpace(permissionEvent.Scope)
 			if decision == "approve" && (scope == string(data.PermissionScopeSession) || scope == string(data.PermissionScopePersistent)) {
 				rule := buildPermissionRule(permissionEvent, scope, projection, controller)
 				switch data.PermissionScope(scope) {
 				case data.PermissionScopePersistent:
 					snapshot, err := h.SessionStore.GetPermissionRuleSnapshot(ctx)
-					if err == nil {
+					if err != nil {
+						logx.Error("ws", "load persistent permission rules failed: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, sessionID, remoteAddr, err)
+					} else {
 						snapshot.Enabled = true
 						snapshot.Items = upsertPermissionRule(snapshot.Items, rule)
-						_ = h.SessionStore.SavePermissionRuleSnapshot(ctx, snapshot)
-					}
-				default:
-					record, err := h.SessionStore.GetSession(ctx, sessionID)
-					if err == nil {
-						record.Projection = session.NormalizeProjectionSnapshot(record.Projection)
-						record.Projection.PermissionRulesEnabled = true
-						record.Projection.PermissionRules = upsertPermissionRule(record.Projection.PermissionRules, rule)
-						if _, err := h.SessionStore.SaveProjection(ctx, sessionID, record.Projection); err == nil {
-							invalidateSessionListCache()
+						if err := h.SessionStore.SavePermissionRuleSnapshot(ctx, snapshot); err != nil {
+							logx.Error("ws", "save persistent permission rule failed: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, sessionID, remoteAddr, err)
 						}
 					}
+				default:
+					projection.PermissionRulesEnabled = true
+					projection.PermissionRules = upsertPermissionRule(projection.PermissionRules, rule)
+					persistProjectionFor(sessionID, projection)
+					invalidateSessionListCache()
 				}
 				emitPermissionRuleList(emit, h.SessionStore, ctx, sessionID)
 			}
@@ -3178,19 +3557,14 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 
 }
 
-func appendUserProjectionEntry(sessionStore data.Store, ctx context.Context, sessionID, text, label, connectionID, remoteAddr string, attachments []protocol.TimelineAttachment) {
-	if sessionStore == nil || strings.TrimSpace(sessionID) == "" || (strings.TrimSpace(text) == "" && len(attachments) == 0) {
-		if sessionStore == nil {
-			logx.Warn("ws", "skip append user projection entry because session store unavailable: connectionID=%s sessionID=%s remoteAddr=%s", connectionID, sessionID, remoteAddr)
+func appendUserProjectionEntry(projection data.ProjectionSnapshot, sessionID, text, label, connectionID, remoteAddr string, attachments []protocol.TimelineAttachment) (data.ProjectionSnapshot, bool) {
+	if strings.TrimSpace(sessionID) == "" || (strings.TrimSpace(text) == "" && len(attachments) == 0) {
+		if strings.TrimSpace(sessionID) == "" {
+			logx.Warn("ws", "skip append user projection entry because session id is empty: connectionID=%s remoteAddr=%s", connectionID, remoteAddr)
 		}
-		return
+		return projection, false
 	}
-	record, err := sessionStore.GetSession(ctx, sessionID)
-	if err != nil {
-		logx.Warn("ws", "get session before append projection entry failed: connectionID=%s sessionID=%s remoteAddr=%s label=%s err=%v", connectionID, sessionID, remoteAddr, label, err)
-		return
-	}
-	projection := session.NormalizeProjectionSnapshot(record.Projection)
+	projection = session.NormalizeProjectionSnapshot(projection)
 	projection.LogEntries = append(projection.LogEntries, data.SnapshotLogEntry{
 		Kind:        "user",
 		Message:     text,
@@ -3198,9 +3572,56 @@ func appendUserProjectionEntry(sessionStore data.Store, ctx context.Context, ses
 		Timestamp:   time.Now().UTC().Format(time.RFC3339),
 		Attachments: append([]protocol.TimelineAttachment(nil), attachments...),
 	})
-	if _, err := sessionStore.SaveProjection(ctx, sessionID, projection); err != nil {
-		logx.Error("ws", "save projection after append user entry failed: connectionID=%s sessionID=%s remoteAddr=%s label=%s err=%v", connectionID, sessionID, remoteAddr, label, err)
+	return projection, true
+}
+
+func mergeProjectionSnapshotsForCache(current data.ProjectionSnapshot, incoming data.ProjectionSnapshot) data.ProjectionSnapshot {
+	current = session.NormalizeProjectionSnapshot(current)
+	incoming = session.NormalizeProjectionSnapshot(incoming)
+	merged := incoming
+	merged.LogEntries = mergeSnapshotLogEntries(current.LogEntries, incoming.LogEntries)
+	merged.RawTerminalByStream = mergeRawTerminalByStream(current.RawTerminalByStream, incoming.RawTerminalByStream)
+	merged.TerminalExecutions = mergeTerminalExecutions(current.TerminalExecutions, incoming.TerminalExecutions)
+	merged.Controller = session.MergeControllerSnapshot(current.Controller, incoming.Controller)
+	merged.Runtime = session.MergeStoreSessionRuntime(current.Runtime, incoming.Runtime)
+	if incoming.CurrentDiff == nil && current.CurrentDiff != nil {
+		merged.CurrentDiff = current.CurrentDiff
 	}
+	if len(incoming.Diffs) == 0 && len(current.Diffs) > 0 {
+		merged.Diffs = current.Diffs
+	}
+	if len(incoming.ReviewGroups) == 0 && len(current.ReviewGroups) > 0 {
+		merged.ReviewGroups = current.ReviewGroups
+	}
+	if incoming.ActiveReviewGroup == nil && current.ActiveReviewGroup != nil {
+		merged.ActiveReviewGroup = current.ActiveReviewGroup
+	}
+	if incoming.CurrentStep == nil && current.CurrentStep != nil {
+		merged.CurrentStep = current.CurrentStep
+	}
+	if incoming.LatestError == nil && current.LatestError != nil {
+		merged.LatestError = current.LatestError
+	}
+	if incoming.ContextWindowUsage.TokenLimit <= 0 && current.ContextWindowUsage.TokenLimit > 0 {
+		merged.ContextWindowUsage = current.ContextWindowUsage
+	}
+	if !incoming.SessionContextSet && current.SessionContextSet {
+		merged.SessionContext = current.SessionContext
+		merged.SessionContextSet = true
+	}
+	if len(incoming.PermissionRules) == 0 && len(current.PermissionRules) > 0 {
+		merged.PermissionRules = current.PermissionRules
+	}
+	if !incoming.PermissionRulesEnabled && current.PermissionRulesEnabled && len(incoming.PermissionRules) == 0 {
+		merged.PermissionRulesEnabled = current.PermissionRulesEnabled
+	}
+	if incoming.SkillCatalogMeta.SyncState == "" && current.SkillCatalogMeta.SyncState != "" {
+		merged.SkillCatalogMeta = current.SkillCatalogMeta
+	}
+	if incoming.MemoryCatalogMeta.SyncState == "" && current.MemoryCatalogMeta.SyncState != "" {
+		merged.MemoryCatalogMeta = current.MemoryCatalogMeta
+	}
+	return session.NormalizeProjectionSnapshot(merged)
 }
 
 func fallback(value, defaultValue string) string {
@@ -5597,49 +6018,6 @@ func laterNonZeroTime(values ...time.Time) time.Time {
 		}
 	}
 	return latest
-}
-
-// syncSessionEntriesToClaudeJSONL writes new user/assistant LogEntries to the
-// Claude CLI JSONL file for this session, if the session has a ClaudeSessionUUID.
-func syncSessionEntriesToClaudeJSONL(sessionStore data.Store, sessionID string, snapshot data.ProjectionSnapshot) {
-	if sessionStore == nil || strings.TrimSpace(sessionID) == "" {
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	record, err := sessionStore.GetSession(ctx, sessionID)
-	if err != nil {
-		return
-	}
-	csuuid := strings.TrimSpace(record.Summary.ClaudeSessionUUID)
-	if csuuid == "" {
-		return
-	}
-	cwd := strings.TrimSpace(record.Summary.Runtime.CWD)
-	if cwd == "" {
-		cwd = strings.TrimSpace(record.Projection.Runtime.CWD)
-	}
-	if cwd == "" {
-		return
-	}
-	startIndex := record.Summary.JSONLSyncEntryCount
-	events, newCount := claudesync.ExtractJSONLEvents(snapshot.LogEntries, startIndex)
-	if len(events) == 0 {
-		return
-	}
-	if err := claudesync.WriteSessionToJSONL(cwd, csuuid, events); err != nil {
-		logx.Error("ws", "sync claude jsonl failed: sessionID=%s err=%v", sessionID, err)
-		return
-	}
-	// Update sync count so we don't re-write the same entries.
-	updated := record
-	updated.Summary.JSONLSyncEntryCount = newCount
-	updated.Projection = snapshot
-	ctx2, cancel2 := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel2()
-	if _, err := sessionStore.UpsertSession(ctx2, updated); err != nil {
-		logx.Error("ws", "update jsonl sync count failed: sessionID=%s err=%v", sessionID, err)
-	}
 }
 
 // lastUserPromptFromEntries returns the text of the most recent user entry.

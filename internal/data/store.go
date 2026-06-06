@@ -333,3 +333,19 @@ type Store interface {
 	GetPermissionRuleSnapshot(ctx context.Context) (PermissionRuleSnapshot, error)
 	SavePermissionRuleSnapshot(ctx context.Context, snapshot PermissionRuleSnapshot) error
 }
+
+type ProjectionSaveOption func(*ProjectionSaveOptions)
+
+type ProjectionSaveOptions struct {
+	JSONLSyncEntryCount *int
+}
+
+func WithJSONLSyncEntryCount(count int) ProjectionSaveOption {
+	return func(opts *ProjectionSaveOptions) {
+		opts.JSONLSyncEntryCount = &count
+	}
+}
+
+type ProjectionOptionStore interface {
+	SaveProjectionWithOptions(ctx context.Context, sessionID string, projection ProjectionSnapshot, opts ...ProjectionSaveOption) (SessionSummary, error)
+}

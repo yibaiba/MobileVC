@@ -93,9 +93,12 @@ func TestAppendUserProjectionEntryAllowsAttachmentOnlyMessage(t *testing.T) {
 		Source:        "user_upload",
 	}
 
-	appendUserProjectionEntry(
-		store,
-		context.Background(),
+	record, err := store.GetSession(context.Background(), summary.ID)
+	if err != nil {
+		t.Fatalf("get initial session: %v", err)
+	}
+	projection, ok := appendUserProjectionEntry(
+		record.Projection,
 		summary.ID,
 		"",
 		"回复",
@@ -103,8 +106,14 @@ func TestAppendUserProjectionEntryAllowsAttachmentOnlyMessage(t *testing.T) {
 		"remote-test",
 		[]protocol.TimelineAttachment{attachment},
 	)
+	if !ok {
+		t.Fatal("expected attachment-only projection entry to be appended")
+	}
+	if _, err := store.SaveProjection(context.Background(), summary.ID, projection); err != nil {
+		t.Fatalf("save projection: %v", err)
+	}
 
-	record, err := store.GetSession(context.Background(), summary.ID)
+	record, err = store.GetSession(context.Background(), summary.ID)
 	if err != nil {
 		t.Fatalf("get session: %v", err)
 	}
