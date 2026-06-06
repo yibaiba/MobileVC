@@ -259,56 +259,72 @@ class _ChatTimelineState extends State<ChatTimeline> {
           reviewAnchorIndex: reviewAnchorIndex,
           extraItems: extraItems,
         );
+        final itemKey = ValueKey<String>(_timelineChildKey(item));
         if (item.kind == 'file_diff') {
-          return const SizedBox.shrink();
+          return KeyedSubtree(
+            key: itemKey,
+            child: const SizedBox.shrink(),
+          );
         }
         if (item.kind == 'review_summary') {
-          return _ReviewSummaryCard(
-            diff: item.context,
-            reviewGroup: widget.activeReviewGroup,
-            pendingDiffCount: widget.pendingDiffCount,
-            pendingReviewGroupCount: widget.pendingReviewGroupCount,
-            isManualReviewMode: widget.isManualReviewMode,
-            isAutoAcceptMode: widget.isAutoAcceptMode,
-            shouldShowReviewChoices: widget.shouldShowReviewChoices,
-            onOpenDiff: widget.onOpenDiff,
-            onReviewDecision: widget.onReviewDecision,
-            onAcceptAll: widget.onAcceptAll,
+          return KeyedSubtree(
+            key: itemKey,
+            child: _ReviewSummaryCard(
+              diff: item.context,
+              reviewGroup: widget.activeReviewGroup,
+              pendingDiffCount: widget.pendingDiffCount,
+              pendingReviewGroupCount: widget.pendingReviewGroupCount,
+              isManualReviewMode: widget.isManualReviewMode,
+              isAutoAcceptMode: widget.isAutoAcceptMode,
+              shouldShowReviewChoices: widget.shouldShowReviewChoices,
+              onOpenDiff: widget.onOpenDiff,
+              onReviewDecision: widget.onReviewDecision,
+              onAcceptAll: widget.onAcceptAll,
+            ),
           );
         }
         if ((item.kind == 'prompt_request' ||
                 item.kind == 'interaction_request') &&
             visiblePrompt != null) {
-          return visiblePrompt is InteractionRequestEvent
-              ? _InteractionRequestCard(
-                  interaction: visiblePrompt,
-                  onSubmit: widget.onPromptSubmit,
-                )
-              : _PromptRequestCard(
-                  prompt: visiblePrompt as PromptRequestEvent,
-                  onSubmit: widget.onPromptSubmit,
-                );
-        }
-        if (item.kind == 'plan_request' && visiblePlanQuestion != null) {
-          return _PlanQuestionCard(
-            question: visiblePlanQuestion,
-            progressLabel: widget.pendingPlanProgressLabel,
-            onSubmit: widget.onPromptSubmit,
+          return KeyedSubtree(
+            key: itemKey,
+            child: visiblePrompt is InteractionRequestEvent
+                ? _InteractionRequestCard(
+                    interaction: visiblePrompt,
+                    onSubmit: widget.onPromptSubmit,
+                  )
+                : _PromptRequestCard(
+                    prompt: visiblePrompt as PromptRequestEvent,
+                    onSubmit: widget.onPromptSubmit,
+                  ),
           );
         }
-        return EventCard(
-          item: item,
-          mediaPreviewStates: widget.mediaPreviewStates,
-          onOpenAttachment: widget.onOpenAttachment,
-          onRequestMediaPreview: widget.onRequestMediaPreview,
-          onAnimatedBodyProgress: _handleAnimatedBodyProgress,
-          onTap: () {
-            if (item.kind == 'runtime_info_result') {
-              widget.onOpenRuntimeInfo?.call();
-            } else if (item.kind == 'fs_read_result') {
-              widget.onOpenFile?.call();
-            }
-          },
+        if (item.kind == 'plan_request' && visiblePlanQuestion != null) {
+          return KeyedSubtree(
+            key: itemKey,
+            child: _PlanQuestionCard(
+              question: visiblePlanQuestion,
+              progressLabel: widget.pendingPlanProgressLabel,
+              onSubmit: widget.onPromptSubmit,
+            ),
+          );
+        }
+        return KeyedSubtree(
+          key: itemKey,
+          child: EventCard(
+            item: item,
+            mediaPreviewStates: widget.mediaPreviewStates,
+            onOpenAttachment: widget.onOpenAttachment,
+            onRequestMediaPreview: widget.onRequestMediaPreview,
+            onAnimatedBodyProgress: _handleAnimatedBodyProgress,
+            onTap: () {
+              if (item.kind == 'runtime_info_result') {
+                widget.onOpenRuntimeInfo?.call();
+              } else if (item.kind == 'fs_read_result') {
+                widget.onOpenFile?.call();
+              }
+            },
+          ),
         );
       },
       separatorBuilder: (_, __) => const SizedBox(height: 12),
@@ -502,6 +518,13 @@ class _ChatTimelineState extends State<ChatTimeline> {
       item.attachments.length,
       item.codexSteps.length,
     ].join('\n');
+  }
+
+  String _timelineChildKey(TimelineItem item) {
+    return [
+      item.kind,
+      item.id,
+    ].join(':');
   }
 
   bool _shouldHidePassiveReadyPrompt(PromptRequestEvent prompt) {

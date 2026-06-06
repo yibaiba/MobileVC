@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_markdown/flutter_markdown.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:mobile_vc/data/models/events.dart';
 import 'package:mobile_vc/data/models/runtime_meta.dart';
@@ -485,6 +486,79 @@ void main() {
     expect(
       scrollableState.position.pixels,
       scrollableState.position.maxScrollExtent,
+    );
+  });
+
+  testWidgets('前插历史消息时流式 markdown 状态不串到其他条目', (tester) async {
+    final activeItems = [
+      TimelineItem(
+        id: 'history-existing-1',
+        kind: 'markdown',
+        timestamp: DateTime(2026, 1, 1),
+        body: '当前历史消息',
+        animateBody: false,
+      ),
+      TimelineItem(
+        id: 'stream-active',
+        kind: 'markdown',
+        timestamp: DateTime(2026, 1, 1, 0, 0, 1),
+        body: '正在生成的最新回复，需要保持自己的动画状态。',
+      ),
+    ];
+    final prependedItems = [
+      TimelineItem(
+        id: 'history-older-0',
+        kind: 'markdown',
+        timestamp: DateTime(2025, 12, 31, 23, 59),
+        body: '更早历史消息',
+        animateBody: false,
+      ),
+      ...activeItems,
+    ];
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SizedBox(
+            height: 320,
+            child: ChatTimeline(
+              sessionId: 'prepend-history-session',
+              bottomPadding: 24,
+              items: activeItems,
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pump(const Duration(milliseconds: 96));
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SizedBox(
+            height: 320,
+            child: ChatTimeline(
+              sessionId: 'prepend-history-session',
+              bottomPadding: 24,
+              items: prependedItems,
+            ),
+          ),
+        ),
+      ),
+    );
+
+    expect(find.text('更早历史消息'), findsOneWidget);
+    expect(find.text('当前历史消息'), findsOneWidget);
+
+    final markdownBodies =
+        tester.widgetList<MarkdownBody>(find.byType(MarkdownBody)).toList();
+    expect(markdownBodies.map((body) => body.data), contains('更早历史消息'));
+    expect(markdownBodies.map((body) => body.data), contains('当前历史消息'));
+    expect(
+      markdownBodies.map((body) => body.data).where(
+            (body) => body.startsWith('正在生成'),
+          ),
+      isNotEmpty,
     );
   });
 
