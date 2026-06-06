@@ -358,6 +358,33 @@ class _MemoryRelaySecureStore implements RelaySecureStore {
   }
 }
 
+class _BlockingFirstReadRelaySecureStore implements RelaySecureStore {
+  _BlockingFirstReadRelaySecureStore(this.delegate);
+
+  final _MemoryRelaySecureStore delegate;
+  final Completer<void> firstReadStarted = Completer<void>();
+  final Completer<void> releaseFirstRead = Completer<void>();
+  var _blocked = false;
+
+  @override
+  Future<String?> read(String key) async {
+    if (!_blocked) {
+      _blocked = true;
+      if (!firstReadStarted.isCompleted) {
+        firstReadStarted.complete();
+      }
+      await releaseFirstRead.future;
+    }
+    return delegate.read(key);
+  }
+
+  @override
+  Future<void> write(String key, String value) => delegate.write(key, value);
+
+  @override
+  Future<void> delete(String key) => delegate.delete(key);
+}
+
 String _testHex(Uint8List bytes) {
   final buffer = StringBuffer();
   for (final byte in bytes) {
@@ -837,6 +864,100 @@ void main() {
 
       expect(service.hasRelayE2eeHandshake, isTrue);
       expect(service.takeRelaySession()?.clientId, 'rc_test');
+    });
+
+    test('stale E2EE reconnect handshake cannot poison replacement connection',
+        () async {
+      final nodeIdentity = await RelayE2eeHandshake.newEphemeralKeyPair();
+      final nodeFingerprint = await RelayE2eeCrypto.fingerprint(
+        nodeIdentity.publicKey,
+      );
+      final firstServer =
+          await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(firstServer.close);
+      final firstSockets = <WebSocket>[];
+      firstServer.transform(WebSocketTransformer()).listen((socket) {
+        firstSockets.add(socket);
+        socket.listen((_) {
+          socket.add(jsonEncode(const <String, dynamic>{
+            'type': 'client.paired',
+            'version': 1,
+            'sessionId': 'rs_test',
+            'clientId': 'rc_test',
+          }));
+        });
+      });
+      final secondServer =
+          await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(secondServer.close);
+      final observedPlaintexts = <Map<String, dynamic>>[];
+      secondServer.transform(WebSocketTransformer()).listen((socket) {
+        _servePairingE2eeRelay(
+          socket,
+          nodeIdentity,
+          null,
+          observedPlaintexts,
+        );
+      });
+
+      final memoryStore = _MemoryRelaySecureStore();
+      final blockingStore = _BlockingFirstReadRelaySecureStore(memoryStore);
+      final service = MobileVcWsService(
+        relayDeviceIdentityStore: RelayDeviceIdentityStore(
+          secureStore: blockingStore,
+          random: Random(201),
+        ),
+        relayDeviceCredentialStore: RelayDeviceCredentialStore(
+          secureStore: memoryStore,
+          random: Random(202),
+        ),
+      );
+      addTearDown(service.dispose);
+      final events = <AppEvent>[];
+      final subscription = service.events.listen(events.add);
+      addTearDown(subscription.cancel);
+
+      final staleConnect = service.connectRelay(
+        relayUrl: 'ws://127.0.0.1:${firstServer.port}',
+        sessionId: 'rs_test',
+        clientId: 'rc_test',
+        clientReconnectSecret: 'reconnect_secret',
+        nodeFingerprintHex: _testHex(nodeFingerprint),
+        relayCapabilities: RelayE2eeCapabilitySet.production(),
+      );
+      await blockingStore.firstReadStarted.future.timeout(
+        const Duration(seconds: 2),
+      );
+
+      await service.connectRelay(
+        relayUrl: 'ws://127.0.0.1:${secondServer.port}',
+        sessionId: 'rs_test',
+        pairingSecret: 'pair-secret-128-bit-minimum',
+        nodeFingerprintHex: _testHex(nodeFingerprint),
+        relayCapabilities: RelayE2eeCapabilitySet.production(),
+      );
+      expect(service.hasRelayE2eeHandshake, isTrue);
+
+      for (final socket in firstSockets) {
+        await socket.close();
+      }
+      blockingStore.releaseFirstRead.complete();
+      await expectLater(staleConnect, throwsStateError);
+
+      expect(service.hasRelayE2eeHandshake, isTrue);
+      expect(service.send(const <String, dynamic>{'type': 'ping'}), isTrue);
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+
+      expect(
+        events
+            .whereType<ErrorEvent>()
+            .where((event) => event.code == 'e2ee_decrypt_failed'),
+        isEmpty,
+      );
+      expect(
+        observedPlaintexts.any((event) => event['type'] == 'ping'),
+        isTrue,
+      );
     });
 
     test('relay E2EE encrypts forward payloads after handshake', () async {
@@ -11980,6 +12101,14 @@ void main() {
       addTearDown(controller.disposeController);
 
       await controller.connect();
+      service.emit(SessionCreatedEvent(
+        timestamp: _timestamp,
+        sessionId: 'conn-1',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_created'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+      ));
+      await _flushEvents();
       service.emit(SessionHistoryEvent(
         timestamp: _timestamp,
         sessionId: 'session-current',
@@ -12123,6 +12252,16 @@ void main() {
       addTearDown(controller.disposeController);
 
       await controller.connect();
+      service.emit(SessionCreatedEvent(
+        timestamp: _timestamp,
+        sessionId: 'conn-1',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_created'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+      ));
+      await _flushEvents();
+      service.sentPayloads.clear();
+
       service.emit(SessionHistoryEvent(
         timestamp: _timestamp,
         sessionId: 'session-current',
@@ -13467,6 +13606,178 @@ void main() {
         controller.timeline.map((item) => item.body).toList(),
         ['Android release APK 已重新打包成功'],
       );
+    });
+
+    test('oversized session_delta marker 会用窗口化 resume 重新同步当前会话', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionCreatedEvent(
+        timestamp: _timestamp,
+        sessionId: 'conn-1',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_created'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+      ));
+      await _flushEvents();
+      service.sentPayloads.clear();
+
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        logEntryStart: 120,
+        logEntryTotal: 240,
+        hasMoreBefore: true,
+        resumeRuntimeMeta: const RuntimeMeta(cwd: '/workspace'),
+      ));
+      await _flushEvents();
+
+      service.sentPayloads.clear();
+      service.emit(SessionDeltaEvent(
+        timestamp: _timestamp.add(const Duration(seconds: 1)),
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_delta'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        base: const SessionDeltaKnown(),
+        latest: const SessionDeltaKnown(logEntryCount: 240),
+        requiresFullSync: true,
+        resumeRuntimeMeta: const RuntimeMeta(cwd: '/workspace'),
+      ));
+      await _flushEvents();
+
+      final resumePayload = service.sentPayloads.singleWhere(
+        (payload) => payload['action'] == 'session_resume',
+      );
+      expect(resumePayload['sessionId'], 'session-current');
+      expect(resumePayload['reason'], 'delta_base_mismatch');
+      expect(resumePayload['limit'], 120);
+    });
+
+    test('payload-limited history 使用 latest known 避免继续请求巨量 delta', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionCreatedEvent(
+        timestamp: _timestamp,
+        sessionId: 'conn-1',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_created'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+      ));
+      await _flushEvents();
+      service.sentPayloads.clear();
+
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        logEntries: const [
+          HistoryLogEntry(
+            kind: 'markdown',
+            message: '窗口里的最后一条',
+            timestamp: '2026-05-27T05:53:00Z',
+          ),
+        ],
+        logEntryStart: 13728,
+        logEntryTotal: 13848,
+        hasMoreBefore: true,
+        latest: const SessionDeltaKnown(
+          eventCursor: 99,
+          logEntryCount: 13848,
+          diffCount: 7,
+          terminalExecutionCount: 3,
+          terminalStdoutLength: 2048,
+          terminalStderrLength: 12,
+        ),
+        payloadLimited: true,
+        payloadLimitReason: 'payload_budget_exceeded',
+        resumeRuntimeMeta: const RuntimeMeta(cwd: '/workspace'),
+      ));
+      await _flushEvents();
+
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      service.sentPayloads.clear();
+      service.emit(SessionUpdatedEvent(
+        timestamp: _timestamp.add(const Duration(seconds: 1)),
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_updated'},
+        generation: 1,
+        eventCursor: 100,
+        reason: 'projection_persisted',
+      ));
+      await Future<void>.delayed(const Duration(milliseconds: 900));
+
+      final deltaPayload = service.sentPayloads.singleWhere(
+        (payload) =>
+            payload['action'] == 'session_delta_get' &&
+            payload['reason'] == 'session_updated:projection_persisted',
+      );
+      final known = deltaPayload['known'] as Map<String, dynamic>;
+      expect(known['eventCursor'], 99);
+      expect(known['logEntryCount'], 13848);
+      expect(known['diffCount'], 7);
+      expect(known['terminalExecutionCount'], 3);
+      expect(known['terminalStdoutLength'], 2048);
+      expect(known['terminalStderrLength'], 12);
+    });
+
+    test('other-session full-sync delta marker 不会触发当前会话 resume', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionCreatedEvent(
+        timestamp: _timestamp,
+        sessionId: 'conn-1',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_created'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+      ));
+      await _flushEvents();
+      service.sentPayloads.clear();
+
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        resumeRuntimeMeta: const RuntimeMeta(cwd: '/workspace'),
+      ));
+      await _flushEvents();
+
+      service.sentPayloads.clear();
+      service.emit(SessionDeltaEvent(
+        timestamp: _timestamp.add(const Duration(seconds: 1)),
+        sessionId: 'session-other',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_delta'},
+        summary: const SessionSummary(id: 'session-other', title: '其他会话'),
+        requiresFullSync: true,
+      ));
+      await _flushEvents();
+
+      expect(
+        service.sentPayloads
+            .where((payload) => payload['action'] == 'session_resume'),
+        isEmpty,
+      );
+      expect(controller.selectedSessionId, 'session-current');
     });
 
     test('session_delta 重放已恢复的历史 entry 时不会重复显示', () async {

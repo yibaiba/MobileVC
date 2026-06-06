@@ -44,6 +44,7 @@ const projectionSessionListFreshnessDelay = 400 * time.Millisecond
 const projectionPersistQueueSize = 64
 const projectionPersistTimeout = 10 * time.Second
 const projectionPersistRetryDelay = 750 * time.Millisecond
+const gatewayRelaySafePayloadBudgetBytes = 8 * 1024 * 1024
 
 func sessionHistoryWindowLimit(requested int) int {
 	if requested <= 0 {
@@ -1944,7 +1945,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 					logx.Warn("ws", "initial session history restore skipped: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
 				} else {
 					updateProjectionMeta(record)
-					emit(session.SessionHistoryWindowEventFromRecord(record, sessionRecordRuntimeAlive(record, runtimeSvc), sessionResumeHistoryLimit))
+					emit(session.SessionHistoryWindowEventFromRecordWithCursorAndPayloadLimit(record, sessionRecordRuntimeAlive(record, runtimeSvc), sessionResumeHistoryLimit, deltaCursorSnapshot(activeRuntimeSession), gatewayRelaySafePayloadBudgetBytes))
 					emitReviewStateFromProjection(emit, selectedSessionID, record.Projection)
 				}
 			}
@@ -2183,7 +2184,8 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			})
 			loadRuntimeAlive := sessionRecordRuntimeAlive(record, runtimeSvc)
 			trace.Step("merge_projection")
-			emit(session.SessionHistoryWindowEventFromRecord(record, loadRuntimeAlive, loadHistoryLimit))
+			loadSessionRuntime, _ := runtimeForSession(record.Summary.ID)
+			emit(session.SessionHistoryWindowEventFromRecordWithCursorAndPayloadLimit(record, loadRuntimeAlive, loadHistoryLimit, deltaCursorSnapshot(loadSessionRuntime), gatewayRelaySafePayloadBudgetBytes))
 			trace.Step("emit_history")
 			emitContextWindowUsageIfAvailable(record.Summary.ID, runtimeSvc)
 			emitReviewStateFromProjection(emit, selectedSessionID, record.Projection)
@@ -2241,7 +2243,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			record.Summary.Runtime = record.Projection.Runtime
 			cacheProjection(record.Summary.ID, record.Projection, false)
 			pageHistoryLimit := sessionHistoryWindowLimit(req.Limit)
-			pageEvent := session.SessionHistoryPageEventFromRecord(record, req.Before, pageHistoryLimit)
+			pageEvent := session.SessionHistoryPageEventFromRecordWithPayloadLimit(record, req.Before, pageHistoryLimit, gatewayRelaySafePayloadBudgetBytes)
 			logx.Info("ws", "session history page response: connectionID=%s sessionID=%s remoteAddr=%s before=%d limit=%d start=%d total=%d entries=%d", connectionID, record.Summary.ID, remoteAddr, req.Before, pageHistoryLimit, pageEvent.LogEntryStart, pageEvent.LogEntryTotal, len(pageEvent.LogEntries))
 			emit(pageEvent)
 		case "register_push_token":
@@ -2326,7 +2328,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			record.Summary.Runtime = record.Projection.Runtime
 			cacheProjection(record.Summary.ID, record.Projection, false)
 			runtimeAlive := sessionRecordRuntimeAlive(record, sessionRuntimeSvc)
-			deltaEvent := session.SessionDeltaEventFromRecord(record, req.Known, deltaCursorSnapshot(sessionRuntime), runtimeAlive)
+			deltaEvent := session.SessionDeltaEventFromRecordWithPayloadLimit(record, req.Known, deltaCursorSnapshot(sessionRuntime), runtimeAlive, gatewayRelaySafePayloadBudgetBytes, sessionResumeHistoryLimit)
 			metrics := projectionMetrics(record.Projection)
 			logx.Info("ws", "session delta response: connectionID=%s sessionID=%s remoteAddr=%s reason=%q runtimeAlive=%v canResume=%v requiresFullSync=%v logEntries=%d diffs=%d stdoutBytes=%d stderrBytes=%d", connectionID, record.Summary.ID, remoteAddr, req.Reason, runtimeAlive, sessionRuntime != nil && runtimeAlive, deltaEvent.RequiresFullSync, metrics.logEntries, metrics.diffs, metrics.stdoutBytes, metrics.stderrBytes)
 			emit(deltaEvent)
@@ -2408,7 +2410,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 					emit(status)
 				}
 			}
-			emit(session.SessionHistoryWindowEventFromRecord(record, runtimeAlive, resumeHistoryLimit))
+			emit(session.SessionHistoryWindowEventFromRecordWithCursorAndPayloadLimit(record, runtimeAlive, resumeHistoryLimit, deltaCursorSnapshot(sessionRuntime), gatewayRelaySafePayloadBudgetBytes))
 			emitContextWindowUsageIfAvailable(record.Summary.ID, runtimeSvc)
 			logx.Info("ws", "session history emitted: sessionID=%s runtimeAlive=%v ownership=%s limit=%d", record.Summary.ID, runtimeAlive, record.Summary.Ownership, resumeHistoryLimit)
 			emitReviewStateFromProjection(emit, selectedSessionID, record.Projection)
@@ -2550,7 +2552,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			record.Projection = buildProjectionSnapshotForService(record.Summary.ID, runtimeSvc)
 			record.Summary.Runtime = record.Projection.Runtime
 			cacheProjection(record.Summary.ID, record.Projection, false)
-			emit(session.SessionHistoryWindowEventFromRecord(record, sessionRecordRuntimeAlive(record, runtimeSvc), sessionResumeHistoryLimit))
+			emit(session.SessionHistoryWindowEventFromRecordWithCursorAndPayloadLimit(record, sessionRecordRuntimeAlive(record, runtimeSvc), sessionResumeHistoryLimit, deltaCursorSnapshot(activeRuntimeSession), gatewayRelaySafePayloadBudgetBytes))
 			emitReviewStateFromProjection(emit, selectedSessionID, record.Projection)
 			if restored := restoredAgentStateEventFromRecord(record, sessionRecordRuntimeAlive(record, runtimeSvc)); restored != nil {
 				emit(*restored)

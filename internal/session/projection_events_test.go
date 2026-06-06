@@ -1,6 +1,7 @@
 package session
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -448,11 +449,248 @@ func TestSessionDeltaEventFromRecord_KnownExceedsLatestResetsToZero(t *testing.T
 			Runtime:    data.SessionRuntime{Command: "claude"},
 		},
 	}
-	// startLog 超过 totalLog -> reset to 0 -> 全部 deliver
 	known := protocol.SessionDeltaKnown{LogEntryCount: 100}
 	got := SessionDeltaEventFromRecord(record, known, DeltaCursorSnapshot{}, false)
-	if len(got.AppendLogEntries) != 1 {
-		t.Errorf("expected reset to deliver all, got %d", len(got.AppendLogEntries))
+	if !got.RequiresFullSync {
+		t.Fatalf("expected full sync when known log count is invalid")
+	}
+	if len(got.AppendLogEntries) != 0 {
+		t.Errorf("expected invalid delta base to avoid full log delivery, got %d", len(got.AppendLogEntries))
+	}
+}
+
+func TestSessionHistoryWindowEventFromRecordWithPayloadLimitShrinksEntries(t *testing.T) {
+	record := data.SessionRecord{
+		Summary: data.SessionSummary{ID: "s1"},
+		Projection: data.ProjectionSnapshot{
+			LogEntries: []data.SnapshotLogEntry{
+				{Kind: "markdown", Message: strings.Repeat("a", 32)},
+				{Kind: "markdown", Message: strings.Repeat("b", 32)},
+				{Kind: "markdown", Message: strings.Repeat("c", 32)},
+			},
+			Runtime: data.SessionRuntime{Command: "claude"},
+		},
+	}
+	full := SessionHistoryWindowEventFromRecord(record, false, 3)
+	fullBytes, err := json.Marshal(full)
+	if err != nil {
+		t.Fatalf("marshal full history: %v", err)
+	}
+
+	got := SessionHistoryWindowEventFromRecordWithPayloadLimit(record, false, 3, len(fullBytes)-10)
+
+	if len(got.LogEntries) >= len(full.LogEntries) {
+		t.Fatalf("expected shrunken history window, got %d entries", len(got.LogEntries))
+	}
+	if got.LogEntryTotal != 3 || !got.HasMoreBefore {
+		t.Fatalf("unexpected window metadata: start=%d total=%d hasMore=%v", got.LogEntryStart, got.LogEntryTotal, got.HasMoreBefore)
+	}
+	encoded, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal shrunken history: %v", err)
+	}
+	if len(encoded) > len(fullBytes)-10 {
+		t.Fatalf("history payload still exceeds budget: got %d budget %d", len(encoded), len(fullBytes)-10)
+	}
+}
+
+func TestSessionHistoryWindowEventFromRecordWithPayloadLimitDropsLargeTerminalPayload(t *testing.T) {
+	record := data.SessionRecord{
+		Summary: data.SessionSummary{ID: "s1"},
+		Projection: data.ProjectionSnapshot{
+			LogEntries: []data.SnapshotLogEntry{
+				{Kind: "markdown", Message: "visible"},
+			},
+			RawTerminalByStream: map[string]string{
+				"stdout": strings.Repeat("x", 4096),
+				"stderr": "",
+			},
+			TerminalExecutions: []data.TerminalExecution{
+				{
+					ExecutionID: "exec-1",
+					Command:     strings.Repeat("cmd", 256),
+					Stdout:      strings.Repeat("y", 4096),
+				},
+			},
+			Runtime: data.SessionRuntime{Command: "claude"},
+		},
+	}
+	budget := 1400
+
+	got := SessionHistoryWindowEventFromRecordWithCursorAndPayloadLimit(record, false, 1, DeltaCursorSnapshot{LatestCursor: 9}, budget)
+
+	if !got.PayloadLimited {
+		t.Fatalf("expected payloadLimited history")
+	}
+	if got.PayloadLimitReason == "" {
+		t.Fatalf("expected payload limit reason")
+	}
+	if len(got.RawTerminalByStream) != 0 {
+		t.Fatalf("expected raw terminal payload to be dropped, got %+v", got.RawTerminalByStream)
+	}
+	if len(got.TerminalExecutions) != 0 {
+		t.Fatalf("expected terminal executions to be dropped, got %+v", got.TerminalExecutions)
+	}
+	if got.Latest.EventCursor != 9 || got.Latest.LogEntryCount != 1 || got.Latest.TerminalExecutionCount != 1 {
+		t.Fatalf("latest known metadata was not preserved: %+v", got.Latest)
+	}
+	encoded, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal history: %v", err)
+	}
+	if len(encoded) > budget {
+		t.Fatalf("history payload exceeds budget: got %d budget %d", len(encoded), budget)
+	}
+}
+
+func TestSessionHistoryWindowEventFromRecordWithPayloadLimitDropsLargeDiffPayload(t *testing.T) {
+	record := data.SessionRecord{
+		Summary: data.SessionSummary{ID: "s1"},
+		Projection: data.ProjectionSnapshot{
+			LogEntries: []data.SnapshotLogEntry{
+				{Kind: "markdown", Message: "visible"},
+			},
+			Diffs: []DiffContext{
+				{ContextID: "diff-1", Path: "file.go", Diff: strings.Repeat("+", 4096)},
+			},
+			CurrentDiff: &DiffContext{
+				ContextID: "diff-1",
+				Path:      "file.go",
+				Diff:      strings.Repeat("+", 4096),
+			},
+			ReviewGroups: []ReviewGroup{
+				{ID: "group-1", Title: strings.Repeat("review", 512)},
+			},
+			ActiveReviewGroup: &ReviewGroup{ID: "group-1"},
+			CurrentStep:       &data.SnapshotContext{Message: strings.Repeat("step", 512)},
+			LatestError:       &data.SnapshotContext{Message: strings.Repeat("error", 512)},
+			Runtime:           data.SessionRuntime{Command: "claude"},
+		},
+	}
+	budget := 1500
+
+	got := SessionHistoryWindowEventFromRecordWithPayloadLimit(record, false, 1, budget)
+
+	if !got.PayloadLimited {
+		t.Fatalf("expected payloadLimited history")
+	}
+	if len(got.Diffs) != 0 || got.CurrentDiff != nil || len(got.ReviewGroups) != 0 || got.ActiveReviewGroup != nil {
+		t.Fatalf("expected diff/review payload to be dropped: diffs=%d current=%v reviews=%d active=%v", len(got.Diffs), got.CurrentDiff, len(got.ReviewGroups), got.ActiveReviewGroup)
+	}
+	if got.CurrentStep != nil || got.LatestError != nil {
+		t.Fatalf("expected step/error payload to be dropped")
+	}
+	encoded, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal history: %v", err)
+	}
+	if len(encoded) > budget {
+		t.Fatalf("history payload exceeds budget: got %d budget %d", len(encoded), budget)
+	}
+}
+
+func TestSessionHistoryPageEventFromRecordWithPayloadLimitShrinksEntries(t *testing.T) {
+	record := data.SessionRecord{
+		Summary: data.SessionSummary{ID: "s1"},
+		Projection: data.ProjectionSnapshot{
+			LogEntries: []data.SnapshotLogEntry{
+				{Kind: "markdown", Message: strings.Repeat("a", 32)},
+				{Kind: "markdown", Message: strings.Repeat("b", 32)},
+				{Kind: "markdown", Message: strings.Repeat("c", 32)},
+			},
+			Runtime: data.SessionRuntime{Command: "claude"},
+		},
+	}
+	full := SessionHistoryPageEventFromRecord(record, 3, 3)
+	fullBytes, err := json.Marshal(full)
+	if err != nil {
+		t.Fatalf("marshal full page: %v", err)
+	}
+
+	got := SessionHistoryPageEventFromRecordWithPayloadLimit(record, 3, 3, len(fullBytes)-10)
+
+	if len(got.LogEntries) >= len(full.LogEntries) {
+		t.Fatalf("expected shrunken history page, got %d entries", len(got.LogEntries))
+	}
+	if got.LogEntryTotal != 3 || !got.HasMoreBefore {
+		t.Fatalf("unexpected page metadata: start=%d total=%d hasMore=%v", got.LogEntryStart, got.LogEntryTotal, got.HasMoreBefore)
+	}
+	encoded, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal shrunken page: %v", err)
+	}
+	if len(encoded) > len(fullBytes)-10 {
+		t.Fatalf("page payload still exceeds budget: got %d budget %d", len(encoded), len(fullBytes)-10)
+	}
+}
+
+func TestSessionDeltaEventFromRecordWithPayloadLimitRequiresFullSyncForLargePayload(t *testing.T) {
+	record := data.SessionRecord{
+		Summary: data.SessionSummary{ID: "s1"},
+		Projection: data.ProjectionSnapshot{
+			LogEntries: []data.SnapshotLogEntry{
+				{Kind: "markdown", Message: strings.Repeat("a", 64)},
+				{Kind: "markdown", Message: strings.Repeat("b", 64)},
+				{Kind: "markdown", Message: strings.Repeat("c", 64)},
+			},
+			Runtime: data.SessionRuntime{Command: "claude"},
+		},
+	}
+	full := SessionDeltaEventFromRecord(record, protocol.SessionDeltaKnown{}, DeltaCursorSnapshot{}, false)
+	fullBytes, err := json.Marshal(full)
+	if err != nil {
+		t.Fatalf("marshal full delta: %v", err)
+	}
+
+	got := SessionDeltaEventFromRecordWithPayloadLimit(record, protocol.SessionDeltaKnown{}, DeltaCursorSnapshot{}, false, len(fullBytes)-10, 0)
+
+	if !got.RequiresFullSync {
+		t.Fatalf("expected oversized delta to require full sync")
+	}
+	if !got.PayloadLimited {
+		t.Fatalf("expected oversized delta to be marked payloadLimited")
+	}
+	if got.PayloadLimitReason == "" {
+		t.Fatalf("expected payload limit reason")
+	}
+	if len(got.AppendLogEntries) != 0 {
+		t.Fatalf("expected oversized delta to omit append log entries, got %d", len(got.AppendLogEntries))
+	}
+	if got.Latest.LogEntryCount != 3 {
+		t.Fatalf("latest log entry count: %d", got.Latest.LogEntryCount)
+	}
+	encoded, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal full-sync delta: %v", err)
+	}
+	if len(encoded) >= len(fullBytes) {
+		t.Fatalf("expected full-sync marker to be smaller than full delta: marker=%d full=%d", len(encoded), len(fullBytes))
+	}
+}
+
+func TestSessionDeltaEventFromRecordWithPayloadLimitUsesMaxAppendEntriesForEmptyKnown(t *testing.T) {
+	record := data.SessionRecord{
+		Summary: data.SessionSummary{ID: "s1"},
+		Projection: data.ProjectionSnapshot{
+			LogEntries: []data.SnapshotLogEntry{
+				{Kind: "markdown", Message: "a"},
+				{Kind: "markdown", Message: "b"},
+				{Kind: "markdown", Message: "c"},
+			},
+			Runtime: data.SessionRuntime{Command: "claude"},
+		},
+	}
+
+	got := SessionDeltaEventFromRecordWithPayloadLimit(record, protocol.SessionDeltaKnown{}, DeltaCursorSnapshot{}, false, 0, 2)
+
+	if !got.RequiresFullSync {
+		t.Fatalf("expected empty-known delta exceeding append limit to require full sync")
+	}
+	if len(got.AppendLogEntries) != 0 {
+		t.Fatalf("expected full-sync marker to omit append entries, got %d", len(got.AppendLogEntries))
+	}
+	if got.Latest.LogEntryCount != 3 {
+		t.Fatalf("latest log entry count: %d", got.Latest.LogEntryCount)
 	}
 }
 
@@ -547,8 +785,8 @@ func TestSessionDeltaEventFromRecord_KnownTerminalExecutionExceedsLatestRequires
 	if !got.RequiresFullSync {
 		t.Fatalf("expected full sync when known terminal execution count is invalid")
 	}
-	if len(got.TerminalExecutions) != 1 {
-		t.Fatalf("expected reset to deliver all executions, got %+v", got.TerminalExecutions)
+	if len(got.TerminalExecutions) != 0 {
+		t.Fatalf("expected invalid delta base to avoid full terminal execution delivery, got %+v", got.TerminalExecutions)
 	}
 }
 

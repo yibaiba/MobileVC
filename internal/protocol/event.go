@@ -692,9 +692,12 @@ type SessionHistoryEvent struct {
 	SessionContext      SessionContext      `json:"sessionContext,omitempty"`
 	SkillCatalogMeta    CatalogMetadata     `json:"skillCatalogMeta,omitempty"`
 	MemoryCatalogMeta   CatalogMetadata     `json:"memoryCatalogMeta,omitempty"`
+	Latest              SessionDeltaKnown   `json:"latest,omitempty"`
 	CanResume           bool                `json:"canResume,omitempty"`
 	RuntimeAlive        bool                `json:"runtimeAlive,omitempty"`
 	ResumeRuntimeMeta   RuntimeMeta         `json:"resumeRuntimeMeta,omitempty"`
+	PayloadLimited      bool                `json:"payloadLimited,omitempty"`
+	PayloadLimitReason  string              `json:"payloadLimitReason,omitempty"`
 }
 
 type SessionDeltaEvent struct {
@@ -719,6 +722,8 @@ type SessionDeltaEvent struct {
 	RuntimeAlive        bool                `json:"runtimeAlive,omitempty"`
 	ResumeRuntimeMeta   RuntimeMeta         `json:"resumeRuntimeMeta,omitempty"`
 	RequiresFullSync    bool                `json:"requiresFullSync,omitempty"`
+	PayloadLimited      bool                `json:"payloadLimited,omitempty"`
+	PayloadLimitReason  string              `json:"payloadLimitReason,omitempty"`
 }
 
 type SessionUpdatedEvent struct {
@@ -730,11 +735,13 @@ type SessionUpdatedEvent struct {
 
 type SessionHistoryPageEvent struct {
 	Event
-	LogEntries        []HistoryLogEntry `json:"logEntries,omitempty"`
-	LogEntryStart     int               `json:"logEntryStart,omitempty"`
-	LogEntryTotal     int               `json:"logEntryTotal,omitempty"`
-	HasMoreBefore     bool              `json:"hasMoreBefore,omitempty"`
-	ResumeRuntimeMeta RuntimeMeta       `json:"resumeRuntimeMeta,omitempty"`
+	LogEntries         []HistoryLogEntry `json:"logEntries,omitempty"`
+	LogEntryStart      int               `json:"logEntryStart,omitempty"`
+	LogEntryTotal      int               `json:"logEntryTotal,omitempty"`
+	HasMoreBefore      bool              `json:"hasMoreBefore,omitempty"`
+	ResumeRuntimeMeta  RuntimeMeta       `json:"resumeRuntimeMeta,omitempty"`
+	PayloadLimited     bool              `json:"payloadLimited,omitempty"`
+	PayloadLimitReason string            `json:"payloadLimitReason,omitempty"`
 }
 
 type SessionResumeResultEvent struct {

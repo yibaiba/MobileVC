@@ -3060,6 +3060,15 @@ class SessionController extends ChangeNotifier {
     );
   }
 
+  bool _sessionDeltaKnownIsEmpty(SessionDeltaKnown known) {
+    return known.eventCursor == 0 &&
+        known.logEntryCount == 0 &&
+        known.diffCount == 0 &&
+        known.terminalExecutionCount == 0 &&
+        known.terminalStdoutLength == 0 &&
+        known.terminalStderrLength == 0;
+  }
+
   Future<void> restoreSessionFromNotification(String sessionId) async {
     final targetId = sessionId.trim();
     if (targetId.isEmpty) {
@@ -5680,16 +5689,29 @@ class SessionController extends ChangeNotifier {
           ..clear()
           ..addAll(history.terminalExecutions);
         _restoreTerminalLogs(history.rawTerminalByStream);
-        _sessionDeltaKnown[resolvedHistorySummary.id] = SessionDeltaKnown(
-          eventCursor: _sessionEventCursors[resolvedHistorySummary.id] ?? 0,
-          logEntryCount: history.logEntryTotal > 0
-              ? history.logEntryTotal
-              : history.logEntries.length,
-          diffCount: history.diffs.length,
-          terminalExecutionCount: history.terminalExecutions.length,
-          terminalStdoutLength: _terminalStdout.length,
-          terminalStderrLength: _terminalStderr.length,
-        );
+        final historyLatest = history.latest;
+        if (_sessionDeltaKnownIsEmpty(historyLatest)) {
+          _sessionDeltaKnown[resolvedHistorySummary.id] = SessionDeltaKnown(
+            eventCursor: _sessionEventCursors[resolvedHistorySummary.id] ?? 0,
+            logEntryCount: history.logEntryTotal > 0
+                ? history.logEntryTotal
+                : history.logEntries.length,
+            diffCount: history.diffs.length,
+            terminalExecutionCount: history.terminalExecutions.length,
+            terminalStdoutLength: _terminalStdout.length,
+            terminalStderrLength: _terminalStderr.length,
+          );
+        } else {
+          _sessionDeltaKnown[resolvedHistorySummary.id] = historyLatest;
+          if (historyLatest.eventCursor > 0) {
+            final previousCursor =
+                _sessionEventCursors[resolvedHistorySummary.id] ?? 0;
+            if (historyLatest.eventCursor > previousCursor) {
+              _sessionEventCursors[resolvedHistorySummary.id] =
+                  historyLatest.eventCursor;
+            }
+          }
+        }
         _syncActiveTerminalExecution();
         _resetRuntimeProcessState();
         if (history.currentDiff != null) {
@@ -6873,13 +6895,13 @@ class SessionController extends ChangeNotifier {
   }
 
   void _handleSessionDelta(SessionDeltaEvent delta) {
-    if (delta.requiresFullSync) {
-      _requestSessionResume(reason: 'delta_base_mismatch');
-      return;
-    }
     // 只处理当前会话或用户主动 loadSession 目标的 delta；否则后台/迟到的
     // 其他会话增量会覆盖 selected session 与运行时上下文。
     if (!_isSessionRecoveryEventForActiveSession(delta.sessionId)) {
+      return;
+    }
+    if (delta.requiresFullSync) {
+      _requestSessionResume(reason: 'delta_base_mismatch');
       return;
     }
     final deltaSessionId = delta.sessionId.trim();

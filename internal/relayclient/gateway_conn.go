@@ -228,13 +228,14 @@ func (c *gatewayConn) handleClientE2EEProof(raw map[string]any) error {
 		return fmt.Errorf("relay e2ee handshake is not connected to the local agent yet")
 	}
 	response, err := c.e2ee.handleClientProof(frame)
-	if writeErr := c.writeControl(response); writeErr != nil {
-		return writeErr
-	}
 	if response.OK {
 		if err := c.activateE2EEStream(frame.HandshakeID); err != nil {
+			_ = c.writeControl(e2eeAgentResult(frame, false, relay.CodeE2EEHandshakeFailed))
 			return err
 		}
+	}
+	if writeErr := c.writeControl(response); writeErr != nil {
+		return writeErr
 	}
 	return err
 }

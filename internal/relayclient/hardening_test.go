@@ -376,6 +376,43 @@ func TestGatewayConnEncryptsRelayForwardAfterPairingE2EEHandshake(t *testing.T) 
 	}
 }
 
+func TestGatewayConnActivatesE2EEBeforeReportingHandshakeOK(t *testing.T) {
+	serverConn, clientConn := newRelayClientTestConns(t)
+	defer serverConn.Close()
+	handshake, clientEphemeral := testPairingHandshakeHandler(t)
+	gateway := newGatewayConnWithE2EE(clientConn, "rs_gateway", handshake)
+	t.Cleanup(func() { _ = gateway.Close() })
+
+	if err := serverConn.WriteJSON(relay.ClientAttachedFrame{
+		Type: relay.TypeClientAttached, Version: relay.Version,
+		SessionID: "rs_gateway", ClientID: "rc_attached",
+	}); err != nil {
+		t.Fatalf("write attached: %v", err)
+	}
+	clientKeys := driveGatewayE2EEHandshake(t, serverConn, clientEphemeral)
+	if gateway.e2eeStream() == nil {
+		t.Fatal("gateway reported e2ee ok before activating local stream")
+	}
+	clientCodec, err := e2ee.NewClientMobileVCStreamCodec("rs_gateway", "rc_attached", "hs_pairing", clientKeys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inbound, err := clientCodec.EncodeJSON("msg_after_ok", map[string]string{"action": "ping"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := serverConn.WriteJSON(relay.ForwardEnvelope(inbound)); err != nil {
+		t.Fatalf("write encrypted inbound after ok: %v", err)
+	}
+	var decoded map[string]any
+	if err := gateway.ReadJSON(&decoded); err != nil {
+		t.Fatalf("read encrypted inbound after ok: %v", err)
+	}
+	if decoded["action"] != "ping" {
+		t.Fatalf("unexpected decrypted inbound: %#v", decoded)
+	}
+}
+
 func TestGatewayConnWaitsForE2EEBeforeWritingProductionForward(t *testing.T) {
 	serverConn, clientConn := newRelayClientTestConns(t)
 	defer serverConn.Close()

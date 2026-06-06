@@ -8676,6 +8676,180 @@ func TestHandlerSessionLoadDefaultsToBoundedHistoryWindow(t *testing.T) {
 	}
 }
 
+func TestHandlerSessionLoadLimitsOversizedPayloadBeforeWebsocketEmission(t *testing.T) {
+	h := newTestHandler()
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	h.SessionStore = tempStore
+	record := newOversizedGatewayPayloadRecord("oversized-load-session", 9, 1024*1024)
+	if _, err := h.SessionStore.UpsertSession(context.Background(), record); err != nil {
+		t.Fatalf("upsert session: %v", err)
+	}
+
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+	if err := conn.WriteJSON(protocol.SessionLoadRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_load"},
+		SessionID:   record.Summary.ID,
+		Limit:       len(record.Projection.LogEntries),
+	}); err != nil {
+		t.Fatalf("write session_load request: %v", err)
+	}
+	history := readUntilSessionHistory(t, conn)
+	requireGatewayPayloadWithinBudget(t, history)
+	requirePayloadLimited(t, history)
+	if got := jsonArrayLength(history, "logEntries"); got >= len(record.Projection.LogEntries) {
+		t.Fatalf("expected oversized session_load history to be trimmed, got %d entries", got)
+	}
+	requireLatestLogEntryCount(t, history, len(record.Projection.LogEntries))
+}
+
+func TestHandlerSessionHistoryPageLimitsOversizedPayloadBeforeWebsocketEmission(t *testing.T) {
+	h := newTestHandler()
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	h.SessionStore = tempStore
+	record := newOversizedGatewayPayloadRecord("oversized-page-session", 9, 1024*1024)
+	if _, err := h.SessionStore.UpsertSession(context.Background(), record); err != nil {
+		t.Fatalf("upsert session: %v", err)
+	}
+
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+	if err := conn.WriteJSON(protocol.SessionLoadRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_load"},
+		SessionID:   record.Summary.ID,
+		Limit:       1,
+	}); err != nil {
+		t.Fatalf("write session_load request: %v", err)
+	}
+	_ = readUntilSessionHistory(t, conn)
+	if err := conn.WriteJSON(protocol.SessionHistoryPageRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_history_page"},
+		SessionID:   record.Summary.ID,
+		Before:      len(record.Projection.LogEntries),
+		Limit:       len(record.Projection.LogEntries),
+	}); err != nil {
+		t.Fatalf("write session_history_page request: %v", err)
+	}
+
+	page := readUntilSessionHistoryPage(t, conn)
+	requireGatewayPayloadWithinBudget(t, page)
+	requirePayloadLimited(t, page)
+	if got := jsonArrayLength(page, "logEntries"); got >= len(record.Projection.LogEntries) {
+		t.Fatalf("expected oversized history page to be trimmed, got %d entries", got)
+	}
+	if got := intFromJSONNumber(page["logEntryTotal"]); got != len(record.Projection.LogEntries) {
+		t.Fatalf("page total: got %d want %d", got, len(record.Projection.LogEntries))
+	}
+}
+
+func TestHandlerSessionDeltaOversizedPayloadRequiresFullSync(t *testing.T) {
+	h := newTestHandler()
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	h.SessionStore = tempStore
+	record := newOversizedGatewayPayloadRecord("oversized-delta-session", 9, 1024*1024)
+	if _, err := h.SessionStore.UpsertSession(context.Background(), record); err != nil {
+		t.Fatalf("upsert session: %v", err)
+	}
+
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+	if err := conn.WriteJSON(protocol.SessionLoadRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_load"},
+		SessionID:   record.Summary.ID,
+		Limit:       1,
+	}); err != nil {
+		t.Fatalf("write session_load request: %v", err)
+	}
+	_ = readUntilSessionHistory(t, conn)
+	if err := conn.WriteJSON(protocol.SessionDeltaRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_delta_get"},
+		SessionID:   record.Summary.ID,
+		Known:       protocol.SessionDeltaKnown{},
+	}); err != nil {
+		t.Fatalf("write session_delta_get request: %v", err)
+	}
+
+	delta := readUntilType(t, conn, protocol.EventTypeSessionDelta)
+	requireGatewayPayloadWithinBudget(t, delta)
+	requirePayloadLimited(t, delta)
+	if delta["requiresFullSync"] != true {
+		t.Fatalf("expected oversized delta to require full sync, got %#v", delta)
+	}
+	if entries, ok := delta["appendLogEntries"].([]any); ok && len(entries) > 0 {
+		t.Fatalf("expected oversized delta to omit append entries, got %d", len(entries))
+	}
+	requireLatestLogEntryCount(t, delta, len(record.Projection.LogEntries))
+}
+
+func newOversizedGatewayPayloadRecord(sessionID string, entryCount, messageBytes int) data.SessionRecord {
+	now := time.Date(2026, 6, 6, 17, 10, 0, 0, time.UTC)
+	entries := make([]data.SnapshotLogEntry, entryCount)
+	for i := range entries {
+		entries[i] = data.SnapshotLogEntry{
+			Kind:      "markdown",
+			Message:   strings.Repeat(string(rune('a'+i)), messageBytes),
+			Timestamp: now.Add(time.Duration(i) * time.Second).Format(time.RFC3339),
+		}
+	}
+	return data.SessionRecord{
+		Summary: data.SessionSummary{
+			ID:        sessionID,
+			Title:     sessionID,
+			CreatedAt: now,
+			UpdatedAt: now,
+		},
+		Projection: data.ProjectionSnapshot{LogEntries: entries},
+	}
+}
+
+func requireGatewayPayloadWithinBudget(t *testing.T, event map[string]any) {
+	t.Helper()
+	encoded, err := json.Marshal(event)
+	if err != nil {
+		t.Fatalf("marshal emitted event: %v", err)
+	}
+	if len(encoded) > gatewayRelaySafePayloadBudgetBytes {
+		t.Fatalf("emitted event is %d bytes, exceeds gateway budget %d", len(encoded), gatewayRelaySafePayloadBudgetBytes)
+	}
+}
+
+func requirePayloadLimited(t *testing.T, event map[string]any) {
+	t.Helper()
+	if limited, _ := event["payloadLimited"].(bool); !limited {
+		t.Fatalf("expected payloadLimited=true")
+	}
+	if reason, _ := event["payloadLimitReason"].(string); strings.TrimSpace(reason) == "" {
+		t.Fatalf("expected payloadLimitReason")
+	}
+}
+
+func jsonArrayLength(event map[string]any, key string) int {
+	if entries, ok := event[key].([]any); ok {
+		return len(entries)
+	}
+	return 0
+}
+
+func requireLatestLogEntryCount(t *testing.T, event map[string]any, want int) {
+	t.Helper()
+	latest, ok := event["latest"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected latest cursor metadata")
+	}
+	if got := intFromJSONNumber(latest["logEntryCount"]); got != want {
+		t.Fatalf("latest log entry count: got %d want %d", got, want)
+	}
+}
+
 func intFromJSONNumber(value any) int {
 	if value == nil {
 		return 0
