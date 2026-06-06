@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"mobilevc/internal/data"
 	"mobilevc/internal/protocol"
@@ -396,6 +397,7 @@ func SessionTerminalRangeEventFromRecordWithPayloadLimit(record data.SessionReco
 	if end > total {
 		end = total
 	}
+	start, end = terminalUTF8ByteRange(content, start, end)
 	event := protocol.NewSessionTerminalRangeEvent(
 		record.Summary.ID,
 		normalizedStream,
@@ -414,6 +416,33 @@ func SessionTerminalRangeEventFromRecordWithPayloadLimit(record data.SessionReco
 	event.PayloadLimitReason = "payload_budget_exceeded"
 	event.SuggestedLimit = suggestedTerminalRangeLimit(maxPayloadBytes)
 	return event, nil
+}
+
+func terminalUTF8ByteRange(content string, start, end int) (int, int) {
+	total := len(content)
+	if start < 0 {
+		start = 0
+	}
+	if end < start {
+		end = start
+	}
+	if end > total {
+		end = total
+	}
+	for start < total && !utf8.RuneStart(content[start]) {
+		start++
+	}
+	for end > start && end < total && !utf8.RuneStart(content[end]) {
+		end--
+	}
+	if end < start {
+		end = start
+	}
+	if end == start && start < total {
+		_, size := utf8.DecodeRuneInString(content[start:])
+		end = start + size
+	}
+	return start, end
 }
 
 func SessionDiffPageEventFromRecordWithPayloadLimit(record data.SessionRecord, before, limit int, cursor DeltaCursorSnapshot, maxPayloadBytes int) protocol.SessionDiffPageEvent {

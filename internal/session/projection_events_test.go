@@ -838,6 +838,31 @@ func TestSessionTerminalRangeEventFromRecordWithPayloadLimitReturnsRange(t *test
 	}
 }
 
+func TestSessionTerminalRangeEventFromRecordWithPayloadLimitKeepsUTF8Boundary(t *testing.T) {
+	record := data.SessionRecord{
+		Summary: data.SessionSummary{ID: "s1"},
+		Projection: data.ProjectionSnapshot{
+			RawTerminalByStream: map[string]string{"stdout": "a你好b"},
+			Runtime:             data.SessionRuntime{Command: "claude"},
+		},
+	}
+
+	got, err := SessionTerminalRangeEventFromRecordWithPayloadLimit(record, "stdout", 1, 4, DeltaCursorSnapshot{}, 0)
+	if err != nil {
+		t.Fatalf("terminal range: %v", err)
+	}
+	if got.Start != 1 || got.End != 4 || got.Total != len("a你好b") || got.Content != "你" {
+		t.Fatalf("unexpected utf8-safe terminal range: %+v", got)
+	}
+	got, err = SessionTerminalRangeEventFromRecordWithPayloadLimit(record, "stdout", 1, 1, DeltaCursorSnapshot{}, 0)
+	if err != nil {
+		t.Fatalf("terminal range with short limit: %v", err)
+	}
+	if got.Start != 1 || got.End != 4 || got.Content != "你" {
+		t.Fatalf("expected short limit to expand to one utf8 rune, got %+v", got)
+	}
+}
+
 func TestSessionTerminalRangeEventFromRecordWithPayloadLimitRejectsInvalidStream(t *testing.T) {
 	record := data.SessionRecord{Summary: data.SessionSummary{ID: "s1"}}
 	if _, err := SessionTerminalRangeEventFromRecordWithPayloadLimit(record, "stdin", 0, 1, DeltaCursorSnapshot{}, 0); err == nil {
