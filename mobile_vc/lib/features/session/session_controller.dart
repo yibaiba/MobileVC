@@ -7395,7 +7395,11 @@ class SessionController extends ChangeNotifier {
           ? 'session_updated:${event.reason.trim()}'
           : 'session_updated';
     }
-    _scheduleSessionUpdatedPull();
+    if (shouldRefreshDelta) {
+      _scheduleSessionUpdatedPull(Duration.zero);
+    } else {
+      _scheduleSessionUpdatedPull();
+    }
   }
 
   void _scheduleSessionUpdatedPull([
@@ -7403,6 +7407,10 @@ class SessionController extends ChangeNotifier {
   ]) {
     if (!_connected || _connecting) {
       return;
+    }
+    if (delay <= Duration.zero && _sessionUpdatedPullTimer != null) {
+      _sessionUpdatedPullTimer?.cancel();
+      _sessionUpdatedPullTimer = null;
     }
     if (_sessionUpdatedPullTimer != null) {
       return;
@@ -7512,9 +7520,8 @@ class SessionController extends ChangeNotifier {
       _rememberVisibleHistoryLogEntry(sessionId, entry);
       return;
     }
-    final beforeCount = _timeline.length;
-    _appendTimelineItem(item, emitNotifications: false);
-    if (_timeline.length > beforeCount) {
+    final accepted = _appendTimelineItem(item, emitNotifications: false);
+    if (accepted) {
       _rememberVisibleHistoryLogEntry(sessionId, entry);
     }
   }
@@ -7555,9 +7562,8 @@ class SessionController extends ChangeNotifier {
       return;
     }
     final item = _codexNativeOperationalTimelineItem(entries, resumeMeta);
-    final beforeCount = _timeline.length;
-    _appendTimelineItem(item, emitNotifications: false);
-    if (_timeline.length > beforeCount) {
+    final accepted = _appendTimelineItem(item, emitNotifications: false);
+    if (accepted) {
       for (final entry in entries) {
         _rememberVisibleHistoryLogEntry(sessionId, entry);
       }
@@ -8269,24 +8275,30 @@ class SessionController extends ChangeNotifier {
     _timelineItemIds.add(item.id);
   }
 
-  void _appendTimelineItem(
+  bool _appendTimelineItem(
     TimelineItem item, {
     bool emitNotifications = true,
   }) {
     if (!_shouldKeepTimelineItem(item)) {
-      return;
+      return false;
     }
     if (_timelineItemIds.contains(item.id)) {
-      return;
+      return false;
+    }
+    if (_reconcileRestoredAssistantTimelineItem(
+      item,
+      emitNotifications: emitNotifications,
+    )) {
+      return true;
     }
     if (_isDuplicateUserTimelineItem(item)) {
-      return;
+      return false;
     }
     if (_isDuplicateAssistantTimelineItem(item)) {
-      return;
+      return false;
     }
     if (_isDuplicateRestoredTimelineItem(item)) {
-      return;
+      return false;
     }
     if (_shouldMergeIntoPreviousTimelineItem(item)) {
       final previous = _timeline.removeLast();
@@ -8316,13 +8328,105 @@ class SessionController extends ChangeNotifier {
           preserveExistingAssistantReply: true,
         );
       }
-      return;
+      return true;
     }
     _timeline.add(item);
     _timelineItemIds.add(item.id);
     if (emitNotifications) {
       _emitTimelineNotification(item);
     }
+    return true;
+  }
+
+  bool _reconcileRestoredAssistantTimelineItem(
+    TimelineItem item, {
+    required bool emitNotifications,
+  }) {
+    if (!_isRestoredAssistantReplayCandidate(item)) {
+      return false;
+    }
+    final index = _findLiveAssistantReplayIndex(item);
+    if (index == -1) {
+      return false;
+    }
+    final previous = _timeline[index];
+    final previousBody = _normalizeAssistantReplyForDedupe(previous.body);
+    final restoredBody = _normalizeAssistantReplyForDedupe(item.body);
+    if (previousBody.isEmpty || restoredBody.isEmpty) {
+      return false;
+    }
+    if (restoredBody == previousBody || restoredBody.startsWith(previousBody)) {
+      final reconciled = item.copyWith(
+        meta: previous.meta.merge(item.meta),
+        context: item.context ?? previous.context,
+        attachments: _mergeTimelineAttachments(
+          previous.attachments,
+          item.attachments,
+        ),
+        animateBody: false,
+      );
+      _replaceTimelineItemAt(index, reconciled);
+      if (emitNotifications) {
+        _emitTimelineNotification(
+          reconciled,
+          preserveExistingAssistantReply: true,
+        );
+      }
+      return true;
+    }
+    return previousBody.startsWith(restoredBody);
+  }
+
+  bool _isRestoredAssistantReplayCandidate(TimelineItem item) {
+    if (item.animateBody || !_isAssistantReplyTimelineItem(item)) {
+      return false;
+    }
+    return item.body.trim().isNotEmpty;
+  }
+
+  int _findLiveAssistantReplayIndex(TimelineItem item) {
+    var inspected = 0;
+    for (var index = _timeline.length - 1; index >= 0; index--) {
+      if (inspected >= 20) {
+        break;
+      }
+      inspected += 1;
+      final previous = _timeline[index];
+      if (!previous.animateBody || !_isAssistantReplyTimelineItem(previous)) {
+        continue;
+      }
+      if (!_hasSameDurableAssistantSource(previous, item)) {
+        continue;
+      }
+      final previousBody = _normalizeAssistantReplyForDedupe(previous.body);
+      final restoredBody = _normalizeAssistantReplyForDedupe(item.body);
+      if (previousBody == restoredBody ||
+          restoredBody.startsWith(previousBody) ||
+          previousBody.startsWith(restoredBody)) {
+        return index;
+      }
+    }
+    return -1;
+  }
+
+  bool _hasSameDurableAssistantSource(
+    TimelineItem previous,
+    TimelineItem item,
+  ) {
+    final previousExecutionId = previous.meta.executionId.trim();
+    final itemExecutionId = item.meta.executionId.trim();
+    if (previousExecutionId.isNotEmpty &&
+        previousExecutionId == itemExecutionId) {
+      return true;
+    }
+    final previousContextId = previous.meta.contextId.trim();
+    final itemContextId = item.meta.contextId.trim();
+    if (previousContextId.isNotEmpty && previousContextId == itemContextId) {
+      return true;
+    }
+    final previousGroupId = previous.meta.groupId.trim();
+    final itemGroupId = item.meta.groupId.trim();
+    return previousGroupId.isNotEmpty && previousGroupId == itemGroupId;
   }
 
   bool _isDuplicateUserTimelineItem(TimelineItem item) {

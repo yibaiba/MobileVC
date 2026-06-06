@@ -6706,14 +6706,14 @@ void main() {
         eventCursor: 11,
         reason: 'projection_persisted',
       ));
-      await Future<void>.delayed(const Duration(milliseconds: 450));
+      await Future<void>.delayed(const Duration(milliseconds: 120));
       expect(
         service.sentPayloads
             .where((payload) => payload['action'] == 'session_delta_get'),
         hasLength(1),
       );
 
-      await Future<void>.delayed(const Duration(milliseconds: 450));
+      await Future<void>.delayed(const Duration(milliseconds: 780));
       final deltaRequests = service.sentPayloads
           .where((payload) => payload['action'] == 'session_delta_get')
           .toList();
@@ -6787,6 +6787,98 @@ void main() {
           .toList();
       expect(deltaRequests, hasLength(2));
       expect(deltaRequests.last['sessionId'], 'session-fresh');
+    });
+
+    test('session_updated 当前会话新 cursor 会尽快拉取 delta', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(
+        SessionCreatedEvent(
+          timestamp: _timestamp,
+          sessionId: 'conn-1',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_created'},
+          summary: const SessionSummary(
+            id: 'session-fresh',
+            title: 'Fresh',
+            ownership: 'mobilevc',
+          ),
+        ),
+      );
+      await _flushEvents();
+      service.sentPayloads.clear();
+
+      service.emit(SessionUpdatedEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-fresh',
+        runtimeMeta: const RuntimeMeta(),
+        raw: const {'type': 'session_updated'},
+        generation: 8,
+        eventCursor: 30,
+        reason: 'projection_persisted',
+      ));
+      await Future<void>.delayed(const Duration(milliseconds: 120));
+
+      final deltaRequests = service.sentPayloads
+          .where((payload) => payload['action'] == 'session_delta_get')
+          .toList();
+      expect(deltaRequests, hasLength(1));
+      expect(deltaRequests.single['reason'],
+          'session_updated:projection_persisted');
+    });
+
+    test('当前会话 session_updated delta 会抢占已有列表刷新 debounce', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(
+        SessionCreatedEvent(
+          timestamp: _timestamp,
+          sessionId: 'conn-1',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_created'},
+          summary: const SessionSummary(
+            id: 'session-fresh',
+            title: 'Fresh',
+            ownership: 'mobilevc',
+          ),
+        ),
+      );
+      await _flushEvents();
+      service.sentPayloads.clear();
+
+      service.emit(SessionUpdatedEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-other',
+        runtimeMeta: const RuntimeMeta(),
+        raw: const {'type': 'session_updated'},
+        generation: 3,
+        eventCursor: 20,
+        reason: 'projection_persisted',
+      ));
+      service.emit(SessionUpdatedEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 1)),
+        sessionId: 'session-fresh',
+        runtimeMeta: const RuntimeMeta(),
+        raw: const {'type': 'session_updated'},
+        generation: 9,
+        eventCursor: 31,
+        reason: 'projection_persisted',
+      ));
+      await Future<void>.delayed(const Duration(milliseconds: 120));
+
+      final deltaRequests = service.sentPayloads
+          .where((payload) => payload['action'] == 'session_delta_get')
+          .toList();
+      expect(deltaRequests, hasLength(1));
+      expect(deltaRequests.single['sessionId'], 'session-fresh');
     });
 
     test('loadSessionFromSummary 会先切换到会话 cwd 再加载', () async {
@@ -8359,6 +8451,77 @@ void main() {
           controller.timeline.where((item) => item.kind == 'markdown').toList();
       expect(markdownItems, hasLength(1));
       expect(markdownItems.single.body, '已修复 relay 重连问题，并补充了回归测试。');
+    });
+
+    test('session_delta 回放已实时显示的完整 assistant 回复时不会重复拼接', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      const meta = RuntimeMeta(
+        command: 'codex',
+        engine: 'codex',
+        executionId: 'exec-codex-delta-final-1',
+        contextId: 'turn-delta-final-1',
+      );
+      await controller.connect();
+      service.emit(SessionCreatedEvent(
+        timestamp: _timestamp,
+        sessionId: 'conn-1',
+        runtimeMeta: meta,
+        raw: const {'type': 'session_created'},
+        summary: const SessionSummary(id: 'session-1', title: 'Session 1'),
+      ));
+      await _flushEvents();
+
+      service.emit(LogEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 100)),
+        sessionId: 'session-1',
+        runtimeMeta: meta,
+        raw: const {'type': 'log'},
+        message: '手机发送后页面刷新慢，',
+        stream: 'stdout',
+      ));
+      service.emit(LogEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 200)),
+        sessionId: 'session-1',
+        runtimeMeta: meta,
+        raw: const {'type': 'log'},
+        message: '并且回复重复显示。',
+        stream: 'stdout',
+      ));
+      await _flushEvents();
+
+      service.emit(SessionDeltaEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 800)),
+        sessionId: 'session-1',
+        runtimeMeta: meta,
+        raw: const {'type': 'session_delta'},
+        summary: const SessionSummary(id: 'session-1', title: 'Session 1'),
+        base: const SessionDeltaKnown(eventCursor: 1, logEntryCount: 0),
+        latest: const SessionDeltaKnown(eventCursor: 2, logEntryCount: 1),
+        appendLogEntries: const [
+          HistoryLogEntry(
+            kind: 'markdown',
+            message: '手机发送后页面刷新慢，并且回复重复显示。',
+            timestamp: '2026-05-27T05:53:00Z',
+            executionId: 'exec-codex-delta-final-1',
+            context: HistoryContext(
+              id: 'turn-delta-final-1',
+              source: 'codex',
+              type: 'assistant',
+            ),
+          ),
+        ],
+        resumeRuntimeMeta: meta,
+      ));
+      await _flushEvents();
+
+      final markdownItems =
+          controller.timeline.where((item) => item.kind == 'markdown').toList();
+      expect(markdownItems, hasLength(1));
+      expect(markdownItems.single.body, '手机发送后页面刷新慢，并且回复重复显示。');
     });
 
     test('codex 单行总结式回复不会再被误判为 terminal 输出', () async {
