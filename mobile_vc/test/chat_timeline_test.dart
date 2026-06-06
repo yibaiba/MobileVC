@@ -611,4 +611,246 @@ void main() {
       );
     }
   });
+
+  testWidgets('底部 plan 选择卡出现时自动滚到最新交互', (tester) async {
+    final items = List<TimelineItem>.generate(
+      18,
+      (index) => TimelineItem(
+        id: 'plan-scroll-$index',
+        kind: 'markdown',
+        timestamp: DateTime(2026, 1, 1, 0, index),
+        body: '计划前历史消息 $index',
+        animateBody: false,
+      ),
+    );
+    const question = PlanQuestion(
+      id: 'implementation-order',
+      title: '选择修复顺序',
+      message: '先修复哪一项？',
+      options: [
+        PromptOption(value: 'relay', label: 'Relay'),
+        PromptOption(value: 'ui', label: '界面刷新'),
+      ],
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SizedBox(
+            height: 320,
+            child: ChatTimeline(
+              sessionId: 'plan-scroll-session',
+              bottomPadding: 24,
+              items: items,
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.pump();
+
+    final scrollableState =
+        tester.state<ScrollableState>(find.byType(Scrollable));
+    final initialMaxScrollExtent = scrollableState.position.maxScrollExtent;
+    expect(scrollableState.position.pixels, initialMaxScrollExtent);
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SizedBox(
+            height: 320,
+            child: ChatTimeline(
+              sessionId: 'plan-scroll-session',
+              bottomPadding: 24,
+              items: items,
+              pendingPlanQuestion: question,
+              pendingPlanProgressLabel: '1/2',
+              shouldShowPlanChoices: true,
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.pump();
+
+    expect(
+      scrollableState.position.maxScrollExtent,
+      greaterThan(initialMaxScrollExtent),
+    );
+    expect(
+      scrollableState.position.pixels,
+      scrollableState.position.maxScrollExtent,
+    );
+  });
+
+  testWidgets('底部 plan 选择卡内容变高时继续贴住底部', (tester) async {
+    final items = List<TimelineItem>.generate(
+      18,
+      (index) => TimelineItem(
+        id: 'plan-grow-$index',
+        kind: 'markdown',
+        timestamp: DateTime(2026, 1, 1, 0, index),
+        body: '计划内容变化前历史消息 $index',
+        animateBody: false,
+      ),
+    );
+    const baseQuestion = PlanQuestion(
+      id: 'sync-strategy',
+      title: '同步策略',
+      message: '请选择同步策略。',
+      options: [
+        PromptOption(value: 'fast', label: '快速'),
+        PromptOption(value: 'safe', label: '稳妥'),
+      ],
+    );
+    final expandedQuestion = PlanQuestion(
+      id: baseQuestion.id,
+      title: baseQuestion.title,
+      message: List<String>.generate(
+        16,
+        (index) => '同步策略补充说明第 $index 行，需要内容变高后保持底部跟随。',
+      ).join('\n'),
+      options: baseQuestion.options,
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SizedBox(
+            height: 320,
+            child: ChatTimeline(
+              sessionId: 'plan-grow-session',
+              bottomPadding: 24,
+              items: items,
+              pendingPlanQuestion: baseQuestion,
+              pendingPlanProgressLabel: '1/2',
+              shouldShowPlanChoices: true,
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.pump();
+
+    final scrollableState =
+        tester.state<ScrollableState>(find.byType(Scrollable));
+    final initialMaxScrollExtent = scrollableState.position.maxScrollExtent;
+    expect(scrollableState.position.pixels, initialMaxScrollExtent);
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SizedBox(
+            height: 320,
+            child: ChatTimeline(
+              sessionId: 'plan-grow-session',
+              bottomPadding: 24,
+              items: items,
+              pendingPlanQuestion: expandedQuestion,
+              pendingPlanProgressLabel: '1/2',
+              shouldShowPlanChoices: true,
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.pump();
+
+    expect(
+      scrollableState.position.maxScrollExtent,
+      greaterThan(initialMaxScrollExtent),
+    );
+    expect(
+      scrollableState.position.pixels,
+      scrollableState.position.maxScrollExtent,
+    );
+  });
+
+  testWidgets('底部 prompt 按钮变多时继续贴住底部', (tester) async {
+    final items = List<TimelineItem>.generate(
+      18,
+      (index) => TimelineItem(
+        id: 'prompt-grow-$index',
+        kind: 'markdown',
+        timestamp: DateTime(2026, 1, 1, 0, index),
+        body: 'Prompt 前历史消息 $index',
+        animateBody: false,
+      ),
+    );
+    final basePrompt = PromptRequestEvent(
+      timestamp: DateTime(2026, 1, 1, 0, 30),
+      sessionId: 'prompt-grow-session',
+      runtimeMeta: const RuntimeMeta(command: 'codex'),
+      raw: const {'type': 'prompt_request'},
+      message: '请选择继续方式',
+      options: const [
+        PromptOption(value: 'continue', label: '继续'),
+      ],
+    );
+    final expandedPrompt = PromptRequestEvent(
+      timestamp: basePrompt.timestamp,
+      sessionId: basePrompt.sessionId,
+      runtimeMeta: basePrompt.runtimeMeta,
+      raw: basePrompt.raw,
+      message: basePrompt.message,
+      options: List<PromptOption>.generate(
+        14,
+        (index) => PromptOption(value: 'choice-$index', label: '选项 $index'),
+      ),
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SizedBox(
+            height: 320,
+            child: ChatTimeline(
+              sessionId: 'prompt-grow-session',
+              bottomPadding: 24,
+              items: items,
+              pendingPrompt: basePrompt,
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.pump();
+
+    final scrollableState =
+        tester.state<ScrollableState>(find.byType(Scrollable));
+    final initialMaxScrollExtent = scrollableState.position.maxScrollExtent;
+    expect(scrollableState.position.pixels, initialMaxScrollExtent);
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SizedBox(
+            height: 320,
+            child: ChatTimeline(
+              sessionId: 'prompt-grow-session',
+              bottomPadding: 24,
+              items: items,
+              pendingPrompt: expandedPrompt,
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.pump();
+
+    expect(
+      scrollableState.position.maxScrollExtent,
+      greaterThan(initialMaxScrollExtent),
+    );
+    expect(
+      scrollableState.position.pixels,
+      scrollableState.position.maxScrollExtent,
+    );
+  });
 }
