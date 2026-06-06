@@ -83,6 +83,10 @@ class ChatTimeline extends StatefulWidget {
 class _ChatTimelineState extends State<ChatTimeline> {
   final ScrollController _scrollController = ScrollController();
   int _lastCount = 0;
+  String _lastTimelineHistoryKey = '';
+  String _lastFirstItemId = '';
+  String _lastLastItemId = '';
+  bool _scrollToBottomScheduled = false;
   List<TimelineItem>? _anchorItemsRef;
   int _anchorItemsLength = -1;
   String _anchorDiffKey = '';
@@ -92,7 +96,7 @@ class _ChatTimelineState extends State<ChatTimeline> {
   void initState() {
     super.initState();
     _scrollController.addListener(_handleScroll);
-    _lastCount = widget.items.length;
+    _rememberTimelineState(widget.items);
     if (widget.items.isNotEmpty) {
       _scrollToBottomAfterFrame();
     }
@@ -121,43 +125,71 @@ class _ChatTimelineState extends State<ChatTimeline> {
   @override
   void didUpdateWidget(covariant ChatTimeline oldWidget) {
     super.didUpdateWidget(oldWidget);
+    final previousItemCount = _lastCount;
+    final previousHistoryKey = _lastTimelineHistoryKey;
+    final previousFirstItemId = _lastFirstItemId;
+    final previousLastItemId = _lastLastItemId;
+    final currentHistoryKey = _timelineHistoryKey(widget.items);
     final currentCount = widget.items.length +
         ((widget.pendingInteraction?.hasVisiblePrompt == true ||
                 widget.pendingPrompt?.hasVisiblePrompt == true)
             ? 1
             : 0);
-    final previousCount = oldWidget.items.length +
+    final previousCount = previousItemCount +
         ((oldWidget.pendingInteraction?.hasVisiblePrompt == true ||
                 oldWidget.pendingPrompt?.hasVisiblePrompt == true)
             ? 1
             : 0);
-    final switchedHistory = _timelineHistoryKey(widget.items) !=
-        _timelineHistoryKey(oldWidget.items);
+    final switchedHistory = currentHistoryKey != previousHistoryKey;
     final switchedSession =
         widget.sessionId.trim() != oldWidget.sessionId.trim();
-    final addedOlderItems = widget.items.length > oldWidget.items.length &&
+    final addedOlderItems = widget.items.length > previousItemCount &&
         widget.items.isNotEmpty &&
-        oldWidget.items.isNotEmpty &&
-        widget.items.last.id == oldWidget.items.last.id &&
-        widget.items.first.id != oldWidget.items.first.id;
+        previousItemCount > 0 &&
+        widget.items.last.id == previousLastItemId &&
+        widget.items.first.id != previousFirstItemId;
     if (!addedOlderItems &&
         (currentCount > previousCount ||
-            widget.items.length > _lastCount ||
+            widget.items.length > previousItemCount ||
             switchedHistory ||
             switchedSession)) {
       _scrollToBottomAfterFrame();
     }
-    _lastCount = widget.items.length;
+    _rememberTimelineState(widget.items);
+  }
+
+  void _rememberTimelineState(List<TimelineItem> items) {
+    _lastCount = items.length;
+    _lastTimelineHistoryKey = _timelineHistoryKey(items);
+    _lastFirstItemId = items.isEmpty ? '' : items.first.id;
+    _lastLastItemId = items.isEmpty ? '' : items.last.id;
   }
 
   void _scrollToBottomAfterFrame() {
+    if (_scrollToBottomScheduled) {
+      return;
+    }
+    _scrollToBottomScheduled = true;
     WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) {
+        _scrollToBottomScheduled = false;
+        return;
+      }
       _jumpToBottom();
-      WidgetsBinding.instance.addPostFrameCallback((_) => _jumpToBottom());
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _scrollToBottomScheduled = false;
+        if (!mounted) {
+          return;
+        }
+        _jumpToBottom();
+      });
     });
   }
 
   void _jumpToBottom() {
+    if (!mounted) {
+      return;
+    }
     if (!_scrollController.hasClients) {
       return;
     }

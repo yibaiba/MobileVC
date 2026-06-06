@@ -1089,10 +1089,9 @@ class _TypewriterMarkdownState extends State<_TypewriterMarkdown> {
   void initState() {
     super.initState();
     _lastBody = widget.item.body;
-    final cached = _revealedTextCache[widget.item.id];
+    final cached = _revealedPrefixFor(widget.item.id, widget.item.body);
     if (cached != null && cached.isNotEmpty) {
-      _visibleText =
-          cached.length > widget.item.body.length ? widget.item.body : cached;
+      _visibleText = cached;
     } else {
       _visibleText = _initialVisibleText(widget.item.body);
       _revealedTextCache[widget.item.id] = _visibleText;
@@ -1109,10 +1108,9 @@ class _TypewriterMarkdownState extends State<_TypewriterMarkdown> {
       final previousBody = _lastBody;
       final sameItem = oldWidget.item.id == widget.item.id;
       _lastBody = widget.item.body;
-      final cached = _revealedTextCache[widget.item.id] ?? '';
+      final cached = _revealedPrefixFor(widget.item.id, widget.item.body) ?? '';
       if (cached.isNotEmpty) {
-        _visibleText =
-            cached.length > widget.item.body.length ? widget.item.body : cached;
+        _visibleText = cached;
         if (sameItem &&
             widget.item.body.startsWith(previousBody) &&
             _visibleText.length < previousBody.length) {
@@ -1198,6 +1196,18 @@ class _TypewriterMarkdownState extends State<_TypewriterMarkdown> {
       return '';
     }
     return body.substring(0, 1);
+  }
+
+  String? _revealedPrefixFor(String itemId, String body) {
+    final cached = _revealedTextCache[itemId];
+    if (cached == null || cached.isEmpty) {
+      return null;
+    }
+    if (!body.startsWith(cached)) {
+      _revealedTextCache.remove(itemId);
+      return null;
+    }
+    return cached;
   }
 }
 

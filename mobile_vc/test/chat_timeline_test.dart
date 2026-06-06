@@ -420,6 +420,74 @@ void main() {
     );
   });
 
+  testWidgets('同一个 timeline 列表实例内最后一条内容变长时仍自动滚到底部', (tester) async {
+    final items = List<TimelineItem>.generate(
+      18,
+      (index) => TimelineItem(
+        id: 'live-stream-$index',
+        kind: 'markdown',
+        timestamp: DateTime(2026, 1, 1, 0, index),
+        body: index == 17 ? '正在生成回复...' : '历史消息 $index',
+        animateBody: false,
+      ),
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SizedBox(
+            height: 320,
+            child: ChatTimeline(
+              sessionId: 'live-stream-session',
+              bottomPadding: 24,
+              items: items,
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.pump();
+
+    final scrollableState =
+        tester.state<ScrollableState>(find.byType(Scrollable));
+    final initialMaxScrollExtent = scrollableState.position.maxScrollExtent;
+    expect(scrollableState.position.pixels, initialMaxScrollExtent);
+
+    items[17] = items[17].copyWith(
+      body: List<String>.generate(
+        48,
+        (index) => '同一个列表实例新增内容第 $index 行，需要真实页面保持底部。',
+      ).join('\n'),
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SizedBox(
+            height: 320,
+            child: ChatTimeline(
+              sessionId: 'live-stream-session',
+              bottomPadding: 24,
+              items: items,
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.pump();
+
+    expect(
+      scrollableState.position.maxScrollExtent,
+      greaterThan(initialMaxScrollExtent),
+    );
+    expect(
+      scrollableState.position.pixels,
+      scrollableState.position.maxScrollExtent,
+    );
+  });
+
   testWidgets('正常对话流式回复逐字渲染变高时继续贴住底部', (tester) async {
     final items = List<TimelineItem>.generate(
       18,
