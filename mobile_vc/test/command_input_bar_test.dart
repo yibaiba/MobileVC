@@ -158,6 +158,39 @@ void main() {
       expect(targetMode, isTrue);
     });
 
+    testWidgets('Codex 添加菜单显示请求目标并可切换目标模式', (tester) async {
+      var targetMode = false;
+      var openedSkills = false;
+      await tester.pumpWidget(
+        _buildTestApp(
+          showClaudeMode: true,
+          currentEngine: 'codex',
+          configuredEngine: 'codex',
+          codexTargetMode: targetMode,
+          onCodexTargetModeChanged: (value) => targetMode = value,
+          onOpenSkills: () => openedSkills = true,
+        ),
+      );
+
+      await tester.tap(find.byKey(const ValueKey('command-add-action-button')));
+      await tester.pumpAndSettle();
+
+      expect(find.text('请求目标'), findsOneWidget);
+      expect(find.text('插件'), findsOneWidget);
+      expect(find.text('图片'), findsOneWidget);
+      expect(find.byIcon(Icons.track_changes_outlined), findsWidgets);
+
+      await tester.tap(find.text('请求目标'));
+      await tester.pumpAndSettle();
+      expect(targetMode, isTrue);
+
+      await tester.tap(find.byKey(const ValueKey('command-add-action-button')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('插件'));
+      await tester.pumpAndSettle();
+      expect(openedSkills, isTrue);
+    });
+
     testWidgets('Codex 窄屏工具栏不会裁切目标工具按钮', (tester) async {
       tester.view.devicePixelRatio = 1;
       tester.view.physicalSize = const Size(360, 780);
@@ -237,8 +270,7 @@ void main() {
 
       expect(find.byIcon(Icons.stop_rounded), findsOneWidget);
 
-      await tester.tap(find.byTooltip('添加图片'));
-      await tester.pump();
+      await _tapAddImage(tester);
 
       expect(find.byIcon(Icons.stop_rounded), findsNothing);
       expect(find.byIcon(Icons.arrow_upward), findsOneWidget);
@@ -271,8 +303,7 @@ void main() {
         ),
       );
 
-      await tester.tap(find.byTooltip('添加图片'));
-      await tester.pump();
+      await _tapAddImage(tester);
 
       expect(find.byIcon(Icons.stop_rounded), findsOneWidget);
       expect(find.byIcon(Icons.arrow_upward), findsNothing);
@@ -299,8 +330,7 @@ void main() {
         ),
       );
 
-      await tester.tap(find.byTooltip('添加图片'));
-      await tester.pump();
+      await _tapAddImage(tester);
 
       final previewFinder =
           find.byKey(const ValueKey('imageAttachmentPreview:screen.png'));
@@ -532,8 +562,7 @@ void main() {
         ),
       );
 
-      await tester.tap(find.byTooltip('添加图片'));
-      await tester.pump();
+      await _tapAddImage(tester);
 
       expect(pickCount, 1);
       expect(find.byKey(const ValueKey('imageAttachmentPreview:screen.png')),
@@ -564,8 +593,7 @@ void main() {
         ),
       );
 
-      await tester.tap(find.byTooltip('添加图片'));
-      await tester.pump();
+      await _tapAddImage(tester);
       expect(find.byKey(const ValueKey('imageAttachmentPreview:screen.png')),
           findsOneWidget);
 
@@ -628,6 +656,7 @@ Widget _buildTestApp({
   Future<ChatImageAttachment?> Function()? onAttachImage,
   VoidCallback? onStop,
   ValueChanged<String>? onPermissionModeChanged,
+  VoidCallback? onOpenSkills,
   EdgeInsets viewInsets = EdgeInsets.zero,
   Widget body = const SizedBox.shrink(),
 }) {
@@ -657,7 +686,7 @@ Widget _buildTestApp({
           onOpenSessions: () {},
           onOpenRuntimeInfo: () {},
           onOpenLogs: () {},
-          onOpenSkills: () {},
+          onOpenSkills: onOpenSkills ?? () {},
           onOpenMemory: () {},
           onOpenPermissions: () {},
           onOpenModels: () {},
@@ -675,6 +704,20 @@ Widget _buildTestApp({
       ),
     ),
   );
+}
+
+Future<void> _tapAddImage(WidgetTester tester) async {
+  final addMenu = find.byKey(const ValueKey('command-add-action-button'));
+  if (addMenu.evaluate().isEmpty) {
+    await tester.tap(find.byTooltip('添加图片'));
+    await tester.pump();
+    return;
+  }
+
+  await tester.tap(addMenu);
+  await tester.pumpAndSettle();
+  await tester.tap(find.text('图片'));
+  await tester.pumpAndSettle();
 }
 
 class _BuildCounter extends StatelessWidget {

@@ -233,6 +233,20 @@ class _CommandInputBarState extends State<CommandInputBar> {
     setState(() => _imageAttachments.removeAt(index));
   }
 
+  void _handleAddAction(_CommandAddAction action) {
+    switch (action) {
+      case _CommandAddAction.target:
+        widget.onCodexTargetModeChanged(!widget.codexTargetMode);
+        return;
+      case _CommandAddAction.skills:
+        widget.onOpenSkills();
+        return;
+      case _CommandAddAction.image:
+        _attachImage();
+        return;
+    }
+  }
+
   bool _shouldKeepKeyboard(String value) {
     final lower = value.trim().toLowerCase();
     return lower == 'claude' ||
@@ -520,43 +534,23 @@ class _CommandInputBarState extends State<CommandInputBar> {
                           ),
                           Padding(
                             padding: const EdgeInsets.fromLTRB(0, 0, 2, 6),
-                            child: SizedBox(
-                              key:
-                                  const ValueKey('command-image-action-button'),
-                              width: _inputActionButtonSize,
-                              height: _inputActionButtonSize,
-                              child: IconButton.filledTonal(
-                                onPressed: _inputLocked || _pickingImage
-                                    ? null
-                                    : _attachImage,
-                                tooltip: '添加图片',
-                                style: IconButton.styleFrom(
-                                  fixedSize: const Size.square(
-                                    _inputActionButtonSize,
+                            child: isCodex
+                                ? _CommandAddMenuButton(
+                                    size: _inputActionButtonSize,
+                                    iconSize: _inputActionIconSize,
+                                    isPickingImage: _pickingImage,
+                                    imageEnabled:
+                                        !_inputLocked && !_pickingImage,
+                                    codexTargetMode: widget.codexTargetMode,
+                                    onSelected: _handleAddAction,
+                                  )
+                                : _ImageAttachButton(
+                                    size: _inputActionButtonSize,
+                                    iconSize: _inputActionIconSize,
+                                    isPickingImage: _pickingImage,
+                                    enabled: !_inputLocked && !_pickingImage,
+                                    onPressed: _attachImage,
                                   ),
-                                  minimumSize: const Size.square(
-                                    _inputActionButtonSize,
-                                  ),
-                                  padding: EdgeInsets.zero,
-                                  tapTargetSize:
-                                      MaterialTapTargetSize.shrinkWrap,
-                                  visualDensity: VisualDensity.compact,
-                                ),
-                                icon: _pickingImage
-                                    ? SizedBox(
-                                        width: _inputActionIconSize,
-                                        height: _inputActionIconSize,
-                                        child: CircularProgressIndicator(
-                                          strokeWidth: 2,
-                                          color: scheme.primary,
-                                        ),
-                                      )
-                                    : const Icon(
-                                        Icons.image_outlined,
-                                        size: _inputActionIconSize,
-                                      ),
-                              ),
-                            ),
                           ),
                           Padding(
                             padding: const EdgeInsets.fromLTRB(0, 0, 4, 6),
@@ -814,6 +808,200 @@ class _PermissionModeIconButton extends StatelessWidget {
       }
     }
     return options.first;
+  }
+}
+
+enum _CommandAddAction { target, skills, image }
+
+class _CommandAddMenuButton extends StatelessWidget {
+  const _CommandAddMenuButton({
+    required this.size,
+    required this.iconSize,
+    required this.isPickingImage,
+    required this.imageEnabled,
+    required this.codexTargetMode,
+    required this.onSelected,
+  });
+
+  final double size;
+  final double iconSize;
+  final bool isPickingImage;
+  final bool imageEnabled;
+  final bool codexTargetMode;
+  final ValueChanged<_CommandAddAction> onSelected;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return PopupMenuButton<_CommandAddAction>(
+      key: const ValueKey('command-add-action-button'),
+      tooltip: '添加',
+      enabled: !isPickingImage,
+      onSelected: onSelected,
+      itemBuilder: (context) => [
+        PopupMenuItem<_CommandAddAction>(
+          key: const ValueKey('command-add-target-item'),
+          value: _CommandAddAction.target,
+          child: _CommandAddMenuRow(
+            icon: Icons.track_changes_outlined,
+            label: '请求目标',
+            trailing: IgnorePointer(
+              child: Switch.adaptive(
+                value: codexTargetMode,
+                onChanged: (_) {},
+                materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              ),
+            ),
+          ),
+        ),
+        const PopupMenuItem<_CommandAddAction>(
+          value: _CommandAddAction.skills,
+          child: _CommandAddMenuRow(
+            icon: Icons.extension_outlined,
+            label: '插件',
+            trailing: Icon(Icons.chevron_right_rounded, size: 18),
+          ),
+        ),
+        PopupMenuItem<_CommandAddAction>(
+          value: _CommandAddAction.image,
+          enabled: imageEnabled,
+          child: const _CommandAddMenuRow(
+            icon: Icons.image_outlined,
+            label: '图片',
+          ),
+        ),
+      ],
+      child: _CommandActionButtonFrame(
+        key: const ValueKey('command-image-action-button'),
+        size: size,
+        backgroundColor: scheme.secondaryContainer.withValues(alpha: 0.62),
+        foregroundColor: scheme.onSecondaryContainer,
+        icon: isPickingImage
+            ? SizedBox(
+                width: iconSize,
+                height: iconSize,
+                child: CircularProgressIndicator(
+                  strokeWidth: 2,
+                  color: scheme.primary,
+                ),
+              )
+            : Icon(Icons.add_rounded, size: iconSize),
+      ),
+    );
+  }
+}
+
+class _ImageAttachButton extends StatelessWidget {
+  const _ImageAttachButton({
+    required this.size,
+    required this.iconSize,
+    required this.isPickingImage,
+    required this.enabled,
+    required this.onPressed,
+  });
+
+  final double size;
+  final double iconSize;
+  final bool isPickingImage;
+  final bool enabled;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return SizedBox(
+      key: const ValueKey('command-image-action-button'),
+      width: size,
+      height: size,
+      child: IconButton.filledTonal(
+        onPressed: enabled ? onPressed : null,
+        tooltip: '添加图片',
+        style: IconButton.styleFrom(
+          fixedSize: Size.square(size),
+          minimumSize: Size.square(size),
+          padding: EdgeInsets.zero,
+          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+          visualDensity: VisualDensity.compact,
+        ),
+        icon: isPickingImage
+            ? SizedBox(
+                width: iconSize,
+                height: iconSize,
+                child: CircularProgressIndicator(
+                  strokeWidth: 2,
+                  color: scheme.primary,
+                ),
+              )
+            : Icon(
+                Icons.image_outlined,
+                size: iconSize,
+              ),
+      ),
+    );
+  }
+}
+
+class _CommandActionButtonFrame extends StatelessWidget {
+  const _CommandActionButtonFrame({
+    super.key,
+    required this.size,
+    required this.backgroundColor,
+    required this.foregroundColor,
+    required this.icon,
+  });
+
+  final double size;
+  final Color backgroundColor;
+  final Color foregroundColor;
+  final Widget icon;
+
+  @override
+  Widget build(BuildContext context) {
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: backgroundColor,
+        shape: BoxShape.circle,
+      ),
+      child: SizedBox(
+        width: size,
+        height: size,
+        child: Center(
+          child: IconTheme(
+            data: IconThemeData(color: foregroundColor),
+            child: icon,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _CommandAddMenuRow extends StatelessWidget {
+  const _CommandAddMenuRow({
+    required this.icon,
+    required this.label,
+    this.trailing,
+  });
+
+  final IconData icon;
+  final String label;
+  final Widget? trailing;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(icon, size: 18, color: scheme.onSurfaceVariant),
+        const SizedBox(width: 10),
+        Text(label),
+        if (trailing != null) ...[
+          const SizedBox(width: 16),
+          trailing!,
+        ],
+      ],
+    );
   }
 }
 
