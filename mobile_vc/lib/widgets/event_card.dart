@@ -16,6 +16,7 @@ class EventCard extends StatefulWidget {
     this.mediaPreviewKeyFor,
     this.onOpenAttachment,
     this.onRequestMediaPreview,
+    this.onAnimatedBodyProgress,
   });
 
   final TimelineItem item;
@@ -24,6 +25,7 @@ class EventCard extends StatefulWidget {
   final String Function(TimelineAttachment attachment)? mediaPreviewKeyFor;
   final ValueChanged<TimelineAttachment>? onOpenAttachment;
   final ValueChanged<TimelineAttachment>? onRequestMediaPreview;
+  final VoidCallback? onAnimatedBodyProgress;
 
   @override
   State<EventCard> createState() => _EventCardState();
@@ -347,6 +349,7 @@ class _EventCardState extends State<EventCard> {
             plain: true,
             useSelectionArea: _selectionMode,
             selectable: _selectionMode,
+            onProgress: widget.onAnimatedBodyProgress,
           );
     return SelectionArea(
       contextMenuBuilder: _buildSelectionAreaContextMenu,
@@ -1061,6 +1064,7 @@ class _TypewriterMarkdown extends StatefulWidget {
     this.plain = false,
     this.useSelectionArea = false,
     this.selectable = false,
+    this.onProgress,
   });
 
   final TimelineItem item;
@@ -1068,6 +1072,7 @@ class _TypewriterMarkdown extends StatefulWidget {
   final bool plain;
   final bool useSelectionArea;
   final bool selectable;
+  final VoidCallback? onProgress;
 
   @override
   State<_TypewriterMarkdown> createState() => _TypewriterMarkdownState();
@@ -1181,6 +1186,7 @@ class _TypewriterMarkdownState extends State<_TypewriterMarkdown> {
         _visibleText = target.substring(0, next);
         _revealedTextCache[widget.item.id] = _visibleText;
       });
+      widget.onProgress?.call();
       if (next >= target.length) {
         timer.cancel();
       }

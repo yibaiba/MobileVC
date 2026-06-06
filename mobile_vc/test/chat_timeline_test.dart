@@ -419,4 +419,54 @@ void main() {
       scrollableState.position.maxScrollExtent,
     );
   });
+
+  testWidgets('正常对话流式回复逐字渲染变高时继续贴住底部', (tester) async {
+    final items = List<TimelineItem>.generate(
+      18,
+      (index) => TimelineItem(
+        id: 'normal-stream-$index',
+        kind: 'markdown',
+        timestamp: DateTime(2026, 1, 1, 0, index),
+        body: index == 17
+            ? List<String>.generate(
+                64,
+                (line) => '正常对话流式回复第 $line 行，需要逐步渲染并保持底部跟随。',
+              ).join('\n')
+            : '正常对话历史消息 $index',
+        animateBody: index == 17,
+      ),
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SizedBox(
+            height: 320,
+            child: ChatTimeline(
+              sessionId: 'normal-stream-session',
+              bottomPadding: 24,
+              items: items,
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.pump();
+
+    final scrollableState =
+        tester.state<ScrollableState>(find.byType(Scrollable));
+    expect(
+      scrollableState.position.pixels,
+      scrollableState.position.maxScrollExtent,
+    );
+
+    for (var i = 0; i < 8; i++) {
+      await tester.pump(const Duration(milliseconds: 16));
+      expect(
+        scrollableState.position.pixels,
+        scrollableState.position.maxScrollExtent,
+      );
+    }
+  });
 }

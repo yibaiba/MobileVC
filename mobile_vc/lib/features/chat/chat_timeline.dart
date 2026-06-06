@@ -164,6 +164,22 @@ class _ChatTimelineState extends State<ChatTimeline> {
     _scrollController.jumpTo(_scrollController.position.maxScrollExtent);
   }
 
+  void _handleAnimatedBodyProgress() {
+    if (!_isNearBottom()) {
+      return;
+    }
+    _scrollToBottomAfterFrame();
+  }
+
+  bool _isNearBottom() {
+    if (!_scrollController.hasClients) {
+      return true;
+    }
+    final position = _scrollController.position;
+    final distance = position.maxScrollExtent - position.pixels;
+    return distance <= 96;
+  }
+
   @override
   Widget build(BuildContext context) {
     final promptCandidate = widget.shouldShowReviewChoices
@@ -253,6 +269,7 @@ class _ChatTimelineState extends State<ChatTimeline> {
           mediaPreviewStates: widget.mediaPreviewStates,
           onOpenAttachment: widget.onOpenAttachment,
           onRequestMediaPreview: widget.onRequestMediaPreview,
+          onAnimatedBodyProgress: _handleAnimatedBodyProgress,
           onTap: () {
             if (item.kind == 'runtime_info_result') {
               widget.onOpenRuntimeInfo?.call();
