@@ -242,6 +242,10 @@ class _ChatTimelineState extends State<ChatTimeline> {
       visiblePromptMessage: visiblePromptMessage,
       visiblePlanQuestion: visiblePlanQuestion,
     );
+    final childIndexByKey = _timelineChildIndexByKey(
+      reviewAnchorIndex: reviewAnchorIndex,
+      extraItems: extraItems,
+    );
     final resolvedItemCount = _resolvedItemCount(
       reviewAnchorIndex: reviewAnchorIndex,
       extraItems: extraItems,
@@ -326,6 +330,13 @@ class _ChatTimelineState extends State<ChatTimeline> {
             },
           ),
         );
+      },
+      findChildIndexCallback: (key) {
+        if (key is! ValueKey<String>) {
+          return null;
+        }
+        final itemIndex = childIndexByKey[key.value];
+        return itemIndex == null ? null : itemIndex * 2;
       },
       separatorBuilder: (_, __) => const SizedBox(height: 12),
       itemCount: resolvedItemCount,
@@ -525,6 +536,26 @@ class _ChatTimelineState extends State<ChatTimeline> {
       item.kind,
       item.id,
     ].join(':');
+  }
+
+  Map<String, int> _timelineChildIndexByKey({
+    required int reviewAnchorIndex,
+    required List<TimelineItem> extraItems,
+  }) {
+    final resolvedItemCount = _resolvedItemCount(
+      reviewAnchorIndex: reviewAnchorIndex,
+      extraItems: extraItems,
+    );
+    final indexes = <String, int>{};
+    for (var index = 0; index < resolvedItemCount; index++) {
+      final item = _timelineItemAt(
+        index,
+        reviewAnchorIndex: reviewAnchorIndex,
+        extraItems: extraItems,
+      );
+      indexes[_timelineChildKey(item)] = index;
+    }
+    return indexes;
   }
 
   bool _shouldHidePassiveReadyPrompt(PromptRequestEvent prompt) {
