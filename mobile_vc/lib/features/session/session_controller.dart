@@ -8291,6 +8291,9 @@ class SessionController extends ChangeNotifier {
     )) {
       return true;
     }
+    if (_isLiveAssistantReplayTailOfRestoredItem(item)) {
+      return false;
+    }
     if (_isDuplicateUserTimelineItem(item)) {
       return false;
     }
@@ -8382,6 +8385,51 @@ class SessionController extends ChangeNotifier {
       return false;
     }
     return item.body.trim().isNotEmpty;
+  }
+
+  bool _isLiveAssistantReplayTailOfRestoredItem(TimelineItem item) {
+    if (!item.animateBody || !_isAssistantReplyTimelineItem(item)) {
+      return false;
+    }
+    final liveBody = _normalizeAssistantReplyForDedupe(item.body);
+    if (liveBody.isEmpty) {
+      return false;
+    }
+    var inspected = 0;
+    for (var index = _timeline.length - 1; index >= 0; index--) {
+      if (inspected >= 20) {
+        break;
+      }
+      inspected += 1;
+      final previous = _timeline[index];
+      if (previous.animateBody || !_isAssistantReplyTimelineItem(previous)) {
+        continue;
+      }
+      if (!_hasSameDurableAssistantSource(previous, item)) {
+        continue;
+      }
+      final restoredBody = _normalizeAssistantReplyForDedupe(previous.body);
+      if (_restoredAssistantBodyContainsLiveReplay(
+        restoredBody,
+        liveBody,
+      )) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool _restoredAssistantBodyContainsLiveReplay(
+    String restoredBody,
+    String liveBody,
+  ) {
+    if (restoredBody.isEmpty || liveBody.isEmpty) {
+      return false;
+    }
+    if (restoredBody == liveBody || restoredBody.endsWith(liveBody)) {
+      return true;
+    }
+    return liveBody.length >= 24 && restoredBody.contains(liveBody);
   }
 
   int _findLiveAssistantReplayIndex(TimelineItem item) {

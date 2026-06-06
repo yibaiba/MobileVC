@@ -8524,6 +8524,73 @@ void main() {
       expect(markdownItems.single.body, '手机发送后页面刷新慢，并且回复重复显示。');
     });
 
+    test('history 已恢复完整 assistant 回复后会吸收后到的同源 live 尾段', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      const meta = RuntimeMeta(
+        command: 'codex',
+        engine: 'codex',
+        executionId: 'exec-codex-restored-tail-1',
+        contextId: 'turn-restored-tail-1',
+      );
+      const fullReply = '''
+修改内容：
+
+- 修改了 mobile_vc/lib/features/session/session_controller.dart
+- 修改了 mobile_vc/test/session_controller_test.dart
+- 统计：283 insertions(+), 16 deletions(-)
+
+当前工作区是干净的，没有还能再提交的变更。
+Flutter 打出来的 app-release.apk 在 mobile_vc/build/ 下，是 ignored 构建产物，不会被正常 Git commit。''';
+      const tailReplay = '''
+- 统计：283 insertions(+), 16 deletions(-)
+
+当前工作区是干净的，没有还能再提交的变更。
+Flutter 打出来的 app-release.apk 在 mobile_vc/build/ 下，是 ignored 构建产物，不会被正常 Git commit。''';
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-1',
+        runtimeMeta: meta,
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-1', title: 'Session 1'),
+        logEntries: const [
+          HistoryLogEntry(
+            kind: 'markdown',
+            message: fullReply,
+            timestamp: '2026-06-06T15:39:00Z',
+            executionId: 'exec-codex-restored-tail-1',
+            context: HistoryContext(
+              id: 'turn-restored-tail-1',
+              source: 'codex',
+              type: 'assistant',
+            ),
+          ),
+        ],
+        resumeRuntimeMeta: meta,
+      ));
+      await _flushEvents();
+
+      service.emit(LogEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 500)),
+        sessionId: 'session-1',
+        runtimeMeta: meta,
+        raw: const {'type': 'log'},
+        message: tailReplay,
+        stream: 'stdout',
+      ));
+      await _flushEvents();
+
+      final markdownItems =
+          controller.timeline.where((item) => item.kind == 'markdown').toList();
+      expect(markdownItems, hasLength(1));
+      expect(markdownItems.single.body, fullReply);
+    });
+
     test('codex 单行总结式回复不会再被误判为 terminal 输出', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);
