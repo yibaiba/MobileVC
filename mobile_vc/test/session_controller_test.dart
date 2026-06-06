@@ -13951,6 +13951,149 @@ void main() {
           hasLength(1));
     });
 
+    test('terminal range hydration counts inserted log separators as bytes',
+        () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      const firstLine = '2026/04/04 15:12:25 [INFO] 你好';
+      const secondLine = '2026/04/04 15:12:26 [INFO] abc';
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        latest: SessionDeltaKnown(
+          eventCursor: 3,
+          logEntryCount: 0,
+          terminalStdoutLength: utf8.encode('$firstLine\n$secondLine!').length,
+        ),
+        resumeRuntimeMeta: const RuntimeMeta(cwd: '/workspace'),
+      ));
+      await _flushEvents();
+
+      service.emit(LogEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 1)),
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'log'},
+        message: firstLine,
+        stream: 'stdout',
+      ));
+      service.emit(LogEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 2)),
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'log'},
+        message: secondLine,
+        stream: 'stdout',
+      ));
+      await _flushEvents();
+
+      expect(controller.terminalStdout, '$firstLine\n$secondLine');
+      service.sentPayloads.clear();
+      controller.requestTerminalRange('stdout');
+      expect(
+        service.sentPayloads.singleWhere(
+          (payload) => payload['action'] == 'session_terminal_range_get',
+        )['start'],
+        utf8.encode('$firstLine\n$secondLine').length,
+      );
+    });
+
+    test('terminal range hydration uses UTF-8 byte offsets', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        logEntries: const [
+          HistoryLogEntry(kind: 'markdown', message: 'visible'),
+        ],
+        latest: SessionDeltaKnown(
+          eventCursor: 3,
+          logEntryCount: 1,
+          terminalStdoutLength: utf8.encode('你好abc').length,
+        ),
+        resumeRuntimeMeta: const RuntimeMeta(cwd: '/workspace'),
+      ));
+      await _flushEvents();
+
+      service.sentPayloads.clear();
+      controller.requestTerminalRange('stdout');
+      expect(
+        service.sentPayloads.singleWhere(
+          (payload) => payload['action'] == 'session_terminal_range_get',
+        )['start'],
+        0,
+      );
+
+      service.emit(SessionTerminalRangeEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 1)),
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_terminal_range'},
+        stream: 'stdout',
+        start: 0,
+        end: utf8.encode('你好').length,
+        total: utf8.encode('你好abc').length,
+        content: '你好',
+        latest: SessionDeltaKnown(
+          eventCursor: 4,
+          logEntryCount: 1,
+          terminalStdoutLength: utf8.encode('你好abc').length,
+        ),
+      ));
+      await _flushEvents();
+
+      service.sentPayloads.clear();
+      controller.requestTerminalRange('stdout');
+      expect(
+        service.sentPayloads.singleWhere(
+          (payload) => payload['action'] == 'session_terminal_range_get',
+        )['start'],
+        utf8.encode('你好').length,
+      );
+
+      service.emit(SessionTerminalRangeEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 2)),
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_terminal_range'},
+        stream: 'stdout',
+        start: utf8.encode('你好').length,
+        end: utf8.encode('你好abc').length,
+        total: utf8.encode('你好abc').length,
+        content: 'abc',
+        latest: SessionDeltaKnown(
+          eventCursor: 5,
+          logEntryCount: 1,
+          terminalStdoutLength: utf8.encode('你好abc').length,
+        ),
+      ));
+      await _flushEvents();
+
+      expect(controller.terminalStdout, '你好abc');
+      service.sentPayloads.clear();
+      controller.requestTerminalRange('stdout');
+      expect(
+        service.sentPayloads.where(
+            (payload) => payload['action'] == 'session_terminal_range_get'),
+        isEmpty,
+      );
+    });
+
     test('loadSession 期间不属于目标的 stale history 仍会被丢弃', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);

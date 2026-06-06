@@ -715,6 +715,36 @@ func TestSessionDeltaEventFromRecord_LeavesTerminalExecutionsLazyLoaded(t *testi
 	}
 }
 
+func TestSessionDeltaEventFromRecord_LeavesCurrentDiffLazyLoaded(t *testing.T) {
+	record := data.SessionRecord{
+		Summary: data.SessionSummary{ID: "s1"},
+		Projection: data.ProjectionSnapshot{
+			Diffs: []DiffContext{{
+				ContextID: "diff-1",
+				Path:      "large.go",
+				Diff:      strings.Repeat("+changed\n", 1024),
+			}},
+			CurrentDiff: &DiffContext{
+				ContextID: "diff-1",
+				Path:      "large.go",
+				Diff:      strings.Repeat("+changed\n", 1024),
+			},
+			Runtime: data.SessionRuntime{Command: "claude"},
+		},
+	}
+
+	got := SessionDeltaEventFromRecord(record, protocol.SessionDeltaKnown{}, DeltaCursorSnapshot{}, false)
+	if got.Latest.DiffCount != 1 {
+		t.Fatalf("latest diff count: %d", got.Latest.DiffCount)
+	}
+	if got.CurrentDiff != nil {
+		t.Fatalf("expected current diff body to stay lazy-loaded, got %+v", got.CurrentDiff)
+	}
+	if len(got.UpsertDiffs) != 0 || len(got.ReviewGroups) != 0 || got.ActiveReviewGroup != nil {
+		t.Fatalf("expected diff/review payloads to stay lazy-loaded, got upserts=%d reviews=%d active=%v", len(got.UpsertDiffs), len(got.ReviewGroups), got.ActiveReviewGroup)
+	}
+}
+
 func TestSessionDeltaEventFromRecord_IncludesUpdatedExecutionForAppendedLog(t *testing.T) {
 	record := data.SessionRecord{
 		Summary: data.SessionSummary{ID: "s1"},

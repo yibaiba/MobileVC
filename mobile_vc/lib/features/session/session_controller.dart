@@ -345,6 +345,8 @@ class SessionController extends ChangeNotifier {
   String _currentDirectoryPath = '';
   String _terminalStdout = '';
   String _terminalStderr = '';
+  int _terminalStdoutBytes = 0;
+  int _terminalStderrBytes = 0;
   String _activeTerminalExecutionId = '';
   String _lastAssistantReplyExecutionKey = '';
   // 用户点击发送后立即点亮的"提交保护锁"——后端流式 LogEvent 不会再瞬间打掉状态球。
@@ -3064,8 +3066,8 @@ class SessionController extends ChangeNotifier {
       logEntryCount: 0,
       diffCount: 0,
       terminalExecutionCount: 0,
-      terminalStdoutLength: _terminalStdout.length,
-      terminalStderrLength: _terminalStderr.length,
+      terminalStdoutLength: _terminalStdoutBytes,
+      terminalStderrLength: _terminalStderrBytes,
     );
   }
 
@@ -3084,6 +3086,8 @@ class SessionController extends ChangeNotifier {
     _terminalExecutionPageRequestsInFlight.clear();
     _diffPageStartBySession.clear();
     _terminalExecutionPageStartBySession.clear();
+    _terminalStdoutBytes = _terminalByteLength(_terminalStdout);
+    _terminalStderrBytes = _terminalByteLength(_terminalStderr);
   }
 
   Future<void> restoreSessionFromNotification(String sessionId) async {
@@ -3470,6 +3474,8 @@ class SessionController extends ChangeNotifier {
     _clearProjectionHydrationState();
     _terminalStdout = '';
     _terminalStderr = '';
+    _terminalStdoutBytes = 0;
+    _terminalStderrBytes = 0;
     _activeTerminalExecutionId = '';
     _lastAssistantReplyExecutionKey = '';
     _terminalExecutions.clear();
@@ -4082,8 +4088,8 @@ class SessionController extends ChangeNotifier {
         stream.trim().toLowerCase() == 'stderr' ? 'stderr' : 'stdout';
     final known = _currentSessionDeltaKnown(sessionId);
     final currentLength = normalizedStream == 'stderr'
-        ? _terminalStderr.length
-        : _terminalStdout.length;
+        ? _terminalStderrBytes
+        : _terminalStdoutBytes;
     final total = normalizedStream == 'stderr'
         ? known.terminalStderrLength
         : known.terminalStdoutLength;
@@ -5822,8 +5828,8 @@ class SessionController extends ChangeNotifier {
                 : history.logEntries.length,
             diffCount: history.diffs.length,
             terminalExecutionCount: history.terminalExecutions.length,
-            terminalStdoutLength: _terminalStdout.length,
-            terminalStderrLength: _terminalStderr.length,
+            terminalStdoutLength: _terminalStdoutBytes,
+            terminalStderrLength: _terminalStderrBytes,
           );
         } else {
           _sessionDeltaKnown[resolvedHistorySummary.id] = historyLatest;
@@ -7184,8 +7190,11 @@ class SessionController extends ChangeNotifier {
       return;
     }
     final current = stream == 'stderr' ? _terminalStderr : _terminalStdout;
+    final currentBytes =
+        stream == 'stderr' ? _terminalStderrBytes : _terminalStdoutBytes;
     final next = _mergedTerminalRange(
       current,
+      currentBytes: currentBytes,
       start: range.start,
       end: range.end,
       content: range.content,
@@ -7198,9 +7207,11 @@ class SessionController extends ChangeNotifier {
       return;
     }
     if (stream == 'stderr') {
-      _terminalStderr = next;
+      _terminalStderr = next.text;
+      _terminalStderrBytes = next.bytes;
     } else {
-      _terminalStdout = next;
+      _terminalStdout = next.text;
+      _terminalStdoutBytes = next.bytes;
     }
     _syncActiveTerminalExecution();
     _syncDerivedState();
@@ -7260,26 +7271,27 @@ class SessionController extends ChangeNotifier {
     notifyListeners();
   }
 
-  String? _mergedTerminalRange(
+  _TerminalBufferMerge? _mergedTerminalRange(
     String current, {
+    required int currentBytes,
     required int start,
     required int end,
     required String content,
   }) {
-    if (start < 0 || end < start || end - start != content.length) {
+    final contentBytes = _terminalByteLength(content);
+    if (start < 0 || end < start || end - start != contentBytes) {
       return null;
     }
-    if (start == current.length) {
-      return current + content;
+    if (start == currentBytes) {
+      return _TerminalBufferMerge(current + content, end);
     }
-    if (start == 0 && end >= current.length) {
-      return content + current.substring(end);
+    if (start == 0 && end >= currentBytes) {
+      return _TerminalBufferMerge(content, end);
     }
-    if (start > current.length || end > current.length) {
-      return null;
-    }
-    return current.replaceRange(start, end, content);
+    return null;
   }
+
+  int _terminalByteLength(String value) => utf8.encode(value).length;
 
   FileDiffEvent _fileDiffFromHistoryContext(
     String sessionId,
@@ -10822,9 +10834,15 @@ class SessionController extends ChangeNotifier {
       return;
     }
     if (normalizedStream == 'stderr') {
-      _terminalStderr = _appendChunk(_terminalStderr, message);
+      final next = _appendChunkWithByteLength(
+          _terminalStderr, _terminalStderrBytes, message);
+      _terminalStderr = next.text;
+      _terminalStderrBytes = next.bytes;
     } else {
-      _terminalStdout = _appendChunk(_terminalStdout, message);
+      final next = _appendChunkWithByteLength(
+          _terminalStdout, _terminalStdoutBytes, message);
+      _terminalStdout = next.text;
+      _terminalStdoutBytes = next.bytes;
     }
     _appendExecutionOutput(
       executionId,
@@ -10889,15 +10907,19 @@ class SessionController extends ChangeNotifier {
     final stderr = rawTerminalByStream['stderr'] ?? '';
     if (stdout.isNotEmpty) {
       _terminalStdout += stdout;
+      _terminalStdoutBytes += _terminalByteLength(stdout);
     }
     if (stderr.isNotEmpty) {
       _terminalStderr += stderr;
+      _terminalStderrBytes += _terminalByteLength(stderr);
     }
   }
 
   void _restoreTerminalLogs(Map<String, String> rawTerminalByStream) {
     _terminalStdout = rawTerminalByStream['stdout'] ?? '';
     _terminalStderr = rawTerminalByStream['stderr'] ?? '';
+    _terminalStdoutBytes = _terminalByteLength(_terminalStdout);
+    _terminalStderrBytes = _terminalByteLength(_terminalStderr);
     _syncActiveTerminalExecution();
   }
 
@@ -11030,6 +11052,18 @@ class SessionController extends ChangeNotifier {
       return chunk;
     }
     return '$original\n$chunk';
+  }
+
+  _TerminalBufferMerge _appendChunkWithByteLength(
+    String original,
+    int originalBytes,
+    String chunk,
+  ) {
+    final appended = original.isEmpty ? chunk : '\n$chunk';
+    return _TerminalBufferMerge(
+      original + appended,
+      originalBytes + _terminalByteLength(appended),
+    );
   }
 
   bool _shouldCaptureTerminalLog(
@@ -11560,3 +11594,10 @@ const Set<String> _codexReasoningEffortOptions = <String>{
   'high',
   'xhigh',
 };
+
+class _TerminalBufferMerge {
+  const _TerminalBufferMerge(this.text, this.bytes);
+
+  final String text;
+  final int bytes;
+}

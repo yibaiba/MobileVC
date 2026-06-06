@@ -859,7 +859,7 @@ func SessionDeltaEventFromRecordWithPayloadLimit(record data.SessionRecord, know
 		latest,
 		appendEntries,
 		nil,
-		ProtocolDiffContext(projection.CurrentDiff),
+		nil,
 		nil,
 		nil,
 		HistoryContextFromSnapshot(projection.CurrentStep),
