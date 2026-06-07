@@ -1234,6 +1234,11 @@ type gatewayAsyncEventResult struct {
 	err       error
 }
 
+type gatewaySessionDeltaPendingRequest struct {
+	targetSessionID string
+	req             protocol.SessionDeltaRequestEvent
+}
+
 func enqueueGatewayWrite(ctx context.Context, writeCh chan<- any, priorityWriteCh chan<- any, event any) {
 	targetCh := writeCh
 	if isPriorityGatewayEvent(event) {
@@ -2033,6 +2038,25 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 		record.Summary.Runtime = record.Projection.Runtime
 		return record, sessionRuntime, nil
 	}
+	buildSessionDeltaEvent := func(req protocol.SessionDeltaRequestEvent, targetSessionID string) (any, error) {
+		sessionRuntime, sessionRuntimeSvc := runtimeForSession(targetSessionID)
+		if deltaEvent, ok, err := buildWindowMetadataDeltaIfPossible(req, targetSessionID, sessionRuntime, sessionRuntimeSvc); err != nil {
+			return nil, err
+		} else if ok {
+			return deltaEvent, nil
+		}
+		record, sessionRuntime, err := loadProjectionRecordForAsyncEvent(targetSessionID)
+		if err != nil {
+			return nil, err
+		}
+		_, sessionRuntimeSvc = runtimeForSession(record.Summary.ID)
+		cacheProjection(record.Summary.ID, record.Projection, false)
+		runtimeAlive := sessionRecordRuntimeAlive(record, sessionRuntimeSvc)
+		deltaEvent := session.SessionDeltaEventFromRecordWithPayloadLimit(record, req.Known, deltaCursorSnapshot(sessionRuntime), runtimeAlive, gatewayRelaySafePayloadBudgetBytes, sessionResumeHistoryLimit)
+		metrics := projectionMetrics(record.Projection)
+		logx.Info("ws", "session delta response: connectionID=%s sessionID=%s remoteAddr=%s reason=%q runtimeAlive=%v canResume=%v requiresFullSync=%v logEntries=%d diffs=%d stdoutBytes=%d stderrBytes=%d", connectionID, record.Summary.ID, remoteAddr, req.Reason, runtimeAlive, sessionRuntime != nil && runtimeAlive, deltaEvent.RequiresFullSync, metrics.logEntries, metrics.diffs, metrics.stdoutBytes, metrics.stderrBytes)
+		return deltaEvent, nil
+	}
 	unregisterFreshnessSubscriber := h.registerFreshnessSubscriber(connectionID, func(event any) bool {
 		return tryEnqueueGatewayWrite(ctx, writeCh, priorityWriteCh, event)
 	})
@@ -2322,6 +2346,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 	var latestSessionSwitchSequence uint64
 	pendingSessionSwitchTargetID := ""
 	asyncEventInFlight := make(map[string]struct{})
+	sessionDeltaPending := make(map[string]gatewaySessionDeltaPendingRequest)
 	var emitAndPersistFor func(sessionID string) func(any)
 	pendingSessionSwitchActive := func() bool {
 		return strings.TrimSpace(pendingSessionSwitchTargetID) != ""
@@ -2330,6 +2355,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 		targetSessionID := strings.TrimSpace(sessionID)
 		return targetSessionID != "" && targetSessionID == strings.TrimSpace(pendingSessionSwitchTargetID)
 	}
+	var startSessionDeltaGetAction func(targetSessionID string, req protocol.SessionDeltaRequestEvent, actionKey string)
 	clearPendingSessionSwitch := func(sessionID string) {
 		if targetIsPendingSessionSwitch(sessionID) {
 			pendingSessionSwitchTargetID = ""
@@ -2351,24 +2377,35 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 		return true
 	}
 	handleAsyncEventResult := func(result gatewayAsyncEventResult) {
-		if strings.TrimSpace(result.actionKey) != "" {
-			delete(asyncEventInFlight, result.actionKey)
+		actionKey := strings.TrimSpace(result.actionKey)
+		if actionKey != "" {
+			delete(asyncEventInFlight, actionKey)
 		}
 		targetSessionID := strings.TrimSpace(result.sessionID)
-		if targetSessionID != "" && !canProcessSelectedSessionReadAction(result.action+" result", targetSessionID) {
-			return
+		processResult := targetSessionID == "" || canProcessSelectedSessionReadAction(result.action+" result", targetSessionID)
+		if processResult {
+			if result.err != nil {
+				logx.Warn("ws", "%s failed: connectionID=%s sessionID=%s requestedSessionID=%s remoteAddr=%s err=%v", result.action, connectionID, selectedSessionID, targetSessionID, remoteAddr, result.err)
+				emit(protocol.NewErrorEvent(selectedSessionID, result.err.Error(), ""))
+			} else {
+				if result.event != nil {
+					emit(result.event)
+				}
+				for _, event := range result.events {
+					if event != nil {
+						emit(event)
+					}
+				}
+			}
 		}
-		if result.err != nil {
-			logx.Warn("ws", "%s failed: connectionID=%s sessionID=%s requestedSessionID=%s remoteAddr=%s err=%v", result.action, connectionID, selectedSessionID, targetSessionID, remoteAddr, result.err)
-			emit(protocol.NewErrorEvent(selectedSessionID, result.err.Error(), ""))
-			return
-		}
-		if result.event != nil {
-			emit(result.event)
-		}
-		for _, event := range result.events {
-			if event != nil {
-				emit(event)
+		if result.action == "session_delta_get" && actionKey != "" {
+			pending, ok := sessionDeltaPending[actionKey]
+			delete(sessionDeltaPending, actionKey)
+			if ok && startSessionDeltaGetAction != nil {
+				pendingTargetSessionID := strings.TrimSpace(pending.targetSessionID)
+				if pendingTargetSessionID != "" && canProcessSelectedSessionReadAction("session_delta_get pending", pendingTargetSessionID) {
+					startSessionDeltaGetAction(pendingTargetSessionID, pending.req, actionKey)
+				}
 			}
 		}
 	}
@@ -2664,6 +2701,42 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			}
 			return []any{event}, err
 		})
+	}
+	startSessionDeltaGetAction = func(targetSessionID string, req protocol.SessionDeltaRequestEvent, actionKey string) {
+		if _, exists := asyncEventInFlight[actionKey]; exists {
+			sessionDeltaPending[actionKey] = gatewaySessionDeltaPendingRequest{
+				targetSessionID: targetSessionID,
+				req:             req,
+			}
+			logx.Info("ws", "coalesce in-flight session_delta_get: connectionID=%s sessionID=%s requestedSessionID=%s remoteAddr=%s reason=%q", connectionID, selectedSessionID, targetSessionID, remoteAddr, req.Reason)
+			return
+		}
+		asyncEventInFlight[actionKey] = struct{}{}
+		go func() {
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					stack := logx.StackTrace()
+					logx.Error(
+						"ws",
+						"session_delta_get panic recovered: connectionID=%s sessionID=%s remoteAddr=%s panic=%v\n%s",
+						connectionID,
+						targetSessionID,
+						remoteAddr,
+						recovered,
+						stack,
+					)
+					select {
+					case asyncEventResultCh <- gatewayAsyncEventResult{actionKey: actionKey, action: "session_delta_get", sessionID: targetSessionID, err: fmt.Errorf("internal server error")}:
+					case <-ctx.Done():
+					}
+				}
+			}()
+			event, err := buildSessionDeltaEvent(req, targetSessionID)
+			select {
+			case asyncEventResultCh <- gatewayAsyncEventResult{actionKey: actionKey, action: "session_delta_get", sessionID: targetSessionID, event: event, err: err}:
+			case <-ctx.Done():
+			}
+		}()
 	}
 
 	emitAndPersistFor = func(sessionID string) func(any) {
@@ -3232,26 +3305,8 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				continue
 			}
 			reqCopy := req
-			actionKey := connectionID + ":session_delta_get:" + targetSessionID + ":" + strings.TrimSpace(reqCopy.Reason)
-			startAsyncEventAction("session_delta_get", actionKey, targetSessionID, func() (any, error) {
-				sessionRuntime, sessionRuntimeSvc := runtimeForSession(targetSessionID)
-				if deltaEvent, ok, err := buildWindowMetadataDeltaIfPossible(reqCopy, targetSessionID, sessionRuntime, sessionRuntimeSvc); err != nil {
-					return nil, err
-				} else if ok {
-					return deltaEvent, nil
-				}
-				record, sessionRuntime, err := loadProjectionRecordForAsyncEvent(targetSessionID)
-				if err != nil {
-					return nil, err
-				}
-				_, sessionRuntimeSvc = runtimeForSession(record.Summary.ID)
-				cacheProjection(record.Summary.ID, record.Projection, false)
-				runtimeAlive := sessionRecordRuntimeAlive(record, sessionRuntimeSvc)
-				deltaEvent := session.SessionDeltaEventFromRecordWithPayloadLimit(record, reqCopy.Known, deltaCursorSnapshot(sessionRuntime), runtimeAlive, gatewayRelaySafePayloadBudgetBytes, sessionResumeHistoryLimit)
-				metrics := projectionMetrics(record.Projection)
-				logx.Info("ws", "session delta response: connectionID=%s sessionID=%s remoteAddr=%s reason=%q runtimeAlive=%v canResume=%v requiresFullSync=%v logEntries=%d diffs=%d stdoutBytes=%d stderrBytes=%d", connectionID, record.Summary.ID, remoteAddr, reqCopy.Reason, runtimeAlive, sessionRuntime != nil && runtimeAlive, deltaEvent.RequiresFullSync, metrics.logEntries, metrics.diffs, metrics.stdoutBytes, metrics.stderrBytes)
-				return deltaEvent, nil
-			})
+			actionKey := connectionID + ":session_delta_get:" + targetSessionID
+			startSessionDeltaGetAction(targetSessionID, reqCopy, actionKey)
 		case "session_resume":
 			var req protocol.SessionResumeRequestEvent
 			if err := json.Unmarshal(payloadBytes, &req); err != nil {

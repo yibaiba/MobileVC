@@ -2035,6 +2035,21 @@ func readUntilPongID(t *testing.T, conn *websocket.Conn, pingID string) map[stri
 	return nil
 }
 
+func readUntilPongIDWithoutError(t *testing.T, conn *websocket.Conn, pingID string) map[string]any {
+	t.Helper()
+	for i := 0; i < 40; i++ {
+		event := readEventMap(t, conn)
+		if event["type"] == protocol.EventTypeError {
+			t.Fatalf("received unexpected error while waiting for pong %q: %#v", pingID, event)
+		}
+		if event["type"] == "pong" && event["pingId"] == pingID {
+			return event
+		}
+	}
+	t.Fatalf("did not receive pong pingID=%s", pingID)
+	return nil
+}
+
 func waitRuntimeSessionDetached(t *testing.T, h *Handler, sessionID string) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
@@ -11019,6 +11034,74 @@ func TestHandlerSessionDeltaOversizedPayloadRequiresFullSync(t *testing.T) {
 		t.Fatalf("expected oversized delta to omit append entries, got %d", len(entries))
 	}
 	requireLatestLogEntryCount(t, delta, len(record.Projection.LogEntries))
+}
+
+func TestHandlerSessionDeltaDuplicateInFlightCoalescesWithoutError(t *testing.T) {
+	h := newTestHandler()
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	now := time.Date(2026, 6, 8, 10, 0, 0, 0, time.UTC)
+	record := data.SessionRecord{
+		Summary: data.SessionSummary{
+			ID:        "delta-duplicate-observe-session",
+			Title:     "Delta Duplicate Observe",
+			CreatedAt: now,
+			UpdatedAt: now,
+		},
+		Projection: data.ProjectionSnapshot{LogEntries: []data.SnapshotLogEntry{
+			{Kind: "markdown", Message: "older"},
+			{Kind: "markdown", Message: "newer"},
+		}},
+	}
+	if _, err := tempStore.UpsertSession(context.Background(), record); err != nil {
+		t.Fatalf("upsert session: %v", err)
+	}
+	h.SessionStore = tempStore
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+	if err := conn.WriteJSON(protocol.SessionLoadRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_load"},
+		SessionID:   record.Summary.ID,
+		Limit:       1,
+	}); err != nil {
+		t.Fatalf("write session_load request: %v", err)
+	}
+	_ = readUntilSessionHistory(t, conn)
+
+	blockingStore := newBlockingSessionLoadStore(tempStore, record.Summary.ID)
+	h.SessionStore = blockingStore
+	request := protocol.SessionDeltaRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_delta_get"},
+		SessionID:   record.Summary.ID,
+		Known:       protocol.SessionDeltaKnown{LogEntryCount: 1},
+		Reason:      "observe_active_session",
+	}
+	if err := conn.WriteJSON(request); err != nil {
+		t.Fatalf("write first session_delta_get request: %v", err)
+	}
+	blockingStore.WaitLoadStarted(t)
+	if err := conn.WriteJSON(request); err != nil {
+		t.Fatalf("write duplicate session_delta_get request: %v", err)
+	}
+	if err := conn.WriteJSON(map[string]any{"action": "ping", "pingId": "delta-duplicate"}); err != nil {
+		t.Fatalf("write ping while session_delta_get blocked: %v", err)
+	}
+	pong := readUntilPongIDWithoutError(t, conn, "delta-duplicate")
+	if pong["type"] != "pong" {
+		t.Fatalf("expected pong before blocked delta result, got %#v", pong)
+	}
+
+	blockingStore.ReleaseLoad()
+	firstDelta := readUntilType(t, conn, protocol.EventTypeSessionDelta)
+	if firstDelta["requiresFullSync"] == true {
+		t.Fatalf("expected first delta without full sync, got %#v", firstDelta)
+	}
+	secondDelta := readUntilType(t, conn, protocol.EventTypeSessionDelta)
+	if secondDelta["requiresFullSync"] == true {
+		t.Fatalf("expected coalesced delta without full sync, got %#v", secondDelta)
+	}
 }
 
 func TestHandlerSessionDeltaWindowMetadataReturnsAppendWindowWithoutFullGet(t *testing.T) {
