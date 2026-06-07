@@ -1188,6 +1188,23 @@ type gatewayWriteRequest struct {
 	done  chan error
 }
 
+type gatewayReadResult struct {
+	payload map[string]any
+	err     error
+}
+
+type gatewaySessionLoadResult struct {
+	actionKey         string
+	req               protocol.SessionLoadRequestEvent
+	loadHistoryLimit  int
+	trace             *sessionLoadTrace
+	activeRuntimeLoad bool
+	record            data.SessionRecord
+	historyWindow     data.SessionHistoryWindow
+	historyWindowOK   bool
+	err               error
+}
+
 func enqueueGatewayWrite(ctx context.Context, writeCh chan<- any, priorityWriteCh chan<- any, event any) {
 	targetCh := writeCh
 	if isPriorityGatewayEvent(event) {
@@ -1365,6 +1382,8 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 	}
 	runtimeSvc := newDetachedRuntimeService()
 	var activeRuntimeSession *runtimeSession // nil for detached service, set when Attach() succeeds
+	readCh := make(chan gatewayReadResult, 1)
+	sessionLoadResultCh := make(chan gatewaySessionLoadResult, 1)
 	writeCh := make(chan any, gatewayWriteQueueSize)
 	priorityWriteCh := make(chan any, gatewayPriorityWriteQueueSize)
 	writeErrCh := make(chan error, 1)
@@ -1413,6 +1432,24 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			if done != nil {
 				done <- nil
 				close(done)
+			}
+		}
+	}()
+
+	go func() {
+		for {
+			payload := map[string]any{}
+			if err := client.ReadJSON(&payload); err != nil {
+				select {
+				case readCh <- gatewayReadResult{err: err}:
+				case <-ctx.Done():
+				}
+				return
+			}
+			select {
+			case readCh <- gatewayReadResult{payload: payload}:
+			case <-ctx.Done():
+				return
 			}
 		}
 	}()
@@ -1590,6 +1627,39 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			return loadSessionRecord(ctx, h.SessionStore, targetSessionID)
 		}
 		return loadStoredSessionRecordForRequest(targetSessionID)
+	}
+
+	canUseLoadedSessionHistoryWindow := func(record data.SessionRecord, activeRuntime bool) bool {
+		if activeRuntime || isNativeMirrorSessionID(record.Summary.ID) {
+			return false
+		}
+		if strings.TrimSpace(record.Summary.ClaudeSessionUUID) == "" {
+			return true
+		}
+		if strings.TrimSpace(firstNonEmptyString(record.Summary.Runtime.CWD, record.Projection.Runtime.CWD)) != "" {
+			return false
+		}
+		return true
+	}
+
+	loadSessionHistoryWindow := func(targetSessionID string, before, limit int) (data.SessionHistoryWindow, bool, error) {
+		targetSessionID = strings.TrimSpace(targetSessionID)
+		if targetSessionID == "" {
+			return data.SessionHistoryWindow{}, false, fmt.Errorf("session ID is required")
+		}
+		windowStore, ok := h.SessionStore.(data.SessionHistoryWindowStore)
+		if !ok || isNativeMirrorSessionID(targetSessionID) {
+			return data.SessionHistoryWindow{}, false, nil
+		}
+		window, err := windowStore.GetSessionHistoryWindow(context.WithoutCancel(ctx), data.SessionHistoryWindowRequest{
+			SessionID: targetSessionID,
+			Before:    before,
+			Limit:     limit,
+		})
+		if err != nil {
+			return data.SessionHistoryWindow{}, true, err
+		}
+		return window, true, nil
 	}
 
 	loadSelectedProjectionRecord := func(requestedSessionID string) (data.SessionRecord, *runtimeSession, error) {
@@ -1947,6 +2017,90 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 		emit(protocol.NewSessionStateEvent(selectedSessionID, string(session.StateActive), "session cleared"))
 	}
 
+	sessionLoadInFlight := make(map[string]struct{})
+	handleSessionLoadResult := func(result gatewaySessionLoadResult) {
+		delete(sessionLoadInFlight, result.actionKey)
+		req := result.req
+		trace := result.trace
+		activeRuntimeLoad := result.activeRuntimeLoad
+		record := result.record
+		if result.err != nil {
+			logx.Warn("ws", "load session failed: connectionID=%s sessionID=%s requestedSessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, req.SessionID, remoteAddr, result.err)
+			if trace != nil {
+				trace.Finish("", activeRuntimeLoad, projectionTraceMetrics{})
+			}
+			emit(protocol.NewErrorEvent(selectedSessionID, result.err.Error(), ""))
+			return
+		}
+		if trace == nil {
+			trace = newSessionLoadTrace(connectionID, selectedSessionID, req.SessionID, remoteAddr, req.Reason)
+		}
+		trace.Step("load_record")
+		if !result.historyWindowOK {
+			updateProjectionMeta(record)
+		}
+		switchRuntimeSession(record.Summary.ID, runtimeSwitchDetachPrevious)
+		trace.Step("switch_runtime")
+		if !activeRuntimeLoad && !isNativeMirrorSessionID(record.Summary.ID) && !result.historyWindowOK {
+			record = mergeClaudeJSONLToRecord(ctx, h.SessionStore, record, runtimeSvc)
+			updateProjectionMeta(record)
+			invalidateSessionListCacheForMutation()
+		}
+		trace.Step("merge_claude_jsonl")
+		augmentedProjection := session.NormalizeProjectionSnapshot(record.Projection)
+		var runtimeProjection data.ProjectionSnapshot
+		if result.historyWindowOK {
+			runtimeProjection = h.mergeActiveLiveProjection(record.Summary.ID, finalizeProjectionSnapshotForService(record.Summary.ID, runtimeSvc, augmentedProjection))
+		} else {
+			runtimeProjection = buildProjectionSnapshotForService(record.Summary.ID, runtimeSvc)
+		}
+		trace.Step("build_projection")
+		if isNativeMirrorSessionID(record.Summary.ID) {
+			record.Projection = mergeProjectionWithOptionalRuntime(augmentedProjection, runtimeProjection, runtimeSvc, record.Summary.ID)
+		} else {
+			record.Projection = runtimeProjection
+			if preferAugmentedLogEntries(augmentedProjection.LogEntries, record.Projection.LogEntries) {
+				record.Projection.LogEntries = augmentedProjection.LogEntries
+			}
+		}
+		record.Summary.Runtime = record.Projection.Runtime
+		if !result.historyWindowOK {
+			updateProjectionMeta(record)
+			cacheProjection(record.Summary.ID, record.Projection, false)
+		}
+		runtimeSvc.SyncRuntimeMeta(protocol.RuntimeMeta{
+			Command:          record.Projection.Runtime.Command,
+			Engine:           record.Projection.Runtime.Engine,
+			CodexSandboxMode: record.Projection.Runtime.CodexSandboxMode,
+			CWD:              record.Projection.Runtime.CWD,
+			PermissionMode:   record.Projection.Runtime.PermissionMode,
+			ResumeSessionID:  record.Projection.Runtime.ResumeSessionID,
+			ClaudeLifecycle:  record.Projection.Runtime.ClaudeLifecycle,
+		})
+		loadRuntimeAlive := sessionRecordRuntimeAlive(record, runtimeSvc)
+		trace.Step("merge_projection")
+		loadSessionRuntime, _ := runtimeForSession(record.Summary.ID)
+		if result.historyWindowOK {
+			result.historyWindow.Record = record
+			result.historyWindow.Record.Projection.LogEntries = nil
+			emit(session.SessionHistoryWindowEventFromWindowWithCursorAndPayloadLimit(result.historyWindow, loadRuntimeAlive, deltaCursorSnapshot(loadSessionRuntime), gatewayRelaySafePayloadBudgetBytes))
+		} else {
+			emit(session.SessionHistoryWindowEventFromRecordWithCursorAndPayloadLimit(record, loadRuntimeAlive, result.loadHistoryLimit, deltaCursorSnapshot(loadSessionRuntime), gatewayRelaySafePayloadBudgetBytes))
+		}
+		trace.Step("emit_history")
+		emitContextWindowUsageIfAvailable(record.Summary.ID, runtimeSvc)
+		if restored := restoredAgentStateEventFromRecord(record, loadRuntimeAlive); restored != nil {
+			emit(*restored)
+			if status, ok := session.AIStatusEventForBackendEvent(record.Summary.ID, runtimeSvc, record.Projection, *restored); ok {
+				emit(status)
+			}
+		}
+		trace.Step("emit_review_state")
+		emit(protocol.NewSessionStateEvent(selectedSessionID, string(session.StateActive), "history loaded"))
+		trace.Step("emit_session_state")
+		trace.Finish(record.Summary.ID, activeRuntimeLoad, projectionMetrics(record.Projection))
+	}
+
 	var emitAndPersistFor func(sessionID string) func(any)
 	emitAndPersistFor = func(sessionID string) func(any) {
 		return h.runtimeEventSinkForSession(sessionID, emit)
@@ -1985,33 +2139,42 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 	}
 
 	for {
+		var payload map[string]any
+		var payloadBytes []byte
+		var clientEvent protocol.ClientEvent
 		select {
 		case err := <-writeErrCh:
 			if err != nil {
 				logx.Error("ws", "writer terminated with error: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
 			}
 			return
-		default:
-		}
-
-		payload := map[string]any{}
-		if err := client.ReadJSON(&payload); err != nil {
-			logx.Info("ws", "connection read loop ended: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
+		case result := <-sessionLoadResultCh:
+			handleSessionLoadResult(result)
+			continue
+		case result := <-readCh:
+			if result.err != nil {
+				logx.Info("ws", "connection read loop ended: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, result.err)
+				return
+			}
+			payload = result.payload
+			if payload == nil {
+				continue
+			}
+			h.trackRelayE2EEConnection(connectionID, client)
+			var err error
+			payloadBytes, err = json.Marshal(payload)
+			if err != nil {
+				logx.Warn("ws", "invalid websocket json payload: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
+				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid json: %v", err), ""))
+				continue
+			}
+			if err := json.Unmarshal(payloadBytes, &clientEvent); err != nil {
+				logx.Warn("ws", "invalid websocket json payload: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
+				emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid json: %v", err), ""))
+				continue
+			}
+		case <-ctx.Done():
 			return
-		}
-		h.trackRelayE2EEConnection(connectionID, client)
-		payloadBytes, err := json.Marshal(payload)
-		if err != nil {
-			logx.Warn("ws", "invalid websocket json payload: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
-			emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid json: %v", err), ""))
-			continue
-		}
-
-		var clientEvent protocol.ClientEvent
-		if err := json.Unmarshal(payloadBytes, &clientEvent); err != nil {
-			logx.Warn("ws", "invalid websocket json payload: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
-			emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("invalid json: %v", err), ""))
-			continue
 		}
 
 		switch clientEvent.Action {
@@ -2172,64 +2335,73 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			trace := newSessionLoadTrace(connectionID, selectedSessionID, req.SessionID, remoteAddr, req.Reason)
 			activeRuntimeLoad := activeRuntimeRecord(req.SessionID)
 			trace.Step("active_runtime_check")
-			record, err := loadSessionRecordForRequest(req.SessionID)
-			trace.Step("load_record")
-			if err != nil {
-				logx.Warn("ws", "load session failed: connectionID=%s sessionID=%s requestedSessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, req.SessionID, remoteAddr, err)
+			loadReq := req
+			loadSelectedSessionID := selectedSessionID
+			loadActionKey := connectionID + ":" + strings.TrimSpace(loadReq.SessionID)
+			if _, exists := sessionLoadInFlight[loadActionKey]; exists {
+				emit(protocol.NewErrorEvent(loadSelectedSessionID, "session load is already running for this connection", ""))
 				trace.Finish("", activeRuntimeLoad, projectionTraceMetrics{})
-				emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
 				continue
 			}
-			updateProjectionMeta(record)
-			// Merge any new events from Claude CLI JSONL (if this session was continued in CLI).
-			// Switch runtime first so merge sees the correct ActiveSession.
-			switchRuntimeSession(record.Summary.ID, runtimeSwitchDetachPrevious)
-			trace.Step("switch_runtime")
-			if !activeRuntimeLoad && !isNativeMirrorSessionID(record.Summary.ID) {
-				record = mergeClaudeJSONLToRecord(ctx, h.SessionStore, record, runtimeSvc)
-				updateProjectionMeta(record)
-				invalidateSessionListCacheForMutation()
+			sessionLoadInFlight[loadActionKey] = struct{}{}
+			if !h.tryStartAsyncAction(context.WithoutCancel(ctx), gatewayAsyncActionOptions{
+				Action:       "session_load",
+				SessionID:    loadActionKey,
+				ConnectionID: connectionID,
+				RemoteAddr:   remoteAddr,
+				OnBusy: func() {
+					delete(sessionLoadInFlight, loadActionKey)
+					emit(protocol.NewErrorEvent(loadSelectedSessionID, "session load is already running for this connection", ""))
+					if trace != nil {
+						trace.Finish("", activeRuntimeLoad, projectionTraceMetrics{})
+					}
+				},
+				OnPanic: func(recovered any, stack string) {
+					logx.Error("ws", "session_load panic: connectionID=%s sessionID=%s requestedSessionID=%s remoteAddr=%s panic=%v\n%s", connectionID, loadSelectedSessionID, loadReq.SessionID, remoteAddr, recovered, stack)
+					select {
+					case sessionLoadResultCh <- gatewaySessionLoadResult{
+						actionKey:         loadActionKey,
+						req:               loadReq,
+						loadHistoryLimit:  loadHistoryLimit,
+						trace:             trace,
+						activeRuntimeLoad: activeRuntimeLoad,
+						err:               fmt.Errorf("internal server error"),
+					}:
+					case <-ctx.Done():
+					}
+				},
+				Run: func() {
+					result := gatewaySessionLoadResult{
+						actionKey:         loadActionKey,
+						req:               loadReq,
+						loadHistoryLimit:  loadHistoryLimit,
+						trace:             trace,
+						activeRuntimeLoad: activeRuntimeLoad,
+					}
+					if !activeRuntimeLoad {
+						window, ok, err := loadSessionHistoryWindow(loadReq.SessionID, 0, loadHistoryLimit)
+						if err != nil {
+							result.err = err
+						} else if ok && canUseLoadedSessionHistoryWindow(window.Record, activeRuntimeLoad) {
+							result.record = window.Record
+							result.historyWindow = window
+							result.historyWindowOK = true
+						}
+					}
+					if result.record.Summary.ID == "" && result.err == nil {
+						record, err := loadSessionRecordForRequest(loadReq.SessionID)
+						result.record = record
+						result.err = err
+					}
+					select {
+					case sessionLoadResultCh <- result:
+					case <-ctx.Done():
+					}
+				},
+			}) {
+				delete(sessionLoadInFlight, loadActionKey)
+				continue
 			}
-			trace.Step("merge_claude_jsonl")
-			augmentedProjection := session.NormalizeProjectionSnapshot(record.Projection)
-			runtimeProjection := buildProjectionSnapshotForService(record.Summary.ID, runtimeSvc)
-			trace.Step("build_projection")
-			if isNativeMirrorSessionID(record.Summary.ID) {
-				record.Projection = mergeProjectionWithOptionalRuntime(augmentedProjection, runtimeProjection, runtimeSvc, record.Summary.ID)
-			} else {
-				record.Projection = runtimeProjection
-				if preferAugmentedLogEntries(augmentedProjection.LogEntries, record.Projection.LogEntries) {
-					record.Projection.LogEntries = augmentedProjection.LogEntries
-				}
-			}
-			record.Summary.Runtime = record.Projection.Runtime
-			updateProjectionMeta(record)
-			cacheProjection(record.Summary.ID, record.Projection, false)
-			runtimeSvc.SyncRuntimeMeta(protocol.RuntimeMeta{
-				Command:          record.Projection.Runtime.Command,
-				Engine:           record.Projection.Runtime.Engine,
-				CodexSandboxMode: record.Projection.Runtime.CodexSandboxMode,
-				CWD:              record.Projection.Runtime.CWD,
-				PermissionMode:   record.Projection.Runtime.PermissionMode,
-				ResumeSessionID:  record.Projection.Runtime.ResumeSessionID,
-				ClaudeLifecycle:  record.Projection.Runtime.ClaudeLifecycle,
-			})
-			loadRuntimeAlive := sessionRecordRuntimeAlive(record, runtimeSvc)
-			trace.Step("merge_projection")
-			loadSessionRuntime, _ := runtimeForSession(record.Summary.ID)
-			emit(session.SessionHistoryWindowEventFromRecordWithCursorAndPayloadLimit(record, loadRuntimeAlive, loadHistoryLimit, deltaCursorSnapshot(loadSessionRuntime), gatewayRelaySafePayloadBudgetBytes))
-			trace.Step("emit_history")
-			emitContextWindowUsageIfAvailable(record.Summary.ID, runtimeSvc)
-			if restored := restoredAgentStateEventFromRecord(record, loadRuntimeAlive); restored != nil {
-				emit(*restored)
-				if status, ok := session.AIStatusEventForBackendEvent(record.Summary.ID, runtimeSvc, record.Projection, *restored); ok {
-					emit(status)
-				}
-			}
-			trace.Step("emit_review_state")
-			emit(protocol.NewSessionStateEvent(selectedSessionID, string(session.StateActive), "history loaded"))
-			trace.Step("emit_session_state")
-			trace.Finish(record.Summary.ID, activeRuntimeLoad, projectionMetrics(record.Projection))
 		case "session_history_page":
 			var req protocol.SessionHistoryPageRequestEvent
 			if err := json.Unmarshal(payloadBytes, &req); err != nil {
@@ -2253,6 +2425,24 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				emit(protocol.NewErrorEvent(selectedSessionID, "session store unavailable", ""))
 				continue
 			}
+			pageHistoryLimit := sessionHistoryWindowLimit(req.Limit)
+			if historyWindow, ok, err := loadSessionHistoryWindow(targetSessionID, req.Before, pageHistoryLimit); err != nil {
+				emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
+				continue
+			} else if ok {
+				record := historyWindow.Record
+				_, pageRuntimeSvc := runtimeForSession(record.Summary.ID)
+				freshProjection := session.NormalizeProjectionSnapshot(record.Projection)
+				runtimeProjection := h.mergeActiveLiveProjection(record.Summary.ID, finalizeProjectionSnapshotForService(record.Summary.ID, pageRuntimeSvc, freshProjection))
+				record.Projection = runtimeProjection
+				record.Projection.LogEntries = nil
+				record.Summary.Runtime = record.Projection.Runtime
+				historyWindow.Record = record
+				pageEvent := session.SessionHistoryPageEventFromWindowWithPayloadLimit(historyWindow, gatewayRelaySafePayloadBudgetBytes)
+				logx.Info("ws", "session history page response: connectionID=%s sessionID=%s remoteAddr=%s before=%d limit=%d start=%d total=%d entries=%d windowStore=true", connectionID, record.Summary.ID, remoteAddr, req.Before, pageHistoryLimit, pageEvent.LogEntryStart, pageEvent.LogEntryTotal, len(pageEvent.LogEntries))
+				emit(pageEvent)
+				continue
+			}
 			record, err := loadSessionDeltaRecord(targetSessionID)
 			if err != nil {
 				emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
@@ -2273,7 +2463,6 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			}
 			record.Summary.Runtime = record.Projection.Runtime
 			cacheProjection(record.Summary.ID, record.Projection, false)
-			pageHistoryLimit := sessionHistoryWindowLimit(req.Limit)
 			pageEvent := session.SessionHistoryPageEventFromRecordWithPayloadLimit(record, req.Before, pageHistoryLimit, gatewayRelaySafePayloadBudgetBytes)
 			logx.Info("ws", "session history page response: connectionID=%s sessionID=%s remoteAddr=%s before=%d limit=%d start=%d total=%d entries=%d", connectionID, record.Summary.ID, remoteAddr, req.Before, pageHistoryLimit, pageEvent.LogEntryStart, pageEvent.LogEntryTotal, len(pageEvent.LogEntries))
 			emit(pageEvent)
@@ -2448,13 +2637,32 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				emit(protocol.NewErrorEvent(selectedSessionID, "session store unavailable", ""))
 				continue
 			}
-			record, err := loadSessionRecordForRequest(req.SessionID)
-			if err != nil {
-				logx.Warn("ws", "resume session failed: connectionID=%s sessionID=%s requestedSessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, req.SessionID, remoteAddr, err)
-				emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
-				continue
+			activeRuntimeResume := activeRuntimeRecord(req.SessionID)
+			var historyWindow data.SessionHistoryWindow
+			historyWindowOK := false
+			if !activeRuntimeResume {
+				if window, ok, err := loadSessionHistoryWindow(req.SessionID, 0, resumeHistoryLimit); err != nil {
+					logx.Warn("ws", "resume session failed: connectionID=%s sessionID=%s requestedSessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, req.SessionID, remoteAddr, err)
+					emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
+					continue
+				} else if ok && canUseLoadedSessionHistoryWindow(window.Record, activeRuntimeResume) {
+					historyWindow = window
+					historyWindowOK = true
+				}
 			}
-			updateProjectionMeta(record)
+			record := historyWindow.Record
+			if record.Summary.ID == "" {
+				var err error
+				record, err = loadSessionRecordForRequest(req.SessionID)
+				if err != nil {
+					logx.Warn("ws", "resume session failed: connectionID=%s sessionID=%s requestedSessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, req.SessionID, remoteAddr, err)
+					emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
+					continue
+				}
+			}
+			if !historyWindowOK {
+				updateProjectionMeta(record)
+			}
 			// Merge any new events from Claude CLI JSONL.
 			// Switch runtime session first so mergeClaudeJSONLToRecord can
 			// check the correct ActiveSession when deciding ownership upgrades.
@@ -2463,12 +2671,17 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			// Re-bind PTY runner output sink to new connection after reconnect.
 			resumeEmitAndPersist := emitAndPersistFor(selectedSessionID)
 			runtimeSvc.SetSink(sessionRuntime.EnsureBufferedSinkWithProcessor(resumeEmitAndPersist))
-			if !isNativeMirrorSessionID(record.Summary.ID) {
+			if !isNativeMirrorSessionID(record.Summary.ID) && !historyWindowOK {
 				record = mergeClaudeJSONLToRecord(ctx, h.SessionStore, record, runtimeSvc)
 				updateProjectionMeta(record)
 			}
 			augmentedProjection := session.NormalizeProjectionSnapshot(record.Projection)
-			runtimeProjection := buildProjectionSnapshotForService(record.Summary.ID, runtimeSvc)
+			var runtimeProjection data.ProjectionSnapshot
+			if historyWindowOK {
+				runtimeProjection = h.mergeActiveLiveProjection(record.Summary.ID, finalizeProjectionSnapshotForService(record.Summary.ID, runtimeSvc, augmentedProjection))
+			} else {
+				runtimeProjection = buildProjectionSnapshotForService(record.Summary.ID, runtimeSvc)
+			}
 			projection := runtimeProjection
 			if isNativeMirrorSessionID(record.Summary.ID) {
 				projection = mergeProjectionWithOptionalRuntime(augmentedProjection, runtimeProjection, runtimeSvc, record.Summary.ID)
@@ -2477,8 +2690,10 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			}
 			record.Projection = projection
 			record.Summary.Runtime = projection.Runtime
-			updateProjectionMeta(record)
-			cacheProjection(record.Summary.ID, record.Projection, false)
+			if !historyWindowOK {
+				updateProjectionMeta(record)
+				cacheProjection(record.Summary.ID, record.Projection, false)
+			}
 			resumeMeta := protocol.MergeRuntimeMeta(protocol.RuntimeMeta{
 				Command:          projection.Runtime.Command,
 				Engine:           projection.Runtime.Engine,
@@ -2493,9 +2708,11 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				projection = updatedProjection
 				record.Projection = projection
 				record.Summary.Runtime = projection.Runtime
-				updateProjectionMeta(record)
-				cacheProjection(record.Summary.ID, record.Projection, false)
 				persistProjectionNow(record.Summary.ID, record.Projection)
+				if !historyWindowOK {
+					updateProjectionMeta(record)
+					cacheProjection(record.Summary.ID, record.Projection, false)
+				}
 			}
 			runtimeAlive := sessionRecordRuntimeAlive(record, runtimeSvc)
 			if runtimeAlive && session.ShouldEmitResumeRecoveryStateEvent(runtimeSvc, projection, req.LastKnownRuntimeState) {
@@ -2505,7 +2722,13 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 					emit(status)
 				}
 			}
-			emit(session.SessionHistoryWindowEventFromRecordWithCursorAndPayloadLimit(record, runtimeAlive, resumeHistoryLimit, deltaCursorSnapshot(sessionRuntime), gatewayRelaySafePayloadBudgetBytes))
+			if historyWindowOK {
+				historyWindow.Record = record
+				historyWindow.Record.Projection.LogEntries = nil
+				emit(session.SessionHistoryWindowEventFromWindowWithCursorAndPayloadLimit(historyWindow, runtimeAlive, deltaCursorSnapshot(sessionRuntime), gatewayRelaySafePayloadBudgetBytes))
+			} else {
+				emit(session.SessionHistoryWindowEventFromRecordWithCursorAndPayloadLimit(record, runtimeAlive, resumeHistoryLimit, deltaCursorSnapshot(sessionRuntime), gatewayRelaySafePayloadBudgetBytes))
+			}
 			emitContextWindowUsageIfAvailable(record.Summary.ID, runtimeSvc)
 			logx.Info("ws", "session history emitted: sessionID=%s runtimeAlive=%v ownership=%s limit=%d", record.Summary.ID, runtimeAlive, record.Summary.Ownership, resumeHistoryLimit)
 			restoredState := ""
@@ -3113,14 +3336,14 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			}
 			sessionRuntime, service := runtimeForSession(sessionID)
 			emitAndPersist := emitAndPersistFor(sessionID)
-			if projectionWithUser, ok := appendUserProjectionEntry(buildRuntimeProjectionSnapshotForService(sessionID, service), sessionID, reqEvent.Command, "命令", connectionID, remoteAddr, nil); ok {
-				persistProjectionNow(sessionID, projectionWithUser)
-			}
 			mode, err := session.ParseMode(reqEvent.Mode)
 			if err != nil {
 				logx.Warn("ws", "parse exec mode failed: connectionID=%s sessionID=%s remoteAddr=%s mode=%q err=%v", connectionID, sessionID, remoteAddr, reqEvent.Mode, err)
 				emit(protocol.NewErrorEvent(sessionID, err.Error(), ""))
 				continue
+			}
+			if projectionWithUser, ok := appendUserProjectionEntry(buildRuntimeProjectionSnapshotForService(sessionID, service), sessionID, reqEvent.Command, "命令", connectionID, remoteAddr, nil); ok {
+				persistProjectionNow(sessionID, projectionWithUser)
 			}
 			logx.Info("ws", "dispatch exec: connectionID=%s sessionID=%s remoteAddr=%s action=exec mode=%s cwd=%q permissionMode=%q preview=%q", connectionID, sessionID, remoteAddr, mode, reqEvent.CWD, reqEvent.PermissionMode, wsDebugPreview(reqEvent.Command))
 			if sessionRuntime != nil {

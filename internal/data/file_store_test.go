@@ -1,9 +1,12 @@
 package data
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -32,6 +35,12 @@ func TestFileStoreDeleteSessionRemovesRecordAndIndex(t *testing.T) {
 	if _, err := os.Stat(fs.sessionPath(created.ID)); !os.IsNotExist(err) {
 		t.Fatalf("expected session file removed, got err=%v", err)
 	}
+	if _, err := os.Stat(fs.sessionLogEntriesPath(created.ID)); !os.IsNotExist(err) {
+		t.Fatalf("expected session log sidecar removed, got err=%v", err)
+	}
+	if _, err := os.Stat(fs.sessionLogEntriesIndexPath(created.ID)); !os.IsNotExist(err) {
+		t.Fatalf("expected session log index removed, got err=%v", err)
+	}
 
 	items, err := fs.ListSessions(context.Background())
 	if err != nil {
@@ -41,6 +50,342 @@ func TestFileStoreDeleteSessionRemovesRecordAndIndex(t *testing.T) {
 		if item.ID == created.ID {
 			t.Fatalf("expected deleted session absent from index, got %#v", items)
 		}
+	}
+}
+
+func TestFileStoreGetSessionHistoryWindowReturnsTailWithoutRecordLogEntries(t *testing.T) {
+	fs, err := NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new file store: %v", err)
+	}
+	created, err := fs.CreateSession(context.Background(), "window")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	entries := make([]SnapshotLogEntry, 0, 250)
+	for i := 0; i < 250; i++ {
+		entries = append(entries, SnapshotLogEntry{
+			Kind:      "user",
+			Message:   fmt.Sprintf("entry-%03d", i),
+			Timestamp: time.Unix(int64(i), 0).UTC().Format(time.RFC3339),
+		})
+	}
+	if _, err := fs.SaveProjection(context.Background(), created.ID, ProjectionSnapshot{
+		RawTerminalByStream: map[string]string{"stdout": "terminal", "stderr": ""},
+		LogEntries:          entries,
+		Runtime:             SessionRuntime{Command: "codex", Engine: "codex"},
+	}); err != nil {
+		t.Fatalf("save projection: %v", err)
+	}
+
+	window, err := fs.GetSessionHistoryWindow(context.Background(), SessionHistoryWindowRequest{
+		SessionID: created.ID,
+		Limit:     120,
+	})
+	if err != nil {
+		t.Fatalf("get history window: %v", err)
+	}
+	if window.LogEntryStart != 130 || window.LogEntryTotal != 250 {
+		t.Fatalf("unexpected window metadata: start=%d total=%d", window.LogEntryStart, window.LogEntryTotal)
+	}
+	if got := len(window.LogEntries); got != 120 {
+		t.Fatalf("expected 120 entries, got %d", got)
+	}
+	if window.LogEntries[0].Timestamp != entries[130].Timestamp || window.LogEntries[119].Timestamp != entries[249].Timestamp {
+		t.Fatalf("unexpected tail entries: first=%#v last=%#v", window.LogEntries[0], window.LogEntries[119])
+	}
+	if got := len(window.Record.Projection.LogEntries); got != 0 {
+		t.Fatalf("expected lightweight record to omit log entries, got %d", got)
+	}
+	if window.Record.Summary.EntryCount != 250 {
+		t.Fatalf("expected summary entry count to remain total, got %#v", window.Record.Summary)
+	}
+	if window.Record.Projection.RawTerminalByStream["stdout"] != "terminal" {
+		t.Fatalf("expected lightweight projection metadata, got %#v", window.Record.Projection.RawTerminalByStream)
+	}
+	recordBytes, err := os.ReadFile(fs.sessionPath(created.ID))
+	if err != nil {
+		t.Fatalf("read session record: %v", err)
+	}
+	var stored map[string]any
+	if err := json.Unmarshal(recordBytes, &stored); err != nil {
+		t.Fatalf("decode stored lightweight record: %v", err)
+	}
+	projection, ok := stored["projection"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected projection object in stored record, got %#v", stored["projection"])
+	}
+	if raw, exists := projection["logEntries"]; exists {
+		if items, ok := raw.([]any); !ok || len(items) != 0 {
+			t.Fatalf("expected canonical record to omit log entries, got %#v", raw)
+		}
+	}
+	fullRecord, err := fs.GetSession(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("get full session: %v", err)
+	}
+	if got := len(fullRecord.Projection.LogEntries); got != 250 {
+		t.Fatalf("expected GetSession to hydrate all entries from sidecar, got %d", got)
+	}
+}
+
+func TestFileStoreGetSessionHistoryWindowReturnsEarlierPage(t *testing.T) {
+	fs, err := NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new file store: %v", err)
+	}
+	created, err := fs.CreateSession(context.Background(), "window-page")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	entries := make([]SnapshotLogEntry, 0, 10)
+	for i := 0; i < 10; i++ {
+		entries = append(entries, SnapshotLogEntry{Kind: "user", Message: fmt.Sprintf("%d", i)})
+	}
+	if _, err := fs.SaveProjection(context.Background(), created.ID, ProjectionSnapshot{
+		RawTerminalByStream: map[string]string{"stdout": "", "stderr": ""},
+		LogEntries:          entries,
+	}); err != nil {
+		t.Fatalf("save projection: %v", err)
+	}
+
+	window, err := fs.GetSessionHistoryWindow(context.Background(), SessionHistoryWindowRequest{
+		SessionID: created.ID,
+		Before:    6,
+		Limit:     3,
+	})
+	if err != nil {
+		t.Fatalf("get page window: %v", err)
+	}
+	if window.LogEntryStart != 3 || window.LogEntryTotal != 10 {
+		t.Fatalf("unexpected page metadata: start=%d total=%d", window.LogEntryStart, window.LogEntryTotal)
+	}
+	got := []string{window.LogEntries[0].Message, window.LogEntries[1].Message, window.LogEntries[2].Message}
+	want := []string{"3", "4", "5"}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("expected page %v, got %v", want, got)
+		}
+	}
+}
+
+func TestFileStoreGetSessionHistoryWindowRebuildsMissingSidecar(t *testing.T) {
+	fs, err := NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new file store: %v", err)
+	}
+	created, err := fs.CreateSession(context.Background(), "legacy-window")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	legacy := SessionRecord{
+		Summary: SessionSummary{
+			ID:        created.ID,
+			Title:     "legacy-window",
+			CreatedAt: created.CreatedAt,
+			UpdatedAt: created.UpdatedAt,
+			Runtime:   SessionRuntime{Source: "mobilevc"},
+		},
+		Projection: ProjectionSnapshot{
+			RawTerminalByStream: map[string]string{"stdout": "", "stderr": ""},
+			LogEntries: []SnapshotLogEntry{
+				{Kind: "user", Message: "a"},
+				{Kind: "markdown", Message: "b"},
+			},
+			Runtime: SessionRuntime{Source: "mobilevc"},
+		},
+	}
+	data, err := json.MarshalIndent(legacy, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal legacy record: %v", err)
+	}
+	if err := os.WriteFile(fs.sessionPath(created.ID), data, 0o644); err != nil {
+		t.Fatalf("write legacy record: %v", err)
+	}
+	if err := os.Remove(fs.sessionLogEntriesPath(created.ID)); err != nil {
+		t.Fatalf("remove sidecar: %v", err)
+	}
+	if err := os.Remove(fs.sessionLogEntriesIndexPath(created.ID)); err != nil {
+		t.Fatalf("remove sidecar index: %v", err)
+	}
+
+	window, err := fs.GetSessionHistoryWindow(context.Background(), SessionHistoryWindowRequest{
+		SessionID: created.ID,
+		Limit:     1,
+	})
+	if err != nil {
+		t.Fatalf("get history window: %v", err)
+	}
+	if window.LogEntryTotal != 2 || len(window.LogEntries) != 1 || window.LogEntries[0].Message != "b" {
+		t.Fatalf("unexpected rebuilt window: %#v", window)
+	}
+	if _, err := os.Stat(fs.sessionLogEntriesPath(created.ID)); err != nil {
+		t.Fatalf("expected sidecar rebuilt, got err=%v", err)
+	}
+	if _, err := os.Stat(fs.sessionLogEntriesIndexPath(created.ID)); err != nil {
+		t.Fatalf("expected sidecar index rebuilt, got err=%v", err)
+	}
+}
+
+func TestFileStoreGetSessionHistoryWindowMigratesLegacySidecar(t *testing.T) {
+	fs, err := NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new file store: %v", err)
+	}
+	created, err := fs.CreateSession(context.Background(), "legacy-sidecar")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if _, err := fs.SaveProjection(context.Background(), created.ID, ProjectionSnapshot{
+		RawTerminalByStream: map[string]string{"stdout": "", "stderr": ""},
+		LogEntries: []SnapshotLogEntry{
+			{Kind: "user", Message: "a"},
+			{Kind: "markdown", Message: "b"},
+			{Kind: "user", Message: "c"},
+		},
+	}); err != nil {
+		t.Fatalf("save projection: %v", err)
+	}
+	if err := os.Remove(fs.sessionLogEntriesIndexPath(created.ID)); err != nil {
+		t.Fatalf("remove sidecar index: %v", err)
+	}
+	legacy := sessionLogEntriesSidecar{
+		SessionID:  created.ID,
+		EntryCount: 3,
+		LogEntries: []SnapshotLogEntry{
+			{Kind: "user", Message: "a"},
+			{Kind: "markdown", Message: "b"},
+			{Kind: "user", Message: "c"},
+		},
+	}
+	data, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatalf("marshal legacy sidecar: %v", err)
+	}
+	if err := os.WriteFile(fs.sessionLogEntriesPath(created.ID), data, 0o644); err != nil {
+		t.Fatalf("write legacy sidecar: %v", err)
+	}
+
+	window, err := fs.GetSessionHistoryWindow(context.Background(), SessionHistoryWindowRequest{
+		SessionID: created.ID,
+		Limit:     2,
+	})
+	if err != nil {
+		t.Fatalf("get history window: %v", err)
+	}
+	if window.LogEntryTotal != 3 || window.LogEntryStart != 1 || len(window.LogEntries) != 2 || window.LogEntries[0].Message != "b" {
+		t.Fatalf("unexpected migrated window: %#v", window)
+	}
+	if _, err := os.Stat(fs.sessionLogEntriesIndexPath(created.ID)); err != nil {
+		t.Fatalf("expected sidecar index created, got err=%v", err)
+	}
+	raw, err := os.ReadFile(fs.sessionLogEntriesPath(created.ID))
+	if err != nil {
+		t.Fatalf("read migrated sidecar: %v", err)
+	}
+	if len(raw) == 0 || raw[0] != '{' || json.Valid(raw) {
+		t.Fatalf("expected migrated JSONL sidecar, got %q", string(raw))
+	}
+}
+
+func TestFileStoreGetSessionHistoryWindowFailsOnSidecarMismatch(t *testing.T) {
+	fs, err := NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new file store: %v", err)
+	}
+	created, err := fs.CreateSession(context.Background(), "bad-sidecar")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if _, err := fs.SaveProjection(context.Background(), created.ID, ProjectionSnapshot{
+		RawTerminalByStream: map[string]string{"stdout": "", "stderr": ""},
+		LogEntries:          []SnapshotLogEntry{{Kind: "user", Message: "a"}},
+	}); err != nil {
+		t.Fatalf("save projection: %v", err)
+	}
+	raw, err := os.ReadFile(fs.sessionLogEntriesPath(created.ID))
+	if err != nil {
+		t.Fatalf("read sidecar: %v", err)
+	}
+	lines := bytes.SplitN(raw, []byte("\n"), 2)
+	if len(lines) != 2 {
+		t.Fatalf("expected JSONL sidecar, got %q", string(raw))
+	}
+	badHeader := sessionLogEntriesSidecarHeader{
+		Version:    sessionLogEntriesSidecarVersion,
+		SessionID:  "other-session",
+		EntryCount: 1,
+	}
+	headerData, err := json.Marshal(badHeader)
+	if err != nil {
+		t.Fatalf("marshal bad header: %v", err)
+	}
+	raw = append(append(headerData, '\n'), lines[1]...)
+	if err := os.WriteFile(fs.sessionLogEntriesPath(created.ID), raw, 0o644); err != nil {
+		t.Fatalf("write bad sidecar: %v", err)
+	}
+	if _, err := fs.GetSessionHistoryWindow(context.Background(), SessionHistoryWindowRequest{SessionID: created.ID, Limit: 1}); err == nil {
+		t.Fatal("expected sidecar mismatch to fail")
+	}
+}
+
+func TestFileStoreGetSessionHistoryWindowTailDoesNotDecodeEarlierRows(t *testing.T) {
+	fs, err := NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new file store: %v", err)
+	}
+	created, err := fs.CreateSession(context.Background(), "tail-window")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	entries := make([]SnapshotLogEntry, 0, 5)
+	for i := 0; i < 5; i++ {
+		entries = append(entries, SnapshotLogEntry{Kind: "user", Message: fmt.Sprintf("entry-%d", i)})
+	}
+	if _, err := fs.SaveProjection(context.Background(), created.ID, ProjectionSnapshot{
+		RawTerminalByStream: map[string]string{"stdout": "", "stderr": ""},
+		LogEntries:          entries,
+	}); err != nil {
+		t.Fatalf("save projection: %v", err)
+	}
+	raw, err := os.ReadFile(fs.sessionLogEntriesPath(created.ID))
+	if err != nil {
+		t.Fatalf("read sidecar: %v", err)
+	}
+	lines := bytes.Split(raw, []byte("\n"))
+	if len(lines) < 7 {
+		t.Fatalf("expected header plus entries, got %q", string(raw))
+	}
+	lines[1] = bytes.Repeat([]byte(" "), len(lines[1]))
+	copy(lines[1], []byte("{bad json}"))
+	var rebuilt bytes.Buffer
+	for _, line := range lines {
+		if len(line) == 0 {
+			continue
+		}
+		rebuilt.Write(line)
+		rebuilt.WriteByte('\n')
+	}
+	if err := os.WriteFile(fs.sessionLogEntriesPath(created.ID), rebuilt.Bytes(), 0o644); err != nil {
+		t.Fatalf("write corrupted earlier row: %v", err)
+	}
+
+	window, err := fs.GetSessionHistoryWindow(context.Background(), SessionHistoryWindowRequest{
+		SessionID: created.ID,
+		Limit:     2,
+	})
+	if err != nil {
+		t.Fatalf("tail window should not decode earlier rows: %v", err)
+	}
+	if got := []string{window.LogEntries[0].Message, window.LogEntries[1].Message}; got[0] != "entry-3" || got[1] != "entry-4" {
+		t.Fatalf("unexpected tail entries: %v", got)
+	}
+	if _, err := fs.GetSessionHistoryWindow(context.Background(), SessionHistoryWindowRequest{
+		SessionID: created.ID,
+		Before:    2,
+		Limit:     2,
+	}); err == nil {
+		t.Fatal("expected page covering corrupted earlier row to fail")
 	}
 }
 
@@ -358,6 +703,175 @@ func TestFileStoreSaveProjectionDerivesTitleAndPreviewFromMeaningfulUserInput(t 
 	}
 	if summary.LastPreview != "再看下恢复逻辑" {
 		t.Fatalf("expected latest user preview, got %q", summary.LastPreview)
+	}
+}
+
+func TestFileStoreSaveProjectionWithoutLogEntriesPreservesExistingHistory(t *testing.T) {
+	fs, err := NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new file store: %v", err)
+	}
+	created, err := fs.CreateSession(context.Background(), "preserve history")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	entries := []SnapshotLogEntry{
+		{Kind: "user", Message: "a"},
+		{Kind: "markdown", Message: "b"},
+		{Kind: "user", Message: "c"},
+	}
+	if _, err := fs.SaveProjection(context.Background(), created.ID, ProjectionSnapshot{
+		RawTerminalByStream: map[string]string{"stdout": "", "stderr": ""},
+		LogEntries:          entries,
+		Runtime:             SessionRuntime{Command: "claude", CWD: "/tmp/project"},
+	}); err != nil {
+		t.Fatalf("save projection with history: %v", err)
+	}
+	summary, err := fs.SaveProjection(context.Background(), created.ID, ProjectionSnapshot{
+		RawTerminalByStream: map[string]string{"stdout": "new output", "stderr": ""},
+		Runtime:             SessionRuntime{Command: "claude", CWD: "/tmp/project", PermissionMode: "auto"},
+	})
+	if err != nil {
+		t.Fatalf("save lightweight projection: %v", err)
+	}
+	if summary.EntryCount != len(entries) {
+		t.Fatalf("expected entry count preserved, got %#v", summary)
+	}
+	window, err := fs.GetSessionHistoryWindow(context.Background(), SessionHistoryWindowRequest{
+		SessionID: created.ID,
+		Limit:     2,
+	})
+	if err != nil {
+		t.Fatalf("get history window: %v", err)
+	}
+	if window.LogEntryTotal != len(entries) || len(window.LogEntries) != 2 || window.LogEntries[0].Message != "b" {
+		t.Fatalf("expected existing history preserved in sidecar, got %#v", window)
+	}
+	record, err := fs.GetSession(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	if len(record.Projection.LogEntries) != len(entries) {
+		t.Fatalf("expected hydrated history preserved, got %#v", record.Projection.LogEntries)
+	}
+	if record.Projection.Runtime.PermissionMode != "auto" {
+		t.Fatalf("expected runtime update persisted, got %#v", record.Projection.Runtime)
+	}
+}
+
+func TestFileStoreSaveLightweightProjectionDoesNotDecodeExistingHistoryRows(t *testing.T) {
+	dir := t.TempDir()
+	fs, err := NewFileStore(dir)
+	if err != nil {
+		t.Fatalf("new file store: %v", err)
+	}
+	created, err := fs.CreateSession(context.Background(), "preserve history without decode")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	entries := make([]SnapshotLogEntry, 0, 5)
+	for i := 0; i < 5; i++ {
+		entries = append(entries, SnapshotLogEntry{Kind: "user", Message: fmt.Sprintf("entry-%d", i)})
+	}
+	if _, err := fs.SaveProjection(context.Background(), created.ID, ProjectionSnapshot{
+		RawTerminalByStream: map[string]string{"stdout": "", "stderr": ""},
+		LogEntries:          entries,
+	}); err != nil {
+		t.Fatalf("save projection with history: %v", err)
+	}
+	raw, err := os.ReadFile(fs.sessionLogEntriesPath(created.ID))
+	if err != nil {
+		t.Fatalf("read sidecar: %v", err)
+	}
+	lines := bytes.Split(raw, []byte("\n"))
+	if len(lines) < 7 {
+		t.Fatalf("expected header plus entries, got %q", string(raw))
+	}
+	lines[1] = bytes.Repeat([]byte(" "), len(lines[1]))
+	copy(lines[1], []byte("{bad json}"))
+	var rebuilt bytes.Buffer
+	for _, line := range lines {
+		if len(line) == 0 {
+			continue
+		}
+		rebuilt.Write(line)
+		rebuilt.WriteByte('\n')
+	}
+	if err := os.WriteFile(fs.sessionLogEntriesPath(created.ID), rebuilt.Bytes(), 0o644); err != nil {
+		t.Fatalf("write corrupted earlier row: %v", err)
+	}
+
+	coldStore, err := NewFileStore(dir)
+	if err != nil {
+		t.Fatalf("new cold file store: %v", err)
+	}
+	summary, err := fs.SaveProjection(context.Background(), created.ID, ProjectionSnapshot{
+		RawTerminalByStream: map[string]string{"stdout": "runtime-only update", "stderr": ""},
+		Runtime:             SessionRuntime{Command: "codex", CWD: "/tmp/project"},
+	})
+	if err != nil {
+		t.Fatalf("warm save lightweight projection should not decode history rows: %v", err)
+	}
+	if summary.EntryCount != len(entries) {
+		t.Fatalf("expected entry count preserved, got %#v", summary)
+	}
+	summary, err = coldStore.SaveProjection(context.Background(), created.ID, ProjectionSnapshot{
+		RawTerminalByStream: map[string]string{"stdout": "cold runtime-only update", "stderr": ""},
+		Runtime:             SessionRuntime{Command: "codex", CWD: "/tmp/project", PermissionMode: "auto"},
+	})
+	if err != nil {
+		t.Fatalf("cold save lightweight projection should not decode history rows: %v", err)
+	}
+	if summary.EntryCount != len(entries) {
+		t.Fatalf("expected entry count preserved, got %#v", summary)
+	}
+	window, err := coldStore.GetSessionHistoryWindow(context.Background(), SessionHistoryWindowRequest{
+		SessionID: created.ID,
+		Limit:     2,
+	})
+	if err != nil {
+		t.Fatalf("tail window should still avoid corrupted earlier row: %v", err)
+	}
+	if got := []string{window.LogEntries[0].Message, window.LogEntries[1].Message}; got[0] != "entry-3" || got[1] != "entry-4" {
+		t.Fatalf("unexpected tail entries: %v", got)
+	}
+	if _, err := coldStore.GetSessionHistoryWindow(context.Background(), SessionHistoryWindowRequest{
+		SessionID: created.ID,
+		Before:    2,
+		Limit:     2,
+	}); err == nil {
+		t.Fatal("expected page covering corrupted earlier row to fail")
+	}
+}
+
+func TestFileStoreUpsertSessionFailsWhenExistingRecordIsCorrupt(t *testing.T) {
+	fs, err := NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new file store: %v", err)
+	}
+	created, err := fs.CreateSession(context.Background(), "corrupt existing")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if err := os.WriteFile(fs.sessionPath(created.ID), []byte("{bad json"), 0o644); err != nil {
+		t.Fatalf("corrupt session record: %v", err)
+	}
+	_, err = fs.UpsertSession(context.Background(), SessionRecord{
+		Summary: SessionSummary{
+			ID:        created.ID,
+			Title:     "replacement",
+			CreatedAt: time.Now().UTC(),
+			UpdatedAt: time.Now().UTC(),
+		},
+		Projection: ProjectionSnapshot{
+			LogEntries: []SnapshotLogEntry{{Kind: "user", Message: "replacement"}},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected corrupt existing record to fail")
+	}
+	if !strings.Contains(err.Error(), "decode session record") {
+		t.Fatalf("expected decode error, got %v", err)
 	}
 }
 

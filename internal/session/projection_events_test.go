@@ -321,6 +321,9 @@ func TestSessionHistoryWindowEventFromRecordReturnsTailWindow(t *testing.T) {
 	if got.LogEntryStart != 1 || got.LogEntryTotal != 3 || !got.HasMoreBefore {
 		t.Fatalf("unexpected window metadata: start=%d total=%d hasMore=%v", got.LogEntryStart, got.LogEntryTotal, got.HasMoreBefore)
 	}
+	if got.Latest.LogEntryCount != 3 {
+		t.Fatalf("latest log entry count should use total history count, got %d", got.Latest.LogEntryCount)
+	}
 	if len(got.LogEntries) != 2 || got.LogEntries[0].Message != "b" || got.LogEntries[1].Message != "c" {
 		t.Fatalf("unexpected window entries: %+v", got.LogEntries)
 	}
@@ -343,6 +346,9 @@ func TestSessionHistoryPageEventFromRecordReturnsEarlierWindow(t *testing.T) {
 
 	if got.LogEntryStart != 0 || got.LogEntryTotal != 4 || got.HasMoreBefore {
 		t.Fatalf("unexpected page metadata: start=%d total=%d hasMore=%v", got.LogEntryStart, got.LogEntryTotal, got.HasMoreBefore)
+	}
+	if got.Latest.LogEntryCount != 4 {
+		t.Fatalf("latest log entry count should use total history count, got %d", got.Latest.LogEntryCount)
 	}
 	if len(got.LogEntries) != 2 || got.LogEntries[0].Message != "a" || got.LogEntries[1].Message != "b" {
 		t.Fatalf("unexpected page entries: %+v", got.LogEntries)
@@ -614,6 +620,9 @@ func TestSessionHistoryPageEventFromRecordWithPayloadLimitShrinksEntries(t *test
 	}
 	if got.LogEntryTotal != 3 || !got.HasMoreBefore {
 		t.Fatalf("unexpected page metadata: start=%d total=%d hasMore=%v", got.LogEntryStart, got.LogEntryTotal, got.HasMoreBefore)
+	}
+	if got.Latest.LogEntryCount != 3 {
+		t.Fatalf("latest log entry count should survive payload shrinking, got %d", got.Latest.LogEntryCount)
 	}
 	encoded, err := json.Marshal(got)
 	if err != nil {

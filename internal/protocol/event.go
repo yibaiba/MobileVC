@@ -769,6 +769,7 @@ type SessionHistoryPageEvent struct {
 	LogEntryTotal      int               `json:"logEntryTotal,omitempty"`
 	HasMoreBefore      bool              `json:"hasMoreBefore,omitempty"`
 	ResumeRuntimeMeta  RuntimeMeta       `json:"resumeRuntimeMeta,omitempty"`
+	Latest             SessionDeltaKnown `json:"latest,omitempty"`
 	PayloadLimited     bool              `json:"payloadLimited,omitempty"`
 	PayloadLimitReason string            `json:"payloadLimitReason,omitempty"`
 }
@@ -1552,7 +1553,7 @@ func NewSessionUpdatedEvent(sessionID string, generation uint64, eventCursor int
 	}
 }
 
-func NewSessionHistoryPageEvent(sessionID string, logEntries []HistoryLogEntry, logEntryStart, logEntryTotal int, resumeRuntimeMeta RuntimeMeta) SessionHistoryPageEvent {
+func NewSessionHistoryPageEvent(sessionID string, logEntries []HistoryLogEntry, logEntryStart, logEntryTotal int, resumeRuntimeMeta RuntimeMeta, latest SessionDeltaKnown) SessionHistoryPageEvent {
 	return SessionHistoryPageEvent{
 		Event:             NewBaseEvent(EventTypeSessionHistoryPage, sessionID),
 		LogEntries:        logEntries,
@@ -1560,6 +1561,7 @@ func NewSessionHistoryPageEvent(sessionID string, logEntries []HistoryLogEntry, 
 		LogEntryTotal:     logEntryTotal,
 		HasMoreBefore:     logEntryStart > 0,
 		ResumeRuntimeMeta: resumeRuntimeMeta,
+		Latest:            latest,
 	}
 }
 

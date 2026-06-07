@@ -305,6 +305,19 @@ type SessionRecord struct {
 	ClientActions []ClientActionRecord `json:"clientActions,omitempty"`
 }
 
+type SessionHistoryWindowRequest struct {
+	SessionID string
+	Before    int
+	Limit     int
+}
+
+type SessionHistoryWindow struct {
+	Record        SessionRecord
+	LogEntries    []SnapshotLogEntry
+	LogEntryStart int
+	LogEntryTotal int
+}
+
 type ClientActionRecord struct {
 	ClientActionID string    `json:"clientActionId"`
 	Action         string    `json:"action"`
@@ -348,4 +361,8 @@ func WithJSONLSyncEntryCount(count int) ProjectionSaveOption {
 
 type ProjectionOptionStore interface {
 	SaveProjectionWithOptions(ctx context.Context, sessionID string, projection ProjectionSnapshot, opts ...ProjectionSaveOption) (SessionSummary, error)
+}
+
+type SessionHistoryWindowStore interface {
+	GetSessionHistoryWindow(ctx context.Context, req SessionHistoryWindowRequest) (SessionHistoryWindow, error)
 }

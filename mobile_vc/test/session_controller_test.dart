@@ -7491,6 +7491,9 @@ void main() {
         service.sentPayloads.where((item) => item['action'] == 'session_list'),
         isNotEmpty,
       );
+      await Future<void>.delayed(const Duration(milliseconds: 520));
+      await _flushEvents();
+
       expect(
         service.sentPayloads
             .where((item) => item['action'] == 'session_context_get'),
@@ -9754,6 +9757,9 @@ Flutter 打出来的 app-release.apk 在 mobile_vc/build/ 下，是 ignored 构�
       );
 
       await controller.connect();
+
+      await Future<void>.delayed(const Duration(milliseconds: 520));
+      await _flushEvents();
 
       final actions = service.sentPayloads
           .map((payload) => payload['action'])
@@ -12848,6 +12854,44 @@ Flutter 打出来的 app-release.apk 在 mobile_vc/build/ 下，是 ignored 构�
       expect(service.sentPayloads.single['limit'], 120);
     });
 
+    test('connect 阶段延后非关键 bootstrap，避免 relay loading burst', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      final initialActions =
+          service.sentPayloads.map((payload) => payload['action']).toList();
+      expect(initialActions, contains('fs_list'));
+      expect(initialActions, contains('session_list'));
+      expect(initialActions, isNot(contains('session_delta_get')),
+          reason: 'no selected session exists during initial connect');
+      expect(initialActions, isNot(contains('runtime_info')));
+      expect(initialActions, isNot(contains('skill_catalog_get')));
+      expect(initialActions, isNot(contains('memory_list')));
+      expect(initialActions, isNot(contains('adb_devices')));
+      expect(initialActions, isNot(contains('session_context_get')));
+      expect(initialActions, isNot(contains('permission_rule_list')));
+      expect(initialActions, isNot(contains('session_diff_page_get')));
+      expect(initialActions, isNot(contains('task_snapshot_get')));
+      expect(initialActions, isNot(contains('context_window_usage_get')));
+
+      await Future<void>.delayed(const Duration(milliseconds: 520));
+      await _flushEvents();
+
+      final delayedActions =
+          service.sentPayloads.map((payload) => payload['action']).toList();
+      expect(delayedActions, contains('runtime_info'));
+      expect(delayedActions, contains('skill_catalog_get'));
+      expect(delayedActions, contains('memory_list'));
+      expect(delayedActions, contains('adb_devices'));
+      expect(delayedActions, contains('session_context_get'));
+      expect(delayedActions, contains('permission_rule_list'));
+      expect(delayedActions, contains('task_snapshot_get'));
+      expect(delayedActions, contains('context_window_usage_get'));
+    });
+
     test('会话历史窗口使用配置里的条数', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);
@@ -13565,6 +13609,47 @@ Flutter 打出来的 app-release.apk 在 mobile_vc/build/ 下，是 ignored 构�
           .toList();
       expect(loads, hasLength(1));
       expect(loads.single['sessionId'], 'session-target');
+    });
+
+    test('e2ee_decrypt_failed 会立即结束会话 loading', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.saveConfig(const AppConfig(
+        connectionMode: 'relay',
+        relayUrl: 'wss://relay.example.test',
+        relaySessionId: 'rs_test',
+        relayClientId: 'rc_test',
+        relayClientReconnectSecret: 'reconnect_secret',
+      ));
+      await controller.connect();
+      service.sentPayloads.clear();
+
+      controller.loadSession('session-target');
+      expect(controller.isLoadingSession, isTrue);
+
+      service.emit(ErrorEvent(
+        timestamp: _timestamp.add(const Duration(seconds: 1)),
+        sessionId: 'session-target',
+        runtimeMeta: const RuntimeMeta(),
+        raw: const {'type': 'error'},
+        code: 'e2ee_decrypt_failed',
+        message: 'Relay E2EE 解密失败',
+      ));
+      await _flushEvents();
+
+      expect(controller.isLoadingSession, isFalse);
+      expect(controller.connected, isFalse);
+      expect(controller.connectionStage, SessionConnectionStage.reconnecting);
+      expect(controller.connectionMessage, '恢复连接中...');
+      expect(controller.relayDeviceStatus, 'Relay E2EE 解密失败');
+      expect(
+        service.sentPayloads
+            .where((payload) => payload['action'] == 'session_load'),
+        hasLength(1),
+      );
     });
 
     test('loadSession history 后延后发送非关键 bootstrap 请求', () async {

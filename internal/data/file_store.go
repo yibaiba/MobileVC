@@ -1,9 +1,13 @@
 package data
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -37,6 +41,53 @@ type sessionRecordMeta struct {
 	ClientActions     []ClientActionRecord
 	SessionContext    SessionContext
 	SessionContextSet bool
+}
+
+type sessionLogEntriesSidecar struct {
+	SessionID  string             `json:"sessionId"`
+	EntryCount int                `json:"entryCount"`
+	LogEntries []SnapshotLogEntry `json:"logEntries"`
+}
+
+const sessionLogEntriesSidecarVersion = 1
+
+type sessionLogEntriesSidecarHeader struct {
+	Version    int    `json:"version"`
+	SessionID  string `json:"sessionId"`
+	EntryCount int    `json:"entryCount"`
+}
+
+type sessionLogEntriesIndex struct {
+	Version    int     `json:"version"`
+	SessionID  string  `json:"sessionId"`
+	EntryCount int     `json:"entryCount"`
+	Offsets    []int64 `json:"offsets"`
+}
+
+type sessionRecordLightweight struct {
+	Summary       SessionSummary            `json:"summary"`
+	Projection    projectionLightweightJSON `json:"projection"`
+	ClientActions []ClientActionRecord      `json:"clientActions,omitempty"`
+}
+
+type projectionLightweightJSON struct {
+	Diffs                  []DiffContext       `json:"diffs,omitempty"`
+	CurrentDiff            *DiffContext        `json:"currentDiff,omitempty"`
+	ReviewGroups           []ReviewGroup       `json:"reviewGroups,omitempty"`
+	ActiveReviewGroup      *ReviewGroup        `json:"activeReviewGroup,omitempty"`
+	CurrentStep            *SnapshotContext    `json:"currentStep,omitempty"`
+	LatestError            *SnapshotContext    `json:"latestError,omitempty"`
+	RawTerminalByStream    map[string]string   `json:"rawTerminalByStream,omitempty"`
+	TerminalExecutions     []TerminalExecution `json:"terminalExecutions,omitempty"`
+	Controller             ControllerSnapshot  `json:"controller,omitempty"`
+	Runtime                SessionRuntime      `json:"runtime,omitempty"`
+	ContextWindowUsage     ContextWindowUsage  `json:"contextWindowUsage,omitempty"`
+	SessionContext         SessionContext      `json:"sessionContext,omitempty"`
+	SessionContextSet      bool                `json:"sessionContextSet,omitempty"`
+	PermissionRulesEnabled bool                `json:"permissionRulesEnabled,omitempty"`
+	PermissionRules        []PermissionRule    `json:"permissionRules,omitempty"`
+	SkillCatalogMeta       CatalogMetadata     `json:"skillCatalogMeta,omitempty"`
+	MemoryCatalogMeta      CatalogMetadata     `json:"memoryCatalogMeta,omitempty"`
 }
 
 var (
@@ -127,7 +178,7 @@ func (s *FileStore) UpsertSession(ctx context.Context, record SessionRecord) (Se
 	if err != nil {
 		return SessionSummary{}, err
 	}
-	if existing, err := s.readSessionLocked(record.Summary.ID); err == nil {
+	if existing, err := s.readSessionWithoutLogEntriesLocked(record.Summary.ID); err == nil {
 		if record.Summary.Title == "" {
 			record.Summary.Title = existing.Summary.Title
 		}
@@ -140,6 +191,8 @@ func (s *FileStore) UpsertSession(ctx context.Context, record SessionRecord) (Se
 		if record.Summary.ClaudeSessionUUID == "" {
 			record.Summary.ClaudeSessionUUID = existing.Summary.ClaudeSessionUUID
 		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return SessionSummary{}, err
 	}
 	record.Summary = deriveProjectionSummary(record.Summary, record.Projection)
 	if err := s.writeSessionLocked(record); err != nil {
@@ -180,11 +233,11 @@ func (s *FileStore) SaveProjectionWithOptions(ctx context.Context, sessionID str
 	}
 	meta, ok := s.sessionMetaLocked(sessionID)
 	if !ok {
-		record, err := s.readSessionLocked(sessionID)
+		record, err := s.readSessionWithoutLogEntriesLocked(sessionID)
 		if err != nil {
 			return SessionSummary{}, err
 		}
-		meta = sessionMetaFromRecord(record)
+		meta = sessionMetaFromLightweightRecord(record)
 	}
 	now := time.Now().UTC()
 	if !projection.SessionContextSet {
@@ -195,6 +248,15 @@ func (s *FileStore) SaveProjectionWithOptions(ctx context.Context, sessionID str
 	if !projection.SessionContextSet {
 		projection.SessionContext = meta.SessionContext
 		projection.SessionContextSet = meta.SessionContextSet
+	}
+	preserveExistingLogEntries := len(projection.LogEntries) == 0 && meta.Summary.EntryCount > 0
+	preservedLogEntryCount := meta.Summary.EntryCount
+	if preserveExistingLogEntries {
+		index, err := s.readSessionLogEntriesIndexLocked(sessionID)
+		if err != nil {
+			return SessionSummary{}, err
+		}
+		preservedLogEntryCount = index.EntryCount
 	}
 	record := SessionRecord{
 		Summary:       meta.Summary,
@@ -213,7 +275,14 @@ func (s *FileStore) SaveProjectionWithOptions(ctx context.Context, sessionID str
 	if saveOpts.JSONLSyncEntryCount != nil {
 		record.Summary.JSONLSyncEntryCount = *saveOpts.JSONLSyncEntryCount
 	}
-	if err := s.writeSessionLocked(record); err != nil {
+	if preserveExistingLogEntries {
+		record.Summary.EntryCount = preservedLogEntryCount
+		record.Summary.Title = meta.Summary.Title
+		record.Summary.LastPreview = meta.Summary.LastPreview
+		if err := s.writeSessionRecordOnlyLocked(record); err != nil {
+			return SessionSummary{}, err
+		}
+	} else if err := s.writeSessionLocked(record); err != nil {
 		return SessionSummary{}, err
 	}
 	s.cacheSessionMetaLocked(record)
@@ -257,6 +326,36 @@ func (s *FileStore) GetSession(ctx context.Context, sessionID string) (SessionRe
 	return record, nil
 }
 
+func (s *FileStore) GetSessionHistoryWindow(ctx context.Context, req SessionHistoryWindowRequest) (SessionHistoryWindow, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	select {
+	case <-ctx.Done():
+		return SessionHistoryWindow{}, ctx.Err()
+	default:
+	}
+	sessionID := strings.TrimSpace(req.SessionID)
+	if sessionID == "" {
+		return SessionHistoryWindow{}, fmt.Errorf("session ID is required")
+	}
+	record, err := s.readSessionWithoutLogEntriesLocked(sessionID)
+	if err != nil {
+		return SessionHistoryWindow{}, err
+	}
+	entries, start, total, err := s.readSessionLogEntryWindowLocked(sessionID, req.Before, req.Limit)
+	if err != nil {
+		return SessionHistoryWindow{}, err
+	}
+	record.Projection.LogEntries = nil
+	record.Summary.EntryCount = total
+	return SessionHistoryWindow{
+		Record:        record,
+		LogEntries:    entries,
+		LogEntryStart: start,
+		LogEntryTotal: total,
+	}, nil
+}
+
 func (s *FileStore) ListSessions(ctx context.Context) ([]SessionSummary, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -293,9 +392,15 @@ func (s *FileStore) DeleteSession(ctx context.Context, sessionID string) error {
 	}
 	if err := os.Remove(s.sessionPath(sessionID)); err != nil {
 		if os.IsNotExist(err) {
-			return fmt.Errorf("session not found: %s", sessionID)
+			return fmt.Errorf("session not found: %s: %w", sessionID, os.ErrNotExist)
 		}
 		return fmt.Errorf("delete session record: %w", err)
+	}
+	if err := os.Remove(s.sessionLogEntriesPath(sessionID)); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("delete session log entries sidecar: %w", err)
+	}
+	if err := os.Remove(s.sessionLogEntriesIndexPath(sessionID)); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("delete session log entries index: %w", err)
 	}
 	index, err := s.readIndexLocked()
 	if err != nil {
@@ -445,10 +550,46 @@ func (s *FileStore) writeIndexLocked(index fileIndex) error {
 }
 
 func (s *FileStore) readSessionLocked(sessionID string) (SessionRecord, error) {
+	record, err := s.readSessionFileLocked(sessionID)
+	if err != nil {
+		return SessionRecord{}, err
+	}
+	embeddedEntries := append([]SnapshotLogEntry(nil), record.Projection.LogEntries...)
+	entries, err := s.readAllSessionLogEntriesIfAvailableLocked(sessionID)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return SessionRecord{}, err
+		}
+		if len(embeddedEntries) == 0 && record.Summary.EntryCount > 0 {
+			return SessionRecord{}, fmt.Errorf("session log entries sidecar missing for %s: %w", sessionID, os.ErrNotExist)
+		}
+		entries = dedupeAdjacentLogEntries(embeddedEntries)
+		if writeErr := s.writeSessionLocked(SessionRecord{
+			Summary:       record.Summary,
+			Projection:    projectionWithLogEntries(record.Projection, entries),
+			ClientActions: record.ClientActions,
+		}); writeErr != nil {
+			return SessionRecord{}, writeErr
+		}
+	} else if len(embeddedEntries) > 0 && len(entries) != len(dedupeAdjacentLogEntries(embeddedEntries)) {
+		entries = dedupeAdjacentLogEntries(embeddedEntries)
+		if writeErr := s.writeSessionLocked(SessionRecord{
+			Summary:       record.Summary,
+			Projection:    projectionWithLogEntries(record.Projection, entries),
+			ClientActions: record.ClientActions,
+		}); writeErr != nil {
+			return SessionRecord{}, writeErr
+		}
+	}
+	record.Projection.LogEntries = entries
+	return normalizeSessionRecord(record), nil
+}
+
+func (s *FileStore) readSessionFileLocked(sessionID string) (SessionRecord, error) {
 	data, err := os.ReadFile(s.sessionPath(sessionID))
 	if err != nil {
 		if os.IsNotExist(err) {
-			return SessionRecord{}, fmt.Errorf("session not found: %s", sessionID)
+			return SessionRecord{}, fmt.Errorf("session not found: %s: %w", sessionID, os.ErrNotExist)
 		}
 		return SessionRecord{}, fmt.Errorf("read session record: %w", err)
 	}
@@ -456,16 +597,271 @@ func (s *FileStore) readSessionLocked(sessionID string) (SessionRecord, error) {
 	if err := json.Unmarshal(data, &record); err != nil {
 		return SessionRecord{}, fmt.Errorf("decode session record: %w", err)
 	}
-	return normalizeSessionRecord(record), nil
+	return record, nil
+}
+
+func (s *FileStore) readSessionWithoutLogEntriesLocked(sessionID string) (SessionRecord, error) {
+	file, err := os.Open(s.sessionPath(sessionID))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return SessionRecord{}, fmt.Errorf("session not found: %s: %w", sessionID, os.ErrNotExist)
+		}
+		return SessionRecord{}, fmt.Errorf("read session record: %w", err)
+	}
+	defer file.Close()
+	var record sessionRecordLightweight
+	if err := json.NewDecoder(file).Decode(&record); err != nil {
+		return SessionRecord{}, fmt.Errorf("decode session record: %w", err)
+	}
+	return normalizeSessionRecordLightweight(SessionRecord{
+		Summary:       record.Summary,
+		Projection:    record.Projection.toProjectionSnapshot(),
+		ClientActions: record.ClientActions,
+	}), nil
 }
 
 func (s *FileStore) writeSessionLocked(record SessionRecord) error {
 	record = normalizeSessionRecord(record)
+	entries := append([]SnapshotLogEntry(nil), record.Projection.LogEntries...)
+	record.Projection.LogEntries = nil
+	if err := s.writeSessionRecordOnlyLocked(record); err != nil {
+		return err
+	}
+	return s.writeSessionLogEntriesLocked(record.Summary.ID, entries)
+}
+
+func (s *FileStore) writeSessionRecordOnlyLocked(record SessionRecord) error {
+	record.Projection.LogEntries = nil
 	data, err := json.Marshal(record)
 	if err != nil {
 		return fmt.Errorf("encode session record: %w", err)
 	}
 	return writeJSONFileAtomic(s.sessionPath(record.Summary.ID), data, 0o644)
+}
+
+func (s *FileStore) readSessionLogEntryWindowLocked(sessionID string, before, limit int) ([]SnapshotLogEntry, int, int, error) {
+	requestBefore := before
+	index, err := s.readSessionLogEntriesIndexLocked(sessionID)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return nil, 0, 0, err
+		}
+		record, rebuildErr := s.readSessionFileLocked(sessionID)
+		if rebuildErr != nil {
+			return nil, 0, 0, rebuildErr
+		}
+		record = normalizeSessionRecord(record)
+		if len(record.Projection.LogEntries) == 0 && record.Summary.EntryCount > 0 {
+			return nil, 0, 0, fmt.Errorf("session log entries sidecar missing for %s: %w", sessionID, os.ErrNotExist)
+		}
+		if writeErr := s.writeSessionLocked(record); writeErr != nil {
+			return nil, 0, 0, writeErr
+		}
+		index, err = s.readSessionLogEntriesIndexLocked(sessionID)
+		if err != nil {
+			return nil, 0, 0, err
+		}
+	}
+	total := index.EntryCount
+	if total < 0 {
+		return nil, 0, 0, fmt.Errorf("session log entries index has negative count: %d", total)
+	}
+	if len(index.Offsets) != total {
+		return nil, 0, 0, fmt.Errorf("session log entries index count mismatch: got %d offsets, index count %d", len(index.Offsets), total)
+	}
+	before = normalizeWindowBefore(before, total)
+	start := normalizeWindowStart(before, limit)
+	entries, err := s.readSessionLogEntriesRangeLocked(sessionID, index.Offsets, start, before)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			record, rebuildErr := s.readSessionLocked(sessionID)
+			if rebuildErr != nil {
+				return nil, 0, 0, rebuildErr
+			}
+			if writeErr := s.writeSessionLogEntriesLocked(sessionID, record.Projection.LogEntries); writeErr != nil {
+				return nil, 0, 0, writeErr
+			}
+			return s.readSessionLogEntryWindowLocked(sessionID, requestBefore, limit)
+		}
+		return nil, 0, 0, err
+	}
+	return entries, start, total, nil
+}
+
+func (s *FileStore) readAllSessionLogEntriesIfAvailableLocked(sessionID string) ([]SnapshotLogEntry, error) {
+	index, err := s.readSessionLogEntriesIndexLocked(sessionID)
+	if err != nil {
+		return nil, err
+	}
+	return s.readSessionLogEntriesRangeLocked(sessionID, index.Offsets, 0, index.EntryCount)
+}
+
+func (s *FileStore) readSessionLogEntriesIndexLocked(sessionID string) (sessionLogEntriesIndex, error) {
+	data, err := os.ReadFile(s.sessionLogEntriesIndexPath(sessionID))
+	if err == nil {
+		var index sessionLogEntriesIndex
+		if decodeErr := json.Unmarshal(data, &index); decodeErr != nil {
+			return sessionLogEntriesIndex{}, fmt.Errorf("decode session log entries index: %w", decodeErr)
+		}
+		if err := validateSessionLogEntriesIndex(sessionID, index); err != nil {
+			return sessionLogEntriesIndex{}, err
+		}
+		return index, nil
+	}
+	if err != nil && !os.IsNotExist(err) {
+		return sessionLogEntriesIndex{}, fmt.Errorf("read session log entries index: %w", err)
+	}
+	entries, legacyErr := s.readLegacySessionLogEntriesSidecarLocked(sessionID)
+	if legacyErr != nil {
+		if errors.Is(legacyErr, os.ErrNotExist) {
+			return sessionLogEntriesIndex{}, os.ErrNotExist
+		}
+		return sessionLogEntriesIndex{}, legacyErr
+	}
+	if writeErr := s.writeSessionLogEntriesLocked(sessionID, entries); writeErr != nil {
+		return sessionLogEntriesIndex{}, writeErr
+	}
+	data, err = os.ReadFile(s.sessionLogEntriesIndexPath(sessionID))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return sessionLogEntriesIndex{}, os.ErrNotExist
+		}
+		return sessionLogEntriesIndex{}, fmt.Errorf("read rebuilt session log entries index: %w", err)
+	}
+	var index sessionLogEntriesIndex
+	if decodeErr := json.Unmarshal(data, &index); decodeErr != nil {
+		return sessionLogEntriesIndex{}, fmt.Errorf("decode rebuilt session log entries index: %w", decodeErr)
+	}
+	if err := validateSessionLogEntriesIndex(sessionID, index); err != nil {
+		return sessionLogEntriesIndex{}, err
+	}
+	return index, nil
+}
+
+func (s *FileStore) readLegacySessionLogEntriesSidecarLocked(sessionID string) ([]SnapshotLogEntry, error) {
+	data, err := os.ReadFile(s.sessionLogEntriesPath(sessionID))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, os.ErrNotExist
+		}
+		return nil, fmt.Errorf("read session log entries sidecar: %w", err)
+	}
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 {
+		return nil, fmt.Errorf("session log entries sidecar is empty")
+	}
+	if trimmed[0] != '{' {
+		return nil, os.ErrNotExist
+	}
+	var sidecar sessionLogEntriesSidecar
+	if err := json.Unmarshal(trimmed, &sidecar); err != nil {
+		return nil, fmt.Errorf("decode legacy session log entries sidecar: %w", err)
+	}
+	if strings.TrimSpace(sidecar.SessionID) != "" && strings.TrimSpace(sidecar.SessionID) != strings.TrimSpace(sessionID) {
+		return nil, fmt.Errorf("session log entries sidecar belongs to %s, not %s", sidecar.SessionID, sessionID)
+	}
+	entries := dedupeAdjacentLogEntries(sidecar.LogEntries)
+	if sidecar.EntryCount != 0 && sidecar.EntryCount != len(entries) {
+		return nil, fmt.Errorf("session log entries sidecar count mismatch: got %d entries, sidecar count %d", len(entries), sidecar.EntryCount)
+	}
+	return append([]SnapshotLogEntry(nil), entries...), nil
+}
+
+func (s *FileStore) readSessionLogEntriesRangeLocked(sessionID string, offsets []int64, start, before int) ([]SnapshotLogEntry, error) {
+	if start < 0 || before < start || before > len(offsets) {
+		return nil, fmt.Errorf("invalid session log entries window: start=%d before=%d total=%d", start, before, len(offsets))
+	}
+	if start == before {
+		return []SnapshotLogEntry{}, nil
+	}
+	file, err := os.Open(s.sessionLogEntriesPath(sessionID))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("session log entries sidecar missing for %s: %w", sessionID, os.ErrNotExist)
+		}
+		return nil, fmt.Errorf("read session log entries sidecar: %w", err)
+	}
+	defer file.Close()
+	reader := bufio.NewReader(file)
+	headerLine, err := reader.ReadBytes('\n')
+	if err != nil {
+		return nil, fmt.Errorf("read session log entries sidecar header: %w", err)
+	}
+	var header sessionLogEntriesSidecarHeader
+	if err := json.Unmarshal(bytes.TrimSpace(headerLine), &header); err != nil {
+		return nil, fmt.Errorf("decode session log entries sidecar header: %w", err)
+	}
+	if err := validateSessionLogEntriesHeader(sessionID, header, len(offsets)); err != nil {
+		return nil, err
+	}
+	if _, err := file.Seek(offsets[start], io.SeekStart); err != nil {
+		return nil, fmt.Errorf("seek session log entries sidecar: %w", err)
+	}
+	reader.Reset(file)
+	entries := make([]SnapshotLogEntry, 0, before-start)
+	for row := start; row < before; row++ {
+		line, err := reader.ReadBytes('\n')
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil, fmt.Errorf("session log entries sidecar ended at row %d before expected %d", row, before)
+			}
+			return nil, fmt.Errorf("read session log entries sidecar row %d: %w", row, err)
+		}
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
+			return nil, fmt.Errorf("session log entries sidecar ended at row %d before expected %d", row, before)
+		}
+		var entry SnapshotLogEntry
+		if err := json.Unmarshal(line, &entry); err != nil {
+			return nil, fmt.Errorf("decode session log entry row %d: %w", row, err)
+		}
+		entries = append(entries, entry)
+	}
+	return entries, nil
+}
+
+func (s *FileStore) writeSessionLogEntriesLocked(sessionID string, entries []SnapshotLogEntry) error {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return fmt.Errorf("session id is required")
+	}
+	entries = dedupeAdjacentLogEntries(entries)
+	var buf bytes.Buffer
+	header := sessionLogEntriesSidecarHeader{
+		Version:    sessionLogEntriesSidecarVersion,
+		SessionID:  sessionID,
+		EntryCount: len(entries),
+	}
+	headerData, err := json.Marshal(header)
+	if err != nil {
+		return fmt.Errorf("encode session log entries sidecar header: %w", err)
+	}
+	buf.Write(headerData)
+	buf.WriteByte('\n')
+	offsets := make([]int64, 0, len(entries))
+	for i, entry := range entries {
+		offsets = append(offsets, int64(buf.Len()))
+		row, err := json.Marshal(entry)
+		if err != nil {
+			return fmt.Errorf("encode session log entry row %d: %w", i, err)
+		}
+		buf.Write(row)
+		buf.WriteByte('\n')
+	}
+	if err := writeJSONFileAtomic(s.sessionLogEntriesPath(sessionID), buf.Bytes(), 0o644); err != nil {
+		return err
+	}
+	index := sessionLogEntriesIndex{
+		Version:    sessionLogEntriesSidecarVersion,
+		SessionID:  sessionID,
+		EntryCount: len(entries),
+		Offsets:    offsets,
+	}
+	indexData, err := json.Marshal(index)
+	if err != nil {
+		return fmt.Errorf("encode session log entries index: %w", err)
+	}
+	return writeJSONFileAtomic(s.sessionLogEntriesIndexPath(sessionID), indexData, 0o644)
 }
 
 func writeJSONFileAtomic(path string, data []byte, perm os.FileMode) error {
@@ -500,6 +896,67 @@ func writeJSONFileAtomic(path string, data []byte, perm os.FileMode) error {
 	}
 	cleanup = false
 	return nil
+}
+
+func validateSessionLogEntriesIndex(sessionID string, index sessionLogEntriesIndex) error {
+	if index.Version != sessionLogEntriesSidecarVersion {
+		return fmt.Errorf("unsupported session log entries index version: %d", index.Version)
+	}
+	if strings.TrimSpace(index.SessionID) != strings.TrimSpace(sessionID) {
+		return fmt.Errorf("session log entries index belongs to %s, not %s", index.SessionID, sessionID)
+	}
+	if index.EntryCount < 0 {
+		return fmt.Errorf("session log entries index has negative count: %d", index.EntryCount)
+	}
+	if len(index.Offsets) != index.EntryCount {
+		return fmt.Errorf("session log entries index count mismatch: got %d offsets, index count %d", len(index.Offsets), index.EntryCount)
+	}
+	var previous int64 = -1
+	for i, offset := range index.Offsets {
+		if offset < 0 {
+			return fmt.Errorf("session log entries index offset %d is negative: %d", i, offset)
+		}
+		if offset <= previous {
+			return fmt.Errorf("session log entries index offset %d is not increasing: %d <= %d", i, offset, previous)
+		}
+		previous = offset
+	}
+	return nil
+}
+
+func validateSessionLogEntriesHeader(sessionID string, header sessionLogEntriesSidecarHeader, expectedCount int) error {
+	if header.Version != sessionLogEntriesSidecarVersion {
+		return fmt.Errorf("unsupported session log entries sidecar version: %d", header.Version)
+	}
+	if strings.TrimSpace(header.SessionID) != strings.TrimSpace(sessionID) {
+		return fmt.Errorf("session log entries sidecar belongs to %s, not %s", header.SessionID, sessionID)
+	}
+	if header.EntryCount != expectedCount {
+		return fmt.Errorf("session log entries sidecar count mismatch: header count %d, index count %d", header.EntryCount, expectedCount)
+	}
+	return nil
+}
+
+func normalizeWindowBefore(before, total int) int {
+	if before <= 0 || before > total {
+		return total
+	}
+	return before
+}
+
+func normalizeWindowStart(before, limit int) int {
+	if before <= 0 {
+		return 0
+	}
+	if limit <= 0 || limit >= before {
+		return 0
+	}
+	return before - limit
+}
+
+func projectionWithLogEntries(projection ProjectionSnapshot, entries []SnapshotLogEntry) ProjectionSnapshot {
+	projection.LogEntries = append([]SnapshotLogEntry(nil), entries...)
+	return projection
 }
 
 func (s *FileStore) readSkillCatalogSnapshotLocked() (SkillCatalogSnapshot, error) {
@@ -571,8 +1028,38 @@ func (s *FileStore) writeJSONFileLocked(path string, value any, encodeErrLabel s
 	return writeJSONFileAtomic(path, data, 0o644)
 }
 
+func (projection projectionLightweightJSON) toProjectionSnapshot() ProjectionSnapshot {
+	return ProjectionSnapshot{
+		Diffs:                  projection.Diffs,
+		CurrentDiff:            projection.CurrentDiff,
+		ReviewGroups:           projection.ReviewGroups,
+		ActiveReviewGroup:      projection.ActiveReviewGroup,
+		CurrentStep:            projection.CurrentStep,
+		LatestError:            projection.LatestError,
+		RawTerminalByStream:    projection.RawTerminalByStream,
+		TerminalExecutions:     projection.TerminalExecutions,
+		Controller:             projection.Controller,
+		Runtime:                projection.Runtime,
+		ContextWindowUsage:     projection.ContextWindowUsage,
+		SessionContext:         projection.SessionContext,
+		SessionContextSet:      projection.SessionContextSet,
+		PermissionRulesEnabled: projection.PermissionRulesEnabled,
+		PermissionRules:        projection.PermissionRules,
+		SkillCatalogMeta:       projection.SkillCatalogMeta,
+		MemoryCatalogMeta:      projection.MemoryCatalogMeta,
+	}
+}
+
 func (s *FileStore) sessionPath(sessionID string) string {
 	return filepath.Join(s.baseDir, sessionID+".json")
+}
+
+func (s *FileStore) sessionLogEntriesPath(sessionID string) string {
+	return filepath.Join(s.baseDir, sessionID+".log_entries.json")
+}
+
+func (s *FileStore) sessionLogEntriesIndexPath(sessionID string) string {
+	return filepath.Join(s.baseDir, sessionID+".log_entries.idx.json")
 }
 
 func (s *FileStore) BaseDir() string {
@@ -641,6 +1128,16 @@ func filterOut(items []SessionSummary, id string) []SessionSummary {
 
 func sessionMetaFromRecord(record SessionRecord) sessionRecordMeta {
 	record = normalizeSessionRecord(record)
+	return sessionRecordMeta{
+		Summary:           record.Summary,
+		ClientActions:     append([]ClientActionRecord(nil), record.ClientActions...),
+		SessionContext:    record.Projection.SessionContext,
+		SessionContextSet: record.Projection.SessionContextSet || record.Projection.SessionContext.Configured,
+	}
+}
+
+func sessionMetaFromLightweightRecord(record SessionRecord) sessionRecordMeta {
+	record = normalizeSessionRecordLightweight(record)
 	return sessionRecordMeta{
 		Summary:           record.Summary,
 		ClientActions:     append([]ClientActionRecord(nil), record.ClientActions...),
@@ -855,6 +1352,47 @@ func normalizeSessionRecord(record SessionRecord) SessionRecord {
 		record.Summary.ExecutionActive = true
 	}
 	record.Summary = deriveProjectionSummary(record.Summary, record.Projection)
+	return record
+}
+
+func normalizeSessionRecordLightweight(record SessionRecord) SessionRecord {
+	record.Projection = normalizeProjection(record.Projection)
+	record.Projection.LogEntries = nil
+	record.ClientActions = normalizeClientActionRecords(record.ClientActions, time.Time{}, 0, 0)
+	runtimeSource := strings.ToLower(strings.TrimSpace(firstNonEmptyString(
+		record.Projection.Runtime.Source,
+		record.Summary.Runtime.Source,
+		record.Summary.Source,
+	)))
+	defaultSource := "mobilevc"
+	if record.Summary.External || runtimeSource == "codex-native" {
+		record.Summary.External = true
+		defaultSource = "codex-native"
+	}
+	if record.Summary.Ownership == "" {
+		if record.Summary.External {
+			record.Summary.Ownership = "claude-native"
+		} else {
+			record.Summary.Ownership = "mobilevc"
+		}
+	}
+	record.Projection.Runtime = mergeSessionRuntime(record.Summary.Runtime, record.Projection.Runtime)
+	if record.Projection.Runtime.Source == "" {
+		record.Projection.Runtime.Source = defaultSource
+	}
+	record.Summary.Runtime = mergeSessionRuntime(record.Summary.Runtime, record.Projection.Runtime)
+	if record.Summary.Runtime.Source == "" {
+		record.Summary.Runtime.Source = defaultSource
+	}
+	if record.Summary.Source == "" {
+		record.Summary.Source = defaultSource
+	}
+	controllerState := strings.TrimSpace(string(record.Projection.Controller.State))
+	if controllerState == "" || controllerState == string(ControllerStateIdle) {
+		record.Summary.ExecutionActive = false
+	} else {
+		record.Summary.ExecutionActive = true
+	}
 	return record
 }
 

@@ -2513,16 +2513,7 @@ class SessionController extends ChangeNotifier {
       _relayDeviceStatus = '';
       _relayDeviceListLoading = false;
       await switchWorkingDirectory(_config.cwd);
-      requestRuntimeInfo('context');
-      requestSkillCatalog();
-      requestMemoryList();
       requestSessionList();
-      requestAdbDevices();
-      requestSessionContext();
-      requestPermissionRuleList();
-      requestReviewState();
-      requestTaskSnapshot();
-      requestContextWindowUsage();
       if (canManageRelayDevices) {
         requestRelayDeviceList();
       }
@@ -2534,6 +2525,7 @@ class SessionController extends ChangeNotifier {
         );
       } else {
         _requestSessionDelta(reason: silently ? 'reconnect' : 'connect');
+        _schedulePostHistoryBootstrap(sessionId: '');
       }
       _sendCachedPushTokenIfPossible();
       _restorePendingNotificationSessionIfNeeded();
@@ -2870,7 +2862,10 @@ class SessionController extends ChangeNotifier {
     notifyListeners();
   }
 
-  void _handleUnexpectedSocketDisconnect(String message) {
+  void _handleUnexpectedSocketDisconnect(
+    String message, {
+    bool reconnectImmediately = true,
+  }) {
     final normalized = message.trim().isEmpty ? '连接已断开' : message.trim();
     final wasRecovering = reconnecting;
     final preserveRuntimeForRelayRecovery =
@@ -2898,7 +2893,9 @@ class SessionController extends ChangeNotifier {
           ? SessionConnectionStage.reconnecting
           : SessionConnectionStage.backgroundSuspended;
       _connectionMessage = _appInForeground ? '恢复连接中...' : '后台连接已暂停';
-      _scheduleReconnect(immediate: _appInForeground && !wasRecovering);
+      _scheduleReconnect(
+        immediate: reconnectImmediately && _appInForeground && !wasRecovering,
+      );
     } else {
       final alreadyDisconnected =
           !_connected && !_connecting && _connectionMessage == normalized;
@@ -3553,18 +3550,33 @@ class SessionController extends ChangeNotifier {
     final normalizedSessionId = sessionId.trim();
     _postHistoryBootstrapTimer = Timer(_postHistoryBootstrapDelay, () {
       _postHistoryBootstrapTimer = null;
-      if (!_connected ||
-          _connecting ||
-          normalizedSessionId.isEmpty ||
-          _selectedSessionId.trim() != normalizedSessionId ||
-          _isLoadingSession) {
+      if (!_canRunPostHistoryBootstrap(normalizedSessionId)) {
         return;
       }
+      requestRuntimeInfo('context');
+      requestSkillCatalog();
+      requestMemoryList();
+      requestAdbDevices();
+      requestSessionContext();
       requestRuntimeProcessList();
+      requestReviewState();
       requestPermissionRuleList();
       requestTaskSnapshot();
       requestContextWindowUsage();
+      if (canManageRelayDevices) {
+        requestRelayDeviceList();
+      }
     });
+  }
+
+  bool _canRunPostHistoryBootstrap(String normalizedSessionId) {
+    if (!_connected || _connecting || _isLoadingSession) {
+      return false;
+    }
+    if (normalizedSessionId.isEmpty) {
+      return _selectedSessionId.trim().isEmpty;
+    }
+    return _selectedSessionId.trim() == normalizedSessionId;
   }
 
   void updatePermissionMode(String permissionMode) {
@@ -6160,6 +6172,17 @@ class SessionController extends ChangeNotifier {
               : error.message.trim();
         }
         final errorMessage = error.message.trim();
+        if (error.code.startsWith('e2ee_')) {
+          if (_isLoadingSession) {
+            _finishSessionLoading(sessionId: error.sessionId);
+          }
+          unawaited(_service.disconnect());
+          _handleUnexpectedSocketDisconnect(
+            errorMessage,
+            reconnectImmediately: false,
+          );
+          break;
+        }
         if (error.code == 'ws_not_connected') {
           break;
         }
@@ -7160,6 +7183,9 @@ class SessionController extends ChangeNotifier {
     }
     _historyPageRequestsInFlight.remove(sessionId);
     _recordHistoryWindow(sessionId, page.logEntryStart, page.logEntryTotal);
+    if (!_sessionDeltaKnownIsEmpty(page.latest)) {
+      _sessionDeltaKnown[sessionId] = page.latest;
+    }
     _prependHistoryTimelineEntries(
       sessionId,
       _sortedHistoryLogEntries(page.logEntries),

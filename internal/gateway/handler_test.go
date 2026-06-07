@@ -468,12 +468,13 @@ type localTestServer struct {
 }
 
 type countingStore struct {
-	inner      data.Store
-	mu         sync.Mutex
-	getCalls   int
-	listCalls  int
-	upsertErr  error
-	upsertSeen []string
+	inner       data.Store
+	mu          sync.Mutex
+	getCalls    int
+	listCalls   int
+	windowCalls int
+	upsertErr   error
+	upsertSeen  []string
 }
 
 type blockingSkillSyncStore struct {
@@ -498,6 +499,14 @@ type blockingFinalMemorySyncStore struct {
 	finalSaveStarted chan struct{}
 	finalSaveRelease chan struct{}
 	finalSaveCount   int
+}
+
+type blockingSessionLoadStore struct {
+	data.Store
+	targetSessionID string
+	started         chan struct{}
+	release         chan struct{}
+	once            sync.Once
 }
 
 type blockingProjectionSaveStore struct {
@@ -533,6 +542,15 @@ func newBlockingProjectionSaveStore(store data.Store) *blockingProjectionSaveSto
 		saveStarted: make(chan struct{}),
 		saveRelease: make(chan struct{}),
 		saveDone:    make(chan struct{}),
+	}
+}
+
+func newBlockingSessionLoadStore(store data.Store, targetSessionID string) *blockingSessionLoadStore {
+	return &blockingSessionLoadStore{
+		Store:           store,
+		targetSessionID: targetSessionID,
+		started:         make(chan struct{}),
+		release:         make(chan struct{}),
 	}
 }
 
@@ -784,6 +802,68 @@ func (s *countingStore) GetSession(ctx context.Context, sessionID string) (data.
 	return s.inner.GetSession(ctx, sessionID)
 }
 
+func (s *countingStore) GetSessionHistoryWindow(ctx context.Context, req data.SessionHistoryWindowRequest) (data.SessionHistoryWindow, error) {
+	s.mu.Lock()
+	s.windowCalls++
+	s.mu.Unlock()
+	windowStore, ok := s.inner.(data.SessionHistoryWindowStore)
+	if !ok {
+		return data.SessionHistoryWindow{}, fmt.Errorf("inner store does not support session history windows")
+	}
+	return windowStore.GetSessionHistoryWindow(ctx, req)
+}
+
+func (s *blockingSessionLoadStore) GetSession(ctx context.Context, sessionID string) (data.SessionRecord, error) {
+	if strings.TrimSpace(sessionID) == strings.TrimSpace(s.targetSessionID) {
+		if err := s.blockLoad(ctx); err != nil {
+			return data.SessionRecord{}, err
+		}
+	}
+	return s.Store.GetSession(ctx, sessionID)
+}
+
+func (s *blockingSessionLoadStore) GetSessionHistoryWindow(ctx context.Context, req data.SessionHistoryWindowRequest) (data.SessionHistoryWindow, error) {
+	if strings.TrimSpace(req.SessionID) == strings.TrimSpace(s.targetSessionID) {
+		if err := s.blockLoad(ctx); err != nil {
+			return data.SessionHistoryWindow{}, err
+		}
+	}
+	windowStore, ok := s.Store.(data.SessionHistoryWindowStore)
+	if !ok {
+		return data.SessionHistoryWindow{}, fmt.Errorf("inner store does not support session history windows")
+	}
+	return windowStore.GetSessionHistoryWindow(ctx, req)
+}
+
+func (s *blockingSessionLoadStore) blockLoad(ctx context.Context) error {
+	s.once.Do(func() {
+		close(s.started)
+	})
+	select {
+	case <-s.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *blockingSessionLoadStore) WaitLoadStarted(t *testing.T) {
+	t.Helper()
+	select {
+	case <-s.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for session load to block")
+	}
+}
+
+func (s *blockingSessionLoadStore) ReleaseLoad() {
+	select {
+	case <-s.release:
+	default:
+		close(s.release)
+	}
+}
+
 func (s *countingStore) ListSessions(ctx context.Context) ([]data.SessionSummary, error) {
 	s.mu.Lock()
 	s.listCalls++
@@ -857,6 +937,12 @@ func (s *countingStore) listCallCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.listCalls
+}
+
+func (s *countingStore) windowCallCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.windowCalls
 }
 
 func (s *localTestServer) Close() {
@@ -2255,6 +2341,65 @@ func TestHandlerSessionResumeReturnsBoundedHistoryWindow(t *testing.T) {
 	}
 	if gotEntries[0].(map[string]any)["message"] != "entry-003" {
 		t.Fatalf("unexpected first bounded entry: %#v", gotEntries[0])
+	}
+}
+
+func TestHandlerSessionResumeUsesWindowStorePath(t *testing.T) {
+	h := newTestHandler()
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	counting := &countingStore{inner: tempStore}
+	h.SessionStore = counting
+	now := time.Date(2026, 6, 7, 15, 0, 0, 0, time.UTC)
+	entries := make([]data.SnapshotLogEntry, 6)
+	for i := range entries {
+		entries[i] = data.SnapshotLogEntry{
+			Kind:      "markdown",
+			Message:   fmt.Sprintf("resume-entry-%02d", i),
+			Timestamp: now.Add(time.Duration(i) * time.Second).Format(time.RFC3339),
+		}
+	}
+	record := data.SessionRecord{
+		Summary: data.SessionSummary{
+			ID:        "resume-window-store-session",
+			Title:     "Resume Window Store",
+			CreatedAt: now,
+			UpdatedAt: now,
+		},
+		Projection: data.ProjectionSnapshot{LogEntries: entries},
+	}
+	if _, err := h.SessionStore.UpsertSession(context.Background(), record); err != nil {
+		t.Fatalf("upsert session: %v", err)
+	}
+
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+	windowCallsBeforeResume := counting.windowCallCount()
+	if err := conn.WriteJSON(protocol.SessionResumeRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_resume"},
+		SessionID:   record.Summary.ID,
+		Limit:       2,
+	}); err != nil {
+		t.Fatalf("write session_resume request: %v", err)
+	}
+	history := readUntilSessionHistory(t, conn)
+	if got := counting.windowCallCount(); got != windowCallsBeforeResume+1 {
+		t.Fatalf("expected session_resume to use window-store history, got %d before=%d", got, windowCallsBeforeResume)
+	}
+	if got := intFromJSONNumber(history["logEntryStart"]); got != 4 {
+		t.Fatalf("history start: got %d", got)
+	}
+	if got := intFromJSONNumber(history["logEntryTotal"]); got != len(entries) {
+		t.Fatalf("history total: got %d want %d", got, len(entries))
+	}
+	latest, ok := history["latest"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected latest counters on resume history, got %#v", history["latest"])
+	}
+	if got := intFromJSONNumber(latest["logEntryCount"]); got != len(entries) {
+		t.Fatalf("latest logEntryCount: got %d want %d", got, len(entries))
 	}
 }
 
@@ -8611,6 +8756,185 @@ func TestHandlerSessionLoadReturnsLimitedHistoryWindowAndOlderPage(t *testing.T)
 	if len(pageEntries) != 2 || pageEntries[0].(map[string]any)["message"] != "one" || pageEntries[1].(map[string]any)["message"] != "two" {
 		t.Fatalf("unexpected page entries: %#v", pageEntries)
 	}
+}
+
+func TestHandlerSessionHistoryPageUsesWindowStorePath(t *testing.T) {
+	h := newTestHandler()
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	counting := &countingStore{inner: tempStore}
+	h.SessionStore = counting
+	now := time.Date(2026, 6, 7, 13, 0, 0, 0, time.UTC)
+	entries := make([]data.SnapshotLogEntry, 8)
+	for i := range entries {
+		entries[i] = data.SnapshotLogEntry{
+			Kind:      "markdown",
+			Message:   fmt.Sprintf("entry-%02d", i),
+			Timestamp: now.Add(time.Duration(i) * time.Second).Format(time.RFC3339),
+		}
+	}
+	record := data.SessionRecord{
+		Summary: data.SessionSummary{
+			ID:        "history-page-window-store-session",
+			Title:     "History Page Window",
+			CreatedAt: now,
+			UpdatedAt: now,
+		},
+		Projection: data.ProjectionSnapshot{LogEntries: entries},
+	}
+	if _, err := h.SessionStore.UpsertSession(context.Background(), record); err != nil {
+		t.Fatalf("upsert session: %v", err)
+	}
+
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+	windowCallsBeforeLoad := counting.windowCallCount()
+	if err := conn.WriteJSON(protocol.SessionLoadRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_load"},
+		SessionID:   record.Summary.ID,
+		Limit:       2,
+	}); err != nil {
+		t.Fatalf("write session_load request: %v", err)
+	}
+	history := readUntilSessionHistory(t, conn)
+	if got := counting.windowCallCount(); got != windowCallsBeforeLoad+1 {
+		t.Fatalf("expected session_load to use window-store history, got %d before=%d", got, windowCallsBeforeLoad)
+	}
+	historyLatest, ok := history["latest"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected latest counters on session history, got %#v", history["latest"])
+	}
+	if got := intFromJSONNumber(historyLatest["logEntryCount"]); got != len(entries) {
+		t.Fatalf("history latest logEntryCount: got %d want %d", got, len(entries))
+	}
+	getCallsAfterLoad := counting.getCallCount()
+	windowCallsAfterLoad := counting.windowCallCount()
+
+	if err := conn.WriteJSON(protocol.SessionHistoryPageRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_history_page"},
+		SessionID:   record.Summary.ID,
+		Before:      6,
+		Limit:       3,
+	}); err != nil {
+		t.Fatalf("write session_history_page request: %v", err)
+	}
+	page := readUntilSessionHistoryPage(t, conn)
+	if got := counting.windowCallCount(); got != windowCallsAfterLoad+1 {
+		t.Fatalf("expected one window-store call, got %d before=%d", got, windowCallsAfterLoad)
+	}
+	if got := counting.getCallCount(); got != getCallsAfterLoad {
+		t.Fatalf("expected session_history_page not to call GetSession, got %d before=%d", got, getCallsAfterLoad)
+	}
+	if got := intFromJSONNumber(page["logEntryStart"]); got != 3 {
+		t.Fatalf("page start: got %d", got)
+	}
+	if got := intFromJSONNumber(page["logEntryTotal"]); got != len(entries) {
+		t.Fatalf("page total: got %d want %d", got, len(entries))
+	}
+	latest, ok := page["latest"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected latest counters on history page, got %#v", page["latest"])
+	}
+	if got := intFromJSONNumber(latest["logEntryCount"]); got != len(entries) {
+		t.Fatalf("latest logEntryCount: got %d want %d", got, len(entries))
+	}
+}
+
+func TestHandlerSessionLoadDoesNotBlockPingPong(t *testing.T) {
+	fileStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	now := time.Date(2026, 6, 7, 14, 0, 0, 0, time.UTC)
+	record := data.SessionRecord{
+		Summary: data.SessionSummary{
+			ID:        "session-load-ping-session",
+			Title:     "Session Load Ping",
+			CreatedAt: now,
+			UpdatedAt: now,
+		},
+		Projection: data.ProjectionSnapshot{
+			LogEntries: []data.SnapshotLogEntry{{Kind: "markdown", Message: "ready"}},
+		},
+	}
+	if _, err := fileStore.UpsertSession(context.Background(), record); err != nil {
+		t.Fatalf("upsert session: %v", err)
+	}
+	blockingStore := newBlockingSessionLoadStore(fileStore, record.Summary.ID)
+	h := newTestHandler()
+	h.SessionStore = blockingStore
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+
+	if err := conn.WriteJSON(protocol.SessionLoadRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_load"},
+		SessionID:   record.Summary.ID,
+		Limit:       1,
+	}); err != nil {
+		t.Fatalf("write session_load request: %v", err)
+	}
+	blockingStore.WaitLoadStarted(t)
+
+	if err := conn.WriteJSON(map[string]any{"action": "ping", "pingId": "during-session-load"}); err != nil {
+		t.Fatalf("write ping request: %v", err)
+	}
+	pong := readUntilPongID(t, conn, "during-session-load")
+	if pong["type"] != "pong" {
+		t.Fatalf("expected pong, got %#v", pong)
+	}
+
+	blockingStore.ReleaseLoad()
+	history := readUntilSessionHistory(t, conn)
+	if history["sessionId"] != record.Summary.ID {
+		t.Fatalf("expected loaded history for %q, got %#v", record.Summary.ID, history)
+	}
+}
+
+func TestHandlerSessionLoadDuplicateInFlightReturnsBusyError(t *testing.T) {
+	fileStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	now := time.Date(2026, 6, 7, 14, 30, 0, 0, time.UTC)
+	record := data.SessionRecord{
+		Summary: data.SessionSummary{
+			ID:        "session-load-busy-session",
+			Title:     "Session Load Busy",
+			CreatedAt: now,
+			UpdatedAt: now,
+		},
+		Projection: data.ProjectionSnapshot{
+			LogEntries: []data.SnapshotLogEntry{{Kind: "markdown", Message: "ready"}},
+		},
+	}
+	if _, err := fileStore.UpsertSession(context.Background(), record); err != nil {
+		t.Fatalf("upsert session: %v", err)
+	}
+	blockingStore := newBlockingSessionLoadStore(fileStore, record.Summary.ID)
+	h := newTestHandler()
+	h.SessionStore = blockingStore
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+	request := protocol.SessionLoadRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_load"},
+		SessionID:   record.Summary.ID,
+		Limit:       1,
+	}
+	if err := conn.WriteJSON(request); err != nil {
+		t.Fatalf("write first session_load request: %v", err)
+	}
+	blockingStore.WaitLoadStarted(t)
+	if err := conn.WriteJSON(request); err != nil {
+		t.Fatalf("write duplicate session_load request: %v", err)
+	}
+	errEvent := readUntilType(t, conn, protocol.EventTypeError)
+	if !strings.Contains(fmt.Sprint(errEvent["message"], errEvent["msg"]), "session load is already running") {
+		t.Fatalf("expected busy error, got %#v", errEvent)
+	}
+	blockingStore.ReleaseLoad()
+	_ = readUntilSessionHistory(t, conn)
 }
 
 func TestHandlerSessionLoadDefaultsToBoundedHistoryWindow(t *testing.T) {

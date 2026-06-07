@@ -314,6 +314,15 @@ func SessionHistoryWindowEventFromRecordWithCursorAndPayloadLimit(record data.Se
 	return shrinkSessionHistoryEventToPayloadBudget(event, window, maxPayloadBytes)
 }
 
+func SessionHistoryWindowEventFromWindowWithCursorAndPayloadLimit(window data.SessionHistoryWindow, runtimeAlive bool, cursor DeltaCursorSnapshot, maxPayloadBytes int) protocol.SessionHistoryEvent {
+	record, projection, snapshotWindow := projectionAndSnapshotWindowFromSessionHistoryWindow(window)
+	event := lightweightSessionHistoryWindowEventFromProjection(record, projection, snapshotWindow, runtimeAlive, cursor)
+	if fitsProtocolPayloadBudget(event, maxPayloadBytes) {
+		return event
+	}
+	return shrinkSessionHistoryEventToPayloadBudget(event, snapshotWindow, maxPayloadBytes)
+}
+
 func sessionHistoryWindowEventFromProjection(record data.SessionRecord, projection data.ProjectionSnapshot, window snapshotLogWindow, runtimeAlive bool, cursor DeltaCursorSnapshot) protocol.SessionHistoryEvent {
 	executions := protocolTerminalExecutions(projection.TerminalExecutions)
 	resumeMeta := protocol.RuntimeMeta{
@@ -330,7 +339,7 @@ func sessionHistoryWindowEventFromProjection(record data.SessionRecord, projecti
 		ToProtocolSummary(record.Summary),
 		protocolLogEntries(window.entries),
 		window.start,
-		len(projection.LogEntries),
+		window.total,
 		ProtocolDiffContexts(projection.Diffs),
 		ProtocolDiffContext(projection.CurrentDiff),
 		ProtocolReviewGroups(projection.ReviewGroups),
@@ -347,7 +356,7 @@ func sessionHistoryWindowEventFromProjection(record data.SessionRecord, projecti
 		runtimeAlive,
 		resumeMeta,
 	)
-	event.Latest = sessionDeltaKnownFromProjection(projection, cursor)
+	event.Latest = sessionDeltaKnownFromProjectionWithLogCount(projection, cursor, window.total)
 	return event
 }
 
@@ -376,6 +385,40 @@ func SessionHistoryPageEventFromRecordWithPayloadLimit(record data.SessionRecord
 		return event
 	}
 	return shrinkSessionHistoryPageEventToPayloadBudget(record, projection, window, maxPayloadBytes)
+}
+
+func SessionHistoryPageEventFromWindowWithPayloadLimit(window data.SessionHistoryWindow, maxPayloadBytes int) protocol.SessionHistoryPageEvent {
+	record, projection, snapshotWindow := projectionAndSnapshotWindowFromSessionHistoryWindow(window)
+	event := sessionHistoryPageEventFromProjection(record, projection, snapshotWindow)
+	if fitsProtocolPayloadBudget(event, maxPayloadBytes) {
+		return event
+	}
+	return shrinkSessionHistoryPageEventToPayloadBudget(record, projection, snapshotWindow, maxPayloadBytes)
+}
+
+func projectionAndSnapshotWindowFromSessionHistoryWindow(window data.SessionHistoryWindow) (data.SessionRecord, data.ProjectionSnapshot, snapshotLogWindow) {
+	record := window.Record
+	projection := NormalizeProjectionSnapshot(record.Projection)
+	total := window.LogEntryTotal
+	if total < 0 {
+		total = 0
+	}
+	entries := append([]data.SnapshotLogEntry(nil), window.LogEntries...)
+	start := window.LogEntryStart
+	if start < 0 {
+		start = 0
+	}
+	if total < start+len(entries) {
+		total = start + len(entries)
+	}
+	projection.LogEntries = nil
+	record.Projection = projection
+	record.Summary.EntryCount = total
+	return record, projection, snapshotLogWindow{
+		entries: entries,
+		start:   start,
+		total:   total,
+	}
 }
 
 func SessionTerminalRangeEventFromRecordWithPayloadLimit(record data.SessionRecord, stream string, start, limit int, cursor DeltaCursorSnapshot, maxPayloadBytes int) (protocol.SessionTerminalRangeEvent, error) {
@@ -502,8 +545,9 @@ func sessionHistoryPageEventFromProjection(record data.SessionRecord, projection
 		record.Summary.ID,
 		protocolLogEntries(window.entries),
 		window.start,
-		len(projection.LogEntries),
+		window.total,
 		resumeMeta,
+		sessionDeltaKnownFromProjectionWithLogCount(projection, DeltaCursorSnapshot{}, window.total),
 	)
 }
 
@@ -629,6 +673,7 @@ func shrinkSnapshotWindowEntries(window snapshotLogWindow, fits func(snapshotLog
 		candidate := snapshotLogWindow{
 			entries: append([]data.SnapshotLogEntry(nil), window.entries[len(window.entries)-count:]...),
 			start:   start,
+			total:   window.total,
 		}
 		if fits(candidate) {
 			best = count
@@ -675,6 +720,7 @@ func markSessionTerminalExecutionPagePayloadLimited(event *protocol.SessionTermi
 type snapshotLogWindow struct {
 	entries []data.SnapshotLogEntry
 	start   int
+	total   int
 }
 
 type snapshotDiffWindow struct {
@@ -696,12 +742,14 @@ func snapshotLogEntryWindow(entries []data.SnapshotLogEntry, before, limit int) 
 		return snapshotLogWindow{
 			entries: append([]data.SnapshotLogEntry(nil), entries[:before]...),
 			start:   0,
+			total:   total,
 		}
 	}
 	start := before - limit
 	return snapshotLogWindow{
 		entries: append([]data.SnapshotLogEntry(nil), entries[start:before]...),
 		start:   start,
+		total:   total,
 	}
 }
 
@@ -914,11 +962,18 @@ func SessionDeltaEventFromRecordWithPayloadLimit(record data.SessionRecord, know
 }
 
 func sessionDeltaKnownFromProjection(projection data.ProjectionSnapshot, cursor DeltaCursorSnapshot) protocol.SessionDeltaKnown {
+	return sessionDeltaKnownFromProjectionWithLogCount(projection, cursor, len(projection.LogEntries))
+}
+
+func sessionDeltaKnownFromProjectionWithLogCount(projection data.ProjectionSnapshot, cursor DeltaCursorSnapshot, logEntryCount int) protocol.SessionDeltaKnown {
+	if logEntryCount < 0 {
+		logEntryCount = 0
+	}
 	return protocol.SessionDeltaKnown{
 		EventCursor:            cursor.LatestCursor,
-		LogEntryCount:          len(protocolLogEntries(projection.LogEntries)),
-		DiffCount:              len(ProtocolDiffContexts(projection.Diffs)),
-		TerminalExecutionCount: len(protocolTerminalExecutions(projection.TerminalExecutions)),
+		LogEntryCount:          logEntryCount,
+		DiffCount:              len(projection.Diffs),
+		TerminalExecutionCount: len(projection.TerminalExecutions),
 		TerminalStdoutLength:   len(projection.RawTerminalByStream["stdout"]),
 		TerminalStderrLength:   len(projection.RawTerminalByStream["stderr"]),
 	}

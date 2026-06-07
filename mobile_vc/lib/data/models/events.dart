@@ -1426,6 +1426,7 @@ class SessionHistoryPageEvent extends AppEvent {
     this.logEntryTotal = 0,
     this.hasMoreBefore = false,
     this.resumeRuntimeMeta = const RuntimeMeta(),
+    this.latest = const SessionDeltaKnown(),
     this.payloadLimited = false,
     this.payloadLimitReason = '',
   }) : super(type: 'session_history_page');
@@ -1435,6 +1436,7 @@ class SessionHistoryPageEvent extends AppEvent {
   final int logEntryTotal;
   final bool hasMoreBefore;
   final RuntimeMeta resumeRuntimeMeta;
+  final SessionDeltaKnown latest;
   final bool payloadLimited;
   final String payloadLimitReason;
 
@@ -1455,6 +1457,9 @@ class SessionHistoryPageEvent extends AppEvent {
             ? RuntimeMeta.fromJson(
                 json['resumeRuntimeMeta'] as Map<String, dynamic>)
             : const RuntimeMeta(),
+        latest: json['latest'] is Map<String, dynamic>
+            ? SessionDeltaKnown.fromJson(json['latest'] as Map<String, dynamic>)
+            : const SessionDeltaKnown(),
         payloadLimited: json['payloadLimited'] == true,
         payloadLimitReason: (json['payloadLimitReason'] ?? '').toString(),
       );
