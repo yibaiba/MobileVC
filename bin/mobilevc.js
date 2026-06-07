@@ -796,11 +796,11 @@ function removeRelayAgentSessionStateFile(filePath) {
 function printRelayQr(language, pairing) {
   const uri = buildRelayPairingUri(pairing);
   console.log('');
-  console.log(`${message(language, 'relayAccess')}: ${redactRelaySecret(uri)}`);
-  console.log('');
   console.log(message(language, 'relayQrTitle'));
   renderTerminalQr(uri);
+  console.log('');
   console.log(message(language, 'relayQrHint'));
+  console.log(`${message(language, 'relayAccess')}: ${uri}`);
 }
 
 function buildRelayPairingUri(pairing) {
@@ -1173,15 +1173,8 @@ function printLanQrWithHost(language, host, port, authToken = '', cwd = process.
 function renderTerminalQr(text) {
   qrcode.generate(text, { small: true }, (qr) => {
     const output = String(qr || '').replace(/\s+$/, '');
-    const lines = output.split('\n');
-    const widenedLines = lines.map((line) => widenQrLine(line));
-    const indent = '';
-    console.log(widenedLines.map((line) => `${indent}${line}`).join('\n'));
+    console.log(output);
   });
-}
-
-function widenQrLine(line) {
-  return Array.from(String(line || '')).map((char) => char.repeat(2)).join('');
 }
 
 function buildLaunchUrl(host, port, authToken = '', cwd = '') {
