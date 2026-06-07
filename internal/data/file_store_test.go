@@ -845,6 +845,74 @@ func TestFileStoreGetSessionContextFailsForCorruptSidecar(t *testing.T) {
 	}
 }
 
+func TestFileStoreGetSessionHistoryWindowMigratesMissingContextSidecar(t *testing.T) {
+	fs, err := NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new file store: %v", err)
+	}
+	created, err := fs.CreateSession(context.Background(), "window context")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if _, err := fs.SaveProjection(context.Background(), created.ID, ProjectionSnapshot{
+		LogEntries: []SnapshotLogEntry{{Kind: "user", Message: "hello"}},
+		SessionContext: SessionContext{
+			EnabledSkillNames: []string{"review"},
+			Configured:        true,
+		},
+		SessionContextSet: true,
+	}); err != nil {
+		t.Fatalf("save projection: %v", err)
+	}
+	if err := os.Remove(fs.sessionContextPath(created.ID)); err != nil {
+		t.Fatalf("remove context sidecar: %v", err)
+	}
+
+	window, err := fs.GetSessionHistoryWindow(context.Background(), SessionHistoryWindowRequest{
+		SessionID: created.ID,
+		Limit:     1,
+	})
+	if err != nil {
+		t.Fatalf("history window should migrate missing context sidecar: %v", err)
+	}
+	if window.LogEntryTotal != 1 || len(window.LogEntries) != 1 {
+		t.Fatalf("unexpected history window: %#v", window)
+	}
+	snapshot, err := fs.GetSessionContext(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("get migrated context: %v", err)
+	}
+	if got := snapshot.SessionContext.EnabledSkillNames; len(got) != 1 || got[0] != "review" {
+		t.Fatalf("unexpected migrated context: %#v", snapshot.SessionContext)
+	}
+}
+
+func TestFileStoreGetSessionHistoryWindowFailsForCorruptContextSidecar(t *testing.T) {
+	fs, err := NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new file store: %v", err)
+	}
+	created, err := fs.CreateSession(context.Background(), "window corrupt context")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if _, err := fs.SaveProjection(context.Background(), created.ID, ProjectionSnapshot{
+		LogEntries: []SnapshotLogEntry{{Kind: "user", Message: "hello"}},
+	}); err != nil {
+		t.Fatalf("save projection: %v", err)
+	}
+	if err := os.WriteFile(fs.sessionContextPath(created.ID), []byte("{bad json}"), 0o644); err != nil {
+		t.Fatalf("write corrupt context sidecar: %v", err)
+	}
+
+	if _, err := fs.GetSessionHistoryWindow(context.Background(), SessionHistoryWindowRequest{
+		SessionID: created.ID,
+		Limit:     1,
+	}); err == nil {
+		t.Fatal("expected corrupt context sidecar to fail history window")
+	}
+}
+
 func TestFileStoreMarkClientActionPersistsDuplicateMetadata(t *testing.T) {
 	fs, err := NewFileStore(t.TempDir())
 	if err != nil {

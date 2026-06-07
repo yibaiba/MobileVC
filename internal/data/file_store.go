@@ -473,6 +473,9 @@ func (s *FileStore) GetSessionHistoryWindow(ctx context.Context, req SessionHist
 	if err != nil {
 		return SessionHistoryWindow{}, err
 	}
+	if _, err := s.readOrRebuildSessionContextSidecarLocked(sessionID, record.Projection); err != nil {
+		return SessionHistoryWindow{}, err
+	}
 	entries, start, total, err := s.readSessionLogEntryWindowLocked(sessionID, req.Before, req.Limit)
 	if err != nil {
 		return SessionHistoryWindow{}, err
@@ -524,15 +527,9 @@ func (s *FileStore) GetSessionContext(ctx context.Context, sessionID string) (Se
 	if err != nil {
 		return SessionContextSnapshot{}, err
 	}
-	sidecar, err := s.readSessionContextSidecarLocked(sessionID)
+	sidecar, err := s.readOrRebuildSessionContextSidecarLocked(sessionID, record.Projection)
 	if err != nil {
-		if !errors.Is(err, os.ErrNotExist) {
-			return SessionContextSnapshot{}, err
-		}
-		sidecar = sessionContextSidecarFromProjection(sessionID, record.Projection)
-		if writeErr := s.writeSessionContextSidecarLocked(sessionID, sidecar); writeErr != nil {
-			return SessionContextSnapshot{}, writeErr
-		}
+		return SessionContextSnapshot{}, err
 	}
 	return SessionContextSnapshot{
 		SessionID:      sidecar.SessionID,
@@ -1695,6 +1692,21 @@ func (s *FileStore) writeSessionContextSidecarLocked(sessionID string, sidecar s
 	sidecar.SessionContext = normalizeSessionContext(sidecar.SessionContext)
 	sidecar.SessionContextSet = sidecar.SessionContextSet || sidecar.SessionContext.Configured
 	return s.writeJSONFileLocked(s.sessionContextPath(sessionID), sidecar, "encode session context sidecar")
+}
+
+func (s *FileStore) readOrRebuildSessionContextSidecarLocked(sessionID string, projection ProjectionSnapshot) (sessionContextSidecar, error) {
+	sidecar, err := s.readSessionContextSidecarLocked(sessionID)
+	if err == nil {
+		return sidecar, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return sessionContextSidecar{}, err
+	}
+	sidecar = sessionContextSidecarFromProjection(sessionID, projection)
+	if writeErr := s.writeSessionContextSidecarLocked(sessionID, sidecar); writeErr != nil {
+		return sessionContextSidecar{}, writeErr
+	}
+	return sidecar, nil
 }
 
 func sessionContextSidecarFromProjection(sessionID string, projection ProjectionSnapshot) sessionContextSidecar {
