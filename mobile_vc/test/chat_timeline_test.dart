@@ -287,6 +287,62 @@ void main() {
         reason: 'review choices mode hides generic prompt card');
   });
 
+  testWidgets('普通 rebuild 会复用 child index 且无 review 时不扫描全列表', (tester) async {
+    final diagnostics = ChatTimelineDiagnostics();
+    final items = List<TimelineItem>.generate(
+      80,
+      (index) => TimelineItem(
+        id: 'cached-$index',
+        kind: 'markdown',
+        timestamp: DateTime(2026, 1, 1, 0, index),
+        body: index == 79 ? '正在生成回复...' : '历史消息 $index',
+        animateBody: false,
+      ),
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SizedBox(
+            height: 320,
+            child: ChatTimeline(
+              sessionId: 'cached-session',
+              items: items,
+              diagnostics: diagnostics,
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+
+    final initialIndexBuilds = diagnostics.childIndexMapBuilds;
+    expect(diagnostics.reviewAnchorFullScans, 0);
+
+    for (var i = 0; i < 3; i++) {
+      items[79] = items[79].copyWith(body: '正在生成回复，继续输出更多内容 $i。');
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: SizedBox(
+              height: 320,
+              child: ChatTimeline(
+                sessionId: 'cached-session',
+                items: items,
+                diagnostics: diagnostics,
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.pump();
+    }
+
+    expect(diagnostics.childIndexMapBuilds - initialIndexBuilds,
+        lessThanOrEqualTo(1));
+    expect(diagnostics.reviewAnchorFullScans, 0);
+  });
+
   testWidgets('切换到较短历史会话时自动滚到最新消息', (tester) async {
     final longItems = List<TimelineItem>.generate(
       30,

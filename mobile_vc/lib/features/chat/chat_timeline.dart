@@ -12,6 +12,16 @@ const List<PromptOption> _permissionPromptOptions = <PromptOption>[
   PromptOption(value: 'deny', label: '拒绝'),
 ];
 
+class ChatTimelineDiagnostics {
+  int childIndexMapBuilds = 0;
+  int reviewAnchorFullScans = 0;
+
+  void reset() {
+    childIndexMapBuilds = 0;
+    reviewAnchorFullScans = 0;
+  }
+}
+
 class ChatTimeline extends StatefulWidget {
   const ChatTimeline({
     super.key,
@@ -44,6 +54,7 @@ class ChatTimeline extends StatefulWidget {
     this.onReviewDecision,
     this.onAcceptAll,
     this.onPromptSubmit,
+    this.diagnostics,
   });
 
   final List<TimelineItem> items;
@@ -75,6 +86,7 @@ class ChatTimeline extends StatefulWidget {
   final ValueChanged<String>? onReviewDecision;
   final VoidCallback? onAcceptAll;
   final ValueChanged<String>? onPromptSubmit;
+  final ChatTimelineDiagnostics? diagnostics;
 
   @override
   State<ChatTimeline> createState() => _ChatTimelineState();
@@ -93,6 +105,8 @@ class _ChatTimelineState extends State<ChatTimeline> {
   String _anchorDiffKey = '';
   String _anchorItemsKey = '';
   int _cachedReviewAnchorIndex = -1;
+  String _childIndexCacheKey = '';
+  Map<String, int> _childIndexByKey = const <String, int>{};
 
   @override
   void initState() {
@@ -258,10 +272,6 @@ class _ChatTimelineState extends State<ChatTimeline> {
       visiblePromptMessage: visiblePromptMessage,
       visiblePlanQuestion: visiblePlanQuestion,
     );
-    final childIndexByKey = _timelineChildIndexByKey(
-      reviewAnchorIndex: reviewAnchorIndex,
-      extraItems: extraItems,
-    );
     final resolvedItemCount = _resolvedItemCount(
       reviewAnchorIndex: reviewAnchorIndex,
       extraItems: extraItems,
@@ -351,7 +361,11 @@ class _ChatTimelineState extends State<ChatTimeline> {
         if (key is! ValueKey<String>) {
           return null;
         }
-        final itemIndex = childIndexByKey[key.value];
+        final itemIndex = _timelineChildIndexForKey(
+          key.value,
+          reviewAnchorIndex: reviewAnchorIndex,
+          extraItems: extraItems,
+        );
         return itemIndex == null ? null : itemIndex * 2;
       },
       separatorBuilder: (_, __) => const SizedBox(height: 12),
@@ -510,10 +524,18 @@ class _ChatTimelineState extends State<ChatTimeline> {
 
   int _cachedReviewAnchorIndexFor(List<TimelineItem> items) {
     final activeDiffKey = _diffKey(widget.activeReviewDiff);
+    if (activeDiffKey.isEmpty) {
+      _anchorItemsLength = items.length;
+      _anchorItemsKey = '';
+      _anchorDiffKey = '';
+      _cachedReviewAnchorIndex = -1;
+      return -1;
+    }
     final itemsKey = _reviewAnchorItemsKey(items);
     if (_anchorItemsLength == items.length &&
         _anchorItemsKey == itemsKey &&
-        _anchorDiffKey == activeDiffKey) {
+        _anchorDiffKey == activeDiffKey &&
+        _cachedReviewAnchorStillMatches(items)) {
       return _cachedReviewAnchorIndex;
     }
     _anchorItemsLength = items.length;
@@ -524,19 +546,19 @@ class _ChatTimelineState extends State<ChatTimeline> {
   }
 
   String _reviewAnchorItemsKey(List<TimelineItem> items) {
+    if (items.isEmpty) {
+      return '0';
+    }
     return [
       items.length.toString(),
-      for (final item in items)
-        [
-          item.id,
-          item.kind,
-          item.context?.id ?? '',
-          item.context?.path ?? '',
-        ].join('|'),
+      _timelineChildKey(items.first),
+      _timelineChildKey(items.last),
+      _timelineLayoutFingerprint(items.last),
     ].join('\n');
   }
 
   int _reviewAnchorIndex(List<TimelineItem> items) {
+    widget.diagnostics?.reviewAnchorFullScans++;
     if (widget.activeReviewDiff == null) {
       return -1;
     }
@@ -554,6 +576,22 @@ class _ChatTimelineState extends State<ChatTimeline> {
       }
     }
     return items.isEmpty ? -1 : items.length - 1;
+  }
+
+  bool _cachedReviewAnchorStillMatches(List<TimelineItem> items) {
+    if (_cachedReviewAnchorIndex == -1) {
+      return true;
+    }
+    if (_cachedReviewAnchorIndex < 0 ||
+        _cachedReviewAnchorIndex >= items.length) {
+      return false;
+    }
+    final item = items[_cachedReviewAnchorIndex];
+    if (item.kind != 'file_diff' || item.context == null) {
+      return false;
+    }
+    final activeDiff = widget.activeReviewDiff;
+    return activeDiff != null && _sameDiff(item.context!, activeDiff);
   }
 
   bool _sameDiff(HistoryContext left, HistoryContext right) {
@@ -704,9 +742,64 @@ class _ChatTimelineState extends State<ChatTimeline> {
     ].join(':');
   }
 
+  int? _timelineChildIndexForKey(
+    String childKey, {
+    required int reviewAnchorIndex,
+    required List<TimelineItem> extraItems,
+  }) {
+    final indexes = _timelineChildIndexByKey(
+      reviewAnchorIndex: reviewAnchorIndex,
+      extraItems: extraItems,
+    );
+    final cachedIndex = indexes[childKey];
+    if (cachedIndex != null &&
+        _timelineIndexMatchesChildKey(
+          cachedIndex,
+          childKey,
+          reviewAnchorIndex: reviewAnchorIndex,
+          extraItems: extraItems,
+        )) {
+      return cachedIndex;
+    }
+    final rebuilt = _rebuildTimelineChildIndexByKey(
+      reviewAnchorIndex: reviewAnchorIndex,
+      extraItems: extraItems,
+    );
+    final rebuiltIndex = rebuilt[childKey];
+    if (rebuiltIndex != null &&
+        _timelineIndexMatchesChildKey(
+          rebuiltIndex,
+          childKey,
+          reviewAnchorIndex: reviewAnchorIndex,
+          extraItems: extraItems,
+        )) {
+      return rebuiltIndex;
+    }
+    return null;
+  }
+
   Map<String, int> _timelineChildIndexByKey({
     required int reviewAnchorIndex,
     required List<TimelineItem> extraItems,
+  }) {
+    final cacheKey = _timelineChildIndexCacheKey(
+      reviewAnchorIndex: reviewAnchorIndex,
+      extraItems: extraItems,
+    );
+    if (_childIndexCacheKey == cacheKey) {
+      return _childIndexByKey;
+    }
+    return _rebuildTimelineChildIndexByKey(
+      reviewAnchorIndex: reviewAnchorIndex,
+      extraItems: extraItems,
+      cacheKey: cacheKey,
+    );
+  }
+
+  Map<String, int> _rebuildTimelineChildIndexByKey({
+    required int reviewAnchorIndex,
+    required List<TimelineItem> extraItems,
+    String? cacheKey,
   }) {
     final resolvedItemCount = _resolvedItemCount(
       reviewAnchorIndex: reviewAnchorIndex,
@@ -721,7 +814,49 @@ class _ChatTimelineState extends State<ChatTimeline> {
       );
       indexes[_timelineChildKey(item)] = index;
     }
+    widget.diagnostics?.childIndexMapBuilds++;
+    _childIndexCacheKey = cacheKey ??
+        _timelineChildIndexCacheKey(
+          reviewAnchorIndex: reviewAnchorIndex,
+          extraItems: extraItems,
+        );
+    _childIndexByKey = indexes;
     return indexes;
+  }
+
+  bool _timelineIndexMatchesChildKey(
+    int index,
+    String childKey, {
+    required int reviewAnchorIndex,
+    required List<TimelineItem> extraItems,
+  }) {
+    final resolvedItemCount = _resolvedItemCount(
+      reviewAnchorIndex: reviewAnchorIndex,
+      extraItems: extraItems,
+    );
+    if (index < 0 || index >= resolvedItemCount) {
+      return false;
+    }
+    final item = _timelineItemAt(
+      index,
+      reviewAnchorIndex: reviewAnchorIndex,
+      extraItems: extraItems,
+    );
+    return _timelineChildKey(item) == childKey;
+  }
+
+  String _timelineChildIndexCacheKey({
+    required int reviewAnchorIndex,
+    required List<TimelineItem> extraItems,
+  }) {
+    return [
+      widget.items.length,
+      widget.items.isEmpty ? '' : _timelineChildKey(widget.items.first),
+      widget.items.isEmpty ? '' : _timelineChildKey(widget.items.last),
+      reviewAnchorIndex,
+      extraItems.length,
+      for (final item in extraItems) _timelineChildKey(item),
+    ].join('\n');
   }
 
   bool _shouldHidePassiveReadyPrompt(PromptRequestEvent prompt) {

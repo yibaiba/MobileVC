@@ -102,6 +102,47 @@ void main() {
     expect(replacementItem.body, startsWith(markdown.data));
   });
 
+  testWidgets('markdown typewriter batches progress callbacks for long replies',
+      (tester) async {
+    var progressCalls = 0;
+    final longBody = List<String>.generate(
+      80,
+      (index) => '第 $index 行 live assistant 输出需要减少 markdown 重建。',
+    ).join('\n');
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SingleChildScrollView(
+            child: EventCard(
+              item: TimelineItem(
+                id: 'stream-md-batched',
+                kind: 'markdown',
+                timestamp: DateTime(2026, 4, 4, 12),
+                body: longBody,
+              ),
+              onAnimatedBodyProgress: () => progressCalls++,
+            ),
+          ),
+        ),
+      ),
+    );
+
+    for (var i = 0; i < 5; i++) {
+      await tester.pump(const Duration(milliseconds: 16));
+    }
+
+    expect(progressCalls, lessThanOrEqualTo(2));
+    final callsAfterFirstChunk = progressCalls;
+    await tester.pump(const Duration(milliseconds: 16));
+    expect(progressCalls, lessThanOrEqualTo(callsAfterFirstChunk + 1));
+
+    await tester.pump(const Duration(seconds: 3));
+    final markdown = tester.widget<MarkdownBody>(find.byType(MarkdownBody));
+    expect(markdown.data, longBody);
+    expect(progressCalls, lessThan(80));
+  });
+
   testWidgets('compaction marker renders loading state', (tester) async {
     await tester.pumpWidget(
       MaterialApp(

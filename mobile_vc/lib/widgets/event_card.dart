@@ -1079,6 +1079,7 @@ class _TypewriterMarkdown extends StatefulWidget {
 }
 
 class _TypewriterMarkdownState extends State<_TypewriterMarkdown> {
+  static const Duration _typingTick = Duration(milliseconds: 48);
   static final Map<String, String> _revealedTextCache = <String, String>{};
 
   Timer? _timer;
@@ -1165,30 +1166,51 @@ class _TypewriterMarkdownState extends State<_TypewriterMarkdown> {
       _revealedTextCache[widget.item.id] = target;
       return;
     }
-    _timer = Timer.periodic(const Duration(milliseconds: 16), (timer) {
+    _timer = Timer.periodic(_typingTick, (timer) {
       if (!mounted) {
         timer.cancel();
         return;
       }
       final current = _visibleText.length;
       final remaining = target.length - current;
-      final step = remaining > 80
-          ? 8
-          : remaining > 40
-              ? 5
-              : remaining > 20
-                  ? 3
-                  : 1;
+      final step = _typingStep(remaining);
       final next = (current + step).clamp(0, target.length);
       setState(() {
         _visibleText = target.substring(0, next);
         _revealedTextCache[widget.item.id] = _visibleText;
       });
-      widget.onProgress?.call();
+      _notifyProgressIfNeeded();
       if (next >= target.length) {
         timer.cancel();
       }
     });
+  }
+
+  int _typingStep(int remaining) {
+    if (remaining > 1200) {
+      return 96;
+    }
+    if (remaining > 600) {
+      return 64;
+    }
+    if (remaining > 240) {
+      return 40;
+    }
+    if (remaining > 80) {
+      return 24;
+    }
+    if (remaining > 24) {
+      return 12;
+    }
+    return remaining > 6 ? 4 : 1;
+  }
+
+  void _notifyProgressIfNeeded() {
+    final onProgress = widget.onProgress;
+    if (onProgress == null) {
+      return;
+    }
+    onProgress();
   }
 
   String _initialVisibleText(String body) {
