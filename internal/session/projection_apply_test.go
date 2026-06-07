@@ -682,7 +682,7 @@ func TestApplyEventToProjection_MergesStreamingAssistantReplyByExecutionID(t *te
 	}
 	snapshot, applied = ApplyEventToProjection(snapshot, protocol.LogEvent{
 		Event:   base,
-		Message: "hello world",
+		Message: " hello world",
 		Stream:  "stdout",
 	})
 	if !applied {
@@ -692,6 +692,31 @@ func TestApplyEventToProjection_MergesStreamingAssistantReplyByExecutionID(t *te
 		t.Fatalf("expected one merged markdown entry, got %+v", snapshot.LogEntries)
 	}
 	if got := snapshot.LogEntries[0].Message; got != "Tip : hello world" {
+		t.Fatalf("unexpected merged assistant reply: %q", got)
+	}
+}
+
+func TestApplyEventToProjection_MergesStreamingAssistantReplyWithoutInventingSpaces(t *testing.T) {
+	base := protocol.Event{
+		Type:        "log",
+		SessionID:   "s1",
+		Timestamp:   time.Now(),
+		RuntimeMeta: protocol.RuntimeMeta{Engine: "codex", Source: "codex/assistant", ExecutionID: "turn-token-split"},
+	}
+	snapshot, _ := ApplyEventToProjection(data.ProjectionSnapshot{}, protocol.LogEvent{
+		Event:   base,
+		Message: "hello wo",
+		Stream:  "stdout",
+	})
+	snapshot, _ = ApplyEventToProjection(snapshot, protocol.LogEvent{
+		Event:   base,
+		Message: "rld",
+		Stream:  "stdout",
+	})
+	if len(snapshot.LogEntries) != 1 {
+		t.Fatalf("expected one merged markdown entry, got %+v", snapshot.LogEntries)
+	}
+	if got := snapshot.LogEntries[0].Message; got != "hello world" {
 		t.Fatalf("unexpected merged assistant reply: %q", got)
 	}
 }

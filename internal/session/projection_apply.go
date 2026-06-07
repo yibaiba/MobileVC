@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"mobilevc/internal/data"
 	"mobilevc/internal/protocol"
@@ -579,8 +578,6 @@ func sameAssistantReplyRun(entry data.SnapshotLogEntry, event protocol.LogEvent)
 }
 
 func mergeAssistantReplyText(previous string, next string) string {
-	previous = strings.TrimSpace(previous)
-	next = strings.TrimSpace(next)
 	if previous == "" {
 		return next
 	}
@@ -593,35 +590,7 @@ func mergeAssistantReplyText(previous string, next string) string {
 	if strings.HasSuffix(previous, next) {
 		return previous
 	}
-	if strings.HasSuffix(previous, " ") || strings.HasPrefix(next, " ") {
-		return previous + next
-	}
-	if assistantReplyBoundaryHasCJK(previous, next) || assistantReplyStartsWithClosingPunctuation(next) {
-		return previous + next
-	}
-	return previous + " " + next
-}
-
-func assistantReplyBoundaryHasCJK(previous string, next string) bool {
-	prevRune, _ := utf8.DecodeLastRuneInString(previous)
-	nextRune, _ := utf8.DecodeRuneInString(next)
-	return isCJKRune(prevRune) || isCJKRune(nextRune)
-}
-
-func assistantReplyStartsWithClosingPunctuation(text string) bool {
-	r, _ := utf8.DecodeRuneInString(text)
-	switch r {
-	case ')', ']', '}', '>', '.', ',', '!', '?', ':', ';', '。', '，', '！', '？', '：', '；':
-		return true
-	default:
-		return false
-	}
-}
-
-func isCJKRune(r rune) bool {
-	return (r >= 0x3400 && r <= 0x4DBF) ||
-		(r >= 0x4E00 && r <= 0x9FFF) ||
-		(r >= 0xF900 && r <= 0xFAFF)
+	return previous + next
 }
 
 func removeSupersededAssistantLogEntry(entries []data.SnapshotLogEntry, event protocol.LogEvent) []data.SnapshotLogEntry {

@@ -2223,10 +2223,10 @@ done:
 	if len(logs) < 1 {
 		t.Fatalf("expected streamed assistant logs, got %#v", logs)
 	}
-	if logs[0].Message != "Tip :" {
+	if logs[0].Message != "Tip : " {
 		t.Fatalf("expected first assistant chunk before completion, got %#v", logs)
 	}
-	combined := strings.Join(logMessages(logs), " ")
+	combined := strings.Join(logMessages(logs), "")
 	if combined != "Tip : hello world" {
 		t.Fatalf("unexpected combined streamed log message: %q from %#v", combined, logs)
 	}
@@ -2319,7 +2319,7 @@ func TestCodexAppSessionKeepsAssistantTurnIDForLateCompletedText(t *testing.T) {
 			if len(logs) != 2 {
 				t.Fatalf("expected streamed chunk plus completed suffix, got %#v", logs)
 			}
-			if logs[0].Message != "Tip :" || logs[1].Message != "hello world" {
+			if logs[0].Message != "Tip :" || logs[1].Message != " hello world" {
 				t.Fatalf("unexpected late completed stream logs: %#v", logMessages(logs))
 			}
 			for _, log := range logs {
@@ -2329,6 +2329,126 @@ func TestCodexAppSessionKeepsAssistantTurnIDForLateCompletedText(t *testing.T) {
 				if log.Source != "codex/assistant" {
 					t.Fatalf("expected codex assistant source, got %#v", log.RuntimeMeta)
 				}
+			}
+			return
+		}
+	}
+}
+
+func TestCodexAppSessionDoesNotDropRepeatedAssistantDeltaChunk(t *testing.T) {
+	runner := NewPtyRunner()
+	eventsCh := make(chan any, 8)
+	app := &codexAppSession{
+		runner:    runner,
+		sessionID: "s-codex-repeated-delta",
+		sink:      func(event any) { eventsCh <- event },
+	}
+	app.setThreadID("thread-123")
+
+	started, err := json.Marshal(map[string]any{
+		"threadId": "thread-123",
+		"turn": map[string]any{
+			"id":     "turn-1",
+			"status": "in_progress",
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal started: %v", err)
+	}
+	app.handleNotification(codexRPCMessage{Method: "turn/started", Params: started})
+
+	for _, delta := range []string{"hello world", " hello world"} {
+		params, err := json.Marshal(map[string]any{
+			"threadId": "thread-123",
+			"turnId":   "turn-1",
+			"itemId":   "item-1",
+			"delta":    delta,
+		})
+		if err != nil {
+			t.Fatalf("marshal delta: %v", err)
+		}
+		app.handleNotification(codexRPCMessage{Method: "item/agentMessage/delta", Params: params})
+	}
+
+	var logs []protocol.LogEvent
+	for {
+		select {
+		case event := <-eventsCh:
+			if log, ok := event.(protocol.LogEvent); ok {
+				logs = append(logs, log)
+			}
+		default:
+			if len(logs) != 2 {
+				t.Fatalf("expected both repeated assistant chunks, got %#v", logMessages(logs))
+			}
+			if got := strings.Join(logMessages(logs), ""); got != "hello world hello world" {
+				t.Fatalf("unexpected repeated assistant chunks: %q from %#v", got, logMessages(logs))
+			}
+			return
+		}
+	}
+}
+
+func TestCodexAppSessionPreservesAssistantChunkNewlineBoundary(t *testing.T) {
+	runner := NewPtyRunner()
+	eventsCh := make(chan any, 8)
+	app := &codexAppSession{
+		runner:    runner,
+		sessionID: "s-codex-newline-delta",
+		sink:      func(event any) { eventsCh <- event },
+	}
+	app.setThreadID("thread-123")
+
+	started, err := json.Marshal(map[string]any{
+		"threadId": "thread-123",
+		"turn": map[string]any{
+			"id":     "turn-1",
+			"status": "in_progress",
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal started: %v", err)
+	}
+	app.handleNotification(codexRPCMessage{Method: "turn/started", Params: started})
+
+	for _, delta := range []string{"hello\n", "world"} {
+		params, err := json.Marshal(map[string]any{
+			"threadId": "thread-123",
+			"turnId":   "turn-1",
+			"itemId":   "item-1",
+			"delta":    delta,
+		})
+		if err != nil {
+			t.Fatalf("marshal delta: %v", err)
+		}
+		app.handleNotification(codexRPCMessage{Method: "item/agentMessage/delta", Params: params})
+	}
+
+	completed, err := json.Marshal(map[string]any{
+		"threadId": "thread-123",
+		"turn": map[string]any{
+			"id":     "turn-1",
+			"status": "completed",
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal completed turn: %v", err)
+	}
+	app.handleNotification(codexRPCMessage{Method: "turn/completed", Params: completed})
+
+	var logs []protocol.LogEvent
+	for {
+		select {
+		case event := <-eventsCh:
+			if log, ok := event.(protocol.LogEvent); ok {
+				logs = append(logs, log)
+			}
+		default:
+			if len(logs) != 2 {
+				t.Fatalf("expected both newline assistant chunks, got %#v", logMessages(logs))
+			}
+			if got := strings.Join(logMessages(logs), ""); got != "hello\nworld" {
+				t.Fatalf("unexpected newline assistant chunks: %q from %#v", got, logMessages(logs))
 			}
 			return
 		}

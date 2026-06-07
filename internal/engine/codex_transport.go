@@ -86,7 +86,6 @@ type codexAppSession struct {
 	assistantTurnID              string
 	lastDiff                     string
 	assistantBuffer              strings.Builder
-	lastAssistantText            string
 	assistantEmitted             string
 	assistantLastFlushed         string
 	pendingApproval              *codexPendingApproval
@@ -885,21 +884,10 @@ func (s *codexAppSession) handleTokenUsageUpdated(raw any) {
 }
 
 func (s *codexAppSession) emitAssistantChunk(text string, turnID string) {
-	text = strings.TrimSpace(text)
-	if text == "" {
+	if strings.TrimSpace(text) == "" {
 		return
 	}
 	s.mu.Lock()
-	if text == s.lastAssistantText {
-		s.mu.Unlock()
-		return
-	}
-	if s.lastAssistantText != "" && strings.Contains(text, s.lastAssistantText) && len([]rune(text)) <= len([]rune(s.lastAssistantText))*2+16 {
-		s.lastAssistantText = text
-		s.mu.Unlock()
-		return
-	}
-	s.lastAssistantText = text
 	s.assistantEmitted += text
 	s.mu.Unlock()
 	meta := s.assistantRuntimeMeta("active", turnID)
@@ -995,33 +983,29 @@ func intValue(value any) int {
 }
 
 func (s *codexAppSession) emitAssistantCompletedText(text string, turnID string) {
-	text = strings.TrimSpace(text)
-	if text == "" {
+	if strings.TrimSpace(text) == "" {
 		return
 	}
 	s.mu.Lock()
-	emitted := strings.TrimSpace(s.assistantEmitted)
+	emitted := s.assistantEmitted
 	s.assistantBuffer.Reset()
 	s.assistantLastFlushed = ""
-	if emitted != "" {
+	if strings.TrimSpace(emitted) != "" {
 		if text == emitted || codexAssistantDedupeText(text) == codexAssistantDedupeText(emitted) {
-			s.lastAssistantText = text
 			s.assistantEmitted = text
 			s.mu.Unlock()
 			return
 		}
 		if strings.HasPrefix(text, emitted) {
-			text = strings.TrimSpace(strings.TrimPrefix(text, emitted))
-			if text == "" {
-				s.lastAssistantText = emitted
+			text = strings.TrimPrefix(text, emitted)
+			if strings.TrimSpace(text) == "" {
 				s.assistantEmitted = emitted
 				s.mu.Unlock()
 				return
 			}
 		} else if suffix, ok := trimCodexCompletedPrefix(text, emitted); ok {
 			text = suffix
-			if text == "" {
-				s.lastAssistantText = emitted
+			if strings.TrimSpace(text) == "" {
 				s.assistantEmitted = emitted
 				s.mu.Unlock()
 				return
@@ -1269,7 +1253,6 @@ func (s *codexAppSession) setActiveTurnID(turnID string) {
 	trimmed := strings.TrimSpace(turnID)
 	if trimmed != "" && trimmed != s.activeTurnID {
 		s.assistantBuffer.Reset()
-		s.lastAssistantText = ""
 		s.assistantEmitted = ""
 		s.assistantLastFlushed = ""
 		s.assistantTurnID = trimmed
@@ -1512,8 +1495,8 @@ func codexDrainAssistantChunks(buffer *strings.Builder, lastFlushed string, flus
 		if idx < 0 {
 			break
 		}
-		chunk := strings.TrimSpace(text[:idx+1])
-		if chunk != "" {
+		chunk := text[:idx+1]
+		if strings.TrimSpace(chunk) != "" {
 			emitted = append(emitted, chunk)
 		}
 		text = text[idx+1:]
@@ -1525,9 +1508,11 @@ func codexDrainAssistantChunks(buffer *strings.Builder, lastFlushed string, flus
 		if flushAll ||
 			runeCount >= codexAssistantMinChunkRunes ||
 			endsWithLiveTailBoundary(trimmed) {
-			emitted = append(emitted, trimmed)
+			emitted = append(emitted, text)
 			text = ""
 		}
+	} else if flushAll {
+		text = ""
 	}
 
 	buffer.Reset()
@@ -1576,7 +1561,7 @@ func trimCodexCompletedPrefix(text string, emitted string) (string, bool) {
 		consumed.WriteRune(r)
 		current := consumed.String()
 		if current == target {
-			return strings.TrimSpace(text[index+len(string(r)):]), true
+			return text[index+len(string(r)):], true
 		}
 		if !strings.HasPrefix(target, current) {
 			return "", false
