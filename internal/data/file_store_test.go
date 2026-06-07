@@ -785,6 +785,66 @@ func TestFileStorePersistsSessionContext(t *testing.T) {
 	}
 }
 
+func TestFileStoreGetSessionContextMigratesMissingSidecar(t *testing.T) {
+	fs, err := NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new file store: %v", err)
+	}
+	created, err := fs.CreateSession(context.Background(), "legacy ctx")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	_, err = fs.SaveProjection(context.Background(), created.ID, ProjectionSnapshot{
+		SessionContext: SessionContext{
+			EnabledSkillNames: []string{"review"},
+			EnabledMemoryIDs:  []string{"memory-1"},
+			Configured:        true,
+		},
+		SessionContextSet: true,
+	})
+	if err != nil {
+		t.Fatalf("save projection: %v", err)
+	}
+	if err := os.Remove(fs.sessionContextPath(created.ID)); err != nil {
+		t.Fatalf("remove context sidecar: %v", err)
+	}
+
+	snapshot, err := fs.GetSessionContext(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("get missing context sidecar: %v", err)
+	}
+	if snapshot.SessionID != created.ID {
+		t.Fatalf("unexpected snapshot session id: %#v", snapshot)
+	}
+	if got := snapshot.SessionContext.EnabledSkillNames; len(got) != 1 || got[0] != "review" {
+		t.Fatalf("unexpected skills from legacy context: %#v", snapshot.SessionContext)
+	}
+	if got := snapshot.SessionContext.EnabledMemoryIDs; len(got) != 1 || got[0] != "memory-1" {
+		t.Fatalf("unexpected memories from legacy context: %#v", snapshot.SessionContext)
+	}
+	if _, err := os.Stat(fs.sessionContextPath(created.ID)); err != nil {
+		t.Fatalf("missing context sidecar was not migrated: %v", err)
+	}
+}
+
+func TestFileStoreGetSessionContextFailsForCorruptSidecar(t *testing.T) {
+	fs, err := NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new file store: %v", err)
+	}
+	created, err := fs.CreateSession(context.Background(), "corrupt ctx")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if err := os.WriteFile(fs.sessionContextPath(created.ID), []byte("{bad json}"), 0o644); err != nil {
+		t.Fatalf("write corrupt context sidecar: %v", err)
+	}
+
+	if _, err := fs.GetSessionContext(context.Background(), created.ID); err == nil {
+		t.Fatal("expected corrupt context sidecar to fail")
+	}
+}
+
 func TestFileStoreMarkClientActionPersistsDuplicateMetadata(t *testing.T) {
 	fs, err := NewFileStore(t.TempDir())
 	if err != nil {

@@ -516,9 +516,23 @@ func (s *FileStore) GetSessionContext(ctx context.Context, sessionID string) (Se
 		return SessionContextSnapshot{}, ctx.Err()
 	default:
 	}
-	sidecar, err := s.readSessionContextSidecarLocked(sessionID)
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return SessionContextSnapshot{}, fmt.Errorf("session id is required")
+	}
+	record, err := s.readSessionWithoutLogEntriesLocked(sessionID)
 	if err != nil {
 		return SessionContextSnapshot{}, err
+	}
+	sidecar, err := s.readSessionContextSidecarLocked(sessionID)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return SessionContextSnapshot{}, err
+		}
+		sidecar = sessionContextSidecarFromProjection(sessionID, record.Projection)
+		if writeErr := s.writeSessionContextSidecarLocked(sessionID, sidecar); writeErr != nil {
+			return SessionContextSnapshot{}, writeErr
+		}
 	}
 	return SessionContextSnapshot{
 		SessionID:      sidecar.SessionID,
@@ -1681,6 +1695,16 @@ func (s *FileStore) writeSessionContextSidecarLocked(sessionID string, sidecar s
 	sidecar.SessionContext = normalizeSessionContext(sidecar.SessionContext)
 	sidecar.SessionContextSet = sidecar.SessionContextSet || sidecar.SessionContext.Configured
 	return s.writeJSONFileLocked(s.sessionContextPath(sessionID), sidecar, "encode session context sidecar")
+}
+
+func sessionContextSidecarFromProjection(sessionID string, projection ProjectionSnapshot) sessionContextSidecar {
+	context := normalizeSessionContext(projection.SessionContext)
+	return sessionContextSidecar{
+		Version:           sessionSideDomainVersion,
+		SessionID:         strings.TrimSpace(sessionID),
+		SessionContext:    context,
+		SessionContextSet: projection.SessionContextSet || context.Configured,
+	}
 }
 
 func (s *FileStore) writeSessionPermissionSidecarLocked(sessionID string, sidecar sessionPermissionSidecar) error {
