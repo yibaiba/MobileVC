@@ -119,10 +119,12 @@ func TestMaybeAutoApplyPermissionEventIgnoresReadyPrompt(t *testing.T) {
 }
 
 func TestMaybeAutoApplyPermissionEventUsesDirectApproveForSessionRule(t *testing.T) {
-	sessionStore, err := data.NewFileStore(t.TempDir())
+	fileStore, err := data.NewFileStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("new temp store: %v", err)
 	}
+	counting := &countingStore{inner: fileStore}
+	sessionStore := counting
 
 	sessionID := "session-auto-approve"
 	created, err := sessionStore.CreateSession(t.Context(), sessionID)
@@ -142,6 +144,13 @@ func TestMaybeAutoApplyPermissionEventUsesDirectApproveForSessionRule(t *testing
 			TargetPathPrefix: "/workspace/lib/main.dart",
 			Summary:          "allow main.dart edits",
 		}},
+		SessionContext:      data.SessionContext{EnabledSkillNames: []string{"review"}, Configured: true},
+		SessionContextSet:   true,
+		Diffs:               []session.DiffContext{{ContextID: "diff-1", Path: "/workspace/lib/main.dart", Diff: "+edit"}},
+		RawTerminalByStream: map[string]string{"stdout": "existing stdout", "stderr": ""},
+		TerminalExecutions:  []data.TerminalExecution{{ExecutionID: "exec-1", Command: "go test", Stdout: "ok"}},
+		Runtime:             data.SessionRuntime{CWD: "/workspace", Engine: "claude"},
+		ContextWindowUsage:  data.ContextWindowUsage{TokensUsed: 12, TokenLimit: 100},
 	}
 	if _, err := sessionStore.SaveProjection(t.Context(), sessionID, projection); err != nil {
 		t.Fatalf("save projection: %v", err)
@@ -189,6 +198,7 @@ func TestMaybeAutoApplyPermissionEventUsesDirectApproveForSessionRule(t *testing
 	)
 
 	var emitted []any
+	beforeGets := counting.getCallCount()
 	applied, err := maybeAutoApplyPermissionEvent(t.Context(), sessionStore, sessionID, event, service, func(evt any) {
 		emitted = append(emitted, evt)
 	}, func(evt any) {
@@ -216,8 +226,11 @@ func TestMaybeAutoApplyPermissionEventUsesDirectApproveForSessionRule(t *testing
 		t.Fatalf("unexpected continuation payload: %q", string(payload))
 	case <-time.After(200 * time.Millisecond):
 	}
+	if got := counting.getCallCount(); got != beforeGets {
+		t.Fatalf("session permission auto-apply should not call GetSession, got %d before=%d", got, beforeGets)
+	}
 
-	record, err := sessionStore.GetSession(t.Context(), sessionID)
+	record, err := fileStore.GetSession(t.Context(), sessionID)
 	if err != nil {
 		t.Fatalf("get session: %v", err)
 	}
@@ -226,6 +239,13 @@ func TestMaybeAutoApplyPermissionEventUsesDirectApproveForSessionRule(t *testing
 	}
 	if record.Projection.PermissionRules[0].MatchCount != 1 {
 		t.Fatalf("expected match count increment, got %#v", record.Projection.PermissionRules[0])
+	}
+	if record.Projection.Runtime.CWD != "/workspace" ||
+		len(record.Projection.Diffs) != 1 ||
+		record.Projection.RawTerminalByStream["stdout"] != "existing stdout" ||
+		len(record.Projection.TerminalExecutions) != 1 ||
+		!record.Projection.SessionContextSet {
+		t.Fatalf("permission sidecar save should preserve other projection domains, got %#v", record.Projection)
 	}
 }
 

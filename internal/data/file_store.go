@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 
@@ -43,6 +44,15 @@ type sessionRecordMeta struct {
 	SessionContextSet bool
 }
 
+type sessionProjectionSidecars struct {
+	RuntimeMeta       sessionRuntimeMetaSidecar
+	Context           sessionContextSidecar
+	Permission        sessionPermissionSidecar
+	Diff              sessionDiffSidecar
+	Terminal          sessionTerminalSidecar
+	TerminalExecution sessionTerminalExecutionSidecar
+}
+
 type sessionLogEntriesSidecar struct {
 	SessionID  string             `json:"sessionId"`
 	EntryCount int                `json:"entryCount"`
@@ -62,6 +72,56 @@ type sessionLogEntriesIndex struct {
 	SessionID  string  `json:"sessionId"`
 	EntryCount int     `json:"entryCount"`
 	Offsets    []int64 `json:"offsets"`
+}
+
+const sessionSideDomainVersion = 1
+
+type sessionRuntimeMetaSidecar struct {
+	Version            int                     `json:"version"`
+	SessionID          string                  `json:"sessionId"`
+	Controller         ControllerSnapshot      `json:"controller,omitempty"`
+	Runtime            SessionRuntime          `json:"runtime,omitempty"`
+	ContextWindowUsage ContextWindowUsage      `json:"contextWindowUsage,omitempty"`
+	CurrentStep        *SnapshotContext        `json:"currentStep,omitempty"`
+	LatestError        *SnapshotContext        `json:"latestError,omitempty"`
+	SkillCatalogMeta   CatalogMetadata         `json:"skillCatalogMeta,omitempty"`
+	MemoryCatalogMeta  CatalogMetadata         `json:"memoryCatalogMeta,omitempty"`
+	Counts             SessionProjectionCounts `json:"counts"`
+}
+
+type sessionContextSidecar struct {
+	Version           int            `json:"version"`
+	SessionID         string         `json:"sessionId"`
+	SessionContext    SessionContext `json:"sessionContext,omitempty"`
+	SessionContextSet bool           `json:"sessionContextSet,omitempty"`
+}
+
+type sessionPermissionSidecar struct {
+	Version   int              `json:"version"`
+	SessionID string           `json:"sessionId"`
+	Enabled   bool             `json:"enabled"`
+	Items     []PermissionRule `json:"items,omitempty"`
+}
+
+type sessionDiffSidecar struct {
+	Version           int           `json:"version"`
+	SessionID         string        `json:"sessionId"`
+	Diffs             []DiffContext `json:"diffs,omitempty"`
+	CurrentDiff       *DiffContext  `json:"currentDiff,omitempty"`
+	ReviewGroups      []ReviewGroup `json:"reviewGroups,omitempty"`
+	ActiveReviewGroup *ReviewGroup  `json:"activeReviewGroup,omitempty"`
+}
+
+type sessionTerminalSidecar struct {
+	Version             int               `json:"version"`
+	SessionID           string            `json:"sessionId"`
+	RawTerminalByStream map[string]string `json:"rawTerminalByStream,omitempty"`
+}
+
+type sessionTerminalExecutionSidecar struct {
+	Version            int                 `json:"version"`
+	SessionID          string              `json:"sessionId"`
+	TerminalExecutions []TerminalExecution `json:"terminalExecutions,omitempty"`
 }
 
 type sessionRecordLightweight struct {
@@ -279,7 +339,11 @@ func (s *FileStore) SaveProjectionWithOptions(ctx context.Context, sessionID str
 		record.Summary.EntryCount = preservedLogEntryCount
 		record.Summary.Title = meta.Summary.Title
 		record.Summary.LastPreview = meta.Summary.LastPreview
+		sidecars := sidecarsFromRecord(record)
 		if err := s.writeSessionRecordOnlyLocked(record); err != nil {
+			return SessionSummary{}, err
+		}
+		if err := s.writeProjectionSidecarsLocked(record.Summary.ID, sidecars); err != nil {
 			return SessionSummary{}, err
 		}
 	} else if err := s.writeSessionLocked(record); err != nil {
@@ -305,6 +369,73 @@ func (s *FileStore) SaveProjectionWithOptions(ctx context.Context, sessionID str
 		return index.Sessions[i].UpdatedAt.After(index.Sessions[j].UpdatedAt)
 	})
 	if err := s.writeIndexLocked(index); err != nil {
+		return SessionSummary{}, err
+	}
+	return record.Summary, nil
+}
+
+func (s *FileStore) AppendSessionLogEntries(ctx context.Context, sessionID string, entries []SnapshotLogEntry, opts ...ProjectionSaveOption) (SessionSummary, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	select {
+	case <-ctx.Done():
+		return SessionSummary{}, ctx.Err()
+	default:
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return SessionSummary{}, fmt.Errorf("session id is required")
+	}
+	record, err := s.readSessionWithoutLogEntriesLocked(sessionID)
+	if err != nil {
+		return SessionSummary{}, err
+	}
+	index, err := s.readSessionLogEntriesIndexLocked(sessionID)
+	if err != nil {
+		return SessionSummary{}, err
+	}
+	appendEntries := dedupeAppendLogEntries(s.readLastSessionLogEntryLocked(sessionID, index), entries)
+	saveOpts := ProjectionSaveOptions{}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&saveOpts)
+		}
+	}
+	if len(appendEntries) == 0 {
+		if saveOpts.JSONLSyncEntryCount == nil {
+			return record.Summary, nil
+		}
+		record.Summary.JSONLSyncEntryCount = *saveOpts.JSONLSyncEntryCount
+		if err := s.writeSessionRecordOnlyLocked(record); err != nil {
+			return SessionSummary{}, err
+		}
+		s.cacheSessionMetaLocked(record)
+		if err := s.updateSessionIndexLocked(record.Summary); err != nil {
+			return SessionSummary{}, err
+		}
+		return record.Summary, nil
+	}
+	if err := s.appendSessionLogEntriesLocked(sessionID, index, appendEntries); err != nil {
+		return SessionSummary{}, err
+	}
+	totalEntryCount := index.EntryCount + len(appendEntries)
+	record.Summary.EntryCount = totalEntryCount
+	record.Summary.UpdatedAt = time.Now().UTC()
+	projection := record.Projection
+	projection.LogEntries = appendEntries
+	record.Summary = deriveProjectionSummary(record.Summary, projection)
+	record.Summary.EntryCount = totalEntryCount
+	if saveOpts.JSONLSyncEntryCount != nil {
+		record.Summary.JSONLSyncEntryCount = *saveOpts.JSONLSyncEntryCount
+	}
+	if err := s.updateRuntimeMetaCountLocked(sessionID, record.Summary.EntryCount); err != nil {
+		return SessionSummary{}, err
+	}
+	if err := s.writeSessionRecordOnlyLocked(record); err != nil {
+		return SessionSummary{}, err
+	}
+	s.cacheSessionMetaLocked(record)
+	if err := s.updateSessionIndexLocked(record.Summary); err != nil {
 		return SessionSummary{}, err
 	}
 	return record.Summary, nil
@@ -356,6 +487,220 @@ func (s *FileStore) GetSessionHistoryWindow(ctx context.Context, req SessionHist
 	}, nil
 }
 
+func (s *FileStore) GetSessionRuntimeMetadata(ctx context.Context, sessionID string) (SessionRuntimeMetadata, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	select {
+	case <-ctx.Done():
+		return SessionRuntimeMetadata{}, ctx.Err()
+	default:
+	}
+	record, err := s.readSessionWithoutLogEntriesLocked(sessionID)
+	if err != nil {
+		return SessionRuntimeMetadata{}, err
+	}
+	runtimeMeta, err := s.readSessionRuntimeMetaSidecarLocked(sessionID)
+	if err != nil {
+		return SessionRuntimeMetadata{}, err
+	}
+	applyRuntimeMetaSidecarToProjection(&record.Projection, runtimeMeta)
+	record.Summary.EntryCount = runtimeMeta.Counts.LogEntryCount
+	return SessionRuntimeMetadata{Record: record, Latest: runtimeMeta.Counts}, nil
+}
+
+func (s *FileStore) GetSessionContext(ctx context.Context, sessionID string) (SessionContextSnapshot, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	select {
+	case <-ctx.Done():
+		return SessionContextSnapshot{}, ctx.Err()
+	default:
+	}
+	sidecar, err := s.readSessionContextSidecarLocked(sessionID)
+	if err != nil {
+		return SessionContextSnapshot{}, err
+	}
+	return SessionContextSnapshot{
+		SessionID:      sidecar.SessionID,
+		SessionContext: normalizeSessionContext(sidecar.SessionContext),
+	}, nil
+}
+
+func (s *FileStore) GetSessionPermissionRuleSnapshot(ctx context.Context, sessionID string) (SessionPermissionRuleSnapshot, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	select {
+	case <-ctx.Done():
+		return SessionPermissionRuleSnapshot{}, ctx.Err()
+	default:
+	}
+	sidecar, err := s.readSessionPermissionSidecarLocked(sessionID)
+	if err != nil {
+		return SessionPermissionRuleSnapshot{}, err
+	}
+	return SessionPermissionRuleSnapshot{
+		SessionID: sidecar.SessionID,
+		Enabled:   sidecar.Enabled,
+		Items:     append([]PermissionRule(nil), sidecar.Items...),
+	}, nil
+}
+
+func (s *FileStore) SaveSessionPermissionRuleSnapshot(ctx context.Context, snapshot SessionPermissionRuleSnapshot) (SessionSummary, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	select {
+	case <-ctx.Done():
+		return SessionSummary{}, ctx.Err()
+	default:
+	}
+	sessionID := strings.TrimSpace(snapshot.SessionID)
+	if sessionID == "" {
+		return SessionSummary{}, fmt.Errorf("session id is required")
+	}
+	record, err := s.readSessionWithoutLogEntriesLocked(sessionID)
+	if err != nil {
+		return SessionSummary{}, err
+	}
+	record.Projection.PermissionRulesEnabled = snapshot.Enabled
+	record.Projection.PermissionRules = normalizePermissionRules(snapshot.Items)
+	record.Summary.UpdatedAt = time.Now().UTC()
+	sidecar := sessionPermissionSidecar{
+		Version:   sessionSideDomainVersion,
+		SessionID: sessionID,
+		Enabled:   record.Projection.PermissionRulesEnabled,
+		Items:     append([]PermissionRule(nil), record.Projection.PermissionRules...),
+	}
+	if err := s.writeSessionRecordOnlyLocked(record); err != nil {
+		return SessionSummary{}, err
+	}
+	if err := s.writeSessionPermissionSidecarLocked(sessionID, sidecar); err != nil {
+		return SessionSummary{}, err
+	}
+	s.cacheSessionMetaLocked(record)
+	if err := s.updateSessionIndexLocked(record.Summary); err != nil {
+		return SessionSummary{}, err
+	}
+	return record.Summary, nil
+}
+
+func (s *FileStore) updateSessionIndexLocked(summary SessionSummary) error {
+	sessionID := strings.TrimSpace(summary.ID)
+	if sessionID == "" {
+		return fmt.Errorf("session id is required")
+	}
+	indexFile, err := s.readIndexLocked()
+	if err != nil {
+		return err
+	}
+	updated := false
+	for i := range indexFile.Sessions {
+		if strings.TrimSpace(indexFile.Sessions[i].ID) == sessionID {
+			indexFile.Sessions[i] = summary
+			updated = true
+			break
+		}
+	}
+	if !updated {
+		indexFile.Sessions = append(indexFile.Sessions, summary)
+	}
+	sort.Slice(indexFile.Sessions, func(i, j int) bool {
+		return indexFile.Sessions[i].UpdatedAt.After(indexFile.Sessions[j].UpdatedAt)
+	})
+	return s.writeIndexLocked(indexFile)
+}
+
+func (s *FileStore) GetSessionDiffPage(ctx context.Context, req SessionDiffPageRequest) (SessionDiffPage, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	select {
+	case <-ctx.Done():
+		return SessionDiffPage{}, ctx.Err()
+	default:
+	}
+	record, latest, err := s.readProjectionSideDomainRecordLocked(req.SessionID)
+	if err != nil {
+		return SessionDiffPage{}, err
+	}
+	diffSidecar, err := s.readSessionDiffSidecarLocked(req.SessionID)
+	if err != nil {
+		return SessionDiffPage{}, err
+	}
+	applyDiffSidecarToProjection(&record.Projection, diffSidecar)
+	diffs, start, total := diffWindow(diffSidecar.Diffs, req.Before, req.Limit)
+	return SessionDiffPage{
+		Record:    record,
+		Latest:    latest,
+		Diffs:     diffs,
+		DiffStart: start,
+		DiffTotal: total,
+	}, nil
+}
+
+func (s *FileStore) GetSessionTerminalRange(ctx context.Context, req SessionTerminalRangeRequest) (SessionTerminalRange, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	select {
+	case <-ctx.Done():
+		return SessionTerminalRange{}, ctx.Err()
+	default:
+	}
+	record, latest, err := s.readProjectionSideDomainRecordLocked(req.SessionID)
+	if err != nil {
+		return SessionTerminalRange{}, err
+	}
+	terminalSidecar, err := s.readSessionTerminalSidecarLocked(req.SessionID)
+	if err != nil {
+		return SessionTerminalRange{}, err
+	}
+	applyTerminalSidecarToProjection(&record.Projection, terminalSidecar)
+	stream, err := normalizeTerminalStream(req.Stream)
+	if err != nil {
+		return SessionTerminalRange{}, err
+	}
+	content := terminalSidecar.RawTerminalByStream[stream]
+	start, end := terminalRangeBounds(content, req.Start, req.Limit)
+	return SessionTerminalRange{
+		Record:  record,
+		Latest:  latest,
+		Stream:  stream,
+		Start:   start,
+		End:     end,
+		Total:   len(content),
+		Content: content[start:end],
+	}, nil
+}
+
+func (s *FileStore) GetSessionTerminalExecutionPage(ctx context.Context, req SessionTerminalExecutionPageRequest) (SessionTerminalExecutionPage, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	select {
+	case <-ctx.Done():
+		return SessionTerminalExecutionPage{}, ctx.Err()
+	default:
+	}
+	record, latest, err := s.readProjectionSideDomainRecordLocked(req.SessionID)
+	if err != nil {
+		return SessionTerminalExecutionPage{}, err
+	}
+	executionSidecar, err := s.readSessionTerminalExecutionSidecarLocked(req.SessionID)
+	if err != nil {
+		return SessionTerminalExecutionPage{}, err
+	}
+	applyTerminalExecutionSidecarToProjection(&record.Projection, executionSidecar)
+	executions, start, total := terminalExecutionWindow(executionSidecar.TerminalExecutions, req.Before, req.Limit)
+	if !req.IncludeOutput {
+		executions = terminalExecutionsWithoutOutput(executions)
+	}
+	return SessionTerminalExecutionPage{
+		Record:             record,
+		Latest:             latest,
+		TerminalExecutions: executions,
+		ExecutionStart:     start,
+		ExecutionTotal:     total,
+		IncludeOutput:      req.IncludeOutput,
+	}, nil
+}
+
 func (s *FileStore) ListSessions(ctx context.Context) ([]SessionSummary, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -387,7 +732,7 @@ func (s *FileStore) DeleteSession(ctx context.Context, sessionID string) error {
 		return ctx.Err()
 	default:
 	}
-	if _, err := s.readSessionLocked(sessionID); err != nil {
+	if _, err := s.readSessionWithoutLogEntriesLocked(sessionID); err != nil {
 		return err
 	}
 	if err := os.Remove(s.sessionPath(sessionID)); err != nil {
@@ -401,6 +746,24 @@ func (s *FileStore) DeleteSession(ctx context.Context, sessionID string) error {
 	}
 	if err := os.Remove(s.sessionLogEntriesIndexPath(sessionID)); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("delete session log entries index: %w", err)
+	}
+	if err := os.Remove(s.sessionRuntimeMetaPath(sessionID)); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("delete session runtime metadata sidecar: %w", err)
+	}
+	if err := os.Remove(s.sessionContextPath(sessionID)); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("delete session context sidecar: %w", err)
+	}
+	if err := os.Remove(s.sessionPermissionPath(sessionID)); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("delete session permission sidecar: %w", err)
+	}
+	if err := os.Remove(s.sessionDiffsPath(sessionID)); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("delete session diff sidecar: %w", err)
+	}
+	if err := os.Remove(s.sessionTerminalPath(sessionID)); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("delete session terminal sidecar: %w", err)
+	}
+	if err := os.Remove(s.sessionTerminalExecutionsPath(sessionID)); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("delete session terminal execution sidecar: %w", err)
 	}
 	index, err := s.readIndexLocked()
 	if err != nil {
@@ -554,6 +917,9 @@ func (s *FileStore) readSessionLocked(sessionID string) (SessionRecord, error) {
 	if err != nil {
 		return SessionRecord{}, err
 	}
+	if err := s.hydrateProjectionSideDomainsLocked(&record); err != nil {
+		return SessionRecord{}, err
+	}
 	embeddedEntries := append([]SnapshotLogEntry(nil), record.Projection.LogEntries...)
 	entries, err := s.readAllSessionLogEntriesIfAvailableLocked(sessionID)
 	if err != nil {
@@ -620,17 +986,35 @@ func (s *FileStore) readSessionWithoutLogEntriesLocked(sessionID string) (Sessio
 	}), nil
 }
 
+func (s *FileStore) readSessionIndexRecordLocked(sessionID string) (SessionRecord, error) {
+	record, err := s.readSessionFileLocked(sessionID)
+	if err != nil {
+		return SessionRecord{}, err
+	}
+	if len(record.Projection.LogEntries) > 0 {
+		return normalizeSessionRecord(record), nil
+	}
+	return normalizeSessionRecordLightweight(record), nil
+}
+
 func (s *FileStore) writeSessionLocked(record SessionRecord) error {
 	record = normalizeSessionRecord(record)
 	entries := append([]SnapshotLogEntry(nil), record.Projection.LogEntries...)
+	record.Summary = deriveProjectionSummary(record.Summary, record.Projection)
+	sidecars := sidecarsFromRecord(record)
+	record.Projection = lightweightProjectionForRecord(record.Projection)
 	record.Projection.LogEntries = nil
 	if err := s.writeSessionRecordOnlyLocked(record); err != nil {
 		return err
 	}
-	return s.writeSessionLogEntriesLocked(record.Summary.ID, entries)
+	if err := s.writeSessionLogEntriesLocked(record.Summary.ID, entries); err != nil {
+		return err
+	}
+	return s.writeProjectionSidecarsLocked(record.Summary.ID, sidecars)
 }
 
 func (s *FileStore) writeSessionRecordOnlyLocked(record SessionRecord) error {
+	record.Projection = lightweightProjectionForRecord(record.Projection)
 	record.Projection.LogEntries = nil
 	data, err := json.Marshal(record)
 	if err != nil {
@@ -704,6 +1088,9 @@ func (s *FileStore) readSessionLogEntriesIndexLocked(sessionID string) (sessionL
 			return sessionLogEntriesIndex{}, fmt.Errorf("decode session log entries index: %w", decodeErr)
 		}
 		if err := validateSessionLogEntriesIndex(sessionID, index); err != nil {
+			return sessionLogEntriesIndex{}, err
+		}
+		if err := s.validateSessionLogEntriesHeaderCountLocked(sessionID, index.EntryCount); err != nil {
 			return sessionLogEntriesIndex{}, err
 		}
 		return index, nil
@@ -791,7 +1178,7 @@ func (s *FileStore) readSessionLogEntriesRangeLocked(sessionID string, offsets [
 	if err := json.Unmarshal(bytes.TrimSpace(headerLine), &header); err != nil {
 		return nil, fmt.Errorf("decode session log entries sidecar header: %w", err)
 	}
-	if err := validateSessionLogEntriesHeader(sessionID, header, len(offsets)); err != nil {
+	if err := validateSessionLogEntriesHeader(sessionID, header); err != nil {
 		return nil, err
 	}
 	if _, err := file.Seek(offsets[start], io.SeekStart); err != nil {
@@ -864,6 +1251,160 @@ func (s *FileStore) writeSessionLogEntriesLocked(sessionID string, entries []Sna
 	return writeJSONFileAtomic(s.sessionLogEntriesIndexPath(sessionID), indexData, 0o644)
 }
 
+func (s *FileStore) readLastSessionLogEntryLocked(sessionID string, index sessionLogEntriesIndex) *SnapshotLogEntry {
+	if index.EntryCount <= 0 || len(index.Offsets) != index.EntryCount {
+		return nil
+	}
+	entries, err := s.readSessionLogEntriesRangeLocked(sessionID, index.Offsets, index.EntryCount-1, index.EntryCount)
+	if err != nil || len(entries) == 0 {
+		return nil
+	}
+	entry := entries[0]
+	return &entry
+}
+
+func dedupeAppendLogEntries(previous *SnapshotLogEntry, entries []SnapshotLogEntry) []SnapshotLogEntry {
+	if len(entries) == 0 {
+		return nil
+	}
+	normalized := dedupeAdjacentLogEntries(entries)
+	out := make([]SnapshotLogEntry, 0, len(normalized))
+	for _, entry := range normalized {
+		if previous != nil && equivalentAdjacentLogEntry(*previous, entry) {
+			continue
+		}
+		out = append(out, entry)
+		previous = &out[len(out)-1]
+	}
+	return out
+}
+
+func (s *FileStore) appendSessionLogEntriesLocked(sessionID string, index sessionLogEntriesIndex, entries []SnapshotLogEntry) error {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return fmt.Errorf("session id is required")
+	}
+	if len(entries) == 0 {
+		return nil
+	}
+	file, err := os.OpenFile(s.sessionLogEntriesPath(sessionID), os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("session log entries sidecar missing for %s: %w", sessionID, os.ErrNotExist)
+		}
+		return fmt.Errorf("open session log entries sidecar for append: %w", err)
+	}
+	defer file.Close()
+	offset, err := file.Seek(0, io.SeekEnd)
+	if err != nil {
+		return fmt.Errorf("seek session log entries sidecar for append: %w", err)
+	}
+	offsets := append([]int64(nil), index.Offsets...)
+	for i, entry := range entries {
+		row, err := json.Marshal(entry)
+		if err != nil {
+			return fmt.Errorf("encode appended session log entry row %d: %w", i, err)
+		}
+		offsets = append(offsets, offset)
+		written, err := file.Write(append(row, '\n'))
+		if err != nil {
+			return fmt.Errorf("append session log entry row %d: %w", i, err)
+		}
+		offset += int64(written)
+	}
+	nextIndex := sessionLogEntriesIndex{
+		Version:    sessionLogEntriesSidecarVersion,
+		SessionID:  sessionID,
+		EntryCount: index.EntryCount + len(entries),
+		Offsets:    offsets,
+	}
+	indexData, err := json.Marshal(nextIndex)
+	if err != nil {
+		return fmt.Errorf("encode session log entries index: %w", err)
+	}
+	if err := s.rewriteSessionLogEntriesHeaderLocked(sessionID, nextIndex.EntryCount); err != nil {
+		return err
+	}
+	return writeJSONFileAtomic(s.sessionLogEntriesIndexPath(sessionID), indexData, 0o644)
+}
+
+func (s *FileStore) updateRuntimeMetaCountLocked(sessionID string, logEntryCount int) error {
+	sidecar, err := s.readSessionRuntimeMetaSidecarLocked(sessionID)
+	if err != nil {
+		return err
+	}
+	sidecar.Counts.LogEntryCount = logEntryCount
+	return s.writeJSONFileLocked(s.sessionRuntimeMetaPath(sessionID), sidecar, "encode session runtime metadata sidecar")
+}
+
+func (s *FileStore) rewriteSessionLogEntriesHeaderLocked(sessionID string, entryCount int) error {
+	path := s.sessionLogEntriesPath(sessionID)
+	src, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("session log entries sidecar missing for %s: %w", sessionID, os.ErrNotExist)
+		}
+		return fmt.Errorf("open session log entries sidecar for header rewrite: %w", err)
+	}
+	defer src.Close()
+	reader := bufio.NewReader(src)
+	oldHeader, err := reader.ReadBytes('\n')
+	if err != nil {
+		return fmt.Errorf("read session log entries sidecar header: %w", err)
+	}
+	var existing sessionLogEntriesSidecarHeader
+	if err := json.Unmarshal(bytes.TrimSpace(oldHeader), &existing); err != nil {
+		return fmt.Errorf("decode session log entries sidecar header: %w", err)
+	}
+	if err := validateSessionLogEntriesHeader(sessionID, existing); err != nil {
+		return err
+	}
+	header := sessionLogEntriesSidecarHeader{
+		Version:    sessionLogEntriesSidecarVersion,
+		SessionID:  strings.TrimSpace(sessionID),
+		EntryCount: entryCount,
+	}
+	headerData, err := json.Marshal(header)
+	if err != nil {
+		return fmt.Errorf("encode session log entries sidecar header: %w", err)
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("create temp log entries sidecar: %w", err)
+	}
+	tmpPath := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if _, err := tmp.Write(headerData); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("write session log entries sidecar header: %w", err)
+	}
+	if _, err := tmp.Write([]byte("\n")); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("write session log entries sidecar newline: %w", err)
+	}
+	if _, err := io.Copy(tmp, reader); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("copy session log entries sidecar body: %w", err)
+	}
+	if err := tmp.Chmod(0o644); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("chmod temp log entries sidecar: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close temp log entries sidecar: %w", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("replace session log entries sidecar: %w", err)
+	}
+	cleanup = false
+	return nil
+}
+
 func writeJSONFileAtomic(path string, data []byte, perm os.FileMode) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -924,17 +1465,384 @@ func validateSessionLogEntriesIndex(sessionID string, index sessionLogEntriesInd
 	return nil
 }
 
-func validateSessionLogEntriesHeader(sessionID string, header sessionLogEntriesSidecarHeader, expectedCount int) error {
+func validateSessionLogEntriesHeader(sessionID string, header sessionLogEntriesSidecarHeader) error {
 	if header.Version != sessionLogEntriesSidecarVersion {
 		return fmt.Errorf("unsupported session log entries sidecar version: %d", header.Version)
 	}
 	if strings.TrimSpace(header.SessionID) != strings.TrimSpace(sessionID) {
 		return fmt.Errorf("session log entries sidecar belongs to %s, not %s", header.SessionID, sessionID)
 	}
+	return nil
+}
+
+func (s *FileStore) validateSessionLogEntriesHeaderCountLocked(sessionID string, expectedCount int) error {
+	header, err := s.readSessionLogEntriesHeaderLocked(sessionID)
+	if err != nil {
+		return err
+	}
 	if header.EntryCount != expectedCount {
 		return fmt.Errorf("session log entries sidecar count mismatch: header count %d, index count %d", header.EntryCount, expectedCount)
 	}
 	return nil
+}
+
+func (s *FileStore) readSessionLogEntriesHeaderLocked(sessionID string) (sessionLogEntriesSidecarHeader, error) {
+	file, err := os.Open(s.sessionLogEntriesPath(sessionID))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return sessionLogEntriesSidecarHeader{}, fmt.Errorf("session log entries sidecar missing for %s: %w", sessionID, os.ErrNotExist)
+		}
+		return sessionLogEntriesSidecarHeader{}, fmt.Errorf("read session log entries sidecar: %w", err)
+	}
+	defer file.Close()
+	line, err := bufio.NewReader(file).ReadBytes('\n')
+	if err != nil {
+		return sessionLogEntriesSidecarHeader{}, fmt.Errorf("read session log entries sidecar header: %w", err)
+	}
+	var header sessionLogEntriesSidecarHeader
+	if err := json.Unmarshal(bytes.TrimSpace(line), &header); err != nil {
+		return sessionLogEntriesSidecarHeader{}, fmt.Errorf("decode session log entries sidecar header: %w", err)
+	}
+	if err := validateSessionLogEntriesHeader(sessionID, header); err != nil {
+		return sessionLogEntriesSidecarHeader{}, err
+	}
+	return header, nil
+}
+
+func (s *FileStore) hydrateProjectionSideDomainsLocked(record *SessionRecord) error {
+	sidecars, err := s.readSessionProjectionSidecarsLocked(record.Summary.ID)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		record.Projection = normalizeProjection(record.Projection)
+		if rebuildErr := s.writeProjectionSidecarsLocked(record.Summary.ID, sidecarsFromRecord(*record)); rebuildErr != nil {
+			return rebuildErr
+		}
+		if rewriteErr := s.writeSessionRecordOnlyLocked(*record); rewriteErr != nil {
+			return rewriteErr
+		}
+		return nil
+	}
+	applySidecarsToProjection(&record.Projection, sidecars)
+	return nil
+}
+
+func (s *FileStore) readProjectionSideDomainRecordLocked(sessionID string) (SessionRecord, SessionProjectionCounts, error) {
+	record, err := s.readSessionWithoutLogEntriesLocked(sessionID)
+	if err != nil {
+		return SessionRecord{}, SessionProjectionCounts{}, err
+	}
+	runtimeMeta, err := s.readSessionRuntimeMetaSidecarLocked(sessionID)
+	if err != nil {
+		return SessionRecord{}, SessionProjectionCounts{}, err
+	}
+	applyRuntimeMetaSidecarToProjection(&record.Projection, runtimeMeta)
+	record.Summary.EntryCount = runtimeMeta.Counts.LogEntryCount
+	return record, runtimeMeta.Counts, nil
+}
+
+func (s *FileStore) readSessionProjectionSidecarsLocked(sessionID string) (sessionProjectionSidecars, error) {
+	runtimeMeta, err := s.readSessionRuntimeMetaSidecarLocked(sessionID)
+	if err != nil {
+		return sessionProjectionSidecars{}, err
+	}
+	contextSidecar, err := s.readSessionContextSidecarLocked(sessionID)
+	if err != nil {
+		return sessionProjectionSidecars{}, err
+	}
+	permissionSidecar, err := s.readSessionPermissionSidecarLocked(sessionID)
+	if err != nil {
+		return sessionProjectionSidecars{}, err
+	}
+	diffSidecar, err := s.readSessionDiffSidecarLocked(sessionID)
+	if err != nil {
+		return sessionProjectionSidecars{}, err
+	}
+	terminalSidecar, err := s.readSessionTerminalSidecarLocked(sessionID)
+	if err != nil {
+		return sessionProjectionSidecars{}, err
+	}
+	executionSidecar, err := s.readSessionTerminalExecutionSidecarLocked(sessionID)
+	if err != nil {
+		return sessionProjectionSidecars{}, err
+	}
+	return sessionProjectionSidecars{
+		RuntimeMeta:       runtimeMeta,
+		Context:           contextSidecar,
+		Permission:        permissionSidecar,
+		Diff:              diffSidecar,
+		Terminal:          terminalSidecar,
+		TerminalExecution: executionSidecar,
+	}, nil
+}
+
+func (s *FileStore) writeProjectionSidecarsLocked(sessionID string, sidecars sessionProjectionSidecars) error {
+	if err := s.writeJSONFileLocked(s.sessionRuntimeMetaPath(sessionID), sidecars.RuntimeMeta, "encode session runtime metadata sidecar"); err != nil {
+		return err
+	}
+	if err := s.writeJSONFileLocked(s.sessionContextPath(sessionID), sidecars.Context, "encode session context sidecar"); err != nil {
+		return err
+	}
+	if err := s.writeSessionPermissionSidecarLocked(sessionID, sidecars.Permission); err != nil {
+		return err
+	}
+	if err := s.writeJSONFileLocked(s.sessionDiffsPath(sessionID), sidecars.Diff, "encode session diff sidecar"); err != nil {
+		return err
+	}
+	if err := s.writeJSONFileLocked(s.sessionTerminalPath(sessionID), sidecars.Terminal, "encode session terminal sidecar"); err != nil {
+		return err
+	}
+	return s.writeJSONFileLocked(s.sessionTerminalExecutionsPath(sessionID), sidecars.TerminalExecution, "encode session terminal execution sidecar")
+}
+
+func (s *FileStore) writeSessionPermissionSidecarLocked(sessionID string, sidecar sessionPermissionSidecar) error {
+	sidecar.SessionID = strings.TrimSpace(sessionID)
+	sidecar.Version = sessionSideDomainVersion
+	sidecar.Items = normalizePermissionRules(sidecar.Items)
+	return s.writeJSONFileLocked(s.sessionPermissionPath(sessionID), sidecar, "encode session permission sidecar")
+}
+
+func (s *FileStore) readSessionRuntimeMetaSidecarLocked(sessionID string) (sessionRuntimeMetaSidecar, error) {
+	var sidecar sessionRuntimeMetaSidecar
+	if err := s.readStrictJSONFileLocked(s.sessionRuntimeMetaPath(sessionID), &sidecar, "read session runtime metadata sidecar", "decode session runtime metadata sidecar"); err != nil {
+		return sessionRuntimeMetaSidecar{}, err
+	}
+	if err := validateSessionSidecar(sessionID, sidecar.Version, sidecar.SessionID, "runtime metadata"); err != nil {
+		return sessionRuntimeMetaSidecar{}, err
+	}
+	sidecar.Counts.LogEntryCount = latestLogEntryCountFromIndexFallback(sidecar.Counts.LogEntryCount)
+	return sidecar, nil
+}
+
+func (s *FileStore) readSessionContextSidecarLocked(sessionID string) (sessionContextSidecar, error) {
+	var sidecar sessionContextSidecar
+	if err := s.readStrictJSONFileLocked(s.sessionContextPath(sessionID), &sidecar, "read session context sidecar", "decode session context sidecar"); err != nil {
+		return sessionContextSidecar{}, err
+	}
+	if err := validateSessionSidecar(sessionID, sidecar.Version, sidecar.SessionID, "context"); err != nil {
+		return sessionContextSidecar{}, err
+	}
+	sidecar.SessionContext = normalizeSessionContext(sidecar.SessionContext)
+	return sidecar, nil
+}
+
+func (s *FileStore) readSessionPermissionSidecarLocked(sessionID string) (sessionPermissionSidecar, error) {
+	var sidecar sessionPermissionSidecar
+	if err := s.readStrictJSONFileLocked(s.sessionPermissionPath(sessionID), &sidecar, "read session permission sidecar", "decode session permission sidecar"); err != nil {
+		return sessionPermissionSidecar{}, err
+	}
+	if err := validateSessionSidecar(sessionID, sidecar.Version, sidecar.SessionID, "permission"); err != nil {
+		return sessionPermissionSidecar{}, err
+	}
+	sidecar.Items = normalizePermissionRules(sidecar.Items)
+	return sidecar, nil
+}
+
+func (s *FileStore) readSessionDiffSidecarLocked(sessionID string) (sessionDiffSidecar, error) {
+	var sidecar sessionDiffSidecar
+	if err := s.readStrictJSONFileLocked(s.sessionDiffsPath(sessionID), &sidecar, "read session diff sidecar", "decode session diff sidecar"); err != nil {
+		return sessionDiffSidecar{}, err
+	}
+	if err := validateSessionSidecar(sessionID, sidecar.Version, sidecar.SessionID, "diff"); err != nil {
+		return sessionDiffSidecar{}, err
+	}
+	return sidecar, nil
+}
+
+func (s *FileStore) readSessionTerminalSidecarLocked(sessionID string) (sessionTerminalSidecar, error) {
+	var sidecar sessionTerminalSidecar
+	if err := s.readStrictJSONFileLocked(s.sessionTerminalPath(sessionID), &sidecar, "read session terminal sidecar", "decode session terminal sidecar"); err != nil {
+		return sessionTerminalSidecar{}, err
+	}
+	if err := validateSessionSidecar(sessionID, sidecar.Version, sidecar.SessionID, "terminal"); err != nil {
+		return sessionTerminalSidecar{}, err
+	}
+	if sidecar.RawTerminalByStream == nil {
+		sidecar.RawTerminalByStream = map[string]string{"stdout": "", "stderr": ""}
+	}
+	if _, ok := sidecar.RawTerminalByStream["stdout"]; !ok {
+		sidecar.RawTerminalByStream["stdout"] = ""
+	}
+	if _, ok := sidecar.RawTerminalByStream["stderr"]; !ok {
+		sidecar.RawTerminalByStream["stderr"] = ""
+	}
+	return sidecar, nil
+}
+
+func (s *FileStore) readSessionTerminalExecutionSidecarLocked(sessionID string) (sessionTerminalExecutionSidecar, error) {
+	var sidecar sessionTerminalExecutionSidecar
+	if err := s.readStrictJSONFileLocked(s.sessionTerminalExecutionsPath(sessionID), &sidecar, "read session terminal execution sidecar", "decode session terminal execution sidecar"); err != nil {
+		return sessionTerminalExecutionSidecar{}, err
+	}
+	if err := validateSessionSidecar(sessionID, sidecar.Version, sidecar.SessionID, "terminal execution"); err != nil {
+		return sessionTerminalExecutionSidecar{}, err
+	}
+	if sidecar.TerminalExecutions == nil {
+		sidecar.TerminalExecutions = []TerminalExecution{}
+	}
+	return sidecar, nil
+}
+
+func validateSessionSidecar(sessionID string, version int, sidecarSessionID, domain string) error {
+	if version == 0 && strings.TrimSpace(sidecarSessionID) == "" {
+		return fmt.Errorf("session %s sidecar missing for %s: %w", domain, sessionID, os.ErrNotExist)
+	}
+	if version != sessionSideDomainVersion {
+		return fmt.Errorf("unsupported session %s sidecar version: %d", domain, version)
+	}
+	if strings.TrimSpace(sidecarSessionID) != strings.TrimSpace(sessionID) {
+		return fmt.Errorf("session %s sidecar belongs to %s, not %s", domain, sidecarSessionID, sessionID)
+	}
+	return nil
+}
+
+func latestLogEntryCountFromIndexFallback(count int) int {
+	if count < 0 {
+		return 0
+	}
+	return count
+}
+
+func sidecarsFromRecord(record SessionRecord) sessionProjectionSidecars {
+	sessionID := record.Summary.ID
+	latest := projectionCounts(record.Projection, record.Summary.EntryCount)
+	return sessionProjectionSidecars{
+		RuntimeMeta: sessionRuntimeMetaSidecar{
+			Version:            sessionSideDomainVersion,
+			SessionID:          sessionID,
+			Controller:         record.Projection.Controller,
+			Runtime:            record.Projection.Runtime,
+			ContextWindowUsage: record.Projection.ContextWindowUsage,
+			CurrentStep:        cloneSnapshotContext(record.Projection.CurrentStep),
+			LatestError:        cloneSnapshotContext(record.Projection.LatestError),
+			SkillCatalogMeta:   record.Projection.SkillCatalogMeta,
+			MemoryCatalogMeta:  record.Projection.MemoryCatalogMeta,
+			Counts:             latest,
+		},
+		Context: sessionContextSidecar{
+			Version:           sessionSideDomainVersion,
+			SessionID:         sessionID,
+			SessionContext:    record.Projection.SessionContext,
+			SessionContextSet: record.Projection.SessionContextSet,
+		},
+		Permission: sessionPermissionSidecar{
+			Version:   sessionSideDomainVersion,
+			SessionID: sessionID,
+			Enabled:   record.Projection.PermissionRulesEnabled,
+			Items:     append([]PermissionRule(nil), record.Projection.PermissionRules...),
+		},
+		Diff: sessionDiffSidecar{
+			Version:           sessionSideDomainVersion,
+			SessionID:         sessionID,
+			Diffs:             append([]DiffContext(nil), record.Projection.Diffs...),
+			CurrentDiff:       cloneDiffContext(record.Projection.CurrentDiff),
+			ReviewGroups:      append([]ReviewGroup(nil), record.Projection.ReviewGroups...),
+			ActiveReviewGroup: cloneReviewGroup(record.Projection.ActiveReviewGroup),
+		},
+		Terminal: sessionTerminalSidecar{
+			Version:             sessionSideDomainVersion,
+			SessionID:           sessionID,
+			RawTerminalByStream: cloneStringMap(record.Projection.RawTerminalByStream),
+		},
+		TerminalExecution: sessionTerminalExecutionSidecar{
+			Version:            sessionSideDomainVersion,
+			SessionID:          sessionID,
+			TerminalExecutions: append([]TerminalExecution(nil), record.Projection.TerminalExecutions...),
+		},
+	}
+}
+
+func lightweightProjectionForRecord(projection ProjectionSnapshot) ProjectionSnapshot {
+	projection.Diffs = nil
+	projection.CurrentDiff = nil
+	projection.ReviewGroups = nil
+	projection.ActiveReviewGroup = nil
+	projection.LogEntries = nil
+	projection.RawTerminalByStream = nil
+	projection.TerminalExecutions = nil
+	return projection
+}
+
+func applySidecarsToProjection(projection *ProjectionSnapshot, sidecars sessionProjectionSidecars) {
+	applyRuntimeMetaSidecarToProjection(projection, sidecars.RuntimeMeta)
+	applyContextSidecarToProjection(projection, sidecars.Context)
+	applyPermissionSidecarToProjection(projection, sidecars.Permission)
+	applyDiffSidecarToProjection(projection, sidecars.Diff)
+	applyTerminalSidecarToProjection(projection, sidecars.Terminal)
+	applyTerminalExecutionSidecarToProjection(projection, sidecars.TerminalExecution)
+	*projection = normalizeProjection(*projection)
+}
+
+func applyRuntimeMetaSidecarToProjection(projection *ProjectionSnapshot, sidecar sessionRuntimeMetaSidecar) {
+	projection.Controller = sidecar.Controller
+	projection.Runtime = sidecar.Runtime
+	projection.ContextWindowUsage = normalizeContextWindowUsage(sidecar.ContextWindowUsage)
+	projection.CurrentStep = cloneSnapshotContext(sidecar.CurrentStep)
+	projection.LatestError = cloneSnapshotContext(sidecar.LatestError)
+	projection.SkillCatalogMeta = normalizeCatalogMetadata(sidecar.SkillCatalogMeta, CatalogDomainSkill)
+	projection.MemoryCatalogMeta = normalizeCatalogMetadata(sidecar.MemoryCatalogMeta, CatalogDomainMemory)
+}
+
+func applyContextSidecarToProjection(projection *ProjectionSnapshot, sidecar sessionContextSidecar) {
+	projection.SessionContext = normalizeSessionContext(sidecar.SessionContext)
+	projection.SessionContextSet = sidecar.SessionContextSet
+}
+
+func applyPermissionSidecarToProjection(projection *ProjectionSnapshot, sidecar sessionPermissionSidecar) {
+	projection.PermissionRulesEnabled = sidecar.Enabled
+	projection.PermissionRules = normalizePermissionRules(sidecar.Items)
+}
+
+func applyDiffSidecarToProjection(projection *ProjectionSnapshot, sidecar sessionDiffSidecar) {
+	projection.Diffs = append([]DiffContext(nil), sidecar.Diffs...)
+	projection.CurrentDiff = cloneDiffContext(sidecar.CurrentDiff)
+	projection.ReviewGroups = append([]ReviewGroup(nil), sidecar.ReviewGroups...)
+	projection.ActiveReviewGroup = cloneReviewGroup(sidecar.ActiveReviewGroup)
+}
+
+func applyTerminalSidecarToProjection(projection *ProjectionSnapshot, sidecar sessionTerminalSidecar) {
+	projection.RawTerminalByStream = cloneStringMap(sidecar.RawTerminalByStream)
+}
+
+func applyTerminalExecutionSidecarToProjection(projection *ProjectionSnapshot, sidecar sessionTerminalExecutionSidecar) {
+	projection.TerminalExecutions = append([]TerminalExecution(nil), sidecar.TerminalExecutions...)
+}
+
+func cloneSnapshotContext(input *SnapshotContext) *SnapshotContext {
+	if input == nil {
+		return nil
+	}
+	out := *input
+	return &out
+}
+
+func cloneDiffContext(input *DiffContext) *DiffContext {
+	if input == nil {
+		return nil
+	}
+	out := *input
+	return &out
+}
+
+func cloneReviewGroup(input *ReviewGroup) *ReviewGroup {
+	if input == nil {
+		return nil
+	}
+	out := *input
+	out.Files = append([]ReviewFile(nil), input.Files...)
+	return &out
+}
+
+func cloneStringMap(input map[string]string) map[string]string {
+	out := make(map[string]string, len(input))
+	for key, value := range input {
+		out[key] = value
+	}
+	if out == nil {
+		out = map[string]string{}
+	}
+	return out
 }
 
 func normalizeWindowBefore(before, total int) int {
@@ -952,6 +1860,92 @@ func normalizeWindowStart(before, limit int) int {
 		return 0
 	}
 	return before - limit
+}
+
+func projectionCounts(projection ProjectionSnapshot, logEntryCount int) SessionProjectionCounts {
+	if logEntryCount < 0 {
+		logEntryCount = 0
+	}
+	projection = normalizeProjection(projection)
+	return SessionProjectionCounts{
+		LogEntryCount:          logEntryCount,
+		DiffCount:              len(projection.Diffs),
+		TerminalExecutionCount: len(projection.TerminalExecutions),
+		TerminalStdoutLength:   len(projection.RawTerminalByStream["stdout"]),
+		TerminalStderrLength:   len(projection.RawTerminalByStream["stderr"]),
+	}
+}
+
+func diffWindow(entries []DiffContext, before, limit int) ([]DiffContext, int, int) {
+	total := len(entries)
+	before = normalizeWindowBefore(before, total)
+	start := normalizeWindowStart(before, limit)
+	return append([]DiffContext(nil), entries[start:before]...), start, total
+}
+
+func terminalExecutionWindow(entries []TerminalExecution, before, limit int) ([]TerminalExecution, int, int) {
+	total := len(entries)
+	before = normalizeWindowBefore(before, total)
+	start := normalizeWindowStart(before, limit)
+	return append([]TerminalExecution(nil), entries[start:before]...), start, total
+}
+
+func terminalExecutionsWithoutOutput(entries []TerminalExecution) []TerminalExecution {
+	if len(entries) == 0 {
+		return entries
+	}
+	out := make([]TerminalExecution, 0, len(entries))
+	for _, entry := range entries {
+		entry.Stdout = ""
+		entry.Stderr = ""
+		out = append(out, entry)
+	}
+	return out
+}
+
+func normalizeTerminalStream(stream string) (string, error) {
+	switch strings.TrimSpace(strings.ToLower(stream)) {
+	case "", "stdout":
+		return "stdout", nil
+	case "stderr":
+		return "stderr", nil
+	default:
+		return "", fmt.Errorf("unsupported terminal stream %q", stream)
+	}
+}
+
+func terminalRangeBounds(content string, start, limit int) (int, int) {
+	total := len(content)
+	if start < 0 {
+		start = 0
+	}
+	if start > total {
+		start = total
+	}
+	if limit <= 0 {
+		limit = 64 * 1024
+	}
+	if limit > 512*1024 {
+		limit = 512 * 1024
+	}
+	end := start + limit
+	if end > total {
+		end = total
+	}
+	for start < total && !utf8.RuneStart(content[start]) {
+		start++
+	}
+	for end > start && end < total && !utf8.RuneStart(content[end]) {
+		end--
+	}
+	if end < start {
+		end = start
+	}
+	if end == start && start < total {
+		_, size := utf8.DecodeRuneInString(content[start:])
+		end = start + size
+	}
+	return start, end
 }
 
 func projectionWithLogEntries(projection ProjectionSnapshot, entries []SnapshotLogEntry) ProjectionSnapshot {
@@ -1020,6 +2014,23 @@ func (s *FileStore) readJSONFileLocked(path string, target any, readErrLabel, de
 	return nil
 }
 
+func (s *FileStore) readStrictJSONFileLocked(path string, target any, readErrLabel, decodeErrLabel string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("%s: %w", readErrLabel, os.ErrNotExist)
+		}
+		return fmt.Errorf("%s: %w", readErrLabel, err)
+	}
+	if len(data) == 0 {
+		return fmt.Errorf("%s: empty file", decodeErrLabel)
+	}
+	if err := json.Unmarshal(data, target); err != nil {
+		return fmt.Errorf("%s: %w", decodeErrLabel, err)
+	}
+	return nil
+}
+
 func (s *FileStore) writeJSONFileLocked(path string, value any, encodeErrLabel string) error {
 	data, err := json.Marshal(value)
 	if err != nil {
@@ -1030,14 +2041,8 @@ func (s *FileStore) writeJSONFileLocked(path string, value any, encodeErrLabel s
 
 func (projection projectionLightweightJSON) toProjectionSnapshot() ProjectionSnapshot {
 	return ProjectionSnapshot{
-		Diffs:                  projection.Diffs,
-		CurrentDiff:            projection.CurrentDiff,
-		ReviewGroups:           projection.ReviewGroups,
-		ActiveReviewGroup:      projection.ActiveReviewGroup,
 		CurrentStep:            projection.CurrentStep,
 		LatestError:            projection.LatestError,
-		RawTerminalByStream:    projection.RawTerminalByStream,
-		TerminalExecutions:     projection.TerminalExecutions,
 		Controller:             projection.Controller,
 		Runtime:                projection.Runtime,
 		ContextWindowUsage:     projection.ContextWindowUsage,
@@ -1060,6 +2065,30 @@ func (s *FileStore) sessionLogEntriesPath(sessionID string) string {
 
 func (s *FileStore) sessionLogEntriesIndexPath(sessionID string) string {
 	return filepath.Join(s.baseDir, sessionID+".log_entries.idx.json")
+}
+
+func (s *FileStore) sessionRuntimeMetaPath(sessionID string) string {
+	return filepath.Join(s.baseDir, sessionID+".runtime_meta.json")
+}
+
+func (s *FileStore) sessionContextPath(sessionID string) string {
+	return filepath.Join(s.baseDir, sessionID+".context.json")
+}
+
+func (s *FileStore) sessionPermissionPath(sessionID string) string {
+	return filepath.Join(s.baseDir, sessionID+".permission.json")
+}
+
+func (s *FileStore) sessionDiffsPath(sessionID string) string {
+	return filepath.Join(s.baseDir, sessionID+".diffs.json")
+}
+
+func (s *FileStore) sessionTerminalPath(sessionID string) string {
+	return filepath.Join(s.baseDir, sessionID+".terminal.json")
+}
+
+func (s *FileStore) sessionTerminalExecutionsPath(sessionID string) string {
+	return filepath.Join(s.baseDir, sessionID+".terminal_executions.json")
 }
 
 func (s *FileStore) BaseDir() string {
@@ -1097,7 +2126,7 @@ func (s *FileStore) MarkClientAction(ctx context.Context, sessionID string, reco
 	if limit <= 0 {
 		limit = 500
 	}
-	sessionRecord, err := s.readSessionLocked(sessionID)
+	sessionRecord, err := s.readSessionWithoutLogEntriesLocked(sessionID)
 	if err != nil {
 		return false, err
 	}
@@ -1109,7 +2138,7 @@ func (s *FileStore) MarkClientAction(ctx context.Context, sessionID string, reco
 	}
 	sessionRecord.ClientActions = append(sessionRecord.ClientActions, record)
 	sessionRecord.ClientActions = normalizeClientActionRecords(sessionRecord.ClientActions, now, ttl, limit)
-	if err := s.writeSessionLocked(sessionRecord); err != nil {
+	if err := s.writeSessionRecordOnlyLocked(sessionRecord); err != nil {
 		return false, err
 	}
 	s.cacheSessionMetaLocked(sessionRecord)
@@ -1151,6 +2180,9 @@ func (s *FileStore) cacheSessionMetaLocked(record SessionRecord) {
 		s.sessionMetaCache = make(map[string]sessionRecordMeta)
 	}
 	meta := sessionMetaFromRecord(record)
+	if len(record.Projection.LogEntries) == 0 && record.Summary.EntryCount > 0 {
+		meta = sessionMetaFromLightweightRecord(record)
+	}
 	sessionID := strings.TrimSpace(meta.Summary.ID)
 	if sessionID == "" {
 		return
@@ -1445,7 +2477,29 @@ func mergeSessionRuntime(base SessionRuntime, overlay SessionRuntime) SessionRun
 		CWD:              firstNonEmptyString(overlay.CWD, base.CWD),
 		ClaudeLifecycle:  firstNonEmptyString(overlay.ClaudeLifecycle, base.ClaudeLifecycle),
 		Source:           firstNonEmptyString(overlay.Source, base.Source),
+		SourcePath:       firstNonEmptyString(overlay.SourcePath, base.SourcePath),
+		SourceSize:       firstNonZeroInt64(overlay.SourceSize, base.SourceSize),
+		SourceModUnixNS:  firstNonZeroInt64(overlay.SourceModUnixNS, base.SourceModUnixNS),
+		SourceEntryCount: firstNonZeroInt(overlay.SourceEntryCount, base.SourceEntryCount),
 	}
+}
+
+func firstNonZeroInt(values ...int) int {
+	for _, value := range values {
+		if value != 0 {
+			return value
+		}
+	}
+	return 0
+}
+
+func firstNonZeroInt64(values ...int64) int64 {
+	for _, value := range values {
+		if value != 0 {
+			return value
+		}
+	}
+	return 0
 }
 
 func normalizeContextWindowUsage(usage ContextWindowUsage) ContextWindowUsage {
@@ -1979,7 +3033,7 @@ func (s *FileStore) reconcileIndexLocked(index fileIndex) (fileIndex, error) {
 	reconciled := make([]SessionSummary, 0, len(index.Sessions))
 	untouched := make(map[string]bool, len(index.Sessions))
 	for i := range index.Sessions {
-		record, err := s.readSessionLocked(index.Sessions[i].ID)
+		record, err := s.readSessionIndexRecordLocked(index.Sessions[i].ID)
 		if err != nil {
 			reconciled = append(reconciled, index.Sessions[i])
 			continue

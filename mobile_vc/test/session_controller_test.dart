@@ -6563,7 +6563,16 @@ void main() {
       expect(controller.terminalExecutions, isEmpty);
       expect(controller.sessionContext.enabledSkillNames, isEmpty);
 
-      final refreshActions = service.sentPayloads
+      var refreshActions = service.sentPayloads
+          .map((item) => (item['action'] ?? '').toString())
+          .toList();
+      expect(refreshActions, isNot(contains('session_context_get')));
+      expect(refreshActions, isNot(contains('permission_rule_list')));
+
+      await Future<void>.delayed(const Duration(milliseconds: 520));
+      await _flushEvents();
+
+      refreshActions = service.sentPayloads
           .map((item) => (item['action'] ?? '').toString())
           .toList();
       expect(refreshActions, contains('session_context_get'));
@@ -12890,6 +12899,7 @@ Flutter 打出来的 app-release.apk 在 mobile_vc/build/ 下，是 ignored 构�
       expect(delayedActions, contains('permission_rule_list'));
       expect(delayedActions, contains('task_snapshot_get'));
       expect(delayedActions, contains('context_window_usage_get'));
+      expect(delayedActions, isNot(contains('relay_device_list')));
     });
 
     test('会话历史窗口使用配置里的条数', () async {
@@ -13591,6 +13601,274 @@ Flutter 打出来的 app-release.apk 在 mobile_vc/build/ 下，是 ignored 构�
       expect(sessionActions.single['sessionId'], 'session-new');
     });
 
+    test('loadSession 期间旧会话 full-sync delta 不会恢复旧会话', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-old',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-old', title: '旧会话'),
+        runtimeAlive: true,
+      ));
+      await _flushEvents();
+      expect(controller.selectedSessionId, 'session-old');
+
+      service.sentPayloads.clear();
+      controller.loadSession('session-new');
+      service.emit(SessionDeltaEvent(
+        timestamp: _timestamp.add(const Duration(seconds: 1)),
+        sessionId: 'session-old',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_delta'},
+        summary: const SessionSummary(id: 'session-old', title: '旧会话'),
+        requiresFullSync: true,
+      ));
+      await _flushEvents();
+
+      final sessionActions = service.sentPayloads
+          .where((payload) =>
+              payload['action'] == 'session_load' ||
+              payload['action'] == 'session_resume' ||
+              payload['action'] == 'session_delta_get')
+          .toList();
+      expect(sessionActions, hasLength(1));
+      expect(sessionActions.single['action'], 'session_load');
+      expect(sessionActions.single['sessionId'], 'session-new');
+      expect(controller.selectedSessionId, 'session-old');
+      expect(controller.isLoadingSession, isTrue);
+    });
+
+    test('loadSession 期间旧会话 runtime 事件不会重启 observe delta', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-old',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-old', title: '旧会话'),
+        runtimeAlive: true,
+      ));
+      await _flushEvents();
+      expect(controller.selectedSessionId, 'session-old');
+
+      service.sentPayloads.clear();
+      controller.loadSession('session-new');
+      service.emit(SessionStateEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 100)),
+        sessionId: 'session-old',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_state'},
+        state: 'RUNNING',
+      ));
+      await _flushEvents();
+
+      final deltaRequests = service.sentPayloads
+          .where((payload) => payload['action'] == 'session_delta_get')
+          .toList();
+      expect(deltaRequests, isEmpty);
+    });
+
+    test('loadSession 期间断线重连会重发 pending target load', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-old',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-old', title: '旧会话'),
+        runtimeAlive: true,
+      ));
+      await _flushEvents();
+
+      service.sentPayloads.clear();
+      controller.loadSession('session-new');
+      service.emit(ErrorEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 100)),
+        sessionId: 'session-old',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'error'},
+        code: 'ws_closed',
+        message: 'websocket closed',
+      ));
+      await _flushEvents();
+
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      await _flushEvents();
+
+      final loads = service.sentPayloads
+          .where((payload) => payload['action'] == 'session_load')
+          .toList();
+      expect(loads, hasLength(2));
+      expect(loads.last['sessionId'], 'session-new');
+      expect(loads.last['reason'], 'reconnect_pending_load');
+      expect(
+        service.sentPayloads
+            .where((payload) => payload['action'] == 'session_resume'),
+        isEmpty,
+      );
+      expect(controller.isLoadingSession, isTrue);
+    });
+
+    test('loadSession 目标 session_state 先到不会提前结束 loading', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-old',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-old', title: '旧会话'),
+      ));
+      await _flushEvents();
+
+      controller.loadSession('session-new');
+      service.emit(SessionStateEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 100)),
+        sessionId: 'session-new',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_state'},
+        state: 'IDLE',
+      ));
+      await _flushEvents();
+
+      expect(controller.isLoadingSession, isTrue);
+      expect(controller.selectedSessionId, 'session-old');
+
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 200)),
+        sessionId: 'session-new',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-new', title: '新会话'),
+        logEntries: const [
+          HistoryLogEntry(
+            kind: 'user',
+            message: '新会话 history',
+            timestamp: '2026-06-07T05:00:00Z',
+          ),
+        ],
+      ));
+      await _flushEvents();
+
+      expect(controller.selectedSessionId, 'session-new');
+      expect(controller.isLoadingSession, isFalse);
+      expect(
+        controller.timeline.map((item) => item.body),
+        contains('新会话 history'),
+      );
+    });
+
+    test('loadSession 超时会清 pending，迟到 history 不会切换会话', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(
+        service: service,
+        sessionLoadingTimeout: const Duration(milliseconds: 30),
+      );
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-old',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-old', title: '旧会话'),
+        runtimeAlive: true,
+      ));
+      await _flushEvents();
+
+      controller.loadSession('session-new');
+      await Future<void>.delayed(const Duration(milliseconds: 80));
+      await _flushEvents();
+      expect(controller.isLoadingSession, isFalse);
+      expect(controller.selectedSessionId, 'session-old');
+      expect(controller.isSessionBusy, isFalse);
+
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp.add(const Duration(seconds: 17)),
+        sessionId: 'session-new',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-new', title: '新会话'),
+        logEntries: const [
+          HistoryLogEntry(
+            kind: 'user',
+            message: '新会话历史',
+            timestamp: '2026-06-07T05:00:00Z',
+          ),
+        ],
+      ));
+      await _flushEvents();
+
+      expect(controller.selectedSessionId, 'session-old');
+      expect(
+        controller.timeline.map((item) => item.body),
+        isNot(contains('新会话历史')),
+      );
+    });
+
+    test('loadSession 目标 delta 成功应用会结束 loading', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-old',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-old', title: '旧会话'),
+        runtimeAlive: true,
+      ));
+      await _flushEvents();
+
+      controller.loadSession('session-new');
+      service.emit(SessionDeltaEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 100)),
+        sessionId: 'session-new',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_delta'},
+        summary: const SessionSummary(id: 'session-new', title: '新会话'),
+        latest: const SessionDeltaKnown(logEntryCount: 1),
+        appendLogEntries: const [
+          HistoryLogEntry(
+            kind: 'user',
+            message: '新会话 delta',
+            timestamp: '2026-06-07T05:00:00Z',
+          ),
+        ],
+      ));
+      await _flushEvents();
+
+      expect(controller.selectedSessionId, 'session-new');
+      expect(controller.isLoadingSession, isFalse);
+      expect(
+          controller.timeline.map((item) => item.body), contains('新会话 delta'));
+    });
+
     test('重复 loadSession 同一目标不会重复发送 session_load', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);
@@ -13609,6 +13887,59 @@ Flutter 打出来的 app-release.apk 在 mobile_vc/build/ 下，是 ignored 构�
           .toList();
       expect(loads, hasLength(1));
       expect(loads.single['sessionId'], 'session-target');
+    });
+
+    test('目标 session_load_failed 会立即结束 loading 并显示错误', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      controller.loadSession('session-target');
+      expect(controller.isLoadingSession, isTrue);
+
+      service.emit(ErrorEvent(
+        timestamp: _timestamp.add(const Duration(seconds: 1)),
+        sessionId: 'session-target',
+        runtimeMeta: const RuntimeMeta(),
+        raw: const {'type': 'error'},
+        code: 'session_load_failed',
+        message: 'session history window unavailable for session-target',
+      ));
+      await _flushEvents();
+
+      expect(controller.isLoadingSession, isFalse);
+      expect(controller.connectionStage, SessionConnectionStage.ready);
+      expect(
+        controller.timeline.where((item) =>
+            item.kind == 'error' &&
+            item.body.contains('session history window unavailable')),
+        isNotEmpty,
+      );
+    });
+
+    test('非目标 session_load_failed 不会结束当前 loading', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      controller.loadSession('session-target');
+      expect(controller.isLoadingSession, isTrue);
+
+      service.emit(ErrorEvent(
+        timestamp: _timestamp.add(const Duration(seconds: 1)),
+        sessionId: 'session-other',
+        runtimeMeta: const RuntimeMeta(),
+        raw: const {'type': 'error'},
+        code: 'session_load_failed',
+        message: 'session history window unavailable for session-other',
+      ));
+      await _flushEvents();
+
+      expect(controller.isLoadingSession, isTrue);
     });
 
     test('e2ee_decrypt_failed 会立即结束会话 loading', () async {
@@ -13713,6 +14044,108 @@ Flutter 打出来的 app-release.apk 在 mobile_vc/build/ 下，是 ignored 构�
             payload['action'] == 'fs_list'),
         isTrue,
       );
+      expect(
+        service.sentPayloads
+            .where((payload) => payload['action'] == 'session_diff_page_get'),
+        isEmpty,
+        reason: 'diff hydration is user-triggered so relay bootstrap does not '
+            'queue a slow non-critical projection read after session switch',
+      );
+    });
+
+    test('loadSession 期间慢 bootstrap 请求不会发到旧会话', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-old',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-old', title: '旧会话'),
+        latest: const SessionDeltaKnown(
+          diffCount: 1,
+          terminalExecutionCount: 1,
+          terminalStdoutLength: 10,
+          terminalStderrLength: 5,
+        ),
+        resumeRuntimeMeta: const RuntimeMeta(cwd: '/workspace'),
+      ));
+      await _flushEvents();
+      service.sentPayloads.clear();
+
+      controller.loadSession('session-new');
+      controller.requestDiffPage();
+      controller.requestTerminalHydration();
+      controller.requestSessionContext();
+      controller.requestTaskSnapshot();
+      controller.requestContextWindowUsage();
+      controller.requestRuntimeProcessList();
+      controller.requestPermissionRuleList();
+      await _flushEvents();
+
+      final actions =
+          service.sentPayloads.map((payload) => payload['action']).toList();
+      expect(actions, contains('session_load'));
+      expect(actions, isNot(contains('session_diff_page_get')));
+      expect(actions, isNot(contains('session_terminal_range_get')));
+      expect(actions, isNot(contains('session_terminal_execution_page_get')));
+      expect(actions, isNot(contains('session_context_get')));
+      expect(actions, isNot(contains('task_snapshot_get')));
+      expect(actions, isNot(contains('context_window_usage_get')));
+      expect(actions, isNot(contains('runtime_process_list')));
+      expect(actions, isNot(contains('permission_rule_list')));
+    });
+
+    test('从长会话快速切短会话会取消长会话延迟 bootstrap', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.sentPayloads.clear();
+
+      controller.loadSession('session-long');
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-long',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-long', title: '长会话'),
+        logEntries: [
+          HistoryLogEntry(
+            kind: 'markdown',
+            message: '长会话首屏',
+            timestamp: _timestamp.toIso8601String(),
+          ),
+        ],
+        latest: const SessionDeltaKnown(logEntryCount: 17754),
+        resumeRuntimeMeta: const RuntimeMeta(cwd: '/workspace'),
+      ));
+      await _flushEvents();
+
+      service.sentPayloads.clear();
+      controller.loadSession('session-short');
+      await Future<void>.delayed(const Duration(milliseconds: 520));
+      await _flushEvents();
+
+      final actions =
+          service.sentPayloads.map((payload) => payload['action']).toList();
+      expect(actions, contains('session_load'));
+      expect(
+        service.sentPayloads
+            .where((payload) => payload['action'] == 'session_load')
+            .single['sessionId'],
+        'session-short',
+      );
+      expect(actions, isNot(contains('session_context_get')));
+      expect(actions, isNot(contains('permission_rule_list')));
+      expect(actions, isNot(contains('runtime_process_list')));
+      expect(actions, isNot(contains('task_snapshot_get')));
     });
 
     test('前台恢复只发 session_resume，history_loaded delta 仍会补齐', () async {

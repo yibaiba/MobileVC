@@ -44,7 +44,7 @@ const projectionSessionListFreshnessDelay = 400 * time.Millisecond
 const projectionPersistQueueSize = 64
 const projectionPersistTimeout = 10 * time.Second
 const projectionPersistRetryDelay = 750 * time.Millisecond
-const gatewayRelaySafePayloadBudgetBytes = 8 * 1024 * 1024
+const gatewayRelaySafePayloadBudgetBytes = 6 * 1024 * 1024
 
 func sessionHistoryWindowLimit(requested int) int {
 	if requested <= 0 {
@@ -75,6 +75,11 @@ type projectionTraceMetrics struct {
 	terminalExecutions int
 	stdoutBytes        int
 	stderrBytes        int
+}
+
+type loadedSessionHistoryWindow struct {
+	window data.SessionHistoryWindow
+	ok     bool
 }
 
 type sessionListCacheEntry struct {
@@ -1195,6 +1200,8 @@ type gatewayReadResult struct {
 
 type gatewaySessionLoadResult struct {
 	actionKey         string
+	sequence          uint64
+	previousSessionID string
 	req               protocol.SessionLoadRequestEvent
 	loadHistoryLimit  int
 	trace             *sessionLoadTrace
@@ -1203,6 +1210,28 @@ type gatewaySessionLoadResult struct {
 	historyWindow     data.SessionHistoryWindow
 	historyWindowOK   bool
 	err               error
+}
+
+type gatewaySessionResumeResult struct {
+	actionKey           string
+	sequence            uint64
+	previousSessionID   string
+	req                 protocol.SessionResumeRequestEvent
+	resumeHistoryLimit  int
+	activeRuntimeResume bool
+	record              data.SessionRecord
+	historyWindow       data.SessionHistoryWindow
+	historyWindowOK     bool
+	err                 error
+}
+
+type gatewayAsyncEventResult struct {
+	actionKey string
+	action    string
+	sessionID string
+	event     any
+	events    []any
+	err       error
 }
 
 func enqueueGatewayWrite(ctx context.Context, writeCh chan<- any, priorityWriteCh chan<- any, event any) {
@@ -1384,6 +1413,8 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 	var activeRuntimeSession *runtimeSession // nil for detached service, set when Attach() succeeds
 	readCh := make(chan gatewayReadResult, 1)
 	sessionLoadResultCh := make(chan gatewaySessionLoadResult, 1)
+	sessionResumeResultCh := make(chan gatewaySessionResumeResult, 1)
+	asyncEventResultCh := make(chan gatewayAsyncEventResult, gatewayWriteQueueSize)
 	writeCh := make(chan any, gatewayWriteQueueSize)
 	priorityWriteCh := make(chan any, gatewayPriorityWriteQueueSize)
 	writeErrCh := make(chan error, 1)
@@ -1506,9 +1537,22 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 		}
 		h.projectionWriter.updateMeta(h.SessionStore, record)
 	}
-
 	finalizeProjectionSnapshotForService := func(sessionID string, service *session.Service, loaded data.ProjectionSnapshot) data.ProjectionSnapshot {
 		return finalizeProjectionSnapshotForRuntimeService(sessionID, service, loaded)
+	}
+
+	readProjectionFromRuntimeMetadata := func(sessionID string) (data.ProjectionSnapshot, bool) {
+		metaStore, ok := h.SessionStore.(data.SessionRuntimeMetaStore)
+		if !ok {
+			logx.Warn("ws", "runtime metadata projection unavailable because store does not implement SessionRuntimeMetaStore: connectionID=%s sessionID=%s remoteAddr=%s", connectionID, sessionID, remoteAddr)
+			return data.ProjectionSnapshot{}, false
+		}
+		meta, err := metaStore.GetSessionRuntimeMetadata(context.WithoutCancel(ctx), sessionID)
+		if err != nil {
+			logx.Warn("ws", "runtime metadata projection read failed: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, sessionID, remoteAddr, err)
+			return data.ProjectionSnapshot{}, false
+		}
+		return meta.Record.Projection, true
 	}
 
 	buildProjectionSnapshotForService := func(sessionID string, service *session.Service) data.ProjectionSnapshot {
@@ -1522,7 +1566,9 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 		if service != nil {
 			runtimeSnapshot := service.RuntimeSnapshot()
 			if runtimeSnapshot.Running && strings.TrimSpace(runtimeSnapshot.ActiveSession) == strings.TrimSpace(sessionID) {
-				loaded = readProjectionFromSessionStoreRaw(h.SessionStore, storeCtx, sessionID, connectionID, remoteAddr)
+				if metaProjection, ok := readProjectionFromRuntimeMetadata(sessionID); ok {
+					loaded = metaProjection
+				}
 				return h.mergeActiveLiveProjection(sessionID, finalizeProjectionSnapshotForService(sessionID, service, loaded))
 			}
 		}
@@ -1536,6 +1582,14 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 		loaded, ok := cachedProjection(sessionID)
 		if !ok {
 			loaded = readProjectionFromSessionStoreRaw(h.SessionStore, storeCtx, sessionID, connectionID, remoteAddr)
+		}
+		return h.mergeActiveLiveProjection(sessionID, finalizeProjectionSnapshotForService(sessionID, service, loaded))
+	}
+
+	buildStatusProjectionSnapshotForService := func(sessionID string, service *session.Service) data.ProjectionSnapshot {
+		loaded, ok := cachedProjection(sessionID)
+		if !ok {
+			loaded, _ = readProjectionFromRuntimeMetadata(sessionID)
 		}
 		return h.mergeActiveLiveProjection(sessionID, finalizeProjectionSnapshotForService(sessionID, service, loaded))
 	}
@@ -1579,7 +1633,10 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			return false
 		}
 		snapshot := entry.service.RuntimeSnapshot()
-		if snapshot.Running && strings.TrimSpace(snapshot.ActiveSession) == trimmedSessionID {
+		if !snapshot.Running {
+			return false
+		}
+		if strings.TrimSpace(snapshot.ActiveSession) == trimmedSessionID {
 			return true
 		}
 		if codexsync.IsMirrorSessionID(trimmedSessionID) {
@@ -1629,15 +1686,9 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 		return loadStoredSessionRecordForRequest(targetSessionID)
 	}
 
-	canUseLoadedSessionHistoryWindow := func(record data.SessionRecord, activeRuntime bool) bool {
-		if activeRuntime || isNativeMirrorSessionID(record.Summary.ID) {
-			return false
-		}
-		if strings.TrimSpace(record.Summary.ClaudeSessionUUID) == "" {
-			return true
-		}
-		if strings.TrimSpace(firstNonEmptyString(record.Summary.Runtime.CWD, record.Projection.Runtime.CWD)) != "" {
-			return false
+	canUseLoadedSessionHistoryWindow := func(record data.SessionRecord) bool {
+		if isNativeMirrorSessionID(record.Summary.ID) {
+			return codexMirrorCacheMatchesSource(record)
 		}
 		return true
 	}
@@ -1648,8 +1699,8 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			return data.SessionHistoryWindow{}, false, fmt.Errorf("session ID is required")
 		}
 		windowStore, ok := h.SessionStore.(data.SessionHistoryWindowStore)
-		if !ok || isNativeMirrorSessionID(targetSessionID) {
-			return data.SessionHistoryWindow{}, false, nil
+		if !ok {
+			return data.SessionHistoryWindow{}, false, fmt.Errorf("session history window store unavailable for session %s", targetSessionID)
 		}
 		window, err := windowStore.GetSessionHistoryWindow(context.WithoutCancel(ctx), data.SessionHistoryWindowRequest{
 			SessionID: targetSessionID,
@@ -1662,37 +1713,46 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 		return window, true, nil
 	}
 
-	loadSelectedProjectionRecord := func(requestedSessionID string) (data.SessionRecord, *runtimeSession, error) {
-		targetSessionID := strings.TrimSpace(requestedSessionID)
-		if targetSessionID == "" {
-			targetSessionID = strings.TrimSpace(selectedSessionID)
-		}
-		if targetSessionID == "" {
-			return data.SessionRecord{}, nil, fmt.Errorf("session ID is required")
-		}
-		if targetSessionID != strings.TrimSpace(selectedSessionID) {
-			return data.SessionRecord{}, nil, fmt.Errorf("session %s is not selected", targetSessionID)
-		}
-		record, err := loadSessionDeltaRecord(targetSessionID)
+	loadUsableSessionHistoryWindow := func(targetSessionID string, before, limit int, activeRuntime bool) (loadedSessionHistoryWindow, error) {
+		window, ok, err := loadSessionHistoryWindow(targetSessionID, before, limit)
 		if err != nil {
-			return data.SessionRecord{}, nil, err
+			if isNativeMirrorSessionID(targetSessionID) && errors.Is(err, os.ErrNotExist) {
+				return loadedSessionHistoryWindow{}, nil
+			}
+			return loadedSessionHistoryWindow{}, err
 		}
-		updateProjectionMeta(record)
-		sessionRuntime, sessionRuntimeSvc := runtimeForSession(record.Summary.ID)
-		if !isNativeMirrorSessionID(record.Summary.ID) {
-			record = mergeClaudeJSONLToRecord(ctx, h.SessionStore, record, sessionRuntimeSvc)
-			updateProjectionMeta(record)
+		if !ok || !canUseLoadedSessionHistoryWindow(window.Record) {
+			if !isNativeMirrorSessionID(targetSessionID) {
+				return loadedSessionHistoryWindow{}, fmt.Errorf("session history window unavailable for session %s", targetSessionID)
+			}
+			return loadedSessionHistoryWindow{}, nil
 		}
+		return loadedSessionHistoryWindow{window: window, ok: true}, nil
+	}
+
+	emit := func(event any) {
+		enqueueGatewayWrite(ctx, writeCh, priorityWriteCh, event)
+	}
+
+	emitSessionHistoryForStoredSessionWindow := func(targetSessionID string, limit int, sessionRuntime *runtimeSession) (bool, error) {
+		loadedWindow, err := loadUsableSessionHistoryWindow(targetSessionID, 0, limit, false)
+		if err != nil {
+			return false, err
+		}
+		if !loadedWindow.ok {
+			return false, nil
+		}
+		historyWindow := loadedWindow.window
+		record := historyWindow.Record
+		_, targetRuntimeSvc := runtimeForSession(record.Summary.ID)
 		freshProjection := session.NormalizeProjectionSnapshot(record.Projection)
-		runtimeProjection := h.mergeActiveLiveProjection(record.Summary.ID, finalizeProjectionSnapshotForService(record.Summary.ID, sessionRuntimeSvc, freshProjection))
-		if isNativeMirrorSessionID(record.Summary.ID) {
-			record.Projection = mergeProjectionWithOptionalRuntime(freshProjection, runtimeProjection, sessionRuntimeSvc, record.Summary.ID)
-		} else {
-			record.Projection = runtimeProjection
-		}
+		runtimeProjection := h.mergeActiveLiveProjection(record.Summary.ID, finalizeProjectionSnapshotForService(record.Summary.ID, targetRuntimeSvc, freshProjection))
+		record.Projection = runtimeProjection
+		record.Projection.LogEntries = nil
 		record.Summary.Runtime = record.Projection.Runtime
-		cacheProjection(record.Summary.ID, record.Projection, false)
-		return record, sessionRuntime, nil
+		historyWindow.Record = record
+		emit(session.SessionHistoryWindowEventFromWindowWithCursorAndPayloadLimit(historyWindow, sessionRecordRuntimeAlive(record, targetRuntimeSvc), deltaCursorSnapshot(sessionRuntime), gatewayRelaySafePayloadBudgetBytes))
+		return true, nil
 	}
 
 	persistProjection := func(sessionID string, snapshot data.ProjectionSnapshot, force bool) {
@@ -1723,15 +1783,169 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 		if h.SessionStore == nil || strings.TrimSpace(sessionID) == "" {
 			return ""
 		}
-		record, err := h.SessionStore.GetSession(ctx, sessionID)
-		if err != nil {
+		metaStore, ok := h.SessionStore.(data.SessionRuntimeMetaStore)
+		if !ok {
+			logx.Warn("ws", "claude session uuid lookup skipped because runtime metadata store unavailable: connectionID=%s sessionID=%s remoteAddr=%s", connectionID, sessionID, remoteAddr)
 			return ""
 		}
-		return strings.TrimSpace(record.Summary.ClaudeSessionUUID)
+		meta, err := metaStore.GetSessionRuntimeMetadata(context.WithoutCancel(ctx), sessionID)
+		if err != nil {
+			logx.Warn("ws", "claude session uuid lookup failed: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, sessionID, remoteAddr, err)
+			return ""
+		}
+		return strings.TrimSpace(meta.Record.Summary.ClaudeSessionUUID)
 	}
 
-	emit := func(event any) {
-		enqueueGatewayWrite(ctx, writeCh, priorityWriteCh, event)
+	buildLiveRuntimeDeltaIfNewer := func(meta data.SessionRuntimeMetadata, req protocol.SessionDeltaRequestEvent, sessionRuntime *runtimeSession, sessionRuntimeSvc *session.Service, runtimeAlive bool) (protocol.SessionDeltaEvent, bool) {
+		if sessionRuntime == nil {
+			return protocol.SessionDeltaEvent{}, false
+		}
+		liveProjection, _, ok := sessionRuntime.latestProjectionSnapshot()
+		if !ok {
+			return protocol.SessionDeltaEvent{}, false
+		}
+		liveProjection = session.NormalizeProjectionSnapshot(liveProjection)
+		liveCount := len(liveProjection.LogEntries)
+		if liveCount <= meta.Latest.LogEntryCount || liveCount <= req.Known.LogEntryCount {
+			return protocol.SessionDeltaEvent{}, false
+		}
+		record := meta.Record
+		record.Projection = h.mergeActiveLiveProjection(record.Summary.ID, finalizeProjectionSnapshotForService(record.Summary.ID, sessionRuntimeSvc, liveProjection))
+		record.Summary.Runtime = record.Projection.Runtime
+		if record.Summary.EntryCount < liveCount {
+			record.Summary.EntryCount = liveCount
+		}
+		deltaEvent := session.SessionDeltaEventFromRecordWithPayloadLimit(record, req.Known, deltaCursorSnapshot(sessionRuntime), runtimeAlive, gatewayRelaySafePayloadBudgetBytes, sessionResumeHistoryLimit)
+		if deltaEvent.RequiresFullSync {
+			return protocol.SessionDeltaEvent{}, false
+		}
+		logx.Info("ws", "session delta response: connectionID=%s sessionID=%s remoteAddr=%s reason=%q runtimeAlive=%v canResume=%v requiresFullSync=%v logEntries=%d liveRuntimeProjection=true", connectionID, record.Summary.ID, remoteAddr, req.Reason, runtimeAlive, sessionRuntime != nil && runtimeAlive, deltaEvent.RequiresFullSync, liveCount)
+		return deltaEvent, true
+	}
+
+	buildWindowMetadataDeltaIfPossible := func(req protocol.SessionDeltaRequestEvent, targetSessionID string, sessionRuntime *runtimeSession, sessionRuntimeSvc *session.Service) (protocol.SessionDeltaEvent, bool, error) {
+		if req.Known.LogEntryCount < 0 {
+			return protocol.SessionDeltaEvent{}, false, nil
+		}
+		metaStore, ok := h.SessionStore.(data.SessionRuntimeMetaStore)
+		if !ok {
+			if !isNativeMirrorSessionID(targetSessionID) {
+				return protocol.SessionDeltaEvent{}, true, fmt.Errorf("session runtime metadata store unavailable for session %s", targetSessionID)
+			}
+			return protocol.SessionDeltaEvent{}, false, nil
+		}
+		meta, err := metaStore.GetSessionRuntimeMetadata(context.WithoutCancel(ctx), targetSessionID)
+		if err != nil {
+			if isNativeMirrorSessionID(targetSessionID) && errors.Is(err, os.ErrNotExist) {
+				return protocol.SessionDeltaEvent{}, false, nil
+			}
+			return protocol.SessionDeltaEvent{}, true, err
+		}
+		if isNativeMirrorSessionID(targetSessionID) && !codexMirrorCacheMatchesSource(meta.Record) {
+			return protocol.SessionDeltaEvent{}, false, nil
+		}
+		if isNativeMirrorSessionID(targetSessionID) && req.Known.LogEntryCount > meta.Latest.LogEntryCount {
+			return protocol.SessionDeltaEvent{}, false, nil
+		}
+		record := meta.Record
+		freshProjection := session.NormalizeProjectionSnapshot(record.Projection)
+		runtimeProjection := h.mergeActiveLiveProjection(record.Summary.ID, finalizeProjectionSnapshotForService(record.Summary.ID, sessionRuntimeSvc, freshProjection))
+		record.Projection = runtimeProjection
+		record.Projection.LogEntries = nil
+		record.Summary.Runtime = record.Projection.Runtime
+		meta.Record = record
+		runtimeAlive := sessionRecordRuntimeAlive(record, sessionRuntimeSvc)
+		if deltaEvent, ok := buildLiveRuntimeDeltaIfNewer(meta, req, sessionRuntime, sessionRuntimeSvc, runtimeAlive); ok {
+			return deltaEvent, true, nil
+		}
+		if !isNativeMirrorSessionID(targetSessionID) && strings.TrimSpace(meta.Record.Summary.ClaudeSessionUUID) != "" {
+			cwd := strings.TrimSpace(firstNonEmptyString(meta.Record.Summary.Runtime.CWD, meta.Record.Projection.Runtime.CWD))
+			csuuid := strings.TrimSpace(meta.Record.Summary.ClaudeSessionUUID)
+			if cwd != "" && csuuid != "" {
+				newEntries, newCount, mergeErr := claudesync.ReadJSONLAppendEntries(cwd, csuuid, meta.Record.Summary.JSONLSyncEntryCount)
+				if mergeErr != nil {
+					return protocol.SessionDeltaEvent{}, true, mergeErr
+				}
+				if len(newEntries) > 0 {
+					appendStore, ok := h.SessionStore.(data.SessionLogEntryAppendStore)
+					if !ok {
+						return protocol.SessionDeltaEvent{}, true, fmt.Errorf("session log entry append store unavailable for claude jsonl refresh: %s", targetSessionID)
+					}
+					summary, appendErr := appendStore.AppendSessionLogEntries(context.WithoutCancel(ctx), targetSessionID, newEntries, data.WithJSONLSyncEntryCount(newCount))
+					if appendErr != nil {
+						return protocol.SessionDeltaEvent{}, true, appendErr
+					}
+					record.Summary = summary
+					meta.Record = record
+					meta.Latest.LogEntryCount = summary.EntryCount
+					appendWindow, err := loadUsableSessionHistoryWindow(targetSessionID, meta.Latest.LogEntryCount, sessionHistoryWindowLimit(meta.Latest.LogEntryCount-req.Known.LogEntryCount), false)
+					if err != nil {
+						return protocol.SessionDeltaEvent{}, true, err
+					}
+					if !appendWindow.ok {
+						return protocol.SessionDeltaEvent{}, true, fmt.Errorf("session history append window unavailable for session %s", targetSessionID)
+					}
+					appendWindow.window.Record = record
+					if appendWindow.window.LogEntryTotal != meta.Latest.LogEntryCount {
+						return protocol.SessionDeltaEvent{}, true, fmt.Errorf("session history window count mismatch for %s: window total %d, metadata count %d", targetSessionID, appendWindow.window.LogEntryTotal, meta.Latest.LogEntryCount)
+					}
+					deltaEvent := session.SessionDeltaEventFromHistoryWindowWithCounts(appendWindow.window, meta.Latest, req.Known, deltaCursorSnapshot(sessionRuntime), runtimeAlive, gatewayRelaySafePayloadBudgetBytes)
+					logx.Info("ws", "session delta response: connectionID=%s sessionID=%s remoteAddr=%s reason=%q runtimeAlive=%v canResume=%v requiresFullSync=%v logEntries=%d appendWindow=true claudeJSONLRefresh=true appendEntries=%d", connectionID, record.Summary.ID, remoteAddr, req.Reason, runtimeAlive, sessionRuntime != nil && runtimeAlive, deltaEvent.RequiresFullSync, meta.Latest.LogEntryCount, len(deltaEvent.AppendLogEntries))
+					return deltaEvent, true, nil
+				}
+				if newCount > meta.Record.Summary.JSONLSyncEntryCount {
+					meta.Record.Summary.JSONLSyncEntryCount = newCount
+				}
+			}
+		}
+		if req.Known.LogEntryCount < meta.Latest.LogEntryCount {
+			loadedWindow, err := loadUsableSessionHistoryWindow(targetSessionID, meta.Latest.LogEntryCount, sessionHistoryWindowLimit(meta.Latest.LogEntryCount-req.Known.LogEntryCount), false)
+			if err != nil {
+				return protocol.SessionDeltaEvent{}, true, err
+			}
+			if !loadedWindow.ok {
+				if !isNativeMirrorSessionID(targetSessionID) {
+					return protocol.SessionDeltaEvent{}, true, fmt.Errorf("session history append window unavailable for session %s", targetSessionID)
+				}
+				return protocol.SessionDeltaEvent{}, false, nil
+			}
+			window := loadedWindow.window
+			window.Record = record
+			if window.LogEntryTotal != meta.Latest.LogEntryCount {
+				return protocol.SessionDeltaEvent{}, true, fmt.Errorf("session history window count mismatch for %s: window total %d, metadata count %d", targetSessionID, window.LogEntryTotal, meta.Latest.LogEntryCount)
+			}
+			deltaEvent := session.SessionDeltaEventFromHistoryWindowWithCounts(window, meta.Latest, req.Known, deltaCursorSnapshot(sessionRuntime), runtimeAlive, gatewayRelaySafePayloadBudgetBytes)
+			logx.Info("ws", "session delta response: connectionID=%s sessionID=%s remoteAddr=%s reason=%q runtimeAlive=%v canResume=%v requiresFullSync=%v logEntries=%d appendWindow=true appendEntries=%d", connectionID, record.Summary.ID, remoteAddr, req.Reason, runtimeAlive, sessionRuntime != nil && runtimeAlive, deltaEvent.RequiresFullSync, meta.Latest.LogEntryCount, len(deltaEvent.AppendLogEntries))
+			return deltaEvent, true, nil
+		}
+		deltaEvent := session.SessionDeltaEventFromRuntimeMetadata(meta, req.Known, deltaCursorSnapshot(sessionRuntime), runtimeAlive, req.Known.LogEntryCount > meta.Latest.LogEntryCount)
+		if deltaEvent.RequiresFullSync {
+			deltaEvent.PayloadLimited = true
+			deltaEvent.PayloadLimitReason = "client_known_log_count_exceeds_latest"
+		}
+		logx.Info("ws", "session delta response: connectionID=%s sessionID=%s remoteAddr=%s reason=%q runtimeAlive=%v canResume=%v requiresFullSync=%v logEntries=%d runtimeMetaStore=true", connectionID, record.Summary.ID, remoteAddr, req.Reason, runtimeAlive, sessionRuntime != nil && runtimeAlive, deltaEvent.RequiresFullSync, meta.Latest.LogEntryCount)
+		return deltaEvent, true, nil
+	}
+	loadProjectionRecordForAsyncEvent := func(targetSessionID string) (data.SessionRecord, *runtimeSession, error) {
+		record, err := loadSessionDeltaRecord(targetSessionID)
+		if err != nil {
+			return data.SessionRecord{}, nil, err
+		}
+		updateProjectionMeta(record)
+		sessionRuntime, sessionRuntimeSvc := runtimeForSession(record.Summary.ID)
+		if !isNativeMirrorSessionID(record.Summary.ID) {
+			record = mergeClaudeJSONLToRecord(ctx, h.SessionStore, record, sessionRuntimeSvc)
+			updateProjectionMeta(record)
+		}
+		freshProjection := session.NormalizeProjectionSnapshot(record.Projection)
+		runtimeProjection := h.mergeActiveLiveProjection(record.Summary.ID, finalizeProjectionSnapshotForService(record.Summary.ID, sessionRuntimeSvc, freshProjection))
+		if isNativeMirrorSessionID(record.Summary.ID) {
+			record.Projection = mergeProjectionWithOptionalRuntime(freshProjection, runtimeProjection, sessionRuntimeSvc, record.Summary.ID)
+		} else {
+			record.Projection = runtimeProjection
+		}
+		record.Summary.Runtime = record.Projection.Runtime
+		return record, sessionRuntime, nil
 	}
 	unregisterFreshnessSubscriber := h.registerFreshnessSubscriber(connectionID, func(event any) bool {
 		return tryEnqueueGatewayWrite(ctx, writeCh, priorityWriteCh, event)
@@ -2018,18 +2232,81 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 	}
 
 	sessionLoadInFlight := make(map[string]struct{})
+	sessionResumeInFlight := make(map[string]struct{})
+	var latestSessionSwitchSequence uint64
+	pendingSessionSwitchTargetID := ""
+	asyncEventInFlight := make(map[string]struct{})
+	var emitAndPersistFor func(sessionID string) func(any)
+	pendingSessionSwitchActive := func() bool {
+		return strings.TrimSpace(pendingSessionSwitchTargetID) != ""
+	}
+	targetIsPendingSessionSwitch := func(sessionID string) bool {
+		targetSessionID := strings.TrimSpace(sessionID)
+		return targetSessionID != "" && targetSessionID == strings.TrimSpace(pendingSessionSwitchTargetID)
+	}
+	clearPendingSessionSwitch := func(sessionID string) {
+		if targetIsPendingSessionSwitch(sessionID) {
+			pendingSessionSwitchTargetID = ""
+		}
+	}
+	canProcessSelectedSessionReadAction := func(action, targetSessionID string) bool {
+		targetSessionID = strings.TrimSpace(targetSessionID)
+		if targetSessionID == "" {
+			return false
+		}
+		if pendingSessionSwitchActive() && !targetIsPendingSessionSwitch(targetSessionID) {
+			logx.Info("ws", "ignore %s while session switch is pending: connectionID=%s sessionID=%s pendingSessionID=%s requestedSessionID=%s remoteAddr=%s", action, connectionID, selectedSessionID, pendingSessionSwitchTargetID, targetSessionID, remoteAddr)
+			return false
+		}
+		if targetSessionID != strings.TrimSpace(selectedSessionID) && !targetIsPendingSessionSwitch(targetSessionID) {
+			logx.Info("ws", "ignore %s for non-selected session: connectionID=%s sessionID=%s pendingSessionID=%s requestedSessionID=%s remoteAddr=%s", action, connectionID, selectedSessionID, pendingSessionSwitchTargetID, targetSessionID, remoteAddr)
+			return false
+		}
+		return true
+	}
+	handleAsyncEventResult := func(result gatewayAsyncEventResult) {
+		if strings.TrimSpace(result.actionKey) != "" {
+			delete(asyncEventInFlight, result.actionKey)
+		}
+		targetSessionID := strings.TrimSpace(result.sessionID)
+		if targetSessionID != "" && !canProcessSelectedSessionReadAction(result.action+" result", targetSessionID) {
+			return
+		}
+		if result.err != nil {
+			logx.Warn("ws", "%s failed: connectionID=%s sessionID=%s requestedSessionID=%s remoteAddr=%s err=%v", result.action, connectionID, selectedSessionID, targetSessionID, remoteAddr, result.err)
+			emit(protocol.NewErrorEvent(selectedSessionID, result.err.Error(), ""))
+			return
+		}
+		if result.event != nil {
+			emit(result.event)
+		}
+		for _, event := range result.events {
+			if event != nil {
+				emit(event)
+			}
+		}
+	}
 	handleSessionLoadResult := func(result gatewaySessionLoadResult) {
 		delete(sessionLoadInFlight, result.actionKey)
 		req := result.req
 		trace := result.trace
 		activeRuntimeLoad := result.activeRuntimeLoad
 		record := result.record
+		if result.sequence != latestSessionSwitchSequence {
+			logx.Info("ws", "ignore stale session_load result: connectionID=%s sessionID=%s requestedSessionID=%s remoteAddr=%s sequence=%d latestSequence=%d", connectionID, selectedSessionID, req.SessionID, remoteAddr, result.sequence, latestSessionSwitchSequence)
+			if trace != nil {
+				trace.Finish("", activeRuntimeLoad, projectionTraceMetrics{})
+			}
+			return
+		}
 		if result.err != nil {
+			clearPendingSessionSwitch(req.SessionID)
 			logx.Warn("ws", "load session failed: connectionID=%s sessionID=%s requestedSessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, req.SessionID, remoteAddr, result.err)
 			if trace != nil {
 				trace.Finish("", activeRuntimeLoad, projectionTraceMetrics{})
 			}
-			emit(protocol.NewErrorEvent(selectedSessionID, result.err.Error(), ""))
+			errorSessionID := strings.TrimSpace(req.SessionID)
+			emit(protocol.NewErrorEventWithCode(errorSessionID, result.err.Error(), "", "session_load_failed"))
 			return
 		}
 		if trace == nil {
@@ -2040,6 +2317,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			updateProjectionMeta(record)
 		}
 		switchRuntimeSession(record.Summary.ID, runtimeSwitchDetachPrevious)
+		clearPendingSessionSwitch(record.Summary.ID)
 		trace.Step("switch_runtime")
 		if !activeRuntimeLoad && !isNativeMirrorSessionID(record.Summary.ID) && !result.historyWindowOK {
 			record = mergeClaudeJSONLToRecord(ctx, h.SessionStore, record, runtimeSvc)
@@ -2100,8 +2378,208 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 		trace.Step("emit_session_state")
 		trace.Finish(record.Summary.ID, activeRuntimeLoad, projectionMetrics(record.Projection))
 	}
+	handleSessionResumeResult := func(result gatewaySessionResumeResult) {
+		delete(sessionResumeInFlight, result.actionKey)
+		req := result.req
+		if result.sequence != latestSessionSwitchSequence {
+			logx.Info("ws", "ignore stale session_resume result: connectionID=%s sessionID=%s requestedSessionID=%s remoteAddr=%s sequence=%d latestSequence=%d", connectionID, selectedSessionID, req.SessionID, remoteAddr, result.sequence, latestSessionSwitchSequence)
+			return
+		}
+		if result.err != nil {
+			clearPendingSessionSwitch(req.SessionID)
+			logx.Warn("ws", "resume session failed: connectionID=%s sessionID=%s requestedSessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, req.SessionID, remoteAddr, result.err)
+			errorSessionID := strings.TrimSpace(req.SessionID)
+			emit(protocol.NewErrorEventWithCode(errorSessionID, result.err.Error(), "", "session_resume_failed"))
+			return
+		}
+		record := result.record
+		historyWindow := result.historyWindow
+		historyWindowOK := result.historyWindowOK
+		if !historyWindowOK {
+			updateProjectionMeta(record)
+		}
+		switchRuntimeSession(record.Summary.ID, runtimeSwitchDetachPrevious)
+		clearPendingSessionSwitch(record.Summary.ID)
+		sessionRuntime := h.runtimeSessions.Ensure(record.Summary.ID)
+		resumeEmitAndPersist := emitAndPersistFor(selectedSessionID)
+		runtimeSvc.SetSink(sessionRuntime.EnsureBufferedSinkWithProcessor(resumeEmitAndPersist))
+		if !isNativeMirrorSessionID(record.Summary.ID) && !historyWindowOK {
+			record = mergeClaudeJSONLToRecord(ctx, h.SessionStore, record, runtimeSvc)
+			updateProjectionMeta(record)
+		}
+		augmentedProjection := session.NormalizeProjectionSnapshot(record.Projection)
+		var runtimeProjection data.ProjectionSnapshot
+		if historyWindowOK {
+			runtimeProjection = h.mergeActiveLiveProjection(record.Summary.ID, finalizeProjectionSnapshotForService(record.Summary.ID, runtimeSvc, augmentedProjection))
+		} else {
+			runtimeProjection = buildProjectionSnapshotForService(record.Summary.ID, runtimeSvc)
+		}
+		projection := runtimeProjection
+		if isNativeMirrorSessionID(record.Summary.ID) {
+			projection = mergeProjectionWithOptionalRuntime(augmentedProjection, runtimeProjection, runtimeSvc, record.Summary.ID)
+		} else if preferAugmentedLogEntries(augmentedProjection.LogEntries, projection.LogEntries) {
+			projection.LogEntries = augmentedProjection.LogEntries
+		}
+		record.Projection = projection
+		record.Summary.Runtime = projection.Runtime
+		if !historyWindowOK {
+			updateProjectionMeta(record)
+			cacheProjection(record.Summary.ID, record.Projection, false)
+		}
+		resumeMeta := protocol.MergeRuntimeMeta(protocol.RuntimeMeta{
+			Command:          projection.Runtime.Command,
+			Engine:           projection.Runtime.Engine,
+			CodexSandboxMode: projection.Runtime.CodexSandboxMode,
+			CWD:              projection.Runtime.CWD,
+			PermissionMode:   projection.Runtime.PermissionMode,
+			ResumeSessionID:  projection.Runtime.ResumeSessionID,
+			ClaudeLifecycle:  projection.Runtime.ClaudeLifecycle,
+		}, req.RuntimeMeta)
+		runtimeSvc.SyncRuntimeMeta(resumeMeta)
+		if updatedProjection, changed := projectionWithResumeRuntimeMeta(projection, resumeMeta); changed {
+			projection = updatedProjection
+			record.Projection = projection
+			record.Summary.Runtime = projection.Runtime
+			persistProjectionNow(record.Summary.ID, record.Projection)
+			if !historyWindowOK {
+				updateProjectionMeta(record)
+				cacheProjection(record.Summary.ID, record.Projection, false)
+			}
+		}
+		runtimeAlive := sessionRecordRuntimeAlive(record, runtimeSvc)
+		if runtimeAlive && session.ShouldEmitResumeRecoveryStateEvent(runtimeSvc, projection, req.LastKnownRuntimeState) {
+			recovery := session.BuildResumeRecoveryStateEvent(record.Summary.ID, runtimeSvc, projection, req.LastKnownRuntimeState)
+			emit(recovery)
+			if status, ok := session.AIStatusEventForBackendEvent(record.Summary.ID, runtimeSvc, projection, recovery); ok {
+				emit(status)
+			}
+		}
+		if historyWindowOK {
+			historyWindow.Record = record
+			historyWindow.Record.Projection.LogEntries = nil
+			emit(session.SessionHistoryWindowEventFromWindowWithCursorAndPayloadLimit(historyWindow, runtimeAlive, deltaCursorSnapshot(sessionRuntime), gatewayRelaySafePayloadBudgetBytes))
+		} else {
+			emit(session.SessionHistoryWindowEventFromRecordWithCursorAndPayloadLimit(record, runtimeAlive, result.resumeHistoryLimit, deltaCursorSnapshot(sessionRuntime), gatewayRelaySafePayloadBudgetBytes))
+		}
+		emitContextWindowUsageIfAvailable(record.Summary.ID, runtimeSvc)
+		logx.Info("ws", "session history emitted: sessionID=%s runtimeAlive=%v ownership=%s limit=%d", record.Summary.ID, runtimeAlive, record.Summary.Ownership, result.resumeHistoryLimit)
+		restoredState := ""
+		var restoredAgentEvent *protocol.AgentStateEvent
+		if restored := restoredAgentStateEventFromRecord(record, runtimeAlive); restored != nil {
+			restoredState = restored.State
+			restoredAgentEvent = restored
+		}
+		replayedCount := 0
+		latestCursor := int64(0)
+		currentPermissionID := ""
+		replayedCurrentPermission := false
+		if sessionRuntime != nil {
+			effectiveCursor := req.LastSeenEventCursor
+			if persisted := sessionRuntime.persistedCursor.Load(); persisted > effectiveCursor {
+				effectiveCursor = persisted
+			}
+			currentPermissionID = strings.TrimSpace(runtimeSvc.CurrentPermissionRequestID(record.Summary.ID))
+			for _, pendingEvent := range sessionRuntime.pendingSince(effectiveCursor) {
+				if currentPermissionID != "" {
+					if prompt, ok := pendingEvent.(protocol.PromptRequestEvent); ok &&
+						strings.TrimSpace(prompt.BlockingKind) == "permission" &&
+						strings.TrimSpace(prompt.PermissionRequestID) == currentPermissionID {
+						replayedCurrentPermission = true
+					}
+				}
+				replayedCount++
+				emit(pendingEvent)
+			}
+			latestCursor = sessionRuntime.latestCursor()
+		}
+		if currentPermissionID != "" && !replayedCurrentPermission {
+			var prompt *protocol.PromptRequestEvent
+			if sessionRuntime != nil {
+				prompt = sessionRuntime.latestPendingPermissionPrompt(currentPermissionID)
+			}
+			if prompt == nil {
+				prompt = session.RefreshedPermissionPromptEventWithID(record.Summary.ID, protocol.PermissionDecisionRequestEvent{
+					PermissionMode:      projection.Runtime.PermissionMode,
+					PermissionRequestID: currentPermissionID,
+					ResumeSessionID:     firstNonEmptyString(projection.Runtime.ResumeSessionID, runtimeSvc.RuntimeSnapshot().ResumeSessionID),
+					PromptMessage:       "当前操作需要你的授权",
+					FallbackCommand:     projection.Runtime.Command,
+					FallbackCWD:         projection.Runtime.CWD,
+					FallbackEngine:      projection.Runtime.Engine,
+				}, runtimeSvc, currentPermissionID)
+			}
+			if prompt != nil {
+				logx.Info("ws", "session resume refreshed pending permission prompt: sessionID=%s requestID=%s", record.Summary.ID, currentPermissionID)
+				emit(*prompt)
+			}
+		}
+		if restoredAgentEvent != nil {
+			emit(*restoredAgentEvent)
+			if status, ok := session.AIStatusEventForBackendEvent(record.Summary.ID, runtimeSvc, record.Projection, *restoredAgentEvent); ok {
+				emit(status)
+			}
+		}
+		if snapshot := runtimeSvc.BuildTaskSnapshotEvent(record.Summary.ID, taskCursorSnapshot(sessionRuntime), "resume", true); snapshot != nil {
+			emit(*snapshot)
+			if status, ok := session.AIStatusEventForBackendEvent(record.Summary.ID, runtimeSvc, record.Projection, *snapshot); ok {
+				emit(status)
+			}
+		}
+		emit(protocol.NewSessionResumeResultEvent(
+			record.Summary.ID,
+			latestCursor,
+			runtimeAlive,
+			session.ResolvedResumeRuntimeState(restoredState, record, runtimeSvc),
+			runtimeAlive,
+			replayedCount,
+			"session resumed",
+		))
+	}
+	startAsyncMultiEventAction := func(action, actionKey, targetSessionID string, build func() ([]any, error)) {
+		if _, exists := asyncEventInFlight[actionKey]; exists {
+			emit(protocol.NewErrorEvent(selectedSessionID, fmt.Sprintf("%s is already running for this session", action), ""))
+			return
+		}
+		asyncEventInFlight[actionKey] = struct{}{}
+		if !h.tryStartAsyncAction(context.WithoutCancel(ctx), gatewayAsyncActionOptions{
+			Action:       action,
+			SessionID:    actionKey,
+			ConnectionID: connectionID,
+			RemoteAddr:   remoteAddr,
+			OnBusy: func() {
+				message := fmt.Sprintf("%s is already running for this session", action)
+				select {
+				case asyncEventResultCh <- gatewayAsyncEventResult{actionKey: actionKey, action: action, sessionID: targetSessionID, err: errors.New(message)}:
+				case <-ctx.Done():
+				}
+			},
+			OnPanic: func(any, string) {
+				select {
+				case asyncEventResultCh <- gatewayAsyncEventResult{actionKey: actionKey, action: action, sessionID: targetSessionID, err: fmt.Errorf("internal server error")}:
+				case <-ctx.Done():
+				}
+			},
+			Run: func() {
+				events, err := build()
+				select {
+				case asyncEventResultCh <- gatewayAsyncEventResult{actionKey: actionKey, action: action, sessionID: targetSessionID, events: events, err: err}:
+				case <-ctx.Done():
+				}
+			},
+		}) {
+			delete(asyncEventInFlight, actionKey)
+		}
+	}
+	startAsyncEventAction := func(action, actionKey, targetSessionID string, build func() (any, error)) {
+		startAsyncMultiEventAction(action, actionKey, targetSessionID, func() ([]any, error) {
+			event, err := build()
+			if event == nil {
+				return nil, err
+			}
+			return []any{event}, err
+		})
+	}
 
-	var emitAndPersistFor func(sessionID string) func(any)
 	emitAndPersistFor = func(sessionID string) func(any) {
 		return h.runtimeEventSinkForSession(sessionID, emit)
 	}
@@ -2125,15 +2603,13 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 	if h.SessionStore != nil {
 		emitSkillCatalogResult(emit, h.SessionStore, ctx, selectedSessionID)
 		emitMemoryListResult(emit, h.SessionStore, ctx, selectedSessionID)
-		if emitSessionList(sessionListFilterCWD) != nil {
-			if strings.TrimSpace(selectedSessionID) != "" {
-				record, err := h.SessionStore.GetSession(ctx, selectedSessionID)
-				if err != nil {
-					logx.Warn("ws", "initial session history restore skipped: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
-				} else {
-					updateProjectionMeta(record)
-					emit(session.SessionHistoryWindowEventFromRecordWithCursorAndPayloadLimit(record, sessionRecordRuntimeAlive(record, runtimeSvc), sessionResumeHistoryLimit, deltaCursorSnapshot(activeRuntimeSession), gatewayRelaySafePayloadBudgetBytes))
-				}
+		if emitSessionList(sessionListFilterCWD) != nil && strings.TrimSpace(selectedSessionID) != "" {
+			emittedWindow, err := emitSessionHistoryForStoredSessionWindow(selectedSessionID, sessionResumeHistoryLimit, activeRuntimeSession)
+			if err != nil {
+				logx.Warn("ws", "initial session history window restore skipped: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, err)
+			}
+			if !emittedWindow && err == nil {
+				logx.Warn("ws", "initial session history window restore skipped: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, fmt.Errorf("session history window unavailable"))
 			}
 		}
 	}
@@ -2150,6 +2626,12 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			return
 		case result := <-sessionLoadResultCh:
 			handleSessionLoadResult(result)
+			continue
+		case result := <-sessionResumeResultCh:
+			handleSessionResumeResult(result)
+			continue
+		case result := <-asyncEventResultCh:
+			handleAsyncEventResult(result)
 			continue
 		case result := <-readCh:
 			if result.err != nil {
@@ -2258,19 +2740,25 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			}
 			invalidateSessionListCacheForMutation()
 			if cwd := normalizeSessionCWD(req.CWD); cwd != "" {
-				record, err := h.SessionStore.GetSession(ctx, created.ID)
-				if err == nil {
-					record.Projection.Runtime.CWD = cwd
-					record.Projection.Runtime.Source = "mobilevc"
-					record.Summary.Runtime = record.Projection.Runtime
-					if _, err := h.SessionStore.UpsertSession(ctx, record); err == nil {
-						invalidateSessionListCacheForMutation()
-						created = record.Summary
-						updateProjectionMeta(record)
-					}
+				record := data.SessionRecord{
+					Summary: created,
+					Projection: data.ProjectionSnapshot{
+						Runtime: data.SessionRuntime{
+							CWD:    cwd,
+							Source: "mobilevc",
+						},
+					},
 				}
-			}
-			if record, err := h.SessionStore.GetSession(ctx, created.ID); err == nil {
+				record.Summary.Runtime = session.MergeStoreSessionRuntime(record.Summary.Runtime, record.Projection.Runtime)
+				summary, err := h.SessionStore.UpsertSession(ctx, record)
+				if err != nil {
+					logx.Error("ws", "update created session runtime failed: connectionID=%s sessionID=%s remoteAddr=%s createdSessionID=%s err=%v", connectionID, selectedSessionID, remoteAddr, created.ID, err)
+					emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
+					continue
+				}
+				invalidateSessionListCacheForMutation()
+				created = summary
+				record.Summary = summary
 				updateProjectionMeta(record)
 			}
 			switchRuntimeSession(created.ID, runtimeSwitchDetachPrevious)
@@ -2287,16 +2775,23 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				pong["pingId"] = pingID
 			}
 			emit(pong)
+			if pendingSessionSwitchActive() {
+				continue
+			}
 			if snapshot := runtimeSvc.BuildTaskSnapshotEvent(selectedSessionID, taskCursorSnapshot(activeRuntimeSession), "heartbeat", false); snapshot != nil {
 				emit(*snapshot)
-				if status, ok := session.AIStatusEventForBackendEvent(selectedSessionID, runtimeSvc, buildProjectionSnapshotForService(selectedSessionID, runtimeSvc), *snapshot); ok {
+				if status, ok := session.AIStatusEventForBackendEvent(selectedSessionID, runtimeSvc, buildStatusProjectionSnapshotForService(selectedSessionID, runtimeSvc), *snapshot); ok {
 					emit(status)
 				}
 			}
 		case "task_snapshot_get":
+			if pendingSessionSwitchActive() {
+				logx.Info("ws", "ignore task_snapshot_get while session switch is pending: connectionID=%s sessionID=%s pendingSessionID=%s remoteAddr=%s", connectionID, selectedSessionID, pendingSessionSwitchTargetID, remoteAddr)
+				continue
+			}
 			if snapshot := runtimeSvc.BuildTaskSnapshotEvent(selectedSessionID, taskCursorSnapshot(activeRuntimeSession), "sync", true); snapshot != nil {
 				emit(*snapshot)
-				if status, ok := session.AIStatusEventForBackendEvent(selectedSessionID, runtimeSvc, buildProjectionSnapshotForService(selectedSessionID, runtimeSvc), *snapshot); ok {
+				if status, ok := session.AIStatusEventForBackendEvent(selectedSessionID, runtimeSvc, buildStatusProjectionSnapshotForService(selectedSessionID, runtimeSvc), *snapshot); ok {
 					emit(status)
 				}
 			}
@@ -2329,7 +2824,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			}
 			if h.SessionStore == nil {
 				logx.Error("ws", "session store unavailable for session_load: connectionID=%s sessionID=%s remoteAddr=%s requestedSessionID=%s", connectionID, selectedSessionID, remoteAddr, req.SessionID)
-				emit(protocol.NewErrorEvent(selectedSessionID, "session store unavailable", ""))
+				emit(protocol.NewErrorEventWithCode(strings.TrimSpace(req.SessionID), "session store unavailable", "", "session_load_failed"))
 				continue
 			}
 			trace := newSessionLoadTrace(connectionID, selectedSessionID, req.SessionID, remoteAddr, req.Reason)
@@ -2339,10 +2834,13 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			loadSelectedSessionID := selectedSessionID
 			loadActionKey := connectionID + ":" + strings.TrimSpace(loadReq.SessionID)
 			if _, exists := sessionLoadInFlight[loadActionKey]; exists {
-				emit(protocol.NewErrorEvent(loadSelectedSessionID, "session load is already running for this connection", ""))
+				emit(protocol.NewErrorEventWithCode(strings.TrimSpace(loadReq.SessionID), "session load is already running for this connection", "", "session_load_failed"))
 				trace.Finish("", activeRuntimeLoad, projectionTraceMetrics{})
 				continue
 			}
+			latestSessionSwitchSequence++
+			loadSequence := latestSessionSwitchSequence
+			pendingSessionSwitchTargetID = strings.TrimSpace(loadReq.SessionID)
 			sessionLoadInFlight[loadActionKey] = struct{}{}
 			if !h.tryStartAsyncAction(context.WithoutCancel(ctx), gatewayAsyncActionOptions{
 				Action:       "session_load",
@@ -2351,7 +2849,8 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				RemoteAddr:   remoteAddr,
 				OnBusy: func() {
 					delete(sessionLoadInFlight, loadActionKey)
-					emit(protocol.NewErrorEvent(loadSelectedSessionID, "session load is already running for this connection", ""))
+					clearPendingSessionSwitch(loadReq.SessionID)
+					emit(protocol.NewErrorEventWithCode(strings.TrimSpace(loadReq.SessionID), "session load is already running for this connection", "", "session_load_failed"))
 					if trace != nil {
 						trace.Finish("", activeRuntimeLoad, projectionTraceMetrics{})
 					}
@@ -2361,6 +2860,8 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 					select {
 					case sessionLoadResultCh <- gatewaySessionLoadResult{
 						actionKey:         loadActionKey,
+						sequence:          loadSequence,
+						previousSessionID: loadSelectedSessionID,
 						req:               loadReq,
 						loadHistoryLimit:  loadHistoryLimit,
 						trace:             trace,
@@ -2373,25 +2874,29 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				Run: func() {
 					result := gatewaySessionLoadResult{
 						actionKey:         loadActionKey,
+						sequence:          loadSequence,
+						previousSessionID: loadSelectedSessionID,
 						req:               loadReq,
 						loadHistoryLimit:  loadHistoryLimit,
 						trace:             trace,
 						activeRuntimeLoad: activeRuntimeLoad,
 					}
-					if !activeRuntimeLoad {
-						window, ok, err := loadSessionHistoryWindow(loadReq.SessionID, 0, loadHistoryLimit)
-						if err != nil {
-							result.err = err
-						} else if ok && canUseLoadedSessionHistoryWindow(window.Record, activeRuntimeLoad) {
-							result.record = window.Record
-							result.historyWindow = window
-							result.historyWindowOK = true
-						}
+					loadedWindow, err := loadUsableSessionHistoryWindow(loadReq.SessionID, 0, loadHistoryLimit, activeRuntimeLoad)
+					if err != nil {
+						result.err = err
+					} else if loadedWindow.ok {
+						result.record = loadedWindow.window.Record
+						result.historyWindow = loadedWindow.window
+						result.historyWindowOK = true
 					}
 					if result.record.Summary.ID == "" && result.err == nil {
-						record, err := loadSessionRecordForRequest(loadReq.SessionID)
-						result.record = record
-						result.err = err
+						if !activeRuntimeLoad && !isNativeMirrorSessionID(loadReq.SessionID) {
+							result.err = fmt.Errorf("session history window unavailable for session %s", strings.TrimSpace(loadReq.SessionID))
+						} else {
+							record, err := loadSessionRecordForRequest(loadReq.SessionID)
+							result.record = record
+							result.err = err
+						}
 					}
 					select {
 					case sessionLoadResultCh <- result:
@@ -2400,6 +2905,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				},
 			}) {
 				delete(sessionLoadInFlight, loadActionKey)
+				clearPendingSessionSwitch(loadReq.SessionID)
 				continue
 			}
 		case "session_history_page":
@@ -2417,8 +2923,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				emit(protocol.NewErrorEvent(selectedSessionID, "session ID is required", ""))
 				continue
 			}
-			if targetSessionID != strings.TrimSpace(selectedSessionID) {
-				logx.Info("ws", "ignore session_history_page for non-selected session: connectionID=%s sessionID=%s requestedSessionID=%s remoteAddr=%s", connectionID, selectedSessionID, targetSessionID, remoteAddr)
+			if !canProcessSelectedSessionReadAction("session_history_page", targetSessionID) {
 				continue
 			}
 			if h.SessionStore == nil {
@@ -2426,46 +2931,27 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				continue
 			}
 			pageHistoryLimit := sessionHistoryWindowLimit(req.Limit)
-			if historyWindow, ok, err := loadSessionHistoryWindow(targetSessionID, req.Before, pageHistoryLimit); err != nil {
-				emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
-				continue
-			} else if ok {
-				record := historyWindow.Record
-				_, pageRuntimeSvc := runtimeForSession(record.Summary.ID)
-				freshProjection := session.NormalizeProjectionSnapshot(record.Projection)
-				runtimeProjection := h.mergeActiveLiveProjection(record.Summary.ID, finalizeProjectionSnapshotForService(record.Summary.ID, pageRuntimeSvc, freshProjection))
-				record.Projection = runtimeProjection
-				record.Projection.LogEntries = nil
-				record.Summary.Runtime = record.Projection.Runtime
-				historyWindow.Record = record
-				pageEvent := session.SessionHistoryPageEventFromWindowWithPayloadLimit(historyWindow, gatewayRelaySafePayloadBudgetBytes)
-				logx.Info("ws", "session history page response: connectionID=%s sessionID=%s remoteAddr=%s before=%d limit=%d start=%d total=%d entries=%d windowStore=true", connectionID, record.Summary.ID, remoteAddr, req.Before, pageHistoryLimit, pageEvent.LogEntryStart, pageEvent.LogEntryTotal, len(pageEvent.LogEntries))
-				emit(pageEvent)
-				continue
-			}
-			record, err := loadSessionDeltaRecord(targetSessionID)
-			if err != nil {
-				emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
-				continue
-			}
-			updateProjectionMeta(record)
-			_, pageRuntimeSvc := runtimeForSession(record.Summary.ID)
-			if !isNativeMirrorSessionID(record.Summary.ID) {
-				record = mergeClaudeJSONLToRecord(ctx, h.SessionStore, record, pageRuntimeSvc)
-				updateProjectionMeta(record)
-			}
-			freshProjection := session.NormalizeProjectionSnapshot(record.Projection)
-			runtimeProjection := h.mergeActiveLiveProjection(record.Summary.ID, finalizeProjectionSnapshotForService(record.Summary.ID, pageRuntimeSvc, freshProjection))
-			if isNativeMirrorSessionID(record.Summary.ID) {
-				record.Projection = mergeProjectionWithOptionalRuntime(freshProjection, runtimeProjection, pageRuntimeSvc, record.Summary.ID)
-			} else {
-				record.Projection = runtimeProjection
-			}
-			record.Summary.Runtime = record.Projection.Runtime
-			cacheProjection(record.Summary.ID, record.Projection, false)
-			pageEvent := session.SessionHistoryPageEventFromRecordWithPayloadLimit(record, req.Before, pageHistoryLimit, gatewayRelaySafePayloadBudgetBytes)
-			logx.Info("ws", "session history page response: connectionID=%s sessionID=%s remoteAddr=%s before=%d limit=%d start=%d total=%d entries=%d", connectionID, record.Summary.ID, remoteAddr, req.Before, pageHistoryLimit, pageEvent.LogEntryStart, pageEvent.LogEntryTotal, len(pageEvent.LogEntries))
-			emit(pageEvent)
+			reqCopy := req
+			actionKey := connectionID + ":session_history_page:" + targetSessionID + ":" + fmt.Sprint(reqCopy.Before) + ":" + fmt.Sprint(reqCopy.Limit)
+			startAsyncEventAction("session_history_page", actionKey, targetSessionID, func() (any, error) {
+				if loadedWindow, err := loadUsableSessionHistoryWindow(targetSessionID, reqCopy.Before, pageHistoryLimit, activeRuntimeRecord(targetSessionID)); err != nil {
+					return nil, err
+				} else if loadedWindow.ok {
+					historyWindow := loadedWindow.window
+					record := historyWindow.Record
+					_, pageRuntimeSvc := runtimeForSession(record.Summary.ID)
+					freshProjection := session.NormalizeProjectionSnapshot(record.Projection)
+					runtimeProjection := h.mergeActiveLiveProjection(record.Summary.ID, finalizeProjectionSnapshotForService(record.Summary.ID, pageRuntimeSvc, freshProjection))
+					record.Projection = runtimeProjection
+					record.Projection.LogEntries = nil
+					record.Summary.Runtime = record.Projection.Runtime
+					historyWindow.Record = record
+					pageEvent := session.SessionHistoryPageEventFromWindowWithPayloadLimit(historyWindow, gatewayRelaySafePayloadBudgetBytes)
+					logx.Info("ws", "session history page response: connectionID=%s sessionID=%s remoteAddr=%s before=%d limit=%d start=%d total=%d entries=%d windowStore=true", connectionID, record.Summary.ID, remoteAddr, reqCopy.Before, pageHistoryLimit, pageEvent.LogEntryStart, pageEvent.LogEntryTotal, len(pageEvent.LogEntries))
+					return pageEvent, nil
+				}
+				return nil, fmt.Errorf("session history window unavailable for session %s", targetSessionID)
+			})
 		case "session_terminal_range_get":
 			var req protocol.SessionTerminalRangeRequestEvent
 			if err := json.Unmarshal(payloadBytes, &req); err != nil {
@@ -2477,20 +2963,38 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				emit(protocol.NewErrorEvent(selectedSessionID, "session store unavailable", ""))
 				continue
 			}
-			record, sessionRuntime, err := loadSelectedProjectionRecord(req.SessionID)
-			if err != nil {
-				logx.Warn("ws", "session terminal range failed: connectionID=%s sessionID=%s requestedSessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, req.SessionID, remoteAddr, err)
-				emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
+			targetSessionID := strings.TrimSpace(req.SessionID)
+			if targetSessionID == "" {
+				targetSessionID = strings.TrimSpace(selectedSessionID)
+			}
+			if targetSessionID == "" {
+				emit(protocol.NewErrorEvent(selectedSessionID, "session ID is required", ""))
 				continue
 			}
-			rangeEvent, err := session.SessionTerminalRangeEventFromRecordWithPayloadLimit(record, req.Stream, req.Start, req.Limit, deltaCursorSnapshot(sessionRuntime), gatewayRelaySafePayloadBudgetBytes)
-			if err != nil {
-				logx.Warn("ws", "session terminal range invalid stream: connectionID=%s sessionID=%s requestedSessionID=%s stream=%q remoteAddr=%s err=%v", connectionID, selectedSessionID, req.SessionID, req.Stream, remoteAddr, err)
-				emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
+			if !canProcessSelectedSessionReadAction("session_terminal_range_get", targetSessionID) {
 				continue
 			}
-			logx.Info("ws", "session terminal range response: connectionID=%s sessionID=%s remoteAddr=%s stream=%s start=%d end=%d total=%d payloadLimited=%v", connectionID, record.Summary.ID, remoteAddr, rangeEvent.Stream, rangeEvent.Start, rangeEvent.End, rangeEvent.Total, rangeEvent.PayloadLimited)
-			emit(rangeEvent)
+			reqCopy := req
+			actionKey := connectionID + ":session_terminal_range_get:" + targetSessionID + ":" + strings.TrimSpace(reqCopy.Stream) + ":" + fmt.Sprint(reqCopy.Start) + ":" + fmt.Sprint(reqCopy.Limit)
+			startAsyncEventAction("session_terminal_range_get", actionKey, targetSessionID, func() (any, error) {
+				rangeStore, ok := h.SessionStore.(data.SessionTerminalRangeStore)
+				if !ok {
+					return nil, fmt.Errorf("session terminal range store unavailable")
+				}
+				sessionRuntime, _ := runtimeForSession(targetSessionID)
+				item, err := rangeStore.GetSessionTerminalRange(context.WithoutCancel(ctx), data.SessionTerminalRangeRequest{
+					SessionID: targetSessionID,
+					Stream:    reqCopy.Stream,
+					Start:     reqCopy.Start,
+					Limit:     reqCopy.Limit,
+				})
+				if err != nil {
+					return nil, err
+				}
+				rangeEvent := session.SessionTerminalRangeEventFromRangeWithPayloadLimit(item, deltaCursorSnapshot(sessionRuntime), gatewayRelaySafePayloadBudgetBytes)
+				logx.Info("ws", "session terminal range response: connectionID=%s sessionID=%s remoteAddr=%s stream=%s start=%d end=%d total=%d payloadLimited=%v lightweightStore=true", connectionID, item.Record.Summary.ID, remoteAddr, rangeEvent.Stream, rangeEvent.Start, rangeEvent.End, rangeEvent.Total, rangeEvent.PayloadLimited)
+				return rangeEvent, nil
+			})
 		case "session_diff_page_get":
 			var req protocol.SessionDiffPageRequestEvent
 			if err := json.Unmarshal(payloadBytes, &req); err != nil {
@@ -2502,15 +3006,37 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				emit(protocol.NewErrorEvent(selectedSessionID, "session store unavailable", ""))
 				continue
 			}
-			record, sessionRuntime, err := loadSelectedProjectionRecord(req.SessionID)
-			if err != nil {
-				logx.Warn("ws", "session diff page failed: connectionID=%s sessionID=%s requestedSessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, req.SessionID, remoteAddr, err)
-				emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
+			targetSessionID := strings.TrimSpace(req.SessionID)
+			if targetSessionID == "" {
+				targetSessionID = strings.TrimSpace(selectedSessionID)
+			}
+			if targetSessionID == "" {
+				emit(protocol.NewErrorEvent(selectedSessionID, "session ID is required", ""))
 				continue
 			}
-			pageEvent := session.SessionDiffPageEventFromRecordWithPayloadLimit(record, req.Before, req.Limit, deltaCursorSnapshot(sessionRuntime), gatewayRelaySafePayloadBudgetBytes)
-			logx.Info("ws", "session diff page response: connectionID=%s sessionID=%s remoteAddr=%s before=%d limit=%d start=%d total=%d diffs=%d payloadLimited=%v", connectionID, record.Summary.ID, remoteAddr, req.Before, req.Limit, pageEvent.DiffStart, pageEvent.DiffTotal, len(pageEvent.Diffs), pageEvent.PayloadLimited)
-			emit(pageEvent)
+			if !canProcessSelectedSessionReadAction("session_diff_page_get", targetSessionID) {
+				continue
+			}
+			reqCopy := req
+			actionKey := connectionID + ":session_diff_page_get:" + targetSessionID + ":" + fmt.Sprint(reqCopy.Before) + ":" + fmt.Sprint(reqCopy.Limit)
+			startAsyncEventAction("session_diff_page_get", actionKey, targetSessionID, func() (any, error) {
+				diffStore, ok := h.SessionStore.(data.SessionDiffPageStore)
+				if !ok {
+					return nil, fmt.Errorf("session diff page store unavailable")
+				}
+				sessionRuntime, _ := runtimeForSession(targetSessionID)
+				page, err := diffStore.GetSessionDiffPage(context.WithoutCancel(ctx), data.SessionDiffPageRequest{
+					SessionID: targetSessionID,
+					Before:    reqCopy.Before,
+					Limit:     reqCopy.Limit,
+				})
+				if err != nil {
+					return nil, err
+				}
+				pageEvent := session.SessionDiffPageEventFromPageWithPayloadLimit(page, deltaCursorSnapshot(sessionRuntime), gatewayRelaySafePayloadBudgetBytes)
+				logx.Info("ws", "session diff page response: connectionID=%s sessionID=%s remoteAddr=%s before=%d limit=%d start=%d total=%d diffs=%d payloadLimited=%v lightweightStore=true", connectionID, page.Record.Summary.ID, remoteAddr, reqCopy.Before, reqCopy.Limit, pageEvent.DiffStart, pageEvent.DiffTotal, len(pageEvent.Diffs), pageEvent.PayloadLimited)
+				return pageEvent, nil
+			})
 		case "session_terminal_execution_page_get":
 			var req protocol.SessionTerminalExecutionPageRequestEvent
 			if err := json.Unmarshal(payloadBytes, &req); err != nil {
@@ -2522,15 +3048,38 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				emit(protocol.NewErrorEvent(selectedSessionID, "session store unavailable", ""))
 				continue
 			}
-			record, sessionRuntime, err := loadSelectedProjectionRecord(req.SessionID)
-			if err != nil {
-				logx.Warn("ws", "session terminal execution page failed: connectionID=%s sessionID=%s requestedSessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, req.SessionID, remoteAddr, err)
-				emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
+			targetSessionID := strings.TrimSpace(req.SessionID)
+			if targetSessionID == "" {
+				targetSessionID = strings.TrimSpace(selectedSessionID)
+			}
+			if targetSessionID == "" {
+				emit(protocol.NewErrorEvent(selectedSessionID, "session ID is required", ""))
 				continue
 			}
-			pageEvent := session.SessionTerminalExecutionPageEventFromRecordWithPayloadLimit(record, req.Before, req.Limit, req.IncludeOutput, deltaCursorSnapshot(sessionRuntime), gatewayRelaySafePayloadBudgetBytes)
-			logx.Info("ws", "session terminal execution page response: connectionID=%s sessionID=%s remoteAddr=%s before=%d limit=%d start=%d total=%d executions=%d includeOutput=%v payloadLimited=%v", connectionID, record.Summary.ID, remoteAddr, req.Before, req.Limit, pageEvent.ExecutionStart, pageEvent.ExecutionTotal, len(pageEvent.TerminalExecutions), pageEvent.IncludeOutput, pageEvent.PayloadLimited)
-			emit(pageEvent)
+			if !canProcessSelectedSessionReadAction("session_terminal_execution_page_get", targetSessionID) {
+				continue
+			}
+			reqCopy := req
+			actionKey := connectionID + ":session_terminal_execution_page_get:" + targetSessionID + ":" + fmt.Sprint(reqCopy.Before) + ":" + fmt.Sprint(reqCopy.Limit) + ":" + fmt.Sprint(reqCopy.IncludeOutput)
+			startAsyncEventAction("session_terminal_execution_page_get", actionKey, targetSessionID, func() (any, error) {
+				executionStore, ok := h.SessionStore.(data.SessionTerminalExecutionPageStore)
+				if !ok {
+					return nil, fmt.Errorf("session terminal execution page store unavailable")
+				}
+				sessionRuntime, _ := runtimeForSession(targetSessionID)
+				page, err := executionStore.GetSessionTerminalExecutionPage(context.WithoutCancel(ctx), data.SessionTerminalExecutionPageRequest{
+					SessionID:     targetSessionID,
+					Before:        reqCopy.Before,
+					Limit:         reqCopy.Limit,
+					IncludeOutput: reqCopy.IncludeOutput,
+				})
+				if err != nil {
+					return nil, err
+				}
+				pageEvent := session.SessionTerminalExecutionPageEventFromPageWithPayloadLimit(page, deltaCursorSnapshot(sessionRuntime), gatewayRelaySafePayloadBudgetBytes)
+				logx.Info("ws", "session terminal execution page response: connectionID=%s sessionID=%s remoteAddr=%s before=%d limit=%d start=%d total=%d executions=%d includeOutput=%v payloadLimited=%v lightweightStore=true", connectionID, page.Record.Summary.ID, remoteAddr, reqCopy.Before, reqCopy.Limit, pageEvent.ExecutionStart, pageEvent.ExecutionTotal, len(pageEvent.TerminalExecutions), pageEvent.IncludeOutput, pageEvent.PayloadLimited)
+				return pageEvent, nil
+			})
 		case "register_push_token":
 			var req protocol.RegisterPushTokenRequestEvent
 			if err := json.Unmarshal(payloadBytes, &req); err != nil {
@@ -2565,13 +3114,17 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				emit(protocol.NewErrorEvent(selectedSessionID, "session ID is required", ""))
 				continue
 			}
-			if targetSessionID != strings.TrimSpace(selectedSessionID) {
-				logx.Info("ws", "session delta requires full sync because target is not selected: connectionID=%s sessionID=%s requestedSessionID=%s remoteAddr=%s reason=%q", connectionID, selectedSessionID, targetSessionID, remoteAddr, req.Reason)
+			if pendingSessionSwitchActive() && !targetIsPendingSessionSwitch(targetSessionID) {
+				logx.Info("ws", "ignore session delta while session switch is pending: connectionID=%s sessionID=%s pendingSessionID=%s requestedSessionID=%s remoteAddr=%s reason=%q", connectionID, selectedSessionID, pendingSessionSwitchTargetID, targetSessionID, remoteAddr, req.Reason)
+				continue
+			}
+			if targetSessionID != strings.TrimSpace(selectedSessionID) && !targetIsPendingSessionSwitch(targetSessionID) {
+				logx.Info("ws", "ignore session delta for non-selected target: connectionID=%s sessionID=%s requestedSessionID=%s remoteAddr=%s reason=%q", connectionID, selectedSessionID, targetSessionID, remoteAddr, req.Reason)
 				emit(protocol.NewSessionDeltaEvent(
 					targetSessionID,
 					protocol.SessionSummary{ID: targetSessionID},
 					req.Known,
-					protocol.SessionDeltaKnown{},
+					req.Known,
 					nil,
 					nil,
 					nil,
@@ -2588,41 +3141,31 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 					false,
 					false,
 					protocol.RuntimeMeta{},
-					true,
+					false,
 				))
 				continue
 			}
-			record, err := loadSessionDeltaRecord(targetSessionID)
-			if err != nil {
-				emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
-				continue
-			}
-			updateProjectionMeta(record)
-			sessionRuntime, sessionRuntimeSvc := runtimeForSession(record.Summary.ID)
-			if !isNativeMirrorSessionID(record.Summary.ID) {
-				record = mergeClaudeJSONLToRecord(ctx, h.SessionStore, record, sessionRuntimeSvc)
-				updateProjectionMeta(record)
-			}
-			freshProjection := session.NormalizeProjectionSnapshot(record.Projection)
-			runtimeProjection := h.mergeActiveLiveProjection(record.Summary.ID, finalizeProjectionSnapshotForService(record.Summary.ID, sessionRuntimeSvc, freshProjection))
-			if isNativeMirrorSessionID(record.Summary.ID) {
-				record.Projection = mergeProjectionWithOptionalRuntime(freshProjection, runtimeProjection, sessionRuntimeSvc, record.Summary.ID)
-			} else {
-				record.Projection = runtimeProjection
-			}
-			record.Summary.Runtime = record.Projection.Runtime
-			cacheProjection(record.Summary.ID, record.Projection, false)
-			runtimeAlive := sessionRecordRuntimeAlive(record, sessionRuntimeSvc)
-			deltaEvent := session.SessionDeltaEventFromRecordWithPayloadLimit(record, req.Known, deltaCursorSnapshot(sessionRuntime), runtimeAlive, gatewayRelaySafePayloadBudgetBytes, sessionResumeHistoryLimit)
-			metrics := projectionMetrics(record.Projection)
-			logx.Info("ws", "session delta response: connectionID=%s sessionID=%s remoteAddr=%s reason=%q runtimeAlive=%v canResume=%v requiresFullSync=%v logEntries=%d diffs=%d stdoutBytes=%d stderrBytes=%d", connectionID, record.Summary.ID, remoteAddr, req.Reason, runtimeAlive, sessionRuntime != nil && runtimeAlive, deltaEvent.RequiresFullSync, metrics.logEntries, metrics.diffs, metrics.stdoutBytes, metrics.stderrBytes)
-			emit(deltaEvent)
-			if snapshot := sessionRuntimeSvc.BuildTaskSnapshotEvent(record.Summary.ID, taskCursorSnapshot(sessionRuntime), "delta", true); snapshot != nil {
-				emit(*snapshot)
-				if status, ok := session.AIStatusEventForBackendEvent(record.Summary.ID, sessionRuntimeSvc, record.Projection, *snapshot); ok {
-					emit(status)
+			reqCopy := req
+			actionKey := connectionID + ":session_delta_get:" + targetSessionID + ":" + strings.TrimSpace(reqCopy.Reason)
+			startAsyncEventAction("session_delta_get", actionKey, targetSessionID, func() (any, error) {
+				sessionRuntime, sessionRuntimeSvc := runtimeForSession(targetSessionID)
+				if deltaEvent, ok, err := buildWindowMetadataDeltaIfPossible(reqCopy, targetSessionID, sessionRuntime, sessionRuntimeSvc); err != nil {
+					return nil, err
+				} else if ok {
+					return deltaEvent, nil
 				}
-			}
+				record, sessionRuntime, err := loadProjectionRecordForAsyncEvent(targetSessionID)
+				if err != nil {
+					return nil, err
+				}
+				_, sessionRuntimeSvc = runtimeForSession(record.Summary.ID)
+				cacheProjection(record.Summary.ID, record.Projection, false)
+				runtimeAlive := sessionRecordRuntimeAlive(record, sessionRuntimeSvc)
+				deltaEvent := session.SessionDeltaEventFromRecordWithPayloadLimit(record, reqCopy.Known, deltaCursorSnapshot(sessionRuntime), runtimeAlive, gatewayRelaySafePayloadBudgetBytes, sessionResumeHistoryLimit)
+				metrics := projectionMetrics(record.Projection)
+				logx.Info("ws", "session delta response: connectionID=%s sessionID=%s remoteAddr=%s reason=%q runtimeAlive=%v canResume=%v requiresFullSync=%v logEntries=%d diffs=%d stdoutBytes=%d stderrBytes=%d", connectionID, record.Summary.ID, remoteAddr, reqCopy.Reason, runtimeAlive, sessionRuntime != nil && runtimeAlive, deltaEvent.RequiresFullSync, metrics.logEntries, metrics.diffs, metrics.stdoutBytes, metrics.stderrBytes)
+				return deltaEvent, nil
+			})
 		case "session_resume":
 			var req protocol.SessionResumeRequestEvent
 			if err := json.Unmarshal(payloadBytes, &req); err != nil {
@@ -2634,177 +3177,85 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			logx.Info("ws", "incoming session_resume: connectionID=%s sessionID=%s remoteAddr=%s requestedSessionID=%s cwd=%q reason=%q lastSeenEventCursor=%d lastKnownRuntimeState=%q limit=%d", connectionID, selectedSessionID, remoteAddr, req.SessionID, req.CWD, req.Reason, req.LastSeenEventCursor, req.LastKnownRuntimeState, resumeHistoryLimit)
 			if h.SessionStore == nil {
 				logx.Error("ws", "session store unavailable for session_resume: connectionID=%s sessionID=%s remoteAddr=%s requestedSessionID=%s", connectionID, selectedSessionID, remoteAddr, req.SessionID)
-				emit(protocol.NewErrorEvent(selectedSessionID, "session store unavailable", ""))
+				emit(protocol.NewErrorEventWithCode(strings.TrimSpace(firstNonEmptyString(req.SessionID, selectedSessionID)), "session store unavailable", "", "session_resume_failed"))
 				continue
 			}
-			activeRuntimeResume := activeRuntimeRecord(req.SessionID)
-			var historyWindow data.SessionHistoryWindow
-			historyWindowOK := false
-			if !activeRuntimeResume {
-				if window, ok, err := loadSessionHistoryWindow(req.SessionID, 0, resumeHistoryLimit); err != nil {
-					logx.Warn("ws", "resume session failed: connectionID=%s sessionID=%s requestedSessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, req.SessionID, remoteAddr, err)
-					emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
-					continue
-				} else if ok && canUseLoadedSessionHistoryWindow(window.Record, activeRuntimeResume) {
-					historyWindow = window
-					historyWindowOK = true
-				}
+			resumeReq := req
+			resumeTargetSessionID := strings.TrimSpace(resumeReq.SessionID)
+			if resumeTargetSessionID == "" {
+				resumeTargetSessionID = strings.TrimSpace(selectedSessionID)
 			}
-			record := historyWindow.Record
-			if record.Summary.ID == "" {
-				var err error
-				record, err = loadSessionRecordForRequest(req.SessionID)
-				if err != nil {
-					logx.Warn("ws", "resume session failed: connectionID=%s sessionID=%s requestedSessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, req.SessionID, remoteAddr, err)
-					emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
-					continue
-				}
+			if resumeTargetSessionID == "" {
+				emit(protocol.NewErrorEvent(selectedSessionID, "session ID is required", ""))
+				continue
 			}
-			if !historyWindowOK {
-				updateProjectionMeta(record)
+			resumeReq.SessionID = resumeTargetSessionID
+			resumeActionKey := connectionID + ":session_resume:" + resumeTargetSessionID
+			if _, exists := sessionResumeInFlight[resumeActionKey]; exists {
+				emit(protocol.NewErrorEventWithCode(resumeTargetSessionID, "session resume is already running for this connection", "", "session_resume_failed"))
+				continue
 			}
-			// Merge any new events from Claude CLI JSONL.
-			// Switch runtime session first so mergeClaudeJSONLToRecord can
-			// check the correct ActiveSession when deciding ownership upgrades.
-			switchRuntimeSession(record.Summary.ID, runtimeSwitchDetachPrevious)
-			sessionRuntime := h.runtimeSessions.Ensure(record.Summary.ID)
-			// Re-bind PTY runner output sink to new connection after reconnect.
-			resumeEmitAndPersist := emitAndPersistFor(selectedSessionID)
-			runtimeSvc.SetSink(sessionRuntime.EnsureBufferedSinkWithProcessor(resumeEmitAndPersist))
-			if !isNativeMirrorSessionID(record.Summary.ID) && !historyWindowOK {
-				record = mergeClaudeJSONLToRecord(ctx, h.SessionStore, record, runtimeSvc)
-				updateProjectionMeta(record)
-			}
-			augmentedProjection := session.NormalizeProjectionSnapshot(record.Projection)
-			var runtimeProjection data.ProjectionSnapshot
-			if historyWindowOK {
-				runtimeProjection = h.mergeActiveLiveProjection(record.Summary.ID, finalizeProjectionSnapshotForService(record.Summary.ID, runtimeSvc, augmentedProjection))
-			} else {
-				runtimeProjection = buildProjectionSnapshotForService(record.Summary.ID, runtimeSvc)
-			}
-			projection := runtimeProjection
-			if isNativeMirrorSessionID(record.Summary.ID) {
-				projection = mergeProjectionWithOptionalRuntime(augmentedProjection, runtimeProjection, runtimeSvc, record.Summary.ID)
-			} else if preferAugmentedLogEntries(augmentedProjection.LogEntries, projection.LogEntries) {
-				projection.LogEntries = augmentedProjection.LogEntries
-			}
-			record.Projection = projection
-			record.Summary.Runtime = projection.Runtime
-			if !historyWindowOK {
-				updateProjectionMeta(record)
-				cacheProjection(record.Summary.ID, record.Projection, false)
-			}
-			resumeMeta := protocol.MergeRuntimeMeta(protocol.RuntimeMeta{
-				Command:          projection.Runtime.Command,
-				Engine:           projection.Runtime.Engine,
-				CodexSandboxMode: projection.Runtime.CodexSandboxMode,
-				CWD:              projection.Runtime.CWD,
-				PermissionMode:   projection.Runtime.PermissionMode,
-				ResumeSessionID:  projection.Runtime.ResumeSessionID,
-				ClaudeLifecycle:  projection.Runtime.ClaudeLifecycle,
-			}, req.RuntimeMeta)
-			runtimeSvc.SyncRuntimeMeta(resumeMeta)
-			if updatedProjection, changed := projectionWithResumeRuntimeMeta(projection, resumeMeta); changed {
-				projection = updatedProjection
-				record.Projection = projection
-				record.Summary.Runtime = projection.Runtime
-				persistProjectionNow(record.Summary.ID, record.Projection)
-				if !historyWindowOK {
-					updateProjectionMeta(record)
-					cacheProjection(record.Summary.ID, record.Projection, false)
-				}
-			}
-			runtimeAlive := sessionRecordRuntimeAlive(record, runtimeSvc)
-			if runtimeAlive && session.ShouldEmitResumeRecoveryStateEvent(runtimeSvc, projection, req.LastKnownRuntimeState) {
-				recovery := session.BuildResumeRecoveryStateEvent(record.Summary.ID, runtimeSvc, projection, req.LastKnownRuntimeState)
-				emit(recovery)
-				if status, ok := session.AIStatusEventForBackendEvent(record.Summary.ID, runtimeSvc, projection, recovery); ok {
-					emit(status)
-				}
-			}
-			if historyWindowOK {
-				historyWindow.Record = record
-				historyWindow.Record.Projection.LogEntries = nil
-				emit(session.SessionHistoryWindowEventFromWindowWithCursorAndPayloadLimit(historyWindow, runtimeAlive, deltaCursorSnapshot(sessionRuntime), gatewayRelaySafePayloadBudgetBytes))
-			} else {
-				emit(session.SessionHistoryWindowEventFromRecordWithCursorAndPayloadLimit(record, runtimeAlive, resumeHistoryLimit, deltaCursorSnapshot(sessionRuntime), gatewayRelaySafePayloadBudgetBytes))
-			}
-			emitContextWindowUsageIfAvailable(record.Summary.ID, runtimeSvc)
-			logx.Info("ws", "session history emitted: sessionID=%s runtimeAlive=%v ownership=%s limit=%d", record.Summary.ID, runtimeAlive, record.Summary.Ownership, resumeHistoryLimit)
-			restoredState := ""
-			var restoredAgentEvent *protocol.AgentStateEvent
-			if restored := restoredAgentStateEventFromRecord(record, runtimeAlive); restored != nil {
-				restoredState = restored.State
-				restoredAgentEvent = restored
-			}
-			replayedCount := 0
-			latestCursor := int64(0)
-			currentPermissionID := ""
-			replayedCurrentPermission := false
-			if sessionRuntime != nil {
-				effectiveCursor := req.LastSeenEventCursor
-				if persisted := sessionRuntime.persistedCursor.Load(); persisted > effectiveCursor {
-					effectiveCursor = persisted
-				}
-				currentPermissionID = strings.TrimSpace(runtimeSvc.CurrentPermissionRequestID(record.Summary.ID))
-				for _, pendingEvent := range sessionRuntime.pendingSince(effectiveCursor) {
-					if currentPermissionID != "" {
-						if prompt, ok := pendingEvent.(protocol.PromptRequestEvent); ok &&
-							strings.TrimSpace(prompt.BlockingKind) == "permission" &&
-							strings.TrimSpace(prompt.PermissionRequestID) == currentPermissionID {
-							replayedCurrentPermission = true
+			latestSessionSwitchSequence++
+			resumeSequence := latestSessionSwitchSequence
+			resumePreviousSessionID := strings.TrimSpace(selectedSessionID)
+			pendingSessionSwitchTargetID = resumeTargetSessionID
+			sessionResumeInFlight[resumeActionKey] = struct{}{}
+			activeRuntimeResume := activeRuntimeRecord(resumeTargetSessionID)
+			if !h.tryStartAsyncAction(context.WithoutCancel(ctx), gatewayAsyncActionOptions{
+				Action:       "session_resume",
+				SessionID:    resumeActionKey,
+				ConnectionID: connectionID,
+				RemoteAddr:   remoteAddr,
+				OnBusy: func() {
+					message := "session resume is already running for this connection"
+					select {
+					case sessionResumeResultCh <- gatewaySessionResumeResult{actionKey: resumeActionKey, sequence: resumeSequence, previousSessionID: resumePreviousSessionID, req: resumeReq, resumeHistoryLimit: resumeHistoryLimit, activeRuntimeResume: activeRuntimeResume, err: errors.New(message)}:
+					case <-ctx.Done():
+					}
+				},
+				OnPanic: func(recovered any, stack string) {
+					logx.Error("ws", "session_resume panic: connectionID=%s sessionID=%s requestedSessionID=%s remoteAddr=%s panic=%v\n%s", connectionID, selectedSessionID, resumeReq.SessionID, remoteAddr, recovered, stack)
+					select {
+					case sessionResumeResultCh <- gatewaySessionResumeResult{actionKey: resumeActionKey, sequence: resumeSequence, previousSessionID: resumePreviousSessionID, req: resumeReq, resumeHistoryLimit: resumeHistoryLimit, activeRuntimeResume: activeRuntimeResume, err: fmt.Errorf("internal server error")}:
+					case <-ctx.Done():
+					}
+				},
+				Run: func() {
+					result := gatewaySessionResumeResult{
+						actionKey:           resumeActionKey,
+						sequence:            resumeSequence,
+						previousSessionID:   resumePreviousSessionID,
+						req:                 resumeReq,
+						resumeHistoryLimit:  resumeHistoryLimit,
+						activeRuntimeResume: activeRuntimeResume,
+					}
+					loadedWindow, err := loadUsableSessionHistoryWindow(resumeTargetSessionID, 0, resumeHistoryLimit, activeRuntimeResume)
+					if err != nil {
+						result.err = err
+					} else if loadedWindow.ok {
+						result.record = loadedWindow.window.Record
+						result.historyWindow = loadedWindow.window
+						result.historyWindowOK = true
+					}
+					if result.record.Summary.ID == "" && result.err == nil {
+						if !activeRuntimeResume && !isNativeMirrorSessionID(resumeTargetSessionID) {
+							result.err = fmt.Errorf("session history window unavailable for session %s", resumeTargetSessionID)
+						} else {
+							record, err := loadSessionRecordForRequest(resumeTargetSessionID)
+							result.record = record
+							result.err = err
 						}
 					}
-					replayedCount++
-					emit(pendingEvent)
-				}
-				latestCursor = sessionRuntime.latestCursor()
+					select {
+					case sessionResumeResultCh <- result:
+					case <-ctx.Done():
+					}
+				},
+			}) {
+				delete(sessionResumeInFlight, resumeActionKey)
+				clearPendingSessionSwitch(resumeTargetSessionID)
+				continue
 			}
-			if currentPermissionID != "" && !replayedCurrentPermission {
-				var prompt *protocol.PromptRequestEvent
-				if sessionRuntime != nil {
-					prompt = sessionRuntime.latestPendingPermissionPrompt(currentPermissionID)
-				}
-				if prompt == nil {
-					prompt = session.RefreshedPermissionPromptEventWithID(record.Summary.ID, protocol.PermissionDecisionRequestEvent{
-						PermissionMode:      projection.Runtime.PermissionMode,
-						PermissionRequestID: currentPermissionID,
-						ResumeSessionID:     firstNonEmptyString(projection.Runtime.ResumeSessionID, runtimeSvc.RuntimeSnapshot().ResumeSessionID),
-						PromptMessage:       "当前操作需要你的授权",
-						FallbackCommand:     projection.Runtime.Command,
-						FallbackCWD:         projection.Runtime.CWD,
-						FallbackEngine:      projection.Runtime.Engine,
-					}, runtimeSvc, currentPermissionID)
-				}
-				if prompt != nil {
-					logx.Info("ws", "session resume refreshed pending permission prompt: sessionID=%s requestID=%s", record.Summary.ID, currentPermissionID)
-					emit(*prompt)
-				}
-			}
-			// Emit restored agent state AFTER pending replay so that log events
-			// (assistant replies) reach Flutter before the state transition,
-			// preventing a "paused → reply text appears" flicker.
-			if restoredAgentEvent != nil {
-				emit(*restoredAgentEvent)
-				if status, ok := session.AIStatusEventForBackendEvent(record.Summary.ID, runtimeSvc, record.Projection, *restoredAgentEvent); ok {
-					emit(status)
-				}
-			}
-			if snapshot := runtimeSvc.BuildTaskSnapshotEvent(record.Summary.ID, taskCursorSnapshot(sessionRuntime), "resume", true); snapshot != nil {
-				emit(*snapshot)
-				if status, ok := session.AIStatusEventForBackendEvent(record.Summary.ID, runtimeSvc, record.Projection, *snapshot); ok {
-					emit(status)
-				}
-			}
-			emit(protocol.NewSessionResumeResultEvent(
-				record.Summary.ID,
-				latestCursor,
-				runtimeAlive,
-				session.ResolvedResumeRuntimeState(restoredState, record, runtimeSvc),
-				runtimeAlive,
-				replayedCount,
-				"session resumed",
-			))
 		case "session_delete":
 			var req protocol.SessionDeleteRequestEvent
 			if err := json.Unmarshal(payloadBytes, &req); err != nil {
@@ -2822,12 +3273,18 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				emit(protocol.NewErrorEventWithCode(selectedSessionID, "session ID is required", "", "session_delete_failed"))
 				continue
 			}
-			record, err := h.SessionStore.GetSession(ctx, deletedSessionID)
+			metaStore, ok := h.SessionStore.(data.SessionRuntimeMetaStore)
+			if !ok {
+				emit(protocol.NewErrorEventWithCode(selectedSessionID, "session runtime metadata store unavailable", "", "session_delete_failed"))
+				continue
+			}
+			meta, err := metaStore.GetSessionRuntimeMetadata(context.WithoutCancel(ctx), deletedSessionID)
 			if err != nil {
 				logx.Warn("ws", "delete session lookup failed: connectionID=%s sessionID=%s requestedSessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, deletedSessionID, remoteAddr, err)
 				emit(protocol.NewErrorEventWithCode(selectedSessionID, err.Error(), "", "session_delete_failed"))
 				continue
 			}
+			record := meta.Record
 			if record.Summary.External || strings.EqualFold(strings.TrimSpace(record.Summary.Source), "codex-native") {
 				emit(protocol.NewErrorEventWithCode(selectedSessionID, "Codex 原生会话仅支持恢复，不支持在 MobileVC 内删除", "", "session_delete_failed"))
 				continue
@@ -2860,32 +3317,50 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				emitEmptySessionState()
 				continue
 			}
-			record, err = h.SessionStore.GetSession(ctx, fallbackSessionID)
-			if err != nil {
-				logx.Warn("ws", "load fallback session after delete failed: connectionID=%s sessionID=%s fallbackSessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, fallbackSessionID, remoteAddr, err)
+			if ok, err := emitSessionHistoryForStoredSessionWindow(fallbackSessionID, sessionResumeHistoryLimit, activeRuntimeSession); err != nil {
+				logx.Warn("ws", "load fallback session window after delete failed: connectionID=%s sessionID=%s fallbackSessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, fallbackSessionID, remoteAddr, err)
 				emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
 				continue
+			} else if ok {
+				emit(protocol.NewSessionStateEvent(selectedSessionID, string(session.StateActive), "history loaded"))
+				continue
 			}
-			record.Projection = buildProjectionSnapshotForService(record.Summary.ID, runtimeSvc)
-			record.Summary.Runtime = record.Projection.Runtime
-			cacheProjection(record.Summary.ID, record.Projection, false)
-			emit(session.SessionHistoryWindowEventFromRecordWithCursorAndPayloadLimit(record, sessionRecordRuntimeAlive(record, runtimeSvc), sessionResumeHistoryLimit, deltaCursorSnapshot(activeRuntimeSession), gatewayRelaySafePayloadBudgetBytes))
-			if restored := restoredAgentStateEventFromRecord(record, sessionRecordRuntimeAlive(record, runtimeSvc)); restored != nil {
-				emit(*restored)
-			}
-			emit(protocol.NewSessionStateEvent(selectedSessionID, string(session.StateActive), "history loaded"))
+			windowErr := fmt.Errorf("session history window unavailable for fallback session %s", fallbackSessionID)
+			logx.Warn("ws", "load fallback session window after delete unavailable: connectionID=%s sessionID=%s fallbackSessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, fallbackSessionID, remoteAddr, windowErr)
+			emit(protocol.NewErrorEvent(selectedSessionID, windowErr.Error(), ""))
 		case "session_context_get":
-			if strings.TrimSpace(selectedSessionID) == "" {
-				emit(protocol.NewSessionContextResultEvent(selectedSessionID, toProtocolSessionContext(data.SessionContext{})))
+			targetSessionID := strings.TrimSpace(selectedSessionID)
+			if targetSessionID == "" {
+				emit(protocol.NewSessionContextResultEvent(targetSessionID, toProtocolSessionContext(data.SessionContext{})))
 				continue
 			}
-			record, ok := loadSelectedSessionRecord(h.SessionStore, ctx, selectedSessionID, emit)
-			if !ok {
+			if !canProcessSelectedSessionReadAction("session_context_get", targetSessionID) {
 				continue
 			}
-			emit(protocol.NewSessionContextResultEvent(selectedSessionID, toProtocolSessionContext(record.Projection.SessionContext)))
+			actionKey := connectionID + ":session_context_get:" + targetSessionID
+			startAsyncEventAction("session_context_get", actionKey, targetSessionID, func() (any, error) {
+				if h.SessionStore == nil {
+					return nil, fmt.Errorf("session store unavailable")
+				}
+				contextStore, ok := h.SessionStore.(data.SessionContextStore)
+				if !ok {
+					return nil, fmt.Errorf("session context store unavailable")
+				}
+				snapshot, err := contextStore.GetSessionContext(context.WithoutCancel(ctx), targetSessionID)
+				if err != nil {
+					return nil, err
+				}
+				return protocol.NewSessionContextResultEvent(targetSessionID, toProtocolSessionContext(snapshot.SessionContext)), nil
+			})
 		case "permission_rule_list":
-			emitPermissionRuleList(emit, h.SessionStore, ctx, selectedSessionID)
+			targetSessionID := strings.TrimSpace(selectedSessionID)
+			if targetSessionID != "" && !canProcessSelectedSessionReadAction("permission_rule_list", targetSessionID) {
+				continue
+			}
+			actionKey := connectionID + ":permission_rule_list:" + targetSessionID
+			startAsyncMultiEventAction("permission_rule_list", actionKey, targetSessionID, func() ([]any, error) {
+				return buildPermissionRuleListEvents(h.SessionStore, context.WithoutCancel(ctx), targetSessionID)
+			})
 		case "permission_rule_upsert":
 			var req protocol.PermissionRuleRequestEvent
 			if err := json.Unmarshal(payloadBytes, &req); err != nil {
@@ -2910,16 +3385,13 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 					continue
 				}
 			default:
-				record, ok := loadSelectedSessionRecord(h.SessionStore, ctx, selectedSessionID, emit)
-				if !ok {
-					continue
-				}
-				record.Projection.PermissionRules = upsertPermissionRule(record.Projection.PermissionRules, rule)
-				if _, err := h.SessionStore.SaveProjection(ctx, selectedSessionID, record.Projection); err != nil {
+				if err := saveSessionPermissionRules(ctx, h.SessionStore, selectedSessionID, func(snapshot data.SessionPermissionRuleSnapshot) data.SessionPermissionRuleSnapshot {
+					snapshot.Items = upsertPermissionRule(snapshot.Items, rule)
+					return snapshot
+				}); err != nil {
 					emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
 					continue
 				}
-				cacheProjection(selectedSessionID, record.Projection, false)
 				invalidateSessionListCacheForMutation()
 			}
 			emitPermissionRuleList(emit, h.SessionStore, ctx, selectedSessionID)
@@ -2942,16 +3414,14 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 					continue
 				}
 			default:
-				record, ok := loadSelectedSessionRecord(h.SessionStore, ctx, selectedSessionID, emit)
-				if !ok {
-					continue
-				}
-				record.Projection.PermissionRules = deletePermissionRule(record.Projection.PermissionRules, strings.TrimSpace(req.ID))
-				if _, err := h.SessionStore.SaveProjection(ctx, selectedSessionID, record.Projection); err != nil {
+				ruleID := strings.TrimSpace(req.ID)
+				if err := saveSessionPermissionRules(ctx, h.SessionStore, selectedSessionID, func(snapshot data.SessionPermissionRuleSnapshot) data.SessionPermissionRuleSnapshot {
+					snapshot.Items = deletePermissionRule(snapshot.Items, ruleID)
+					return snapshot
+				}); err != nil {
 					emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
 					continue
 				}
-				cacheProjection(selectedSessionID, record.Projection, false)
 				invalidateSessionListCacheForMutation()
 			}
 			emitPermissionRuleList(emit, h.SessionStore, ctx, selectedSessionID)
@@ -2974,16 +3444,13 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 					continue
 				}
 			default:
-				record, ok := loadSelectedSessionRecord(h.SessionStore, ctx, selectedSessionID, emit)
-				if !ok {
-					continue
-				}
-				record.Projection.PermissionRulesEnabled = req.Enabled
-				if _, err := h.SessionStore.SaveProjection(ctx, selectedSessionID, record.Projection); err != nil {
+				if err := saveSessionPermissionRules(ctx, h.SessionStore, selectedSessionID, func(snapshot data.SessionPermissionRuleSnapshot) data.SessionPermissionRuleSnapshot {
+					snapshot.Enabled = req.Enabled
+					return snapshot
+				}); err != nil {
 					emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
 					continue
 				}
-				cacheProjection(selectedSessionID, record.Projection, false)
 				invalidateSessionListCacheForMutation()
 			}
 			emitPermissionRuleList(emit, h.SessionStore, ctx, selectedSessionID)
@@ -3696,8 +4163,16 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				default:
 					projection.PermissionRulesEnabled = true
 					projection.PermissionRules = upsertPermissionRule(projection.PermissionRules, rule)
-					persistProjectionFor(sessionID, projection)
-					invalidateSessionListCacheForMutation()
+					if err := saveSessionPermissionRules(ctx, h.SessionStore, sessionID, func(snapshot data.SessionPermissionRuleSnapshot) data.SessionPermissionRuleSnapshot {
+						snapshot.Enabled = true
+						snapshot.Items = upsertPermissionRule(snapshot.Items, rule)
+						return snapshot
+					}); err != nil {
+						logx.Error("ws", "save session permission rule failed: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, sessionID, remoteAddr, err)
+						emit(protocol.NewErrorEvent(sessionID, err.Error(), ""))
+					} else {
+						invalidateSessionListCacheForMutation()
+					}
 				}
 				emitPermissionRuleList(emit, h.SessionStore, ctx, sessionID)
 			}
@@ -4540,6 +5015,29 @@ func isNativeMirrorSessionID(sessionID string) bool {
 	return claudesync.IsMirrorSessionID(sessionID) || codexsync.IsMirrorSessionID(sessionID)
 }
 
+func codexMirrorCacheMatchesSource(record data.SessionRecord) bool {
+	record = data.SessionRecord{
+		Summary:       record.Summary,
+		Projection:    session.NormalizeProjectionSnapshot(record.Projection),
+		ClientActions: record.ClientActions,
+	}
+	if !codexsync.IsMirrorSessionID(record.Summary.ID) {
+		return false
+	}
+	runtime := session.MergeStoreSessionRuntime(record.Summary.Runtime, record.Projection.Runtime)
+	if strings.TrimSpace(runtime.SourcePath) == "" || runtime.SourceSize <= 0 || runtime.SourceModUnixNS <= 0 {
+		return false
+	}
+	if runtime.SourceEntryCount <= 0 || runtime.SourceEntryCount != record.Summary.EntryCount {
+		return false
+	}
+	info, err := os.Stat(runtime.SourcePath)
+	if err != nil {
+		return false
+	}
+	return info.Size() == runtime.SourceSize && info.ModTime().UnixNano() == runtime.SourceModUnixNS
+}
+
 func sessionRecordRuntimeAlive(record data.SessionRecord, svc *session.Service) bool {
 	allowStoredRuntime := record.Summary.External ||
 		codexsync.IsMirrorSessionID(record.Summary.ID) ||
@@ -5088,13 +5586,30 @@ func (h *Handler) runMemorySyncPull(ctx context.Context, sessionID, syncCWD, con
 
 func resolveCatalogSyncCWD(sessionStore data.Store, ctx context.Context, sessionID, fallbackCWD string) string {
 	if sessionStore != nil && strings.TrimSpace(sessionID) != "" {
-		record, err := sessionStore.GetSession(ctx, sessionID)
-		if err == nil {
-			if cwd := normalizeSessionCWD(record.Projection.Runtime.CWD); cwd != "" {
-				return cwd
+		if metaStore, ok := sessionStore.(data.SessionRuntimeMetaStore); ok {
+			meta, err := metaStore.GetSessionRuntimeMetadata(ctx, sessionID)
+			if err == nil {
+				record := meta.Record
+				if cwd := normalizeSessionCWD(record.Projection.Runtime.CWD); cwd != "" {
+					return cwd
+				}
+				if cwd := normalizeSessionCWD(record.Summary.Runtime.CWD); cwd != "" {
+					return cwd
+				}
 			}
-			if cwd := normalizeSessionCWD(record.Summary.Runtime.CWD); cwd != "" {
-				return cwd
+		}
+		// Catalog sync is not a selected-session bootstrap path. Non-side-domain
+		// stores keep the legacy full-record lookup because they have no runtime
+		// metadata reader to derive cwd from.
+		if _, ok := sessionStore.(data.SessionRuntimeMetaStore); !ok {
+			record, err := sessionStore.GetSession(ctx, sessionID)
+			if err == nil {
+				if cwd := normalizeSessionCWD(record.Projection.Runtime.CWD); cwd != "" {
+					return cwd
+				}
+				if cwd := normalizeSessionCWD(record.Summary.Runtime.CWD); cwd != "" {
+					return cwd
+				}
 			}
 		}
 	}
@@ -5105,6 +5620,19 @@ func resolveCatalogSourceOfTruth(sessionStore data.Store, ctx context.Context, s
 	if sessionStore == nil || strings.TrimSpace(sessionID) == "" {
 		return data.CatalogSourceTruthClaude
 	}
+	if metaStore, ok := sessionStore.(data.SessionRuntimeMetaStore); ok {
+		meta, err := metaStore.GetSessionRuntimeMetadata(ctx, sessionID)
+		if err != nil {
+			return data.CatalogSourceTruthClaude
+		}
+		record := meta.Record
+		if isCodexRuntime(record.Projection.Runtime) || isCodexRuntime(record.Summary.Runtime) || strings.EqualFold(strings.TrimSpace(record.Summary.Source), "codex-native") {
+			return data.CatalogSourceTruthCodex
+		}
+		return data.CatalogSourceTruthClaude
+	}
+	// Catalog sync is outside selected-session bootstrap. This fallback is kept
+	// only for non-side-domain stores that cannot expose runtime metadata.
 	record, err := sessionStore.GetSession(ctx, sessionID)
 	if err != nil {
 		return data.CatalogSourceTruthClaude
@@ -6191,10 +6719,15 @@ func resolveTrackedCodexThreadID(ctx context.Context, sessionStore data.Store, i
 	if sessionStore == nil || strings.TrimSpace(item.ID) == "" {
 		return ""
 	}
-	record, err := sessionStore.GetSession(ctx, item.ID)
+	metaStore, ok := sessionStore.(data.SessionRuntimeMetaStore)
+	if !ok {
+		return ""
+	}
+	meta, err := metaStore.GetSessionRuntimeMetadata(ctx, item.ID)
 	if err != nil {
 		return ""
 	}
+	record := meta.Record
 	if resumeID := strings.TrimSpace(record.Projection.Runtime.ResumeSessionID); resumeID != "" {
 		return resumeID
 	}
@@ -6326,10 +6859,15 @@ func resolveTrackedClaudeSessionID(ctx context.Context, sessionStore data.Store,
 	if sessionStore == nil || strings.TrimSpace(item.ID) == "" {
 		return ""
 	}
-	record, err := sessionStore.GetSession(ctx, item.ID)
+	metaStore, ok := sessionStore.(data.SessionRuntimeMetaStore)
+	if !ok {
+		return ""
+	}
+	meta, err := metaStore.GetSessionRuntimeMetadata(ctx, item.ID)
 	if err != nil {
 		return ""
 	}
+	record := meta.Record
 	if resumeID := strings.TrimSpace(record.Projection.Runtime.ResumeSessionID); resumeID != "" && isClaudeRuntime(record.Projection.Runtime) {
 		return resumeID
 	}
@@ -6416,9 +6954,9 @@ func mergeSessionSummaries(ctx context.Context, sessionStore data.Store, items [
 		if _, ok := seen[record.Summary.ID]; ok {
 			continue
 		}
-		if sessionStore != nil {
-			if stored, getErr := sessionStore.GetSession(ctx, record.Summary.ID); getErr == nil {
-				record = stored
+		if metaStore, ok := sessionStore.(data.SessionRuntimeMetaStore); ok {
+			if stored, getErr := metaStore.GetSessionRuntimeMetadata(ctx, record.Summary.ID); getErr == nil {
+				record = stored.Record
 			}
 		}
 		merged = append(merged, record.Summary)
@@ -6432,9 +6970,9 @@ func mergeSessionSummaries(ctx context.Context, sessionStore data.Store, items [
 		if _, ok := seen[record.Summary.ID]; ok {
 			continue
 		}
-		if sessionStore != nil {
-			if stored, getErr := sessionStore.GetSession(ctx, record.Summary.ID); getErr == nil {
-				record = stored
+		if metaStore, ok := sessionStore.(data.SessionRuntimeMetaStore); ok {
+			if stored, getErr := metaStore.GetSessionRuntimeMetadata(ctx, record.Summary.ID); getErr == nil {
+				record = stored.Record
 			}
 		}
 		merged = append(merged, record.Summary)
@@ -6645,6 +7183,10 @@ func mergeNativeMirrorRuntime(fresh data.SessionRuntime, existing data.SessionRu
 	if strings.TrimSpace(merged.ResumeSessionID) != strings.TrimSpace(fresh.ResumeSessionID) {
 		merged.ResumeSessionID = fresh.ResumeSessionID
 	}
+	merged.SourcePath = fresh.SourcePath
+	merged.SourceSize = fresh.SourceSize
+	merged.SourceModUnixNS = fresh.SourceModUnixNS
+	merged.SourceEntryCount = fresh.SourceEntryCount
 	merged.Source = firstNonEmptyString(fresh.Source, merged.Source, source)
 	return merged
 }
@@ -6654,11 +7196,15 @@ func mergeNativeMirrorController(fresh session.ControllerSnapshot, existing sess
 	merged.ResumeSession = firstNonEmptyString(fresh.ResumeSession, merged.ResumeSession)
 	merged.CurrentCommand = firstNonEmptyString(fresh.CurrentCommand, merged.CurrentCommand)
 	merged.ActiveMeta = protocol.MergeRuntimeMeta(merged.ActiveMeta, protocol.RuntimeMeta{
-		ResumeSessionID: fresh.ActiveMeta.ResumeSessionID,
-		Command:         fresh.ActiveMeta.Command,
-		Engine:          fresh.ActiveMeta.Engine,
-		CWD:             fresh.ActiveMeta.CWD,
-		Source:          firstNonEmptyString(fresh.ActiveMeta.Source, source),
+		ResumeSessionID:  fresh.ActiveMeta.ResumeSessionID,
+		Command:          fresh.ActiveMeta.Command,
+		Engine:           fresh.ActiveMeta.Engine,
+		CWD:              fresh.ActiveMeta.CWD,
+		Source:           firstNonEmptyString(fresh.ActiveMeta.Source, source),
+		SourcePath:       fresh.ActiveMeta.SourcePath,
+		SourceSize:       fresh.ActiveMeta.SourceSize,
+		SourceModUnixNS:  fresh.ActiveMeta.SourceModUnixNS,
+		SourceEntryCount: fresh.ActiveMeta.SourceEntryCount,
 	})
 	expectedEngine := strings.TrimSuffix(source, "-native")
 	if !strings.EqualFold(strings.TrimSpace(merged.ActiveMeta.Engine), expectedEngine) {

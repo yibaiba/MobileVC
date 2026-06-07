@@ -633,6 +633,43 @@ func TestSessionHistoryPageEventFromRecordWithPayloadLimitShrinksEntries(t *test
 	}
 }
 
+func TestSessionHistoryPageEventFromWindowWithPayloadLimitShrinksBeforeFullMarshal(t *testing.T) {
+	entries := []data.SnapshotLogEntry{
+		{Kind: "markdown", Message: strings.Repeat("a", 1024)},
+		{Kind: "markdown", Message: strings.Repeat("b", 1024)},
+		{Kind: "markdown", Message: strings.Repeat("c", 1024)},
+	}
+	window := data.SessionHistoryWindow{
+		Record: data.SessionRecord{
+			Summary:    data.SessionSummary{ID: "s1"},
+			Projection: data.ProjectionSnapshot{Runtime: data.SessionRuntime{Command: "claude"}},
+		},
+		LogEntries:    entries,
+		LogEntryStart: 0,
+		LogEntryTotal: len(entries),
+	}
+	budget := 2300
+
+	got := SessionHistoryPageEventFromWindowWithPayloadLimit(window, budget)
+
+	if !got.PayloadLimited {
+		t.Fatalf("expected payloadLimited history page")
+	}
+	if len(got.LogEntries) >= len(entries) {
+		t.Fatalf("expected shrunken window history page, got %d entries", len(got.LogEntries))
+	}
+	if got.LogEntryTotal != len(entries) || got.Latest.LogEntryCount != len(entries) {
+		t.Fatalf("window metadata should survive shrinking: total=%d latest=%d", got.LogEntryTotal, got.Latest.LogEntryCount)
+	}
+	encoded, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal shrunken window page: %v", err)
+	}
+	if len(encoded) > budget {
+		t.Fatalf("window page payload still exceeds budget: got %d budget %d", len(encoded), budget)
+	}
+}
+
 func TestSessionDeltaEventFromRecordWithPayloadLimitRequiresFullSyncForLargePayload(t *testing.T) {
 	record := data.SessionRecord{
 		Summary: data.SessionSummary{ID: "s1"},

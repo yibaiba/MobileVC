@@ -226,6 +226,7 @@ class SessionController extends ChangeNotifier {
     @visibleForTesting Duration? lanReturnProbeInterval,
     @visibleForTesting Duration? connectionHealthInterval,
     @visibleForTesting int maxMissedHealthPongs = _defaultMaxMissedHealthPongs,
+    @visibleForTesting Duration? sessionLoadingTimeout,
   })  : _service = service ?? MobileVcWsService(),
         _outboundAckRetryDelay = outboundAckRetryDelay,
         _outboundAckStaleTimeout = outboundAckStaleTimeout,
@@ -233,7 +234,9 @@ class SessionController extends ChangeNotifier {
             lanReturnProbeInterval ?? _defaultLanReturnProbeInterval,
         _connectionHealthInterval =
             connectionHealthInterval ?? _defaultConnectionHealthInterval,
-        _maxMissedHealthPongs = maxMissedHealthPongs {
+        _maxMissedHealthPongs = maxMissedHealthPongs,
+        _sessionLoadingTimeoutDuration =
+            sessionLoadingTimeout ?? _defaultSessionLoadingTimeoutDuration {
     _terminalExecutionsView = UnmodifiableListView(_terminalExecutions);
     _runtimeProcessesView = UnmodifiableListView(_runtimeProcesses);
     _codexModelCatalogView = UnmodifiableListView(_codexModelCatalog);
@@ -333,7 +336,9 @@ class SessionController extends ChangeNotifier {
   bool _isCompacting = false;
   Timer? _sessionLoadingTimeout;
   Timer? _postHistoryBootstrapTimer;
-  static const Duration _sessionLoadingTimeoutDuration = Duration(seconds: 15);
+  static const Duration _defaultSessionLoadingTimeoutDuration =
+      Duration(seconds: 15);
+  final Duration _sessionLoadingTimeoutDuration;
   static const Duration _postHistoryBootstrapDelay =
       Duration(milliseconds: 450);
   String _connectionMessage = '未连接';
@@ -663,7 +668,10 @@ class SessionController extends ChangeNotifier {
   String get relayDeviceStatus => _relayDeviceStatus;
   bool get canManageRelayDevices =>
       connected &&
+      !_connecting &&
+      !_isLoadingSession &&
       _activeTransportPath == ActiveTransportPath.relay &&
+      _service.hasRelayE2eeHandshake &&
       _service.hasRelayE2eeDeviceBinding;
   Future<RelaySecurityState> relaySecurityState() {
     final actualConnectionMode =
@@ -2331,10 +2339,20 @@ class SessionController extends ChangeNotifier {
   }
 
   bool get _currentSessionShouldSendCodexSandboxMode =>
-      _runtimeMetaIsCodex(_liveRuntimeMeta) ||
-      _runtimeMetaIsCodex(_resumeRuntimeMeta) ||
-      _selectedSessionId.trim().toLowerCase().startsWith('codex-thread:') ||
-      _sessionSummaryIsCodex(_selectedSessionSummary);
+      _sessionShouldSendCodexSandboxMode(_selectedSessionId);
+
+  bool _sessionShouldSendCodexSandboxMode(String sessionId) {
+    final normalizedSessionId = sessionId.trim();
+    if (normalizedSessionId == _selectedSessionId.trim()) {
+      return _runtimeMetaIsCodex(_liveRuntimeMeta) ||
+          _runtimeMetaIsCodex(_resumeRuntimeMeta) ||
+          normalizedSessionId.toLowerCase().startsWith('codex-thread:') ||
+          _sessionSummaryIsCodex(_selectedSessionSummary);
+    }
+    final summary = _findSessionSummary(_sessions, normalizedSessionId);
+    return normalizedSessionId.toLowerCase().startsWith('codex-thread:') ||
+        _sessionSummaryIsCodex(summary);
+  }
 
   void _applyCodexSandboxModeIfNeeded(Map<String, dynamic> payload) {
     if (_currentSessionShouldSendCodexSandboxMode) {
@@ -2514,10 +2532,10 @@ class SessionController extends ChangeNotifier {
       _relayDeviceListLoading = false;
       await switchWorkingDirectory(_config.cwd);
       requestSessionList();
-      if (canManageRelayDevices) {
-        requestRelayDeviceList();
-      }
-      if (_selectedSessionId.trim().isNotEmpty) {
+      final pendingLoadTarget = _pendingSessionTargetId.trim();
+      if (pendingLoadTarget.isNotEmpty) {
+        _resendPendingSessionLoad(pendingLoadTarget);
+      } else if (_selectedSessionId.trim().isNotEmpty) {
         final isRelayPath = _activeTransportPath == ActiveTransportPath.relay;
         _requestSessionResume(
           reason: silently ? 'reconnect' : 'connect',
@@ -2868,6 +2886,8 @@ class SessionController extends ChangeNotifier {
   }) {
     final normalized = message.trim().isEmpty ? '连接已断开' : message.trim();
     final wasRecovering = reconnecting;
+    final interruptedLoadTarget =
+        _isLoadingSession ? _pendingSessionTargetId.trim() : '';
     final preserveRuntimeForRelayRecovery =
         _shouldPreserveRuntimeForRelayRecovery();
     _connected = false;
@@ -2877,7 +2897,8 @@ class SessionController extends ChangeNotifier {
     _clearStoppingState();
     _isLoadingSession = false;
     _sessionListSyncedSinceConnect = false;
-    _pendingSessionTargetId = '';
+    _pendingSessionTargetId =
+        _autoReconnectEnabled ? interruptedLoadTarget : '';
     _pendingNotificationSessionTargetId = '';
     _clearDeferredFirstInput();
     _sessionEventCursors.clear();
@@ -2945,28 +2966,30 @@ class SessionController extends ChangeNotifier {
   void _requestSessionResume({
     String reason = '',
     bool allowWhileConnecting = false,
+    String sessionId = '',
   }) {
-    final sessionId = _selectedSessionId.trim();
+    final targetSessionId =
+        sessionId.trim().isEmpty ? _selectedSessionId.trim() : sessionId.trim();
     if (!_connected ||
         (_connecting && !allowWhileConnecting) ||
-        sessionId.isEmpty) {
+        targetSessionId.isEmpty) {
       return;
     }
     final pendingTargetId = _pendingSessionTargetId.trim();
     if (_isLoadingSession &&
         pendingTargetId.isNotEmpty &&
-        pendingTargetId != sessionId) {
+        pendingTargetId != targetSessionId) {
       return;
     }
-    final lastSeenCursor = _sessionEventCursors[sessionId] ?? 0;
+    final lastSeenCursor = _sessionEventCursors[targetSessionId] ?? 0;
     final runtimeState =
         (_agentState?.state ?? _sessionState?.state ?? '').trim();
     final shouldSendCodexRuntimeMeta =
-        _currentSessionShouldSendCodexSandboxMode;
+        _sessionShouldSendCodexSandboxMode(targetSessionId);
     _connectionStage = SessionConnectionStage.catchingUp;
     _service.send({
       'action': 'session_resume',
-      'sessionId': sessionId,
+      'sessionId': targetSessionId,
       'cwd': effectiveCwd,
       'limit': _historyWindowLimit,
       if (shouldSendCodexRuntimeMeta) ...{
@@ -3013,6 +3036,7 @@ class SessionController extends ChangeNotifier {
   void _syncObservedSessionPolling() {
     if (!_connected ||
         _connecting ||
+        _isLoadingSession ||
         !_appInForeground ||
         _selectedSessionId.trim().isEmpty ||
         (!_sessionRuntimeAlive && !_selectedSessionExternalNative)) {
@@ -3295,11 +3319,14 @@ class SessionController extends ChangeNotifier {
     if (_isLoadingSession && pendingTargetId == targetId) {
       return;
     }
-    if (!_isLoadingSession && selectedId == targetId) {
+    if (!_isLoadingSession &&
+        pendingTargetId.isEmpty &&
+        selectedId == targetId) {
       return;
     }
     _postHistoryBootstrapTimer?.cancel();
     _postHistoryBootstrapTimer = null;
+    _clearSessionUpdatedPullState();
     _stopObservedSessionSync();
     _sessionDeltaLastRequestedAt.clear();
     _connectionStage =
@@ -3310,6 +3337,24 @@ class SessionController extends ChangeNotifier {
       'sessionId': targetId,
       'cwd': effectiveCwd,
       'limit': _historyWindowLimit,
+    });
+  }
+
+  void _resendPendingSessionLoad(String sessionId) {
+    final targetId = sessionId.trim();
+    if (!_connected || targetId.isEmpty) {
+      return;
+    }
+    _isLoadingSession = true;
+    _connectionStage = SessionConnectionStage.catchingUp;
+    _agentPhaseLabel = '切换会话中';
+    _beginSessionLoading(targetId: targetId);
+    _service.send({
+      'action': 'session_load',
+      'sessionId': targetId,
+      'cwd': effectiveCwd,
+      'limit': _historyWindowLimit,
+      'reason': 'reconnect_pending_load',
     });
   }
 
@@ -3385,8 +3430,17 @@ class SessionController extends ChangeNotifier {
       if (!_isLoadingSession) {
         return;
       }
+      final timedOutTargetId = _pendingSessionTargetId.trim();
+      _sessionLoadingTimeout = null;
       _isLoadingSession = false;
       _pendingSessionTargetId = '';
+      if (timedOutTargetId.isNotEmpty &&
+          _pendingNotificationSessionTargetId.trim() == timedOutTargetId) {
+        _pendingNotificationSessionTargetId = '';
+      }
+      if (_connected && !_connecting) {
+        _connectionStage = SessionConnectionStage.ready;
+      }
       _agentPhaseLabel = '加载超时';
       _pushSystem('error', '会话加载超时，请检查网络后重试');
       _syncDerivedState();
@@ -3519,6 +3573,9 @@ class SessionController extends ChangeNotifier {
 
   bool _eventTargetsCurrentSession(String sessionId) {
     final normalized = sessionId.trim();
+    if (_isLoadingSession || _pendingSessionTargetId.trim().isNotEmpty) {
+      return _isHistoryEventForActiveTarget(normalized);
+    }
     if (normalized.isEmpty) {
       return _selectedSessionId.trim().isEmpty && !_isLoadingSession;
     }
@@ -3530,12 +3587,16 @@ class SessionController extends ChangeNotifier {
   }
 
   void _finishSessionLoading({String sessionId = ''}) {
+    final normalized = sessionId.trim();
     if (!_isLoadingSession) {
+      if (normalized.isNotEmpty &&
+          _pendingSessionTargetId.trim() == normalized) {
+        _pendingSessionTargetId = '';
+      }
       return;
     }
     _sessionLoadingTimeout?.cancel();
     _sessionLoadingTimeout = null;
-    final normalized = sessionId.trim();
     if (normalized.isNotEmpty) {
       _pendingSessionTargetId = normalized;
     }
@@ -3559,13 +3620,9 @@ class SessionController extends ChangeNotifier {
       requestAdbDevices();
       requestSessionContext();
       requestRuntimeProcessList();
-      requestReviewState();
       requestPermissionRuleList();
       requestTaskSnapshot();
       requestContextWindowUsage();
-      if (canManageRelayDevices) {
-        requestRelayDeviceList();
-      }
     });
   }
 
@@ -4049,6 +4106,9 @@ class SessionController extends ChangeNotifier {
   }
 
   void requestSessionContext() {
+    if (!_connected || _connecting || _isLoadingSession) {
+      return;
+    }
     _service.send({'action': 'session_context_get'});
   }
 
@@ -4058,7 +4118,7 @@ class SessionController extends ChangeNotifier {
 
   void requestDiffPage({int limit = 50, bool force = false}) {
     final sessionId = _selectedSessionId.trim();
-    if (!_connected || _connecting || sessionId.isEmpty) {
+    if (!_connected || _connecting || _isLoadingSession || sessionId.isEmpty) {
       return;
     }
     final known = _currentSessionDeltaKnown(sessionId);
@@ -4093,7 +4153,7 @@ class SessionController extends ChangeNotifier {
     bool force = false,
   }) {
     final sessionId = _selectedSessionId.trim();
-    if (!_connected || _connecting || sessionId.isEmpty) {
+    if (!_connected || _connecting || _isLoadingSession || sessionId.isEmpty) {
       return;
     }
     final normalizedStream =
@@ -4129,7 +4189,7 @@ class SessionController extends ChangeNotifier {
     bool force = false,
   }) {
     final sessionId = _selectedSessionId.trim();
-    if (!_connected || _connecting || sessionId.isEmpty) {
+    if (!_connected || _connecting || _isLoadingSession || sessionId.isEmpty) {
       return;
     }
     final known = _currentSessionDeltaKnown(sessionId);
@@ -4157,7 +4217,7 @@ class SessionController extends ChangeNotifier {
   }
 
   void requestTaskSnapshot() {
-    if (!_connected || _connecting) {
+    if (!_connected || _connecting || _isLoadingSession) {
       return;
     }
     _service.send({
@@ -4168,7 +4228,7 @@ class SessionController extends ChangeNotifier {
   }
 
   void requestContextWindowUsage() {
-    if (!_connected || _connecting) {
+    if (!_connected || _connecting || _isLoadingSession) {
       return;
     }
     _service.send({
@@ -5542,6 +5602,9 @@ class SessionController extends ChangeNotifier {
   }
 
   void requestRuntimeProcessList() {
+    if (_isLoadingSession) {
+      return;
+    }
     _requestRuntimeProcessList();
   }
 
@@ -5550,6 +5613,9 @@ class SessionController extends ChangeNotifier {
   }
 
   void requestPermissionRuleList() {
+    if (!_connected || _connecting || _isLoadingSession) {
+      return;
+    }
     _service.send({'action': 'permission_rule_list'});
   }
 
@@ -5709,10 +5775,8 @@ class SessionController extends ChangeNotifier {
         _sendCachedPushTokenIfPossible();
         _resetNewSessionState();
         _upsertSession(created.summary);
-        requestSessionContext();
-        requestPermissionRuleList();
-        requestContextWindowUsage();
         _finishSessionLoading(sessionId: created.summary.id);
+        _schedulePostHistoryBootstrap(sessionId: created.summary.id);
         _flushDeferredFirstInputIfNeeded();
         break;
       case SessionListResultEvent list:
@@ -5979,10 +6043,6 @@ class SessionController extends ChangeNotifier {
           _clearStoppingState();
         }
 
-        if (_isLoadingSession &&
-            _matchesPendingSessionTarget(state.sessionId)) {
-          _finishSessionLoading(sessionId: state.sessionId);
-        }
         if (_connected) {
           _restorePendingNotificationSessionIfNeeded();
         }
@@ -6172,6 +6232,13 @@ class SessionController extends ChangeNotifier {
               : error.message.trim();
         }
         final errorMessage = error.message.trim();
+        if (_shouldFinishSessionLoadingForError(error)) {
+          _finishSessionLoading(sessionId: error.sessionId);
+          if (_connected && !_connecting) {
+            _connectionStage = SessionConnectionStage.ready;
+          }
+          _agentPhaseLabel = '加载失败';
+        }
         if (error.code.startsWith('e2ee_')) {
           if (_isLoadingSession) {
             _finishSessionLoading(sessionId: error.sessionId);
@@ -6832,6 +6899,24 @@ class SessionController extends ChangeNotifier {
     return handled;
   }
 
+  bool _shouldFinishSessionLoadingForError(ErrorEvent error) {
+    if (!_isLoadingSession) {
+      return false;
+    }
+    if (!_isHistoryEventForActiveTarget(error.sessionId)) {
+      return false;
+    }
+    final code = error.code.trim();
+    if (code == 'session_load_failed' || code == 'session_resume_failed') {
+      return true;
+    }
+    final message = error.message.trim().toLowerCase();
+    return message.contains('session load is already running') ||
+        message.contains('session resume is already running') ||
+        message.contains('session history window unavailable') ||
+        message.contains('session history window store unavailable');
+  }
+
   bool _isIdleLikeState(String state) {
     final normalized = state.trim().toUpperCase();
     return normalized.isEmpty ||
@@ -7031,7 +7116,10 @@ class SessionController extends ChangeNotifier {
       return;
     }
     if (delta.requiresFullSync) {
-      _requestSessionResume(reason: 'delta_base_mismatch');
+      _requestSessionResume(
+        reason: 'delta_base_mismatch',
+        sessionId: delta.sessionId,
+      );
       return;
     }
     final deltaSessionId = delta.sessionId.trim();
@@ -7120,13 +7208,16 @@ class SessionController extends ChangeNotifier {
         delta.resumeRuntimeMeta,
       );
     }
+    if (_matchesPendingSessionTarget(deltaSessionId)) {
+      _finishSessionLoading(sessionId: deltaSessionId);
+    }
     _syncDerivedState();
     notifyListeners();
     _syncObservedSessionPolling();
   }
 
   bool _isSessionRecoveryEventForActiveSession(String sessionId) {
-    if (_isLoadingSession) {
+    if (_isLoadingSession || _pendingSessionTargetId.trim().isNotEmpty) {
       return _isHistoryEventForActiveTarget(sessionId);
     }
     return _eventTargetsCurrentSession(sessionId);
@@ -7387,6 +7478,10 @@ class SessionController extends ChangeNotifier {
   void _handleSessionUpdated(SessionUpdatedEvent event) {
     final updatedSessionId = event.sessionId.trim();
     if (updatedSessionId.isEmpty || !_connected || _connecting) {
+      return;
+    }
+    if (_isLoadingSession &&
+        !_isHistoryEventForActiveTarget(updatedSessionId)) {
       return;
     }
     final previousGeneration =

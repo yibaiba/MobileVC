@@ -100,6 +100,36 @@ func MergeJSONLToSession(cwd, claudeUUID string, existingEntries []data.Snapshot
 	return merged, len(allEntries), nil
 }
 
+func ReadJSONLAppendEntries(cwd, claudeUUID string, knownJSONLEntryCount int) (appendEntries []data.SnapshotLogEntry, totalCount int, _ error) {
+	if strings.TrimSpace(cwd) == "" || strings.TrimSpace(claudeUUID) == "" {
+		return nil, 0, nil
+	}
+	if knownJSONLEntryCount < 0 {
+		knownJSONLEntryCount = 0
+	}
+	projectsDir, err := ClaudeProjectsDir()
+	if err != nil {
+		return nil, 0, err
+	}
+	encoded := EncodeCWDToProjectDir(cwd)
+	if encoded == "" {
+		return nil, 0, nil
+	}
+	filePath := filepath.Join(projectsDir, encoded, claudeUUID+".jsonl")
+	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		return nil, 0, nil
+	}
+	native, err := parseSessionFromFile(filePath, claudeUUID)
+	if err != nil {
+		return nil, 0, fmt.Errorf("parse claude jsonl for append: %w", err)
+	}
+	totalCount = len(native.LogEntries)
+	if knownJSONLEntryCount >= totalCount {
+		return nil, totalCount, nil
+	}
+	return append([]data.SnapshotLogEntry(nil), native.LogEntries[knownJSONLEntryCount:]...), totalCount, nil
+}
+
 func entryDedupKey(e data.SnapshotLogEntry) string {
 	text := strings.TrimSpace(e.Message)
 	if text == "" {

@@ -90,6 +90,10 @@ type RuntimeMeta struct {
 	ClaudeSessionUUID   string `json:"claudeSessionUUID,omitempty"`
 	ClaudeLifecycle     string `json:"claudeLifecycle,omitempty"`
 	BlockingKind        string `json:"blockingKind,omitempty"`
+	SourcePath          string `json:"sourcePath,omitempty"`
+	SourceSize          int64  `json:"sourceSize,omitempty"`
+	SourceModUnixNS     int64  `json:"sourceModUnixNs,omitempty"`
+	SourceEntryCount    int    `json:"sourceEntryCount,omitempty"`
 }
 
 type Event struct {
@@ -1854,6 +1858,18 @@ func MergeRuntimeMeta(base, overlay RuntimeMeta) RuntimeMeta {
 	}
 	if overlay.BlockingKind != "" {
 		merged.BlockingKind = overlay.BlockingKind
+	}
+	if overlay.SourcePath != "" {
+		merged.SourcePath = overlay.SourcePath
+	}
+	if overlay.SourceSize != 0 {
+		merged.SourceSize = overlay.SourceSize
+	}
+	if overlay.SourceModUnixNS != 0 {
+		merged.SourceModUnixNS = overlay.SourceModUnixNS
+	}
+	if overlay.SourceEntryCount != 0 {
+		merged.SourceEntryCount = overlay.SourceEntryCount
 	}
 	return merged
 }

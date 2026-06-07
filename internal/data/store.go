@@ -138,6 +138,10 @@ type SessionRuntime struct {
 	CWD              string `json:"cwd,omitempty"`
 	ClaudeLifecycle  string `json:"claudeLifecycle,omitempty"`
 	Source           string `json:"source,omitempty"`
+	SourcePath       string `json:"sourcePath,omitempty"`
+	SourceSize       int64  `json:"sourceSize,omitempty"`
+	SourceModUnixNS  int64  `json:"sourceModUnixNs,omitempty"`
+	SourceEntryCount int    `json:"sourceEntryCount,omitempty"`
 }
 
 type ContextWindowUsage struct {
@@ -318,6 +322,77 @@ type SessionHistoryWindow struct {
 	LogEntryTotal int
 }
 
+type SessionProjectionCounts struct {
+	LogEntryCount          int
+	DiffCount              int
+	TerminalExecutionCount int
+	TerminalStdoutLength   int
+	TerminalStderrLength   int
+}
+
+type SessionRuntimeMetadata struct {
+	Record SessionRecord
+	Latest SessionProjectionCounts
+}
+
+type SessionContextSnapshot struct {
+	SessionID      string
+	SessionContext SessionContext
+}
+
+type SessionPermissionRuleSnapshot struct {
+	SessionID string
+	Enabled   bool
+	Items     []PermissionRule
+}
+
+type SessionDiffPageRequest struct {
+	SessionID string
+	Before    int
+	Limit     int
+}
+
+type SessionDiffPage struct {
+	Record    SessionRecord
+	Latest    SessionProjectionCounts
+	Diffs     []DiffContext
+	DiffStart int
+	DiffTotal int
+}
+
+type SessionTerminalRangeRequest struct {
+	SessionID string
+	Stream    string
+	Start     int
+	Limit     int
+}
+
+type SessionTerminalRange struct {
+	Record  SessionRecord
+	Latest  SessionProjectionCounts
+	Stream  string
+	Start   int
+	End     int
+	Total   int
+	Content string
+}
+
+type SessionTerminalExecutionPageRequest struct {
+	SessionID     string
+	Before        int
+	Limit         int
+	IncludeOutput bool
+}
+
+type SessionTerminalExecutionPage struct {
+	Record             SessionRecord
+	Latest             SessionProjectionCounts
+	TerminalExecutions []TerminalExecution
+	ExecutionStart     int
+	ExecutionTotal     int
+	IncludeOutput      bool
+}
+
 type ClientActionRecord struct {
 	ClientActionID string    `json:"clientActionId"`
 	Action         string    `json:"action"`
@@ -363,6 +438,35 @@ type ProjectionOptionStore interface {
 	SaveProjectionWithOptions(ctx context.Context, sessionID string, projection ProjectionSnapshot, opts ...ProjectionSaveOption) (SessionSummary, error)
 }
 
+type SessionLogEntryAppendStore interface {
+	AppendSessionLogEntries(ctx context.Context, sessionID string, entries []SnapshotLogEntry, opts ...ProjectionSaveOption) (SessionSummary, error)
+}
+
 type SessionHistoryWindowStore interface {
 	GetSessionHistoryWindow(ctx context.Context, req SessionHistoryWindowRequest) (SessionHistoryWindow, error)
+}
+
+type SessionRuntimeMetaStore interface {
+	GetSessionRuntimeMetadata(ctx context.Context, sessionID string) (SessionRuntimeMetadata, error)
+}
+
+type SessionContextStore interface {
+	GetSessionContext(ctx context.Context, sessionID string) (SessionContextSnapshot, error)
+}
+
+type SessionPermissionRuleStore interface {
+	GetSessionPermissionRuleSnapshot(ctx context.Context, sessionID string) (SessionPermissionRuleSnapshot, error)
+	SaveSessionPermissionRuleSnapshot(ctx context.Context, snapshot SessionPermissionRuleSnapshot) (SessionSummary, error)
+}
+
+type SessionDiffPageStore interface {
+	GetSessionDiffPage(ctx context.Context, req SessionDiffPageRequest) (SessionDiffPage, error)
+}
+
+type SessionTerminalRangeStore interface {
+	GetSessionTerminalRange(ctx context.Context, req SessionTerminalRangeRequest) (SessionTerminalRange, error)
+}
+
+type SessionTerminalExecutionPageStore interface {
+	GetSessionTerminalExecutionPage(ctx context.Context, req SessionTerminalExecutionPageRequest) (SessionTerminalExecutionPage, error)
 }

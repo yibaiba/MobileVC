@@ -380,7 +380,29 @@ func MergeStoreSessionRuntime(base data.SessionRuntime, overlay data.SessionRunt
 		CWD:              firstNonEmptyString(overlay.CWD, base.CWD),
 		ClaudeLifecycle:  firstNonEmptyString(overlay.ClaudeLifecycle, base.ClaudeLifecycle),
 		Source:           firstNonEmptyString(overlay.Source, base.Source),
+		SourcePath:       firstNonEmptyString(overlay.SourcePath, base.SourcePath),
+		SourceSize:       firstNonZeroInt64(overlay.SourceSize, base.SourceSize),
+		SourceModUnixNS:  firstNonZeroInt64(overlay.SourceModUnixNS, base.SourceModUnixNS),
+		SourceEntryCount: firstNonZeroInt(overlay.SourceEntryCount, base.SourceEntryCount),
 	}
+}
+
+func firstNonZeroInt(values ...int) int {
+	for _, value := range values {
+		if value != 0 {
+			return value
+		}
+	}
+	return 0
+}
+
+func firstNonZeroInt64(values ...int64) int64 {
+	for _, value := range values {
+		if value != 0 {
+			return value
+		}
+	}
+	return 0
 }
 
 func MergeControllerSnapshot(base ControllerSnapshot, overlay ControllerSnapshot) ControllerSnapshot {
