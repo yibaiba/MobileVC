@@ -13,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"mobilevc/internal/logx"
 	"mobilevc/internal/protocol"
@@ -21,6 +22,9 @@ import (
 const (
 	codexPromptApprove = "approve"
 	codexPromptDeny    = "deny"
+
+	codexAssistantInitialChunkRunes = 8
+	codexAssistantMinChunkRunes     = 8
 )
 
 var (
@@ -79,10 +83,12 @@ type codexAppSession struct {
 
 	threadID                     string
 	activeTurnID                 string
+	assistantTurnID              string
 	lastDiff                     string
 	assistantBuffer              strings.Builder
 	lastAssistantText            string
 	assistantEmitted             string
+	assistantLastFlushed         string
 	pendingApproval              *codexPendingApproval
 	readyPromptSeq               uint64
 	compactionID                 string
@@ -645,7 +651,7 @@ func (s *codexAppSession) handleNotification(message codexRPCMessage) {
 		var payload codexAgentDeltaNotification
 		if err := json.Unmarshal(message.Params, &payload); err == nil {
 			for _, chunk := range s.appendAssistantDelta(payload.Delta) {
-				s.emitAssistantChunk(chunk)
+				s.emitAssistantChunk(chunk, payload.TurnID)
 			}
 		}
 	case "item/started":
@@ -762,7 +768,7 @@ func (s *codexAppSession) handleTurnCompleted(raw json.RawMessage) {
 		return
 	}
 	for _, chunk := range s.flushAssistantDelta() {
-		s.emitAssistantChunk(chunk)
+		s.emitAssistantChunk(chunk, payload.Turn.ID)
 	}
 	s.clearActiveTurnID(payload.Turn.ID)
 	if payload.Turn.Error != nil && strings.TrimSpace(payload.Turn.Error.Message) != "" {
@@ -802,10 +808,10 @@ func (s *codexAppSession) handleItemEvent(raw json.RawMessage, status string) {
 	}
 	if status == "done" && itemType == "agentMessage" {
 		if text := codexItemText(payload.Item); text != "" {
-			s.emitAssistantCompletedText(text)
+			s.emitAssistantCompletedText(text, payload.TurnID)
 		} else {
 			for _, chunk := range s.flushAssistantDelta() {
-				s.emitAssistantChunk(chunk)
+				s.emitAssistantChunk(chunk, payload.TurnID)
 			}
 		}
 		return
@@ -863,7 +869,7 @@ func (s *codexAppSession) handleRawResponseItemCompleted(raw json.RawMessage) {
 	if text == "" {
 		return
 	}
-	s.emitAssistantCompletedText(text)
+	s.emitAssistantCompletedText(text, payload.TurnID)
 }
 
 func (s *codexAppSession) handleTokenUsageUpdated(raw any) {
@@ -878,7 +884,7 @@ func (s *codexAppSession) handleTokenUsageUpdated(raw any) {
 	))
 }
 
-func (s *codexAppSession) emitAssistantChunk(text string) {
+func (s *codexAppSession) emitAssistantChunk(text string, turnID string) {
 	text = strings.TrimSpace(text)
 	if text == "" {
 		return
@@ -896,7 +902,7 @@ func (s *codexAppSession) emitAssistantChunk(text string) {
 	s.lastAssistantText = text
 	s.assistantEmitted += text
 	s.mu.Unlock()
-	meta := s.runtimeMeta("active")
+	meta := s.assistantRuntimeMeta("active", turnID)
 	meta.Source = "codex/assistant"
 	sendEvent(s.sink, protocol.ApplyRuntimeMeta(
 		protocol.NewLogEvent(s.sessionID, text, "stdout"),
@@ -988,7 +994,7 @@ func intValue(value any) int {
 	return -1
 }
 
-func (s *codexAppSession) emitAssistantCompletedText(text string) {
+func (s *codexAppSession) emitAssistantCompletedText(text string, turnID string) {
 	text = strings.TrimSpace(text)
 	if text == "" {
 		return
@@ -996,8 +1002,9 @@ func (s *codexAppSession) emitAssistantCompletedText(text string) {
 	s.mu.Lock()
 	emitted := strings.TrimSpace(s.assistantEmitted)
 	s.assistantBuffer.Reset()
+	s.assistantLastFlushed = ""
 	if emitted != "" {
-		if text == emitted {
+		if text == emitted || codexAssistantDedupeText(text) == codexAssistantDedupeText(emitted) {
 			s.lastAssistantText = text
 			s.assistantEmitted = text
 			s.mu.Unlock()
@@ -1011,10 +1018,18 @@ func (s *codexAppSession) emitAssistantCompletedText(text string) {
 				s.mu.Unlock()
 				return
 			}
+		} else if suffix, ok := trimCodexCompletedPrefix(text, emitted); ok {
+			text = suffix
+			if text == "" {
+				s.lastAssistantText = emitted
+				s.assistantEmitted = emitted
+				s.mu.Unlock()
+				return
+			}
 		}
 	}
 	s.mu.Unlock()
-	s.emitAssistantChunk(text)
+	s.emitAssistantChunk(text, turnID)
 }
 
 func (s *codexAppSession) emitReadyPromptAfterReply() {
@@ -1256,6 +1271,8 @@ func (s *codexAppSession) setActiveTurnID(turnID string) {
 		s.assistantBuffer.Reset()
 		s.lastAssistantText = ""
 		s.assistantEmitted = ""
+		s.assistantLastFlushed = ""
+		s.assistantTurnID = trimmed
 	}
 	s.activeTurnID = trimmed
 }
@@ -1380,8 +1397,10 @@ func (s *codexAppSession) threadAndTurn() (string, string) {
 }
 
 func (s *codexAppSession) runtimeMeta(lifecycle string) protocol.RuntimeMeta {
+	threadID, turnID := s.threadAndTurn()
 	meta := protocol.RuntimeMeta{
-		ResumeSessionID: s.threadIDValue(),
+		ResumeSessionID: threadID,
+		ExecutionID:     turnID,
 		ClaudeLifecycle: lifecycle,
 	}
 	if meta.ClaudeLifecycle == "" {
@@ -1390,6 +1409,21 @@ func (s *codexAppSession) runtimeMeta(lifecycle string) protocol.RuntimeMeta {
 	if meta.ClaudeLifecycle == "waiting_input" {
 		meta.BlockingKind = "ready"
 	}
+	return meta
+}
+
+func (s *codexAppSession) assistantRuntimeMeta(lifecycle string, turnID string) protocol.RuntimeMeta {
+	meta := s.runtimeMeta(lifecycle)
+	if trimmed := strings.TrimSpace(turnID); trimmed != "" {
+		meta.ExecutionID = trimmed
+		return meta
+	}
+	if strings.TrimSpace(meta.ExecutionID) != "" {
+		return meta
+	}
+	s.mu.Lock()
+	meta.ExecutionID = strings.TrimSpace(s.assistantTurnID)
+	s.mu.Unlock()
 	return meta
 }
 
@@ -1434,7 +1468,7 @@ func (s *codexAppSession) appendAssistantDelta(delta string) []string {
 	}
 	s.mu.Lock()
 	s.assistantBuffer.WriteString(delta)
-	emitted := codexDrainAssistantChunks(&s.assistantBuffer, false)
+	emitted := s.drainAssistantChunksLocked(false)
 	s.mu.Unlock()
 	return emitted
 }
@@ -1442,12 +1476,33 @@ func (s *codexAppSession) appendAssistantDelta(delta string) []string {
 func (s *codexAppSession) flushAssistantDelta() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return codexDrainAssistantChunks(&s.assistantBuffer, true)
+	return s.drainAssistantChunksLocked(true)
 }
 
-func codexDrainAssistantChunks(buffer *strings.Builder, flushAll bool) []string {
+func (s *codexAppSession) drainAssistantChunksLocked(flushAll bool) []string {
+	emitted := codexDrainAssistantChunks(&s.assistantBuffer, s.assistantLastFlushed, flushAll)
+	for _, chunk := range emitted {
+		s.assistantLastFlushed += chunk
+	}
+	if flushAll {
+		s.assistantLastFlushed = ""
+	}
+	return emitted
+}
+
+func codexDrainAssistantChunks(buffer *strings.Builder, lastFlushed string, flushAll bool) []string {
 	text := buffer.String()
 	if text == "" {
+		return nil
+	}
+
+	base := strings.TrimSpace(lastFlushed)
+	fullText := strings.TrimSpace(base + text)
+	if fullText == "" {
+		buffer.Reset()
+		return nil
+	}
+	if !flushAll && !strings.Contains(text, "\n") && !shouldFlushCodexAssistantChunk(fullText, base) {
 		return nil
 	}
 
@@ -1467,7 +1522,9 @@ func codexDrainAssistantChunks(buffer *strings.Builder, flushAll bool) []string 
 	trimmed := strings.TrimSpace(text)
 	if trimmed != "" {
 		runeCount := len([]rune(trimmed))
-		if flushAll || runeCount >= 64 || (runeCount >= 24 && endsWithLiveTailBoundary(trimmed)) {
+		if flushAll ||
+			runeCount >= codexAssistantMinChunkRunes ||
+			endsWithLiveTailBoundary(trimmed) {
 			emitted = append(emitted, trimmed)
 			text = ""
 		}
@@ -1478,6 +1535,54 @@ func codexDrainAssistantChunks(buffer *strings.Builder, flushAll bool) []string 
 		buffer.WriteString(text)
 	}
 	return emitted
+}
+
+func shouldFlushCodexAssistantChunk(fullText string, base string) bool {
+	if base == "" {
+		return len([]rune(fullText)) >= codexAssistantInitialChunkRunes ||
+			endsWithLiveTailBoundary(fullText)
+	}
+	if !strings.HasPrefix(fullText, base) {
+		return true
+	}
+	delta := strings.TrimSpace(strings.TrimPrefix(fullText, base))
+	if delta == "" {
+		return false
+	}
+	return len([]rune(delta)) >= codexAssistantMinChunkRunes ||
+		endsWithLiveTailBoundary(delta)
+}
+
+func codexAssistantDedupeText(text string) string {
+	var builder strings.Builder
+	for _, r := range strings.TrimSpace(text) {
+		if !unicode.IsSpace(r) {
+			builder.WriteRune(r)
+		}
+	}
+	return builder.String()
+}
+
+func trimCodexCompletedPrefix(text string, emitted string) (string, bool) {
+	target := codexAssistantDedupeText(emitted)
+	if target == "" {
+		return "", false
+	}
+	var consumed strings.Builder
+	for index, r := range text {
+		if unicode.IsSpace(r) {
+			continue
+		}
+		consumed.WriteRune(r)
+		current := consumed.String()
+		if current == target {
+			return strings.TrimSpace(text[index+len(string(r)):]), true
+		}
+		if !strings.HasPrefix(target, current) {
+			return "", false
+		}
+	}
+	return "", consumed.String() == target
 }
 
 func codexApprovalPolicy(permissionMode string, defaults codexConfigDefaults) string {

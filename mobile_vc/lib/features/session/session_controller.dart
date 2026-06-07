@@ -9324,8 +9324,16 @@ class SessionController extends ChangeNotifier {
         looksLikeSessionBootstrapCommand(message)) {
       return false;
     }
+    if (_isAssistantSource(meta.source)) {
+      return true;
+    }
     return _looksLikeAssistantReplyAllowingSoftTerminal(message) ||
         _looksLikeTrustedShortAssistantReply(message);
+  }
+
+  bool _isAssistantSource(String source) {
+    final normalized = source.trim().toLowerCase();
+    return normalized == 'claude/assistant' || normalized == 'codex/assistant';
   }
 
   String _timelineAiEngine(RuntimeMeta meta) {

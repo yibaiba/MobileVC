@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"mobilevc/internal/data"
 	"mobilevc/internal/protocol"
@@ -177,10 +178,11 @@ func ApplyEventToProjection(snapshot data.ProjectionSnapshot, event any) (data.P
 		}
 		if IsVisibleAssistantReplyLog(e) {
 			snapshot.Controller.State = ControllerStateIdle
-			snapshot.LogEntries = removeSupersededAssistantLogEntry(
-				snapshot.LogEntries,
-				e,
-			)
+			if merged, ok := mergeAssistantReplyLogEntry(snapshot.LogEntries, e, context, phase); ok {
+				snapshot.LogEntries = merged
+				return snapshot, true
+			}
+			snapshot.LogEntries = removeSupersededAssistantLogEntry(snapshot.LogEntries, e)
 			snapshot.LogEntries = append(snapshot.LogEntries, data.SnapshotLogEntry{Kind: "markdown", Message: e.Message, Timestamp: e.Timestamp.Format(time.RFC3339), Stream: e.Stream, ExecutionID: e.ExecutionID, Phase: phase, ExitCode: e.ExitCode, Context: context, Attachments: TimelineAttachmentsFromText(e.Message, "assistant_path")})
 		} else {
 			previousIndex := len(snapshot.LogEntries) - 1
@@ -530,6 +532,96 @@ func logSnapshotContextFromEvent(event protocol.LogEvent) *data.SnapshotContext 
 		SkillName:   skillName,
 		ExecutionID: event.ExecutionID,
 	}
+}
+
+func mergeAssistantReplyLogEntry(entries []data.SnapshotLogEntry, event protocol.LogEvent, context *data.SnapshotContext, phase string) ([]data.SnapshotLogEntry, bool) {
+	if len(entries) == 0 || strings.TrimSpace(event.Message) == "" {
+		return entries, false
+	}
+	index := len(entries) - 1
+	entry := entries[index]
+	if !sameAssistantReplyRun(entry, event) {
+		return entries, false
+	}
+	merged := entry
+	merged.Message = mergeAssistantReplyText(merged.Message, event.Message)
+	merged.Text = ""
+	merged.Timestamp = event.Timestamp.Format(time.RFC3339)
+	merged.Phase = phase
+	merged.ExitCode = event.ExitCode
+	if merged.Context == nil && context != nil {
+		merged.Context = context
+	}
+	merged.Attachments = TimelineAttachmentsFromText(merged.Message, "assistant_path")
+	next := append([]data.SnapshotLogEntry(nil), entries...)
+	next[index] = merged
+	return next, true
+}
+
+func sameAssistantReplyRun(entry data.SnapshotLogEntry, event protocol.LogEvent) bool {
+	if entry.Kind != "markdown" {
+		return false
+	}
+	if strings.TrimSpace(entry.Stream) != strings.TrimSpace(event.Stream) {
+		return false
+	}
+	entryExecutionID := strings.TrimSpace(entry.ExecutionID)
+	eventExecutionID := strings.TrimSpace(event.ExecutionID)
+	if entryExecutionID != "" || eventExecutionID != "" {
+		return entryExecutionID != "" && entryExecutionID == eventExecutionID
+	}
+	entrySource := ""
+	if entry.Context != nil {
+		entrySource = strings.TrimSpace(entry.Context.Source)
+	}
+	eventSource := strings.TrimSpace(event.Source)
+	return entrySource != "" && entrySource == eventSource
+}
+
+func mergeAssistantReplyText(previous string, next string) string {
+	previous = strings.TrimSpace(previous)
+	next = strings.TrimSpace(next)
+	if previous == "" {
+		return next
+	}
+	if next == "" || previous == next {
+		return previous
+	}
+	if strings.HasPrefix(next, previous) {
+		return next
+	}
+	if strings.HasSuffix(previous, next) {
+		return previous
+	}
+	if strings.HasSuffix(previous, " ") || strings.HasPrefix(next, " ") {
+		return previous + next
+	}
+	if assistantReplyBoundaryHasCJK(previous, next) || assistantReplyStartsWithClosingPunctuation(next) {
+		return previous + next
+	}
+	return previous + " " + next
+}
+
+func assistantReplyBoundaryHasCJK(previous string, next string) bool {
+	prevRune, _ := utf8.DecodeLastRuneInString(previous)
+	nextRune, _ := utf8.DecodeRuneInString(next)
+	return isCJKRune(prevRune) || isCJKRune(nextRune)
+}
+
+func assistantReplyStartsWithClosingPunctuation(text string) bool {
+	r, _ := utf8.DecodeRuneInString(text)
+	switch r {
+	case ')', ']', '}', '>', '.', ',', '!', '?', ':', ';', '。', '，', '！', '？', '：', '；':
+		return true
+	default:
+		return false
+	}
+}
+
+func isCJKRune(r rune) bool {
+	return (r >= 0x3400 && r <= 0x4DBF) ||
+		(r >= 0x4E00 && r <= 0x9FFF) ||
+		(r >= 0xF900 && r <= 0xFAFF)
 }
 
 func removeSupersededAssistantLogEntry(entries []data.SnapshotLogEntry, event protocol.LogEvent) []data.SnapshotLogEntry {

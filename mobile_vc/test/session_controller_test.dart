@@ -8415,6 +8415,46 @@ void main() {
       );
     });
 
+    test('codex 短 delta 分片第一块会立即进入 timeline', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      const meta = RuntimeMeta(
+        command: 'codex',
+        engine: 'codex',
+        source: 'codex/assistant',
+        executionId: 'turn-short-delta-1',
+      );
+      service.emit(LogEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-1',
+        runtimeMeta: meta,
+        raw: const {'type': 'log'},
+        message: 'Tip :',
+        stream: 'stdout',
+      ));
+      await _flushEvents();
+
+      expect(controller.timeline, hasLength(1));
+      expect(controller.timeline.single.kind, 'markdown');
+      expect(controller.timeline.single.body, 'Tip :');
+
+      service.emit(LogEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 120)),
+        sessionId: 'session-1',
+        runtimeMeta: meta,
+        raw: const {'type': 'log'},
+        message: 'hello world',
+        stream: 'stdout',
+      ));
+      await _flushEvents();
+
+      expect(controller.timeline, hasLength(1));
+      expect(controller.timeline.single.body, 'Tip : hello world');
+    });
+
     test('codex 最终完整回复会覆盖已合并流式片段而不是重复拼接', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);

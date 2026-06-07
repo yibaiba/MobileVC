@@ -672,6 +672,24 @@ func TestFileStoreProjectionSideReadersAvoidLogEntrySidecarRows(t *testing.T) {
 	if execPage.TerminalExecutions[0].ExecutionID != "exec-2" || execPage.TerminalExecutions[0].Stdout != "" {
 		t.Fatalf("expected output-stripped execution page, got %#v", execPage.TerminalExecutions)
 	}
+	execSnapshot, err := fs.GetSessionTerminalExecution(context.Background(), SessionTerminalExecutionRequest{
+		SessionID:     created.ID,
+		ExecutionID:   "exec-2",
+		IncludeOutput: true,
+	})
+	if err != nil {
+		t.Fatalf("get terminal execution: %v", err)
+	}
+	if execSnapshot.TerminalExecution.ExecutionID != "exec-2" || execSnapshot.TerminalExecution.Stdout != "hidden-2" {
+		t.Fatalf("unexpected terminal execution: %#v", execSnapshot)
+	}
+	if _, err := fs.GetSessionTerminalExecution(context.Background(), SessionTerminalExecutionRequest{
+		SessionID:     created.ID,
+		ExecutionID:   "missing",
+		IncludeOutput: true,
+	}); err == nil {
+		t.Fatal("expected missing execution error")
+	}
 	if _, err := fs.GetSessionHistoryWindow(context.Background(), SessionHistoryWindowRequest{
 		SessionID: created.ID,
 		Before:    2,
@@ -1335,6 +1353,73 @@ func TestFileStoreSaveSessionPermissionRulesDoesNotDecodeExistingHistoryRows(t *
 		terminalRange.Content != "existing stdout" ||
 		len(execPage.TerminalExecutions) != 1 {
 		t.Fatalf("permission sidecar update should preserve other domains, rules=%#v runtime=%#v context=%#v diff=%#v terminal=%#v exec=%#v", rules, runtimeMeta, contextSnapshot, diffPage, terminalRange, execPage)
+	}
+}
+
+func TestFileStoreSaveSessionContextDoesNotDecodeExistingHistoryRows(t *testing.T) {
+	dir := t.TempDir()
+	fs, err := NewFileStore(dir)
+	if err != nil {
+		t.Fatalf("new file store: %v", err)
+	}
+	created, err := fs.CreateSession(context.Background(), "context sidecar update")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	entries := make([]SnapshotLogEntry, 0, 5)
+	for i := 0; i < 5; i++ {
+		entries = append(entries, SnapshotLogEntry{Kind: "user", Message: fmt.Sprintf("entry-%d", i)})
+	}
+	if _, err := fs.SaveProjection(context.Background(), created.ID, ProjectionSnapshot{
+		LogEntries:          entries,
+		RawTerminalByStream: map[string]string{"stdout": "existing stdout", "stderr": ""},
+		Runtime:             SessionRuntime{Command: "codex", CWD: "/tmp/project"},
+		SessionContext:      SessionContext{EnabledMemoryIDs: []string{"old-memory"}, Configured: true},
+		SessionContextSet:   true,
+		Diffs:               []DiffContext{{ContextID: "diff-1", Path: "a.go", Diff: "+a"}},
+	}); err != nil {
+		t.Fatalf("save projection with history: %v", err)
+	}
+	corruptLogEntrySidecarRow(t, fs, created.ID, 1)
+	coldStore, err := NewFileStore(dir)
+	if err != nil {
+		t.Fatalf("new cold file store: %v", err)
+	}
+	summary, err := coldStore.SaveSessionContext(context.Background(), SessionContextSnapshot{
+		SessionID: created.ID,
+		SessionContext: SessionContext{
+			EnabledSkillNames: []string{"review"},
+			EnabledMemoryIDs:  []string{"memory-1"},
+			Configured:        true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("save context sidecar should not decode history rows: %v", err)
+	}
+	if summary.EntryCount != len(entries) {
+		t.Fatalf("expected entry count preserved, got %#v", summary)
+	}
+	contextSnapshot, err := coldStore.GetSessionContext(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("get session context: %v", err)
+	}
+	if got := contextSnapshot.SessionContext.EnabledSkillNames; len(got) != 1 || got[0] != "review" {
+		t.Fatalf("unexpected context skills: %#v", contextSnapshot.SessionContext)
+	}
+	runtimeMeta, err := coldStore.GetSessionRuntimeMetadata(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("get runtime metadata: %v", err)
+	}
+	diffPage, err := coldStore.GetSessionDiffPage(context.Background(), SessionDiffPageRequest{
+		SessionID: created.ID,
+		Before:    1,
+		Limit:     1,
+	})
+	if err != nil {
+		t.Fatalf("get diff page: %v", err)
+	}
+	if runtimeMeta.Record.Projection.Runtime.CWD != "/tmp/project" || len(diffPage.Diffs) != 1 {
+		t.Fatalf("context sidecar update should preserve other domains, runtime=%#v diff=%#v", runtimeMeta, diffPage)
 	}
 }
 

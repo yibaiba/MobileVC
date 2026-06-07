@@ -393,6 +393,18 @@ type SessionTerminalExecutionPage struct {
 	IncludeOutput      bool
 }
 
+type SessionTerminalExecutionRequest struct {
+	SessionID     string
+	ExecutionID   string
+	IncludeOutput bool
+}
+
+type SessionTerminalExecutionSnapshot struct {
+	SessionID         string
+	Latest            SessionProjectionCounts
+	TerminalExecution TerminalExecution
+}
+
 type ClientActionRecord struct {
 	ClientActionID string    `json:"clientActionId"`
 	Action         string    `json:"action"`
@@ -452,6 +464,7 @@ type SessionRuntimeMetaStore interface {
 
 type SessionContextStore interface {
 	GetSessionContext(ctx context.Context, sessionID string) (SessionContextSnapshot, error)
+	SaveSessionContext(ctx context.Context, snapshot SessionContextSnapshot) (SessionSummary, error)
 }
 
 type SessionPermissionRuleStore interface {
@@ -469,4 +482,8 @@ type SessionTerminalRangeStore interface {
 
 type SessionTerminalExecutionPageStore interface {
 	GetSessionTerminalExecutionPage(ctx context.Context, req SessionTerminalExecutionPageRequest) (SessionTerminalExecutionPage, error)
+}
+
+type SessionTerminalExecutionStore interface {
+	GetSessionTerminalExecution(ctx context.Context, req SessionTerminalExecutionRequest) (SessionTerminalExecutionSnapshot, error)
 }

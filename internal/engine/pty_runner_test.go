@@ -2152,6 +2152,18 @@ func TestCodexAppSessionStreamsAssistantDeltasBeforePromptWithoutDuplicateFinalT
 	}
 	app.setThreadID("thread-123")
 
+	started, err := json.Marshal(map[string]any{
+		"threadId": "thread-123",
+		"turn": map[string]any{
+			"id":     "turn-1",
+			"status": "in_progress",
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal started: %v", err)
+	}
+	app.handleNotification(codexRPCMessage{Method: "turn/started", Params: started})
+
 	for _, delta := range []string{"T", "ip", " : ", "hello", " world"} {
 		params, err := json.Marshal(map[string]any{
 			"threadId": "thread-123",
@@ -2211,22 +2223,124 @@ done:
 	if len(logs) < 1 {
 		t.Fatalf("expected streamed assistant logs, got %#v", logs)
 	}
-	finalMessage := logs[len(logs)-1].Message
-	if finalMessage != "Tip : hello world" {
-		t.Fatalf("unexpected final streamed log message: %q", finalMessage)
+	if logs[0].Message != "Tip :" {
+		t.Fatalf("expected first assistant chunk before completion, got %#v", logs)
+	}
+	combined := strings.Join(logMessages(logs), " ")
+	if combined != "Tip : hello world" {
+		t.Fatalf("unexpected combined streamed log message: %q from %#v", combined, logs)
 	}
 	countFinal := 0
 	for _, log := range logs {
 		if log.Message == "Tip : hello world" {
 			countFinal++
 		}
+		if log.Source != "codex/assistant" {
+			t.Fatalf("expected codex assistant source on streamed log, got %#v", log.RuntimeMeta)
+		}
+		if log.ExecutionID != "turn-1" {
+			t.Fatalf("expected turn id execution key on streamed log, got %#v", log.RuntimeMeta)
+		}
 	}
-	if countFinal != 1 {
-		t.Fatalf("expected final assistant text once, got %d occurrences in %#v", countFinal, logs)
+	if countFinal != 0 {
+		t.Fatalf("did not expect completed full text after streamed chunks, got %d occurrences in %#v", countFinal, logs)
 	}
 	if len(prompts) != 1 || prompts[0].ResumeSessionID != "thread-123" {
 		t.Fatalf("expected invisible continue prompt with thread id, got %#v", prompts)
 	}
+}
+
+func TestCodexAppSessionKeepsAssistantTurnIDForLateCompletedText(t *testing.T) {
+	runner := NewPtyRunner()
+	eventsCh := make(chan any, 8)
+	app := &codexAppSession{
+		runner:    runner,
+		sessionID: "s-codex-late-completed",
+		sink:      func(event any) { eventsCh <- event },
+	}
+	app.setThreadID("thread-123")
+
+	started, err := json.Marshal(map[string]any{
+		"threadId": "thread-123",
+		"turn": map[string]any{
+			"id":     "turn-1",
+			"status": "in_progress",
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal started: %v", err)
+	}
+	app.handleNotification(codexRPCMessage{Method: "turn/started", Params: started})
+
+	delta, err := json.Marshal(map[string]any{
+		"threadId": "thread-123",
+		"turnId":   "turn-1",
+		"itemId":   "item-1",
+		"delta":    "Tip :",
+	})
+	if err != nil {
+		t.Fatalf("marshal delta: %v", err)
+	}
+	app.handleNotification(codexRPCMessage{Method: "item/agentMessage/delta", Params: delta})
+
+	completedTurn, err := json.Marshal(map[string]any{
+		"threadId": "thread-123",
+		"turn": map[string]any{
+			"id":     "turn-1",
+			"status": "completed",
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal completed turn: %v", err)
+	}
+	app.handleNotification(codexRPCMessage{Method: "turn/completed", Params: completedTurn})
+
+	completedItem, err := json.Marshal(map[string]any{
+		"threadId": "thread-123",
+		"turnId":   "turn-1",
+		"item": map[string]any{
+			"type": "agentMessage",
+			"text": "Tip : hello world",
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal completed item: %v", err)
+	}
+	app.handleNotification(codexRPCMessage{Method: "item/completed", Params: completedItem})
+
+	var logs []protocol.LogEvent
+	for {
+		select {
+		case event := <-eventsCh:
+			if log, ok := event.(protocol.LogEvent); ok {
+				logs = append(logs, log)
+			}
+		default:
+			if len(logs) != 2 {
+				t.Fatalf("expected streamed chunk plus completed suffix, got %#v", logs)
+			}
+			if logs[0].Message != "Tip :" || logs[1].Message != "hello world" {
+				t.Fatalf("unexpected late completed stream logs: %#v", logMessages(logs))
+			}
+			for _, log := range logs {
+				if log.ExecutionID != "turn-1" {
+					t.Fatalf("expected late completed log to keep turn execution id, got %#v", log.RuntimeMeta)
+				}
+				if log.Source != "codex/assistant" {
+					t.Fatalf("expected codex assistant source, got %#v", log.RuntimeMeta)
+				}
+			}
+			return
+		}
+	}
+}
+
+func logMessages(logs []protocol.LogEvent) []string {
+	messages := make([]string, 0, len(logs))
+	for _, log := range logs {
+		messages = append(messages, log.Message)
+	}
+	return messages
 }
 
 func TestCodexAppSessionEmitsHookAIStatus(t *testing.T) {

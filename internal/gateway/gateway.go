@@ -1531,6 +1531,85 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 		projectionCacheMu.Unlock()
 		return cloneProjectionSnapshot(projection), ok
 	}
+	readSessionContextForAction := func(action, sessionID string) (data.SessionContext, error) {
+		sessionID = strings.TrimSpace(sessionID)
+		if sessionID == "" {
+			return data.SessionContext{}, nil
+		}
+		if h.SessionStore == nil {
+			return data.SessionContext{}, fmt.Errorf("session store unavailable")
+		}
+		contextStore, ok := h.SessionStore.(data.SessionContextStore)
+		if !ok {
+			return data.SessionContext{}, fmt.Errorf("%s requires session context store for session %s", action, sessionID)
+		}
+		snapshot, err := contextStore.GetSessionContext(context.WithoutCancel(ctx), sessionID)
+		if err != nil {
+			return data.SessionContext{}, err
+		}
+		return snapshot.SessionContext, nil
+	}
+	saveSelectedSessionContext := func(sessionID string, sessionContext data.SessionContext) (data.SessionContext, error) {
+		sessionID = strings.TrimSpace(sessionID)
+		if sessionID == "" {
+			return data.SessionContext{}, fmt.Errorf("session ID is required")
+		}
+		if h.SessionStore == nil {
+			return data.SessionContext{}, fmt.Errorf("session store unavailable")
+		}
+		contextStore, ok := h.SessionStore.(data.SessionContextStore)
+		if !ok {
+			return data.SessionContext{}, fmt.Errorf("session_context_update requires session context store for session %s", sessionID)
+		}
+		normalized := data.SessionContext{
+			EnabledSkillNames: append([]string(nil), sessionContext.EnabledSkillNames...),
+			EnabledMemoryIDs:  append([]string(nil), sessionContext.EnabledMemoryIDs...),
+			Configured:        true,
+		}
+		if _, err := contextStore.SaveSessionContext(context.WithoutCancel(ctx), data.SessionContextSnapshot{
+			SessionID:      sessionID,
+			SessionContext: normalized,
+		}); err != nil {
+			return data.SessionContext{}, err
+		}
+		if cached, ok := cachedProjection(sessionID); ok {
+			cached.SessionContext = normalized
+			cached.SessionContextSet = true
+			cacheProjection(sessionID, cached, false)
+		}
+		return normalized, nil
+	}
+	readRuntimeProcessExecutionLog := func(sessionID string, item protocol.RuntimeProcessItem) (data.TerminalExecution, string, error) {
+		sessionID = strings.TrimSpace(sessionID)
+		if sessionID == "" {
+			return data.TerminalExecution{}, "", fmt.Errorf("session ID is required")
+		}
+		executionID := strings.TrimSpace(item.ExecutionID)
+		if executionID == "" {
+			return data.TerminalExecution{}, "", fmt.Errorf("runtime process %d has no execution id; captured logs are unavailable", item.PID)
+		}
+		if h.SessionStore == nil {
+			return data.TerminalExecution{}, "", fmt.Errorf("session store unavailable")
+		}
+		executionStore, ok := h.SessionStore.(data.SessionTerminalExecutionStore)
+		if !ok {
+			return data.TerminalExecution{}, "", fmt.Errorf("runtime_process_log_get requires session terminal execution store for session %s", sessionID)
+		}
+		snapshot, err := executionStore.GetSessionTerminalExecution(context.WithoutCancel(ctx), data.SessionTerminalExecutionRequest{
+			SessionID:     sessionID,
+			ExecutionID:   executionID,
+			IncludeOutput: true,
+		})
+		if err != nil {
+			return data.TerminalExecution{}, "", err
+		}
+		execution := snapshot.TerminalExecution
+		message := ""
+		if strings.TrimSpace(execution.Stdout) == "" && strings.TrimSpace(execution.Stderr) == "" {
+			message = "该进程暂无已捕获的 stdout / stderr"
+		}
+		return execution, message, nil
+	}
 	updateProjectionMeta := func(record data.SessionRecord) {
 		if h.projectionWriter == nil {
 			return
@@ -1606,6 +1685,13 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			}
 		}
 		return buildProjectionSnapshotForService(trimmedSessionID, service)
+	}
+	loadFullProjectionForInteractiveMutation := func(action, sessionID string) data.ProjectionSnapshot {
+		// Interactive mutations can require runtime, controller, diff, permission, and
+		// context state at once. Keep this named boundary out of selected-session
+		// bootstrap/read hydration paths so remaining full projection loads are auditable.
+		logx.Info("ws", "full projection load for interactive mutation: connectionID=%s sessionID=%s remoteAddr=%s action=%s", connectionID, sessionID, remoteAddr, action)
+		return buildProjectionSnapshotFor(sessionID)
 	}
 
 	runtimeForSession := func(sessionID string) (*runtimeSession, *session.Service) {
@@ -3339,18 +3425,11 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			}
 			actionKey := connectionID + ":session_context_get:" + targetSessionID
 			startAsyncEventAction("session_context_get", actionKey, targetSessionID, func() (any, error) {
-				if h.SessionStore == nil {
-					return nil, fmt.Errorf("session store unavailable")
-				}
-				contextStore, ok := h.SessionStore.(data.SessionContextStore)
-				if !ok {
-					return nil, fmt.Errorf("session context store unavailable")
-				}
-				snapshot, err := contextStore.GetSessionContext(context.WithoutCancel(ctx), targetSessionID)
+				sessionContext, err := readSessionContextForAction("session_context_get", targetSessionID)
 				if err != nil {
 					return nil, err
 				}
-				return protocol.NewSessionContextResultEvent(targetSessionID, toProtocolSessionContext(snapshot.SessionContext)), nil
+				return protocol.NewSessionContextResultEvent(targetSessionID, toProtocolSessionContext(sessionContext)), nil
 			})
 		case "permission_rule_list":
 			targetSessionID := strings.TrimSpace(selectedSessionID)
@@ -3455,7 +3534,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			}
 			emitPermissionRuleList(emit, h.SessionStore, ctx, selectedSessionID)
 		case "review_state_get":
-			emitReviewStateFromProjection(emit, selectedSessionID, buildProjectionSnapshotFor(selectedSessionID))
+			emit(protocol.NewErrorEventWithCode(selectedSessionID, "review_state_get is deprecated; use session_diff_page_get", "", "review_state_get_deprecated"))
 		case "session_context_update":
 			var req protocol.SessionContextUpdateRequestEvent
 			if err := json.Unmarshal(payloadBytes, &req); err != nil {
@@ -3467,23 +3546,17 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				emit(protocol.NewErrorEvent(selectedSessionID, "请先创建或加载会话后再更新 session context", ""))
 				continue
 			}
-			record, ok := loadSelectedSessionRecord(h.SessionStore, ctx, selectedSessionID, emit)
-			if !ok {
-				continue
-			}
-			record.Projection.SessionContext = data.SessionContext{
+			sessionContext, err := saveSelectedSessionContext(selectedSessionID, data.SessionContext{
 				EnabledSkillNames: req.EnabledSkillNames,
 				EnabledMemoryIDs:  req.EnabledMemoryIDs,
 				Configured:        true,
-			}
-			record.Projection.SessionContextSet = true
-			if _, err := h.SessionStore.SaveProjection(ctx, selectedSessionID, record.Projection); err != nil {
+			})
+			if err != nil {
 				emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
 				continue
 			}
-			cacheProjection(selectedSessionID, record.Projection, false)
 			invalidateSessionListCacheForMutation()
-			emit(protocol.NewSessionContextResultEvent(selectedSessionID, toProtocolSessionContext(record.Projection.SessionContext)))
+			emit(protocol.NewSessionContextResultEvent(selectedSessionID, toProtocolSessionContext(sessionContext)))
 		case "skill_catalog_get":
 			emitSkillCatalogResult(emit, h.SessionStore, ctx, selectedSessionID)
 		case "skill_catalog_upsert":
@@ -3612,7 +3685,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			}
 			controller := service.ControllerSnapshot()
 			snapshot := service.RuntimeSnapshot()
-			projection := buildProjectionSnapshotFor(sessionID)
+			projection := loadFullProjectionForInteractiveMutation(clientEvent.Action, sessionID)
 			engineName := strings.TrimSpace(strings.ToLower(firstNonEmptyString(
 				aiReq.Engine,
 				aiReq.RuntimeMeta.Engine,
@@ -3627,7 +3700,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				service.UpdatePermissionModeForEngine(aiReq.PermissionMode, engineName)
 				controller = service.ControllerSnapshot()
 				snapshot = service.RuntimeSnapshot()
-				projection = buildProjectionSnapshotFor(sessionID)
+				projection = loadFullProjectionForInteractiveMutation(clientEvent.Action, sessionID)
 			}
 			command := strings.TrimSpace(firstNonEmptyString(
 				aiReq.RuntimeMeta.Command,
@@ -3819,7 +3892,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			initialInput := reqEvent.InputData
 			if initialInput != "" {
 				service.RecordUserInput(initialInput)
-				projection := buildProjectionSnapshotFor(sessionID)
+				projection := loadFullProjectionForInteractiveMutation(clientEvent.Action, sessionID)
 				if shouldInjectEnabledSkillsForInput(
 					reqEvent.Command,
 					reqEvent.Engine,
@@ -3927,7 +4000,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				continue
 			}
 			controller := service.ControllerSnapshot()
-			projection := buildProjectionSnapshotFor(sessionID)
+			projection := loadFullProjectionForInteractiveMutation(clientEvent.Action, sessionID)
 			snapshot := service.RuntimeSnapshot()
 			inputData := inputEvent.Data
 			attachments, err := persistImageAttachments(ctx, sessionID, inputEvent.ImageAttachments)
@@ -4122,7 +4195,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			}
 			sessionRuntime, _ := runtimeForSession(sessionID)
 			emitAndPersist := emitAndPersistFor(sessionID)
-			projection := buildProjectionSnapshotFor(sessionID)
+			projection := loadFullProjectionForInteractiveMutation(clientEvent.Action, sessionID)
 			controller := service.ControllerSnapshot()
 			if requestedID := strings.TrimSpace(permissionEvent.PermissionRequestID); requestedID != "" {
 				currentID := strings.TrimSpace(service.CurrentPermissionRequestID(sessionID))
@@ -4225,7 +4298,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			}
 			_, service := runtimeForSession(sessionID)
 			emitAndPersist := emitAndPersistFor(sessionID)
-			projection := buildProjectionSnapshotFor(sessionID)
+			projection := loadFullProjectionForInteractiveMutation(clientEvent.Action, sessionID)
 			controller := service.ControllerSnapshot()
 			effectivePermissionMode := strings.TrimSpace(reviewEvent.PermissionMode)
 			if effectivePermissionMode == "" {
@@ -4298,6 +4371,8 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			}
 			_, service := runtimeForSession(selectedSessionID)
 			emitAndPersist := emitAndPersistFor(selectedSessionID)
+			projection := loadFullProjectionForInteractiveMutation(clientEvent.Action, selectedSessionID)
+			controller := service.ControllerSnapshot()
 			req := session.PlanDecisionRequest{
 				Decision: planEvent.Decision,
 				RuntimeMeta: protocol.RuntimeMeta{
@@ -4310,12 +4385,12 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 					ContextTitle:    planEvent.ContextTitle,
 					TargetPath:      planEvent.TargetPath,
 					TargetText:      planEvent.TargetText,
-					Command:         firstNonEmptyString(planEvent.Command, service.ControllerSnapshot().ActiveMeta.Command, buildProjectionSnapshotFor(selectedSessionID).Runtime.Command),
-					Engine:          firstNonEmptyString(planEvent.Engine, service.ControllerSnapshot().ActiveMeta.Engine),
-					CWD:             firstNonEmptyString(planEvent.CWD, service.ControllerSnapshot().ActiveMeta.CWD, buildProjectionSnapshotFor(selectedSessionID).Runtime.CWD),
-					Target:          firstNonEmptyString(planEvent.Target, service.ControllerSnapshot().ActiveMeta.Target),
-					TargetType:      firstNonEmptyString(planEvent.TargetType, service.ControllerSnapshot().ActiveMeta.TargetType),
-					PermissionMode:  firstNonEmptyString(planEvent.PermissionMode, service.ControllerSnapshot().ActiveMeta.PermissionMode, buildProjectionSnapshotFor(selectedSessionID).Runtime.PermissionMode),
+					Command:         firstNonEmptyString(planEvent.Command, controller.ActiveMeta.Command, projection.Runtime.Command),
+					Engine:          firstNonEmptyString(planEvent.Engine, controller.ActiveMeta.Engine),
+					CWD:             firstNonEmptyString(planEvent.CWD, controller.ActiveMeta.CWD, projection.Runtime.CWD),
+					Target:          firstNonEmptyString(planEvent.Target, controller.ActiveMeta.Target),
+					TargetType:      firstNonEmptyString(planEvent.TargetType, controller.ActiveMeta.TargetType),
+					PermissionMode:  firstNonEmptyString(planEvent.PermissionMode, controller.ActiveMeta.PermissionMode, projection.Runtime.PermissionMode),
 				},
 			}
 			if err := service.PlanDecision(ctx, selectedSessionID, req, emitAndPersist); err != nil {
@@ -4338,7 +4413,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				continue
 			}
 			_, service := runtimeForSession(selectedSessionID)
-			projection := buildProjectionSnapshotFor(selectedSessionID)
+			projection := loadFullProjectionForInteractiveMutation(clientEvent.Action, selectedSessionID)
 			engineName := strings.TrimSpace(projection.Runtime.Engine)
 			if isCodexRuntime(projection.Runtime) {
 				engineName = "codex"
@@ -4346,7 +4421,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			service.UpdatePermissionModeForEngine(modeEvent.PermissionMode, engineName)
 			effectivePermissionMode := service.ControllerSnapshot().ActiveMeta.PermissionMode
 			if strings.TrimSpace(effectivePermissionMode) != "" {
-				projection = buildProjectionSnapshotFor(selectedSessionID)
+				projection = loadFullProjectionForInteractiveMutation(clientEvent.Action, selectedSessionID)
 				projection.Runtime.PermissionMode = effectivePermissionMode
 				if effectivePermissionMode == "auto" || effectivePermissionMode == "bypassPermissions" {
 					projection = session.ApplyAutoReviewAcceptanceToProjection(projection)
@@ -4370,11 +4445,12 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			}
 			sessionContext := data.SessionContext{}
 			if h.SessionStore != nil {
-				record, ok := loadSelectedSessionRecord(h.SessionStore, ctx, selectedSessionID, emit)
-				if !ok {
+				loadedContext, err := readSessionContextForAction("skill_exec", selectedSessionID)
+				if err != nil {
+					emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
 					continue
 				}
-				sessionContext = record.Projection.SessionContext
+				sessionContext = loadedContext
 			}
 			sessionID := selectedSessionID
 			_, service := runtimeForSession(sessionID)
@@ -4444,17 +4520,21 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				emit(protocol.NewErrorEvent(selectedSessionID, "指定进程不存在或已退出", ""))
 				continue
 			}
-			projection := buildProjectionSnapshotFor(selectedSessionID)
-			stdout, stderr, message := resolveRuntimeProcessLogs(item, projection)
+			execution, message, err := readRuntimeProcessExecutionLog(selectedSessionID, item)
+			if err != nil {
+				logx.Warn("ws", "load runtime process log failed: connectionID=%s sessionID=%s remoteAddr=%s pid=%d executionID=%q err=%v", connectionID, selectedSessionID, remoteAddr, processReq.PID, item.ExecutionID, err)
+				emit(protocol.NewErrorEventWithCode(selectedSessionID, err.Error(), "", "runtime_process_log_unavailable"))
+				continue
+			}
 			emit(protocol.NewRuntimeProcessLogResultEvent(
 				selectedSessionID,
 				item.PID,
 				item.ExecutionID,
-				item.Command,
-				item.CWD,
+				firstNonEmptyString(execution.Command, item.Command),
+				firstNonEmptyString(execution.CWD, item.CWD),
 				item.Source,
-				stdout,
-				stderr,
+				execution.Stdout,
+				execution.Stderr,
 				message,
 			))
 		case "adb_devices":
@@ -4656,11 +4736,12 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			}
 			sessionContext := data.SessionContext{}
 			if h.SessionStore != nil && strings.TrimSpace(selectedSessionID) != "" {
-				record, ok := loadSelectedSessionRecord(h.SessionStore, ctx, selectedSessionID, emit)
-				if !ok {
+				loadedContext, err := readSessionContextForAction("slash_command", selectedSessionID)
+				if err != nil {
+					emit(protocol.NewErrorEvent(selectedSessionID, err.Error(), ""))
 					continue
 				}
-				sessionContext = record.Projection.SessionContext
+				sessionContext = loadedContext
 			}
 			sessionID := strings.TrimSpace(firstNonEmptyString(slashReq.SessionID, selectedSessionID))
 			if sessionID == "" && (parsedSlash.spec.category == "local" || parsedSlash.spec.category == "runtime-info") {
@@ -5261,29 +5342,6 @@ func findRuntimeProcessItem(items []protocol.RuntimeProcessItem, pid int) (proto
 		}
 	}
 	return protocol.RuntimeProcessItem{}, false
-}
-
-func resolveRuntimeProcessLogs(item protocol.RuntimeProcessItem, projection data.ProjectionSnapshot) (string, string, string) {
-	projection = session.NormalizeProjectionSnapshot(projection)
-	if executionID := strings.TrimSpace(item.ExecutionID); executionID != "" {
-		for _, execution := range projection.TerminalExecutions {
-			if strings.TrimSpace(execution.ExecutionID) != executionID {
-				continue
-			}
-			message := ""
-			if strings.TrimSpace(execution.Stdout) == "" && strings.TrimSpace(execution.Stderr) == "" {
-				message = "该进程暂无已捕获的 stdout / stderr"
-			}
-			return execution.Stdout, execution.Stderr, message
-		}
-	}
-	stdout := projection.RawTerminalByStream["stdout"]
-	stderr := projection.RawTerminalByStream["stderr"]
-	message := ""
-	if strings.TrimSpace(stdout) == "" && strings.TrimSpace(stderr) == "" {
-		message = "该进程暂无可展示的捕获日志"
-	}
-	return stdout, stderr, message
 }
 
 func upsertLocalSkill(sessionStore data.Store, ctx context.Context, item protocol.SkillDefinition) error {

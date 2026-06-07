@@ -23,6 +23,7 @@ import (
 	"mobilevc/internal/data"
 	"mobilevc/internal/data/claudesync"
 	"mobilevc/internal/data/codexsync"
+	"mobilevc/internal/data/skills"
 	"mobilevc/internal/engine"
 	"mobilevc/internal/protocol"
 	"mobilevc/internal/push"
@@ -708,6 +709,14 @@ func (s *blockingProjectionSaveStore) GetSessionContext(ctx context.Context, ses
 	return contextStore.GetSessionContext(ctx, sessionID)
 }
 
+func (s *blockingProjectionSaveStore) SaveSessionContext(ctx context.Context, snapshot data.SessionContextSnapshot) (data.SessionSummary, error) {
+	contextStore, ok := s.Store.(data.SessionContextStore)
+	if !ok {
+		return data.SessionSummary{}, fmt.Errorf("inner store does not support session context")
+	}
+	return contextStore.SaveSessionContext(ctx, snapshot)
+}
+
 func (s *blockingProjectionSaveStore) GetSessionPermissionRuleSnapshot(ctx context.Context, sessionID string) (data.SessionPermissionRuleSnapshot, error) {
 	ruleStore, ok := s.Store.(data.SessionPermissionRuleStore)
 	if !ok {
@@ -746,6 +755,14 @@ func (s *blockingProjectionSaveStore) GetSessionTerminalExecutionPage(ctx contex
 		return data.SessionTerminalExecutionPage{}, fmt.Errorf("inner store does not support session terminal execution pages")
 	}
 	return executionStore.GetSessionTerminalExecutionPage(ctx, req)
+}
+
+func (s *blockingProjectionSaveStore) GetSessionTerminalExecution(ctx context.Context, req data.SessionTerminalExecutionRequest) (data.SessionTerminalExecutionSnapshot, error) {
+	executionStore, ok := s.Store.(data.SessionTerminalExecutionStore)
+	if !ok {
+		return data.SessionTerminalExecutionSnapshot{}, fmt.Errorf("inner store does not support session terminal execution")
+	}
+	return executionStore.GetSessionTerminalExecution(ctx, req)
 }
 
 func (s *failOnceProjectionSaveStore) SaveProjection(ctx context.Context, sessionID string, projection data.ProjectionSnapshot) (data.SessionSummary, error) {
@@ -941,6 +958,14 @@ func (s *countingStore) GetSessionContext(ctx context.Context, sessionID string)
 	return contextStore.GetSessionContext(ctx, sessionID)
 }
 
+func (s *countingStore) SaveSessionContext(ctx context.Context, snapshot data.SessionContextSnapshot) (data.SessionSummary, error) {
+	contextStore, ok := s.inner.(data.SessionContextStore)
+	if !ok {
+		return data.SessionSummary{}, fmt.Errorf("inner store does not support session context")
+	}
+	return contextStore.SaveSessionContext(ctx, snapshot)
+}
+
 func (s *countingStore) GetSessionRuntimeMetadata(ctx context.Context, sessionID string) (data.SessionRuntimeMetadata, error) {
 	s.mu.Lock()
 	s.metaCalls++
@@ -992,6 +1017,14 @@ func (s *countingStore) GetSessionTerminalExecutionPage(ctx context.Context, req
 	return executionStore.GetSessionTerminalExecutionPage(ctx, req)
 }
 
+func (s *countingStore) GetSessionTerminalExecution(ctx context.Context, req data.SessionTerminalExecutionRequest) (data.SessionTerminalExecutionSnapshot, error) {
+	executionStore, ok := s.inner.(data.SessionTerminalExecutionStore)
+	if !ok {
+		return data.SessionTerminalExecutionSnapshot{}, fmt.Errorf("inner store does not support session terminal execution")
+	}
+	return executionStore.GetSessionTerminalExecution(ctx, req)
+}
+
 func (s *blockingSessionLoadStore) GetSession(ctx context.Context, sessionID string) (data.SessionRecord, error) {
 	if strings.TrimSpace(sessionID) == strings.TrimSpace(s.targetSessionID) {
 		if err := s.blockLoad(ctx); err != nil {
@@ -1030,6 +1063,14 @@ func (s *targetGetCountingStore) GetSessionContext(ctx context.Context, sessionI
 		return data.SessionContextSnapshot{}, fmt.Errorf("inner store does not support session context")
 	}
 	return contextStore.GetSessionContext(ctx, sessionID)
+}
+
+func (s *targetGetCountingStore) SaveSessionContext(ctx context.Context, snapshot data.SessionContextSnapshot) (data.SessionSummary, error) {
+	contextStore, ok := s.Store.(data.SessionContextStore)
+	if !ok {
+		return data.SessionSummary{}, fmt.Errorf("inner store does not support session context")
+	}
+	return contextStore.SaveSessionContext(ctx, snapshot)
 }
 
 func (s *targetGetCountingStore) GetSessionRuntimeMetadata(ctx context.Context, sessionID string) (data.SessionRuntimeMetadata, error) {
@@ -1080,6 +1121,14 @@ func (s *targetGetCountingStore) GetSessionTerminalExecutionPage(ctx context.Con
 	return executionStore.GetSessionTerminalExecutionPage(ctx, req)
 }
 
+func (s *targetGetCountingStore) GetSessionTerminalExecution(ctx context.Context, req data.SessionTerminalExecutionRequest) (data.SessionTerminalExecutionSnapshot, error) {
+	executionStore, ok := s.Store.(data.SessionTerminalExecutionStore)
+	if !ok {
+		return data.SessionTerminalExecutionSnapshot{}, fmt.Errorf("inner store does not support session terminal execution")
+	}
+	return executionStore.GetSessionTerminalExecution(ctx, req)
+}
+
 func (s *blockingSessionLoadStore) GetSessionHistoryWindow(ctx context.Context, req data.SessionHistoryWindowRequest) (data.SessionHistoryWindow, error) {
 	if strings.TrimSpace(req.SessionID) == strings.TrimSpace(s.targetSessionID) {
 		if err := s.blockLoad(ctx); err != nil {
@@ -1099,6 +1148,14 @@ func (s *blockingSessionLoadStore) GetSessionContext(ctx context.Context, sessio
 		return data.SessionContextSnapshot{}, fmt.Errorf("inner store does not support session context")
 	}
 	return contextStore.GetSessionContext(ctx, sessionID)
+}
+
+func (s *blockingSessionLoadStore) SaveSessionContext(ctx context.Context, snapshot data.SessionContextSnapshot) (data.SessionSummary, error) {
+	contextStore, ok := s.Store.(data.SessionContextStore)
+	if !ok {
+		return data.SessionSummary{}, fmt.Errorf("inner store does not support session context")
+	}
+	return contextStore.SaveSessionContext(ctx, snapshot)
 }
 
 func (s *blockingSessionLoadStore) GetSessionRuntimeMetadata(ctx context.Context, sessionID string) (data.SessionRuntimeMetadata, error) {
@@ -1149,6 +1206,14 @@ func (s *blockingSessionLoadStore) GetSessionTerminalExecutionPage(ctx context.C
 	return executionStore.GetSessionTerminalExecutionPage(ctx, req)
 }
 
+func (s *blockingSessionLoadStore) GetSessionTerminalExecution(ctx context.Context, req data.SessionTerminalExecutionRequest) (data.SessionTerminalExecutionSnapshot, error) {
+	executionStore, ok := s.Store.(data.SessionTerminalExecutionStore)
+	if !ok {
+		return data.SessionTerminalExecutionSnapshot{}, fmt.Errorf("inner store does not support session terminal execution")
+	}
+	return executionStore.GetSessionTerminalExecution(ctx, req)
+}
+
 func (s *blockingTargetGetStore) GetSession(ctx context.Context, sessionID string) (data.SessionRecord, error) {
 	if strings.TrimSpace(sessionID) == strings.TrimSpace(s.targetSessionID) {
 		if err := s.blockLoad(ctx); err != nil {
@@ -1169,6 +1234,19 @@ func (s *blockingTargetGetStore) GetSessionContext(ctx context.Context, sessionI
 		return data.SessionContextSnapshot{}, fmt.Errorf("inner store does not support session context")
 	}
 	return contextStore.GetSessionContext(ctx, sessionID)
+}
+
+func (s *blockingTargetGetStore) SaveSessionContext(ctx context.Context, snapshot data.SessionContextSnapshot) (data.SessionSummary, error) {
+	if strings.TrimSpace(snapshot.SessionID) == strings.TrimSpace(s.targetSessionID) {
+		if err := s.blockLoad(ctx); err != nil {
+			return data.SessionSummary{}, err
+		}
+	}
+	contextStore, ok := s.Store.(data.SessionContextStore)
+	if !ok {
+		return data.SessionSummary{}, fmt.Errorf("inner store does not support session context")
+	}
+	return contextStore.SaveSessionContext(ctx, snapshot)
 }
 
 func (s *blockingTargetGetStore) GetSessionRuntimeMetadata(ctx context.Context, sessionID string) (data.SessionRuntimeMetadata, error) {
@@ -1247,6 +1325,19 @@ func (s *blockingTargetGetStore) GetSessionTerminalExecutionPage(ctx context.Con
 		return data.SessionTerminalExecutionPage{}, fmt.Errorf("inner store does not support session terminal execution pages")
 	}
 	return executionStore.GetSessionTerminalExecutionPage(ctx, req)
+}
+
+func (s *blockingTargetGetStore) GetSessionTerminalExecution(ctx context.Context, req data.SessionTerminalExecutionRequest) (data.SessionTerminalExecutionSnapshot, error) {
+	if strings.TrimSpace(req.SessionID) == strings.TrimSpace(s.targetSessionID) {
+		if err := s.blockLoad(ctx); err != nil {
+			return data.SessionTerminalExecutionSnapshot{}, err
+		}
+	}
+	executionStore, ok := s.Store.(data.SessionTerminalExecutionStore)
+	if !ok {
+		return data.SessionTerminalExecutionSnapshot{}, fmt.Errorf("inner store does not support session terminal execution")
+	}
+	return executionStore.GetSessionTerminalExecution(ctx, req)
 }
 
 func (s *blockingTargetGetStore) blockLoad(ctx context.Context) error {
@@ -1853,6 +1944,58 @@ func readInitialSessionID(t *testing.T, conn *websocket.Conn) string {
 	return sessionID
 }
 
+func TestInteractiveFullProjectionHelperIsNotUsedBySessionBootstrap(t *testing.T) {
+	gatewayPath := filepath.Join("gateway.go")
+	raw, err := os.ReadFile(gatewayPath)
+	if err != nil {
+		t.Fatalf("read gateway source: %v", err)
+	}
+	source := string(raw)
+	allowedActions := map[string]bool{
+		"ai_turn":             true,
+		"exec":                true,
+		"input":               true,
+		"permission_decision": true,
+		"review_decision":     true,
+		"plan_decision":       true,
+		"set_permission_mode": true,
+	}
+	callToken := "loadFullProjectionForInteractiveMutation("
+	searchStart := 0
+	foundCalls := 0
+	for {
+		callIndex := strings.Index(source[searchStart:], callToken)
+		if callIndex < 0 {
+			break
+		}
+		absoluteCallIndex := searchStart + callIndex
+		prefix := source[:absoluteCallIndex]
+		caseIndex := strings.LastIndex(prefix, "\t\tcase \"")
+		if caseIndex < 0 {
+			helperDefinitionIndex := strings.LastIndex(prefix, "loadFullProjectionForInteractiveMutation := func")
+			if helperDefinitionIndex >= 0 && helperDefinitionIndex > strings.LastIndex(prefix, "\n}") {
+				searchStart = absoluteCallIndex + len(callToken)
+				continue
+			}
+			t.Fatalf("full projection helper call outside websocket action case near byte %d", absoluteCallIndex)
+		}
+		actionStart := caseIndex + len("\t\tcase \"")
+		actionEnd := strings.Index(source[actionStart:], "\"")
+		if actionEnd < 0 {
+			t.Fatalf("could not parse websocket action near byte %d", absoluteCallIndex)
+		}
+		action := source[actionStart : actionStart+actionEnd]
+		if !allowedActions[action] {
+			t.Fatalf("full projection helper used by non-interactive action %q near byte %d", action, absoluteCallIndex)
+		}
+		foundCalls++
+		searchStart = absoluteCallIndex + len(callToken)
+	}
+	if foundCalls == 0 {
+		t.Fatal("expected at least one interactive full projection helper call")
+	}
+}
+
 func readUntilType(t *testing.T, conn *websocket.Conn, want string) map[string]any {
 	t.Helper()
 	for i := 0; i < 20; i++ {
@@ -1962,6 +2105,30 @@ func waitForPersistedReviewFile(t *testing.T, h *Handler, sessionID, fileID stri
 	}
 	t.Fatalf("did not persist review file %q, last projection: %#v", fileID, last)
 	return last
+}
+
+func waitForPersistedTerminalExecution(t *testing.T, store data.Store, sessionID, executionID string) data.TerminalExecution {
+	t.Helper()
+	executionStore, ok := store.(data.SessionTerminalExecutionStore)
+	if !ok {
+		t.Fatal("store does not support session terminal execution")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		snapshot, err := executionStore.GetSessionTerminalExecution(context.Background(), data.SessionTerminalExecutionRequest{
+			SessionID:     sessionID,
+			ExecutionID:   executionID,
+			IncludeOutput: true,
+		})
+		if err == nil {
+			return snapshot.TerminalExecution
+		}
+		lastErr = err
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("did not persist terminal execution %q: %v", executionID, lastErr)
+	return data.TerminalExecution{}
 }
 
 func waitForPersistedPermissionMode(t *testing.T, store data.Store, sessionID, mode string) data.SessionRecord {
@@ -3923,6 +4090,44 @@ func TestHandlerContextAndPermissionListUseSideDomainReaders(t *testing.T) {
 	}
 }
 
+func TestHandlerSessionContextUpdateUsesSideDomainWriter(t *testing.T) {
+	h := newTestHandler()
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	counting := &countingStore{inner: tempStore}
+	h.SessionStore = counting
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+	sessionID := createHistorySessionForHandlerTest(t, h, conn, "context-update-side-domain")
+	beforeGets := counting.getCallCount()
+
+	if err := conn.WriteJSON(protocol.SessionContextUpdateRequestEvent{
+		ClientEvent:       protocol.ClientEvent{Action: "session_context_update"},
+		EnabledSkillNames: []string{"review"},
+		EnabledMemoryIDs:  []string{"memory-1"},
+	}); err != nil {
+		t.Fatalf("write session_context_update request: %v", err)
+	}
+	event := readUntilType(t, conn, protocol.EventTypeSessionContextResult)
+	payload, _ := event["sessionContext"].(map[string]any)
+	if skills, _ := payload["enabledSkillNames"].([]any); len(skills) != 1 || skills[0] != "review" {
+		t.Fatalf("unexpected session context update result: %#v", event)
+	}
+	if got := counting.getCallCount(); got != beforeGets {
+		t.Fatalf("session_context_update should not call GetSession, got %d before=%d", got, beforeGets)
+	}
+
+	snapshot, err := tempStore.GetSessionContext(context.Background(), sessionID)
+	if err != nil {
+		t.Fatalf("get session context snapshot: %v", err)
+	}
+	if got := snapshot.SessionContext.EnabledSkillNames; len(got) != 1 || got[0] != "review" {
+		t.Fatalf("expected context sidecar to be updated, got %#v", snapshot.SessionContext)
+	}
+}
+
 func TestHandlerSessionContextUpdateWithoutSelectedSessionReturnsError(t *testing.T) {
 	h := newTestHandler()
 	tempStore, err := data.NewFileStore(t.TempDir())
@@ -4684,22 +4889,18 @@ func TestSaveProjectionWithOptionsRequiresOptionStoreWhenOptionsPresent(t *testi
 	}
 }
 
-func TestHandlerReviewStateGetReturnsProjectionGroups(t *testing.T) {
+func TestHandlerReviewStateGetIsDeprecatedWithoutFullProjectionLoad(t *testing.T) {
 	h := newTestHandler()
 	tempStore, err := data.NewFileStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("new temp store: %v", err)
 	}
-	h.SessionStore = tempStore
+	counting := &countingStore{inner: tempStore}
+	h.SessionStore = counting
 	conn := newTestConn(t, h)
 	_, _ = readInitialEvents(t, conn)
 	sessionID := createHistorySessionForHandlerTest(t, h, conn, "review-state-session")
-
-	record, err := h.SessionStore.GetSession(context.Background(), sessionID)
-	if err != nil {
-		t.Fatalf("get session: %v", err)
-	}
-	record.Projection = session.NormalizeProjectionSnapshot(data.ProjectionSnapshot{
+	if _, err := tempStore.SaveProjection(context.Background(), sessionID, session.NormalizeProjectionSnapshot(data.ProjectionSnapshot{
 		Diffs: []session.DiffContext{{
 			ContextID:     "diff-1",
 			Title:         "handler diff",
@@ -4713,25 +4914,23 @@ func TestHandlerReviewStateGetReturnsProjectionGroups(t *testing.T) {
 			ReviewStatus:  "pending",
 		}},
 		RawTerminalByStream: map[string]string{"stdout": "", "stderr": ""},
-	})
-	if _, err := h.SessionStore.SaveProjection(context.Background(), sessionID, record.Projection); err != nil {
+	})); err != nil {
 		t.Fatalf("save projection: %v", err)
 	}
+	beforeGets := counting.getCallCount()
 
 	if err := conn.WriteJSON(protocol.ClientEvent{Action: "review_state_get"}); err != nil {
 		t.Fatalf("write review_state_get request: %v", err)
 	}
-	event := readUntilType(t, conn, protocol.EventTypeReviewState)
-	groups, ok := event["groups"].([]any)
-	if !ok || len(groups) != 1 {
-		t.Fatalf("expected one review group, got %#v", event)
+	event := readUntilType(t, conn, protocol.EventTypeError)
+	if event["code"] != "review_state_get_deprecated" {
+		t.Fatalf("expected deprecated review_state_get error, got %#v", event)
 	}
-	activeGroup, ok := event["activeGroup"].(map[string]any)
-	if !ok {
-		t.Fatalf("expected activeGroup payload, got %#v", event)
+	if msg := fmt.Sprint(event["msg"], event["message"]); !strings.Contains(msg, "session_diff_page_get") {
+		t.Fatalf("expected replacement action in error, got %#v", event)
 	}
-	if activeGroup["id"] != "group-1" {
-		t.Fatalf("expected activeGroup id group-1, got %#v", activeGroup)
+	if got := counting.getCallCount(); got != beforeGets {
+		t.Fatalf("review_state_get should not call GetSession, got %d before=%d", got, beforeGets)
 	}
 }
 
@@ -4894,7 +5093,8 @@ func TestHandlerRuntimeProcessLogReturnsCapturedExecutionOutput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new temp store: %v", err)
 	}
-	h.SessionStore = tempStore
+	counting := &countingStore{inner: tempStore}
+	h.SessionStore = counting
 	h.NewExecRunner = func() engine.Runner { return execRunner }
 
 	conn := newTestConn(t, h)
@@ -4927,6 +5127,7 @@ func TestHandlerRuntimeProcessLogReturnsCapturedExecutionOutput(t *testing.T) {
 
 	requireAgentState(t, readUntilType(t, conn, protocol.EventTypeAgentState), "THINKING", false)
 	execRunner.WaitStarted(t)
+	beforeGets := counting.getCallCount()
 
 	if err := conn.WriteJSON(protocol.RuntimeProcessLogRequestEvent{
 		ClientEvent: protocol.ClientEvent{Action: "runtime_process_log_get"},
@@ -4947,6 +5148,9 @@ func TestHandlerRuntimeProcessLogReturnsCapturedExecutionOutput(t *testing.T) {
 	}
 	if event["stderr"] != "captured stderr" {
 		t.Fatalf("expected captured stderr, got %#v", event["stderr"])
+	}
+	if got := counting.getCallCount(); got != beforeGets {
+		t.Fatalf("runtime_process_log_get should not call GetSession, got %d before=%d", got, beforeGets)
 	}
 }
 
@@ -4971,11 +5175,15 @@ func TestHandlerRuntimeProcessListAndLogUseGeneratedExecutionIDForPty(t *testing
 	_, _ = readInitialEvents(t, conn)
 	sessionID := createHistorySessionForHandlerTest(t, h, conn, "runtime-process-pty")
 
-	ptyRunner.mu.Lock()
-	ptyRunner.events = []any{
-		protocol.NewLogEvent(sessionID, "pty stdout", "stdout"),
+	ptyRunner.onStart = func() {
+		ptyRunner.mu.Lock()
+		executionID := strings.TrimSpace(ptyRunner.lastReq.RuntimeMeta.ExecutionID)
+		ptyRunner.mu.Unlock()
+		ptyRunner.Emit(protocol.ApplyRuntimeMeta(
+			protocol.NewLogEvent(sessionID, "pty stdout", "stdout"),
+			protocol.RuntimeMeta{ExecutionID: executionID},
+		))
 	}
-	ptyRunner.mu.Unlock()
 
 	if err := conn.WriteJSON(protocol.ExecRequestEvent{
 		ClientEvent: protocol.ClientEvent{Action: "exec"},
@@ -4993,6 +5201,10 @@ func TestHandlerRuntimeProcessListAndLogUseGeneratedExecutionIDForPty(t *testing
 	ptyRunner.mu.Unlock()
 	if executionID == "" {
 		t.Fatal("expected generated execution id on pty request")
+	}
+	execution := waitForPersistedTerminalExecution(t, h.SessionStore, sessionID, executionID)
+	if execution.Stdout != "pty stdout" {
+		t.Fatalf("expected persisted pty stdout before log request, got %#v", execution)
 	}
 
 	if err := conn.WriteJSON(protocol.RuntimeProcessListRequestEvent{
@@ -5030,6 +5242,57 @@ func TestHandlerRuntimeProcessListAndLogUseGeneratedExecutionIDForPty(t *testing
 	}
 	if logEvent["stdout"] != "pty stdout" {
 		t.Fatalf("expected pty stdout, got %#v", logEvent["stdout"])
+	}
+}
+
+func TestHandlerRuntimeProcessLogWithoutExecutionIDFailsExplicitlyWithoutFullProjectionLoad(t *testing.T) {
+	execRunner := newHoldingStubRunner()
+	execRunner.processRef = engine.ProcessRef{
+		RootPID: os.Getpid(),
+		Command: "legacy process",
+		CWD:     "/tmp/mobilevc",
+		Source:  "exec",
+	}
+
+	h := newTestHandler()
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	counting := &countingStore{inner: tempStore}
+	h.SessionStore = counting
+	h.NewExecRunner = func() engine.Runner { return execRunner }
+
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+	_ = createHistorySessionForHandlerTest(t, h, conn, "runtime-process-log-no-exec-id")
+
+	if err := conn.WriteJSON(protocol.ExecRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "exec"},
+		Command:     "legacy process",
+	}); err != nil {
+		t.Fatalf("write exec request: %v", err)
+	}
+	requireAgentState(t, readUntilType(t, conn, protocol.EventTypeAgentState), "THINKING", false)
+	execRunner.WaitStarted(t)
+	beforeGets := counting.getCallCount()
+
+	if err := conn.WriteJSON(protocol.RuntimeProcessLogRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "runtime_process_log_get"},
+		PID:         os.Getpid(),
+	}); err != nil {
+		t.Fatalf("write runtime_process_log_get request: %v", err)
+	}
+
+	errEvent := readUntilType(t, conn, protocol.EventTypeError)
+	if errEvent["code"] != "runtime_process_log_unavailable" {
+		t.Fatalf("expected runtime process log unavailable code, got %#v", errEvent)
+	}
+	if msg := fmt.Sprint(errEvent["msg"], errEvent["message"]); !strings.Contains(msg, "execution id") {
+		t.Fatalf("expected execution id error, got %#v", errEvent)
+	}
+	if got := counting.getCallCount(); got != beforeGets {
+		t.Fatalf("runtime_process_log_get without execution id should not call GetSession, got %d before=%d", got, beforeGets)
 	}
 }
 
@@ -7992,6 +8255,86 @@ func TestHandlerSlashCommandExecMappings(t *testing.T) {
 			default:
 			}
 		})
+	}
+}
+
+func TestHandlerSkillExecUsesSessionContextSideDomainReader(t *testing.T) {
+	h := newTestHandler()
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	h.SessionStore = tempStore
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+	sessionID := createHistorySessionForHandlerTest(t, h, conn, "skill-exec-side-domain")
+	if _, err := tempStore.SaveSessionContext(context.Background(), data.SessionContextSnapshot{
+		SessionID:      sessionID,
+		SessionContext: data.SessionContext{Configured: true},
+	}); err != nil {
+		t.Fatalf("save session context: %v", err)
+	}
+	counting := &countingStore{inner: tempStore}
+	h.SessionStore = counting
+	h.replaceSkillLauncher(skills.NewLauncher(counting))
+	beforeGets := counting.getCallCount()
+
+	if err := conn.WriteJSON(protocol.SkillRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "skill_exec"},
+		Name:        "review",
+		CWD:         ".",
+		TargetType:  "diff",
+		TargetDiff:  "diff --git a/a.go b/a.go\n+change",
+		TargetTitle: "a.go",
+	}); err != nil {
+		t.Fatalf("write skill_exec request: %v", err)
+	}
+	errEvent := readUntilType(t, conn, protocol.EventTypeError)
+	if msg := fmt.Sprint(errEvent["msg"], errEvent["message"]); !strings.Contains(msg, "当前 skill 未在本会话启用") {
+		t.Fatalf("expected disabled skill error from side-domain context, got %#v", errEvent)
+	}
+	if got := counting.getCallCount(); got != beforeGets {
+		t.Fatalf("skill_exec should read session context without GetSession, got %d before=%d", got, beforeGets)
+	}
+}
+
+func TestHandlerSlashCommandSkillUsesSessionContextSideDomainReader(t *testing.T) {
+	h := newTestHandler()
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	h.SessionStore = tempStore
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+	sessionID := createHistorySessionForHandlerTest(t, h, conn, "slash-skill-side-domain")
+	if _, err := tempStore.SaveSessionContext(context.Background(), data.SessionContextSnapshot{
+		SessionID:      sessionID,
+		SessionContext: data.SessionContext{Configured: true},
+	}); err != nil {
+		t.Fatalf("save session context: %v", err)
+	}
+	counting := &countingStore{inner: tempStore}
+	h.SessionStore = counting
+	h.replaceSkillLauncher(skills.NewLauncher(counting))
+	beforeGets := counting.getCallCount()
+
+	if err := conn.WriteJSON(protocol.SlashCommandRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "slash_command"},
+		Command:     "/review",
+		CWD:         ".",
+		TargetType:  "diff",
+		TargetDiff:  "diff --git a/a.go b/a.go\n+change",
+		TargetTitle: "a.go",
+	}); err != nil {
+		t.Fatalf("write slash_command request: %v", err)
+	}
+	errEvent := readUntilType(t, conn, protocol.EventTypeError)
+	if msg := fmt.Sprint(errEvent["msg"], errEvent["message"]); !strings.Contains(msg, "当前 skill 未在本会话启用") {
+		t.Fatalf("expected disabled skill error from side-domain context, got %#v", errEvent)
+	}
+	if got := counting.getCallCount(); got != beforeGets {
+		t.Fatalf("slash_command should read session context without GetSession, got %d before=%d", got, beforeGets)
 	}
 }
 

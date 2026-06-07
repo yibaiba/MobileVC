@@ -526,6 +526,44 @@ func (s *FileStore) GetSessionContext(ctx context.Context, sessionID string) (Se
 	}, nil
 }
 
+func (s *FileStore) SaveSessionContext(ctx context.Context, snapshot SessionContextSnapshot) (SessionSummary, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	select {
+	case <-ctx.Done():
+		return SessionSummary{}, ctx.Err()
+	default:
+	}
+	sessionID := strings.TrimSpace(snapshot.SessionID)
+	if sessionID == "" {
+		return SessionSummary{}, fmt.Errorf("session id is required")
+	}
+	record, err := s.readSessionWithoutLogEntriesLocked(sessionID)
+	if err != nil {
+		return SessionSummary{}, err
+	}
+	record.Projection.SessionContext = normalizeSessionContext(snapshot.SessionContext)
+	record.Projection.SessionContextSet = record.Projection.SessionContext.Configured
+	record.Summary.UpdatedAt = time.Now().UTC()
+	sidecar := sessionContextSidecar{
+		Version:           sessionSideDomainVersion,
+		SessionID:         sessionID,
+		SessionContext:    record.Projection.SessionContext,
+		SessionContextSet: record.Projection.SessionContextSet,
+	}
+	if err := s.writeSessionRecordOnlyLocked(record); err != nil {
+		return SessionSummary{}, err
+	}
+	if err := s.writeSessionContextSidecarLocked(sessionID, sidecar); err != nil {
+		return SessionSummary{}, err
+	}
+	s.cacheSessionMetaLocked(record)
+	if err := s.updateSessionIndexLocked(record.Summary); err != nil {
+		return SessionSummary{}, err
+	}
+	return record.Summary, nil
+}
+
 func (s *FileStore) GetSessionPermissionRuleSnapshot(ctx context.Context, sessionID string) (SessionPermissionRuleSnapshot, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -699,6 +737,47 @@ func (s *FileStore) GetSessionTerminalExecutionPage(ctx context.Context, req Ses
 		ExecutionTotal:     total,
 		IncludeOutput:      req.IncludeOutput,
 	}, nil
+}
+
+func (s *FileStore) GetSessionTerminalExecution(ctx context.Context, req SessionTerminalExecutionRequest) (SessionTerminalExecutionSnapshot, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	select {
+	case <-ctx.Done():
+		return SessionTerminalExecutionSnapshot{}, ctx.Err()
+	default:
+	}
+	sessionID := strings.TrimSpace(req.SessionID)
+	executionID := strings.TrimSpace(req.ExecutionID)
+	if sessionID == "" {
+		return SessionTerminalExecutionSnapshot{}, fmt.Errorf("session id is required")
+	}
+	if executionID == "" {
+		return SessionTerminalExecutionSnapshot{}, fmt.Errorf("execution id is required")
+	}
+	_, latest, err := s.readProjectionSideDomainRecordLocked(sessionID)
+	if err != nil {
+		return SessionTerminalExecutionSnapshot{}, err
+	}
+	executionSidecar, err := s.readSessionTerminalExecutionSidecarLocked(sessionID)
+	if err != nil {
+		return SessionTerminalExecutionSnapshot{}, err
+	}
+	for _, execution := range executionSidecar.TerminalExecutions {
+		if strings.TrimSpace(execution.ExecutionID) != executionID {
+			continue
+		}
+		if !req.IncludeOutput {
+			execution.Stdout = ""
+			execution.Stderr = ""
+		}
+		return SessionTerminalExecutionSnapshot{
+			SessionID:         sessionID,
+			Latest:            latest,
+			TerminalExecution: execution,
+		}, nil
+	}
+	return SessionTerminalExecutionSnapshot{}, fmt.Errorf("terminal execution %s not found for session %s", executionID, sessionID)
 }
 
 func (s *FileStore) ListSessions(ctx context.Context) ([]SessionSummary, error) {
@@ -1581,7 +1660,7 @@ func (s *FileStore) writeProjectionSidecarsLocked(sessionID string, sidecars ses
 	if err := s.writeJSONFileLocked(s.sessionRuntimeMetaPath(sessionID), sidecars.RuntimeMeta, "encode session runtime metadata sidecar"); err != nil {
 		return err
 	}
-	if err := s.writeJSONFileLocked(s.sessionContextPath(sessionID), sidecars.Context, "encode session context sidecar"); err != nil {
+	if err := s.writeSessionContextSidecarLocked(sessionID, sidecars.Context); err != nil {
 		return err
 	}
 	if err := s.writeSessionPermissionSidecarLocked(sessionID, sidecars.Permission); err != nil {
@@ -1594,6 +1673,14 @@ func (s *FileStore) writeProjectionSidecarsLocked(sessionID string, sidecars ses
 		return err
 	}
 	return s.writeJSONFileLocked(s.sessionTerminalExecutionsPath(sessionID), sidecars.TerminalExecution, "encode session terminal execution sidecar")
+}
+
+func (s *FileStore) writeSessionContextSidecarLocked(sessionID string, sidecar sessionContextSidecar) error {
+	sidecar.SessionID = strings.TrimSpace(sessionID)
+	sidecar.Version = sessionSideDomainVersion
+	sidecar.SessionContext = normalizeSessionContext(sidecar.SessionContext)
+	sidecar.SessionContextSet = sidecar.SessionContextSet || sidecar.SessionContext.Configured
+	return s.writeJSONFileLocked(s.sessionContextPath(sessionID), sidecar, "encode session context sidecar")
 }
 
 func (s *FileStore) writeSessionPermissionSidecarLocked(sessionID string, sidecar sessionPermissionSidecar) error {

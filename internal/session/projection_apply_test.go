@@ -665,6 +665,90 @@ func TestApplyEventToProjection_LogVisibleAssistantReply(t *testing.T) {
 	}
 }
 
+func TestApplyEventToProjection_MergesStreamingAssistantReplyByExecutionID(t *testing.T) {
+	base := protocol.Event{
+		Type:        "log",
+		SessionID:   "s1",
+		Timestamp:   time.Now(),
+		RuntimeMeta: protocol.RuntimeMeta{Engine: "codex", Source: "codex/assistant", ExecutionID: "turn-1"},
+	}
+	snapshot, applied := ApplyEventToProjection(data.ProjectionSnapshot{}, protocol.LogEvent{
+		Event:   base,
+		Message: "Tip :",
+		Stream:  "stdout",
+	})
+	if !applied {
+		t.Fatal("expected first assistant chunk applied")
+	}
+	snapshot, applied = ApplyEventToProjection(snapshot, protocol.LogEvent{
+		Event:   base,
+		Message: "hello world",
+		Stream:  "stdout",
+	})
+	if !applied {
+		t.Fatal("expected second assistant chunk applied")
+	}
+	if len(snapshot.LogEntries) != 1 {
+		t.Fatalf("expected one merged markdown entry, got %+v", snapshot.LogEntries)
+	}
+	if got := snapshot.LogEntries[0].Message; got != "Tip : hello world" {
+		t.Fatalf("unexpected merged assistant reply: %q", got)
+	}
+}
+
+func TestApplyEventToProjection_MergesStreamingAssistantReplyCJKWithoutSpace(t *testing.T) {
+	base := protocol.Event{
+		Type:        "log",
+		SessionID:   "s1",
+		Timestamp:   time.Now(),
+		RuntimeMeta: protocol.RuntimeMeta{Engine: "codex", Source: "codex/assistant", ExecutionID: "turn-cjk"},
+	}
+	snapshot, _ := ApplyEventToProjection(data.ProjectionSnapshot{}, protocol.LogEvent{
+		Event:   base,
+		Message: "已经定位",
+		Stream:  "stdout",
+	})
+	snapshot, _ = ApplyEventToProjection(snapshot, protocol.LogEvent{
+		Event:   base,
+		Message: "到根因",
+		Stream:  "stdout",
+	})
+	if len(snapshot.LogEntries) != 1 {
+		t.Fatalf("expected one merged markdown entry, got %+v", snapshot.LogEntries)
+	}
+	if got := snapshot.LogEntries[0].Message; got != "已经定位到根因" {
+		t.Fatalf("unexpected merged assistant reply: %q", got)
+	}
+}
+
+func TestApplyEventToProjection_DoesNotMergeAssistantReplyAcrossExecutionID(t *testing.T) {
+	base := protocol.Event{
+		Type:      "log",
+		SessionID: "s1",
+		Timestamp: time.Now(),
+		RuntimeMeta: protocol.RuntimeMeta{
+			Engine:      "codex",
+			Source:      "codex/assistant",
+			ExecutionID: "turn-1",
+		},
+	}
+	snapshot, _ := ApplyEventToProjection(data.ProjectionSnapshot{}, protocol.LogEvent{
+		Event:   base,
+		Message: "first turn",
+		Stream:  "stdout",
+	})
+	next := base
+	next.RuntimeMeta.ExecutionID = "turn-2"
+	snapshot, _ = ApplyEventToProjection(snapshot, protocol.LogEvent{
+		Event:   next,
+		Message: "second turn",
+		Stream:  "stdout",
+	})
+	if len(snapshot.LogEntries) != 2 {
+		t.Fatalf("expected separate markdown entries, got %+v", snapshot.LogEntries)
+	}
+}
+
 func TestApplyEventToProjection_UnknownEvent(t *testing.T) {
 	type customEvent struct{}
 	_, applied := ApplyEventToProjection(data.ProjectionSnapshot{}, customEvent{})
