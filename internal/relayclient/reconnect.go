@@ -28,6 +28,21 @@ func serveWithReconnect(ctx context.Context, cfg Config, handler Handler, conn *
 			cfg.DeviceTrust,
 		)
 		gatewayConn := newGatewayConnWithPolicy(conn, sessionID, e2eeHandler, cfg.DownloadRoots, selectedRoutePolicy(cfg))
+		if err := gatewayConn.waitReadyForHandler(); err != nil {
+			if errors.Is(gatewayConn.closeReason(), errRelaySessionRotated) {
+				return errRelaySessionRotated
+			}
+			_ = gatewayConn.Close()
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			nextConn, err := reconnectUntilAccepted(ctx, cfg, sessionID, reconnectSecret)
+			if err != nil {
+				return err
+			}
+			conn = nextConn
+			continue
+		}
 		handler.ServeClientConn(ctx, gatewayConn)
 		if errors.Is(gatewayConn.closeReason(), errRelaySessionRotated) {
 			return errRelaySessionRotated

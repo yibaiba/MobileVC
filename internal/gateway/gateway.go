@@ -114,6 +114,13 @@ type freshnessSubscriber struct {
 	emit func(any) bool
 }
 
+type gatewayWriteQueues struct {
+	writeCh                    chan any
+	priorityWriteCh            chan any
+	mu                         sync.Mutex
+	pendingSessionUpdatedByKey map[string]*protocol.SessionUpdatedEvent
+}
+
 type projectionPersistWorker struct {
 	ctx       context.Context
 	cancel    context.CancelFunc
@@ -1193,6 +1200,12 @@ type gatewayWriteRequest struct {
 	done  chan error
 }
 
+type gatewayCoalescedSessionUpdatedWrite struct {
+	queue *gatewayWriteQueues
+	key   string
+	event *protocol.SessionUpdatedEvent
+}
+
 type gatewayReadResult struct {
 	payload map[string]any
 	err     error
@@ -1262,6 +1275,164 @@ func tryEnqueueGatewayWrite(ctx context.Context, writeCh chan<- any, priorityWri
 	}
 }
 
+func newGatewayWriteQueues() *gatewayWriteQueues {
+	return &gatewayWriteQueues{
+		writeCh:                    make(chan any, gatewayWriteQueueSize),
+		priorityWriteCh:            make(chan any, gatewayPriorityWriteQueueSize),
+		pendingSessionUpdatedByKey: make(map[string]*protocol.SessionUpdatedEvent),
+	}
+}
+
+func (q *gatewayWriteQueues) tryEnqueue(ctx context.Context, event any) bool {
+	if q == nil {
+		return false
+	}
+	if sessionUpdated, ok := event.(protocol.SessionUpdatedEvent); ok {
+		return q.tryEnqueueSessionUpdated(ctx, sessionUpdated)
+	}
+	return tryEnqueueGatewayWrite(ctx, q.writeCh, q.priorityWriteCh, event)
+}
+
+func (q *gatewayWriteQueues) tryEnqueueSessionUpdated(ctx context.Context, event protocol.SessionUpdatedEvent) bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	key := strings.TrimSpace(event.SessionID)
+	if key == "" {
+		key = "__unknown_session__"
+	}
+	if pending := q.pendingSessionUpdatedByKey[key]; pending != nil {
+		*pending = latestSessionUpdatedEvent(*pending, event)
+		return true
+	}
+	pending := latestSessionUpdatedEvent(protocol.SessionUpdatedEvent{}, event)
+	wrapper := gatewayCoalescedSessionUpdatedWrite{
+		queue: q,
+		key:   key,
+		event: &pending,
+	}
+	q.pendingSessionUpdatedByKey[key] = &pending
+	select {
+	case <-ctx.Done():
+		delete(q.pendingSessionUpdatedByKey, key)
+		return false
+	case q.priorityWriteCh <- wrapper:
+		return true
+	default:
+		delete(q.pendingSessionUpdatedByKey, key)
+		return false
+	}
+}
+
+func latestSessionUpdatedEvent(current protocol.SessionUpdatedEvent, next protocol.SessionUpdatedEvent) protocol.SessionUpdatedEvent {
+	if strings.TrimSpace(current.SessionID) == "" {
+		return next
+	}
+	if strings.TrimSpace(next.SessionID) == "" {
+		return current
+	}
+	latest := current
+	if next.Generation > latest.Generation {
+		latest.Generation = next.Generation
+	}
+	if next.EventCursor > latest.EventCursor {
+		latest.EventCursor = next.EventCursor
+	}
+	if !next.Timestamp.IsZero() && (latest.Timestamp.IsZero() || next.Timestamp.After(latest.Timestamp)) {
+		latest.Event.Timestamp = next.Timestamp
+	}
+	if strings.TrimSpace(next.Reason) != "" {
+		latest.Reason = next.Reason
+	}
+	return latest
+}
+
+func sessionIDFromGatewayEvent(event any) string {
+	switch e := event.(type) {
+	case protocol.Event:
+		return strings.TrimSpace(e.SessionID)
+	case protocol.LogEvent:
+		return strings.TrimSpace(e.SessionID)
+	case protocol.ProgressEvent:
+		return strings.TrimSpace(e.SessionID)
+	case protocol.ErrorEvent:
+		return strings.TrimSpace(e.SessionID)
+	case protocol.ClientActionAckEvent:
+		return strings.TrimSpace(e.SessionID)
+	case protocol.CompactionEvent:
+		return strings.TrimSpace(e.SessionID)
+	case protocol.ContextWindowUsageEvent:
+		return strings.TrimSpace(e.SessionID)
+	case protocol.InteractionRequestEvent:
+		return strings.TrimSpace(e.SessionID)
+	case protocol.PromptRequestEvent:
+		return strings.TrimSpace(e.SessionID)
+	case protocol.SessionStateEvent:
+		return strings.TrimSpace(e.SessionID)
+	case protocol.AgentStateEvent:
+		return strings.TrimSpace(e.SessionID)
+	case protocol.AIStatusEvent:
+		return strings.TrimSpace(e.SessionID)
+	case protocol.RuntimePhaseEvent:
+		return strings.TrimSpace(e.SessionID)
+	case protocol.TaskSnapshotEvent:
+		return strings.TrimSpace(e.SessionID)
+	case protocol.StepUpdateEvent:
+		return strings.TrimSpace(e.SessionID)
+	case protocol.FileDiffEvent:
+		return strings.TrimSpace(e.SessionID)
+	case protocol.ADBFrameEvent:
+		return strings.TrimSpace(e.SessionID)
+	case protocol.SessionCreatedEvent:
+		return strings.TrimSpace(e.SessionID)
+	case protocol.SessionListResultEvent:
+		return strings.TrimSpace(e.SessionID)
+	case protocol.SessionHistoryEvent:
+		return strings.TrimSpace(e.SessionID)
+	case protocol.SessionDeltaEvent:
+		return strings.TrimSpace(e.SessionID)
+	case protocol.SessionUpdatedEvent:
+		return strings.TrimSpace(e.SessionID)
+	case protocol.SessionHistoryPageEvent:
+		return strings.TrimSpace(e.SessionID)
+	case protocol.SessionTerminalRangeEvent:
+		return strings.TrimSpace(e.SessionID)
+	case protocol.SessionDiffPageEvent:
+		return strings.TrimSpace(e.SessionID)
+	case protocol.SessionTerminalExecutionPageEvent:
+		return strings.TrimSpace(e.SessionID)
+	case protocol.SessionResumeResultEvent:
+		return strings.TrimSpace(e.SessionID)
+	case protocol.SessionResumeNoticeEvent:
+		return strings.TrimSpace(e.SessionID)
+	case map[string]any:
+		raw, ok := e["sessionId"]
+		if !ok || raw == nil {
+			return ""
+		}
+		sessionID := strings.TrimSpace(fmt.Sprint(raw))
+		if sessionID == "<nil>" {
+			return ""
+		}
+		return sessionID
+	default:
+		return ""
+	}
+}
+
+func (w gatewayCoalescedSessionUpdatedWrite) payload() (protocol.SessionUpdatedEvent, bool) {
+	if w.queue == nil || w.event == nil {
+		return protocol.SessionUpdatedEvent{}, false
+	}
+	w.queue.mu.Lock()
+	defer w.queue.mu.Unlock()
+	event := *w.event
+	if w.queue.pendingSessionUpdatedByKey != nil && w.queue.pendingSessionUpdatedByKey[w.key] == w.event {
+		delete(w.queue.pendingSessionUpdatedByKey, w.key)
+	}
+	return event, strings.TrimSpace(event.SessionID) != ""
+}
+
 func isPriorityGatewayEvent(event any) bool {
 	switch payload := event.(type) {
 	case protocol.ClientActionAckEvent:
@@ -1272,10 +1443,43 @@ func isPriorityGatewayEvent(event any) bool {
 		return isGatewayHealthSnapshot(payload)
 	case protocol.AIStatusEvent:
 		return isGatewayHealthAIStatus(payload)
+	case protocol.PromptRequestEvent, protocol.InteractionRequestEvent:
+		return true
+	case protocol.ErrorEvent:
+		return true
 	case protocol.SessionUpdatedEvent:
 		return true
 	case gatewayWriteRequest:
 		return isPriorityGatewayEvent(payload.event)
+	case gatewayCoalescedSessionUpdatedWrite:
+		return true
+	default:
+		return false
+	}
+}
+
+func isDroppableGatewayEvent(event any) bool {
+	switch payload := event.(type) {
+	case protocol.LogEvent:
+		return true
+	case protocol.ProgressEvent:
+		return true
+	case protocol.AgentStateEvent:
+		return true
+	case protocol.RuntimePhaseEvent:
+		return true
+	case protocol.StepUpdateEvent:
+		return true
+	case protocol.FileDiffEvent:
+		return true
+	case protocol.ADBFrameEvent:
+		return true
+	case protocol.TaskSnapshotEvent:
+		return !isGatewayHealthSnapshot(payload)
+	case protocol.AIStatusEvent:
+		return !isGatewayHealthAIStatus(payload)
+	case gatewayWriteRequest:
+		return isDroppableGatewayEvent(payload.event)
 	default:
 		return false
 	}
@@ -1420,8 +1624,9 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 	sessionLoadResultCh := make(chan gatewaySessionLoadResult, 1)
 	sessionResumeResultCh := make(chan gatewaySessionResumeResult, 1)
 	asyncEventResultCh := make(chan gatewayAsyncEventResult, gatewayWriteQueueSize)
-	writeCh := make(chan any, gatewayWriteQueueSize)
-	priorityWriteCh := make(chan any, gatewayPriorityWriteQueueSize)
+	writeQueues := newGatewayWriteQueues()
+	writeCh := writeQueues.writeCh
+	priorityWriteCh := writeQueues.priorityWriteCh
 	writeErrCh := make(chan error, 1)
 	signalWriterFailure := func(err error) {
 		if err == nil {
@@ -1455,6 +1660,13 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			if req, ok := event.(gatewayWriteRequest); ok {
 				payload = req.event
 				done = req.done
+			}
+			if req, ok := event.(gatewayCoalescedSessionUpdatedWrite); ok {
+				next, ok := req.payload()
+				if !ok {
+					continue
+				}
+				payload = next
 			}
 			if err := client.WriteJSON(payload); err != nil {
 				if done != nil {
@@ -1821,8 +2033,47 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 		return loadedSessionHistoryWindow{window: window, ok: true}, nil
 	}
 
+	emitBackpressureHint := func(event any) bool {
+		sessionID := sessionIDFromGatewayEvent(event)
+		if sessionID == "" {
+			sessionID = strings.TrimSpace(selectedSessionID)
+		}
+		if sessionID == "" {
+			return true
+		}
+		generation := h.currentSessionListGeneration()
+		cursor := int64(0)
+		if h.runtimeSessions != nil {
+			if entry := h.runtimeSessions.Get(sessionID); entry != nil {
+				cursor = entry.latestCursor()
+			}
+		}
+		if writeQueues.tryEnqueue(ctx, protocol.NewSessionUpdatedEvent(sessionID, generation, cursor, "gateway_write_backpressure")) {
+			return true
+		}
+		logx.Warn("ws", "gateway backpressure hint enqueue failed: connectionID=%s sessionID=%s remoteAddr=%s eventType=%T", connectionID, sessionID, remoteAddr, event)
+		signalWriterFailure(fmt.Errorf("gateway priority write queue full for backpressure hint"))
+		return false
+	}
 	emit := func(event any) {
-		enqueueGatewayWrite(ctx, writeCh, priorityWriteCh, event)
+		if event == nil {
+			return
+		}
+		if writeQueues.tryEnqueue(ctx, event) {
+			return
+		}
+		if isPriorityGatewayEvent(event) {
+			logx.Warn("ws", "priority websocket event dropped because gateway write queue is full: connectionID=%s sessionID=%s remoteAddr=%s eventType=%T", connectionID, selectedSessionID, remoteAddr, event)
+			signalWriterFailure(fmt.Errorf("gateway priority write queue full for event %T", event))
+			return
+		}
+		if !isDroppableGatewayEvent(event) {
+			logx.Warn("ws", "required websocket event cannot be enqueued because gateway write queue is full: connectionID=%s sessionID=%s remoteAddr=%s eventType=%T", connectionID, selectedSessionID, remoteAddr, event)
+			signalWriterFailure(fmt.Errorf("gateway write queue full for required event %T", event))
+			return
+		}
+		logx.Warn("ws", "droppable websocket event skipped because gateway write queue is full: connectionID=%s sessionID=%s remoteAddr=%s eventType=%T", connectionID, selectedSessionID, remoteAddr, event)
+		emitBackpressureHint(event)
 	}
 
 	emitSessionHistoryForStoredSessionWindow := func(targetSessionID string, limit int, sessionRuntime *runtimeSession) (bool, error) {
@@ -2058,19 +2309,22 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 		return deltaEvent, nil
 	}
 	unregisterFreshnessSubscriber := h.registerFreshnessSubscriber(connectionID, func(event any) bool {
-		return tryEnqueueGatewayWrite(ctx, writeCh, priorityWriteCh, event)
+		if writeQueues.tryEnqueue(ctx, event) {
+			return true
+		}
+		if ctx.Err() != nil {
+			return false
+		}
+		sessionID := sessionIDFromGatewayEvent(event)
+		logx.Warn("ws", "gateway freshness event enqueue failed: connectionID=%s sessionID=%s remoteAddr=%s eventType=%T", connectionID, sessionID, remoteAddr, event)
+		signalWriterFailure(fmt.Errorf("gateway priority write queue full for freshness event %T", event))
+		return false
 	})
 	emitAndWait := func(event any) error {
 		done := make(chan error, 1)
 		req := gatewayWriteRequest{event: event, done: done}
-		targetCh := writeCh
-		if isPriorityGatewayEvent(req) {
-			targetCh = priorityWriteCh
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case targetCh <- req:
+		if !tryEnqueueGatewayWrite(ctx, writeCh, priorityWriteCh, req) {
+			return fmt.Errorf("gateway write queue full for event %T", event)
 		}
 		select {
 		case err := <-done:

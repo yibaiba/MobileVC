@@ -47,6 +47,7 @@ type gatewayConn struct {
 	downloadsMu      sync.Mutex
 	downloads        map[uint64]*fileDownloadStream
 	readQueueTimeout time.Duration
+	e2eeReadyTimeout time.Duration
 }
 
 type readResult struct {
@@ -57,6 +58,7 @@ type readResult struct {
 const relayReadQueueSize = 8
 const relayWriteTimeout = 10 * time.Second
 const relayReadQueueTimeout = 5 * time.Second
+const relayE2EEReadyTimeout = 15 * time.Second
 
 func newGatewayConn(conn *websocket.Conn, sessionID string) *gatewayConn {
 	return newGatewayConnWithE2EE(conn, sessionID, nil)
@@ -78,6 +80,7 @@ func newGatewayConnWithPolicy(conn *websocket.Conn, sessionID string, e2eeHandle
 		tunnelSend:       e2ee.NewTunnelCounterState(),
 		downloads:        map[uint64]*fileDownloadStream{},
 		readQueueTimeout: relayReadQueueTimeout,
+		e2eeReadyTimeout: relayE2EEReadyTimeout,
 	}
 	if e2eeHandler != nil {
 		gateway.e2eeReadyCh = make(chan struct{})
@@ -728,6 +731,27 @@ func (c *gatewayConn) WriteJSON(v any) error {
 	return c.writeForward(payload)
 }
 
+func (c *gatewayConn) waitReadyForHandler() error {
+	if err := c.waitAttached(); err != nil {
+		return err
+	}
+	if !c.requiresE2EE() {
+		return nil
+	}
+	for {
+		readyCh, err := c.currentE2EEReadyCh()
+		if err != nil {
+			return err
+		}
+		if readyCh == nil {
+			return nil
+		}
+		if err := c.waitE2EEReady(readyCh); err != nil {
+			return err
+		}
+	}
+}
+
 func (c *gatewayConn) setClientID(clientID string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -925,6 +949,12 @@ func (c *gatewayConn) requiresE2EE() bool {
 }
 
 func (c *gatewayConn) waitE2EEReady(readyCh chan struct{}) error {
+	timeout := c.e2eeReadyTimeout
+	if timeout <= 0 {
+		timeout = relayE2EEReadyTimeout
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 	select {
 	case <-readyCh:
 		return nil
@@ -932,6 +962,11 @@ func (c *gatewayConn) waitE2EEReady(readyCh chan struct{}) error {
 		return c.readError()
 	case <-c.closeCh:
 		return c.readError()
+	case <-timer.C:
+		err := fmt.Errorf("%s: relay e2ee stream did not become ready within %s", relay.CodeE2EEHandshakeFailed, timeout)
+		c.setReadError(err)
+		_ = c.Close()
+		return err
 	}
 }
 
@@ -956,6 +991,7 @@ func (c *gatewayConn) currentRelayDeviceID() string {
 }
 
 func (c *gatewayConn) Close() error {
+	c.setCloseReason(fmt.Errorf("relay connection closed"))
 	c.closeOnce.Do(func() { close(c.closeCh) })
 	return c.conn.Close()
 }

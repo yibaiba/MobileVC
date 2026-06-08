@@ -105,7 +105,7 @@ func TestRunRegistersNewSessionAfterRotate(t *testing.T) {
 			PairingEventPath:  filepath.Join(t.TempDir(), "pairing.json"),
 			SessionStatePath:  statePath,
 			DownloadRoots:     []string{downloadRoot},
-			Capabilities:      e2ee.ProductionCapabilities(),
+			Capabilities:      e2ee.PlaintextTestCapabilities(),
 			NodeIdentityStore: nodeStore,
 		}, handler, func(_ string, event PairingReadyEvent) error {
 			events <- event
@@ -173,7 +173,7 @@ func TestRunReconnectsSavedAgentSessionWithoutNewPairingEvent(t *testing.T) {
 			PairingEventPath:  filepath.Join(t.TempDir(), "pairing.json"),
 			SessionStatePath:  statePath,
 			DownloadRoots:     []string{t.TempDir()},
-			Capabilities:      e2ee.ProductionCapabilities(),
+			Capabilities:      e2ee.PlaintextTestCapabilities(),
 			NodeIdentityStore: nodeStore,
 		}, handler, func(_ string, event PairingReadyEvent) error {
 			events <- event
@@ -197,6 +197,61 @@ func TestRunReconnectsSavedAgentSessionWithoutNewPairingEvent(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("Run did not stop after reconnect test cancellation")
+	}
+}
+
+func TestRunServesHandlerAfterProductionE2EEHandshake(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	registrations := make(chan relay.AgentRegisterFrame, 1)
+	clientEphemeral, err := e2ee.NewEphemeralKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pairingEvents := make(chan PairingReadyEvent, 1)
+	relayURL := startRelayRegisterProductionE2EEStub(t, ctx, registrations, pairingEvents, clientEphemeral)
+	nodeStore, err := e2ee.LoadOrCreateNodeIdentityStore(filepath.Join(t.TempDir(), e2ee.NodeIdentityFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handlerCalled := make(chan gateway.RelayE2EEInfo, 1)
+	handler := &relayE2EEInfoHandler{cancel: cancel, called: handlerCalled}
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- Run(ctx, Config{
+			RelayURL:          relayURL,
+			PairingTTL:        time.Minute,
+			AgentGracePeriod:  time.Minute,
+			PairingEventPath:  filepath.Join(t.TempDir(), "pairing.json"),
+			SessionStatePath:  filepath.Join(t.TempDir(), "agent-session.json"),
+			DownloadRoots:     []string{t.TempDir()},
+			Capabilities:      e2ee.ProductionCapabilities(),
+			NodeIdentityStore: nodeStore,
+		}, handler, func(_ string, event PairingReadyEvent) error {
+			pairingEvents <- event
+			return nil
+		})
+	}()
+
+	register := readAgentRegister(t, registrations)
+	if register.Capabilities == nil {
+		t.Fatal("registration omitted production capabilities")
+	}
+	if err := e2ee.ValidateProductionCapabilities(*register.Capabilities); err != nil {
+		t.Fatalf("registration did not use production capabilities: %v", err)
+	}
+	info := readRelayE2EEInfo(t, handlerCalled)
+	if !info.Enabled || info.SessionID != register.SessionID || info.ClientID != "rc_test" || info.HandshakeID != "hs_pairing" {
+		t.Fatalf("handler was not served after production e2ee readiness: register=%#v info=%#v", register, info)
+	}
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run returned %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Run did not stop after production e2ee handler cancellation")
 	}
 }
 
@@ -227,7 +282,7 @@ func TestRunReconnectsSavedAgentSessionAfterPairingTTL(t *testing.T) {
 			PairingEventPath:  filepath.Join(t.TempDir(), "pairing.json"),
 			SessionStatePath:  statePath,
 			DownloadRoots:     []string{t.TempDir()},
-			Capabilities:      e2ee.ProductionCapabilities(),
+			Capabilities:      e2ee.PlaintextTestCapabilities(),
 			NodeIdentityStore: nodeStore,
 		}, &cancelHandler{cancel: cancel}, func(_ string, event PairingReadyEvent) error {
 			events <- event
@@ -282,7 +337,7 @@ func TestRunDeletesRejectedSavedSessionAndRegistersNewPairing(t *testing.T) {
 			PairingEventPath:  filepath.Join(t.TempDir(), "pairing.json"),
 			SessionStatePath:  statePath,
 			DownloadRoots:     []string{t.TempDir()},
-			Capabilities:      e2ee.ProductionCapabilities(),
+			Capabilities:      e2ee.PlaintextTestCapabilities(),
 			NodeIdentityStore: nodeStore,
 		}, &cancelHandler{cancel: cancel}, func(_ string, event PairingReadyEvent) error {
 			events <- event
@@ -317,7 +372,22 @@ type cancelHandler struct {
 	cancel context.CancelFunc
 }
 
+type relayE2EEInfoHandler struct {
+	cancel context.CancelFunc
+	called chan<- gateway.RelayE2EEInfo
+}
+
 func (h *cancelHandler) ServeClientConn(_ context.Context, client gateway.ClientConn) {
+	h.cancel()
+	_ = client.Close()
+}
+
+func (h *relayE2EEInfoHandler) ServeClientConn(_ context.Context, client gateway.ClientConn) {
+	info := gateway.RelayE2EEInfo{}
+	if reporter, ok := client.(interface{ RelayE2EEInfo() gateway.RelayE2EEInfo }); ok {
+		info = reporter.RelayE2EEInfo()
+	}
+	h.called <- info
 	h.cancel()
 	_ = client.Close()
 }
@@ -333,6 +403,48 @@ func (h *rotateThenStopHandler) ServeClientConn(_ context.Context, client gatewa
 	}
 	h.cancel()
 	_ = client.Close()
+}
+
+func startRelayRegisterProductionE2EEStub(
+	t *testing.T,
+	ctx context.Context,
+	registrations chan<- relay.AgentRegisterFrame,
+	pairingEvents <-chan PairingReadyEvent,
+	clientEphemeral *e2ee.EphemeralKeyPair,
+) string {
+	t.Helper()
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/relay/agent" {
+			http.NotFound(w, r)
+			return
+		}
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade production e2ee relay stub: %v", err)
+			return
+		}
+		go func() {
+			defer conn.Close()
+			var frame relay.AgentRegisterFrame
+			if err := conn.ReadJSON(&frame); err != nil {
+				return
+			}
+			registrations <- frame
+			_ = conn.WriteJSON(relay.AgentRegisteredFrame{
+				Type: relay.TypeAgentRegistered, Version: relay.Version, SessionID: frame.SessionID,
+			})
+			pairing := readPairingEvent(t, pairingEvents)
+			_ = conn.WriteJSON(relay.ClientAttachedFrame{
+				Type: relay.TypeClientAttached, Version: relay.Version,
+				SessionID: frame.SessionID, ClientID: "rc_test",
+			})
+			driveGatewayPairingE2EEHandshake(t, conn, clientEphemeral, pairing.SessionID, "rc_test", "hs_pairing", pairing.PairingSecret)
+			<-ctx.Done()
+		}()
+	}))
+	t.Cleanup(server.Close)
+	return "ws" + strings.TrimPrefix(server.URL, "http")
 }
 
 func startRelayRegisterStub(t *testing.T, ctx context.Context, registrations chan<- relay.AgentRegisterFrame) string {
@@ -357,6 +469,10 @@ func startRelayRegisterStub(t *testing.T, ctx context.Context, registrations cha
 			registrations <- frame
 			_ = conn.WriteJSON(relay.AgentRegisteredFrame{
 				Type: relay.TypeAgentRegistered, Version: relay.Version, SessionID: frame.SessionID,
+			})
+			_ = conn.WriteJSON(relay.ClientAttachedFrame{
+				Type: relay.TypeClientAttached, Version: relay.Version,
+				SessionID: frame.SessionID, ClientID: "rc_test",
 			})
 			for {
 				select {
@@ -397,6 +513,10 @@ func startRelayReconnectStub(t *testing.T, ctx context.Context, reconnects chan<
 			reconnects <- frame
 			_ = conn.WriteJSON(relay.AgentRegisteredFrame{
 				Type: relay.TypeAgentRegistered, Version: relay.Version, SessionID: frame.SessionID,
+			})
+			_ = conn.WriteJSON(relay.ClientAttachedFrame{
+				Type: relay.TypeClientAttached, Version: relay.Version,
+				SessionID: frame.SessionID, ClientID: "rc_test",
 			})
 			<-ctx.Done()
 		}()
@@ -444,11 +564,74 @@ func startRelayRejectReconnectThenRegisterStub(
 			_ = conn.WriteJSON(relay.AgentRegisteredFrame{
 				Type: relay.TypeAgentRegistered, Version: relay.Version, SessionID: frame.SessionID,
 			})
+			_ = conn.WriteJSON(relay.ClientAttachedFrame{
+				Type: relay.TypeClientAttached, Version: relay.Version,
+				SessionID: frame.SessionID, ClientID: "rc_test",
+			})
 			<-ctx.Done()
 		}()
 	}))
 	t.Cleanup(server.Close)
 	return "ws" + strings.TrimPrefix(server.URL, "http")
+}
+
+func driveGatewayPairingE2EEHandshake(
+	t *testing.T,
+	serverConn *websocket.Conn,
+	clientEphemeral *e2ee.EphemeralKeyPair,
+	sessionID string,
+	clientID string,
+	handshakeID string,
+	pairingSecret string,
+) {
+	t.Helper()
+	capabilities := e2ee.ProductionCapabilities()
+	clientHello := relay.E2EEClientHelloFrame{
+		Type: relay.TypeClientE2EEHello, Version: relay.Version,
+		SessionID: sessionID, ClientID: clientID, HandshakeID: handshakeID,
+		Kind: e2ee.HandshakeKindPairing, Capabilities: &capabilities,
+		ClientEphemeralPublicKey: e2ee.EncodeFrameBytes(clientEphemeral.PublicKey),
+	}
+	if err := serverConn.WriteJSON(clientHello); err != nil {
+		t.Fatalf("write client hello: %v", err)
+	}
+	var agentHello relay.E2EEAgentHelloFrame
+	if err := serverConn.ReadJSON(&agentHello); err != nil {
+		t.Fatalf("read agent hello: %v", err)
+	}
+	agentMaterial, err := e2ee.ValidateAgentHelloFrame(agentHello)
+	if err != nil {
+		t.Fatalf("validate agent hello: %v", err)
+	}
+	input := capabilities.ApplyToHandshake(e2ee.HandshakeInput{
+		Kind:                     e2ee.HandshakeKindPairing,
+		SessionID:                sessionID,
+		ClientID:                 clientID,
+		HandshakeID:              handshakeID,
+		ClientEphemeralPublicKey: clientEphemeral.PublicKey,
+		NodeEphemeralPublicKey:   agentMaterial.NodeEphemeralPublicKey,
+		NodeIdentityPublicKey:    agentMaterial.NodeIdentityPublicKey,
+	})
+	transcript, err := e2ee.HandshakeTranscript(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof := relay.E2EEClientProofFrame{
+		Type: relay.TypeClientE2EEProof, Version: relay.Version,
+		SessionID: sessionID, ClientID: clientID, HandshakeID: handshakeID,
+		Kind:         e2ee.HandshakeKindPairing,
+		PairingProof: e2ee.EncodeFrameBytes(e2ee.PairingProof(pairingSecret, transcript)),
+	}
+	if err := serverConn.WriteJSON(proof); err != nil {
+		t.Fatalf("write client proof: %v", err)
+	}
+	var result relay.E2EEAgentResultFrame
+	if err := serverConn.ReadJSON(&result); err != nil {
+		t.Fatalf("read agent result: %v", err)
+	}
+	if !result.OK {
+		t.Fatalf("unexpected handshake failure: %#v", result)
+	}
 }
 
 func readPairingEvent(t *testing.T, events <-chan PairingReadyEvent) PairingReadyEvent {
@@ -482,4 +665,15 @@ func readAgentReconnect(t *testing.T, reconnects <-chan relay.AgentReconnectFram
 		t.Fatal("timed out waiting for agent reconnect")
 	}
 	return relay.AgentReconnectFrame{}
+}
+
+func readRelayE2EEInfo(t *testing.T, called <-chan gateway.RelayE2EEInfo) gateway.RelayE2EEInfo {
+	t.Helper()
+	select {
+	case info := <-called:
+		return info
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for production e2ee handler")
+	}
+	return gateway.RelayE2EEInfo{}
 }

@@ -66,10 +66,33 @@ type failingWriteClientConn struct {
 	closeOnce sync.Once
 }
 
+type blockingWriteClientConn struct {
+	inbound      chan map[string]any
+	writes       chan any
+	writeStarted chan struct{}
+	allowWrites  chan struct{}
+	pingRead     chan struct{}
+	closedCh     chan struct{}
+	closeOnce    sync.Once
+	startOnce    sync.Once
+	pingOnce     sync.Once
+}
+
 func newFailingWriteClientConn(writeErr error) *failingWriteClientConn {
 	return &failingWriteClientConn{
 		writeErr: writeErr,
 		closedCh: make(chan struct{}),
+	}
+}
+
+func newBlockingWriteClientConn(buffer int) *blockingWriteClientConn {
+	return &blockingWriteClientConn{
+		inbound:      make(chan map[string]any, buffer),
+		writes:       make(chan any, buffer),
+		writeStarted: make(chan struct{}),
+		allowWrites:  make(chan struct{}),
+		pingRead:     make(chan struct{}),
+		closedCh:     make(chan struct{}),
 	}
 }
 
@@ -104,6 +127,60 @@ func (c *failingWriteClientConn) closed() bool {
 	default:
 		return false
 	}
+}
+
+func (c *blockingWriteClientConn) ReadJSON(v any) error {
+	select {
+	case payload := <-c.inbound:
+		if payload["action"] == "ping" {
+			c.pingOnce.Do(func() { close(c.pingRead) })
+		}
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			return err
+		}
+		return json.Unmarshal(encoded, v)
+	case <-c.closedCh:
+		return errors.New("client closed")
+	}
+}
+
+func (c *blockingWriteClientConn) WriteJSON(v any) error {
+	c.startOnce.Do(func() { close(c.writeStarted) })
+	select {
+	case <-c.allowWrites:
+	case <-c.closedCh:
+		return errors.New("client closed")
+	}
+	select {
+	case c.writes <- v:
+		return nil
+	case <-c.closedCh:
+		return errors.New("client closed")
+	}
+}
+
+func (c *blockingWriteClientConn) Close() error {
+	c.closeOnce.Do(func() {
+		close(c.closedCh)
+	})
+	return nil
+}
+
+func (c *blockingWriteClientConn) RemoteAddr() string {
+	return "test-blocking-write"
+}
+
+func (c *blockingWriteClientConn) Origin() string {
+	return "test"
+}
+
+func (c *blockingWriteClientConn) send(payload map[string]any) {
+	c.inbound <- payload
+}
+
+func (c *blockingWriteClientConn) releaseWrites() {
+	close(c.allowWrites)
 }
 
 func newStubRunner(events ...any) *stubRunner {
@@ -223,6 +300,144 @@ func TestGatewayWriterPrioritizesHeartbeatSnapshot(t *testing.T) {
 	}
 }
 
+func TestGatewayEventDropClassification(t *testing.T) {
+	if !isDroppableGatewayEvent(protocol.NewLogEvent("session-1", "queued output", "stdout")) {
+		t.Fatal("log events should be droppable under gateway write backpressure")
+	}
+	if !isDroppableGatewayEvent(protocol.NewADBFrameEvent("session-1", "serial", "png", "image", 10, 20, 1)) {
+		t.Fatal("ADB frame stream events should be droppable under gateway write backpressure")
+	}
+	if isDroppableGatewayEvent(protocol.NewSessionListResultEvent("session-1", nil)) {
+		t.Fatal("session_list_result must not be droppable")
+	}
+	if isDroppableGatewayEvent(protocol.NewFSReadResultEvent("session-1", "/tmp/a.txt", "hello", 5, "txt", "utf-8", true)) {
+		t.Fatal("fs_read_result must not be droppable")
+	}
+	if isDroppableGatewayEvent(protocol.NewMediaPreviewResultEvent("session-1", "attachment-1", "/tmp/a.png", "image", 4, "image/png", "ok", "")) {
+		t.Fatal("media_preview_result must not be droppable")
+	}
+	if isDroppableGatewayEvent(protocol.NewRuntimeInfoResultEvent("session-1", "q", "title", "message", false, nil)) {
+		t.Fatal("runtime_info_result must not be droppable")
+	}
+	if isDroppableGatewayEvent(protocol.NewCatalogSyncResultEvent("session-1", "skill", true, "ok", protocol.CatalogMetadata{})) {
+		t.Fatal("catalog_sync_result must not be droppable")
+	}
+	if isDroppableGatewayEvent(protocol.NewADBDevicesResultEvent("session-1", nil, "", nil, "", true, true, "", "")) {
+		t.Fatal("adb_devices_result must not be droppable")
+	}
+	if isDroppableGatewayEvent(protocol.NewADBStreamStateEvent("session-1", false, "serial", 0, 0, 0, "stopped")) {
+		t.Fatal("ADB stream state must not be droppable because it carries lifecycle/error state")
+	}
+	heartbeat := protocol.NewTaskSnapshotEvent(
+		"session-1",
+		"IDLE",
+		"Task idle (heartbeat)",
+		false,
+		false,
+		"",
+		"",
+		"",
+		0,
+		time.Time{},
+		protocol.RuntimeMeta{},
+	)
+	if isDroppableGatewayEvent(heartbeat) {
+		t.Fatal("heartbeat task snapshots must not be droppable")
+	}
+}
+
+func TestSessionIDFromGatewayEventMapRejectsMissingNilSessionID(t *testing.T) {
+	if got := sessionIDFromGatewayEvent(map[string]any{"type": "pong"}); got != "" {
+		t.Fatalf("missing sessionId should return empty string, got %q", got)
+	}
+	if got := sessionIDFromGatewayEvent(map[string]any{"type": "pong", "sessionId": nil}); got != "" {
+		t.Fatalf("nil sessionId should return empty string, got %q", got)
+	}
+	if got := sessionIDFromGatewayEvent(map[string]any{"type": "pong", "sessionId": " session-1 "}); got != "session-1" {
+		t.Fatalf("expected trimmed sessionId, got %q", got)
+	}
+	if got := sessionIDFromGatewayEvent(protocol.NewADBFrameEvent(" session-adb ", "serial", "png", "image", 10, 20, 1)); got != "session-adb" {
+		t.Fatalf("expected ADB frame sessionId, got %q", got)
+	}
+}
+
+func TestGatewayWriteQueuesCoalesceSessionUpdatedHints(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	queues := newGatewayWriteQueues()
+
+	for i := 0; i < gatewayPriorityWriteQueueSize*2; i++ {
+		event := protocol.NewSessionUpdatedEvent("session-1", uint64(i+1), int64(i+10), "projection_persisted")
+		if !queues.tryEnqueue(ctx, event) {
+			t.Fatalf("session_updated hint %d should coalesce instead of filling priority queue", i)
+		}
+	}
+	for i := 0; i < gatewayPriorityWriteQueueSize-1; i++ {
+		event := protocol.NewClientActionAckEvent("session-1", "ping", fmt.Sprintf("ack-%d", i), "accepted", false)
+		if !queues.tryEnqueue(ctx, event) {
+			t.Fatalf("coalesced session_updated hints used more than one priority queue slot; filler %d failed", i)
+		}
+	}
+	extraAck := protocol.NewClientActionAckEvent("session-1", "ping", "ack-overflow", "accepted", false)
+	if queues.tryEnqueue(ctx, extraAck) {
+		t.Fatal("priority queue accepted more events than its configured capacity")
+	}
+
+	next, ok := nextGatewayWriterEvent(ctx, queues.writeCh, queues.priorityWriteCh)
+	if !ok {
+		t.Fatal("writer queue returned closed before coalesced hint")
+	}
+	hint, ok := next.(gatewayCoalescedSessionUpdatedWrite)
+	if !ok {
+		t.Fatalf("expected coalesced session_updated wrapper, got %#v", next)
+	}
+	latest, ok := hint.payload()
+	if !ok {
+		t.Fatal("coalesced session_updated wrapper returned no payload")
+	}
+	if latest.Generation != uint64(gatewayPriorityWriteQueueSize*2) || latest.EventCursor != int64(gatewayPriorityWriteQueueSize*2+9) {
+		t.Fatalf("coalesced hint did not retain latest freshness state: %#v", latest)
+	}
+}
+
+func TestGatewayWriteQueuesCoalesceSessionUpdatedHintsPerSession(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	queues := newGatewayWriteQueues()
+
+	for i := 0; i < 3; i++ {
+		if !queues.tryEnqueue(ctx, protocol.NewSessionUpdatedEvent("session-a", uint64(i+1), int64(i+10), "projection_persisted")) {
+			t.Fatalf("session-a hint %d should enqueue or coalesce", i)
+		}
+		if !queues.tryEnqueue(ctx, protocol.NewSessionUpdatedEvent("session-b", uint64(i+10), int64(i+100), "projection_persisted")) {
+			t.Fatalf("session-b hint %d should enqueue or coalesce", i)
+		}
+	}
+
+	got := map[string]protocol.SessionUpdatedEvent{}
+	for i := 0; i < 2; i++ {
+		next, ok := nextGatewayWriterEvent(ctx, queues.writeCh, queues.priorityWriteCh)
+		if !ok {
+			t.Fatal("writer queue returned closed before coalesced hint")
+		}
+		hint, ok := next.(gatewayCoalescedSessionUpdatedWrite)
+		if !ok {
+			t.Fatalf("expected coalesced session_updated wrapper, got %#v", next)
+		}
+		event, ok := hint.payload()
+		if !ok {
+			t.Fatal("coalesced session_updated wrapper returned no payload")
+		}
+		got[event.SessionID] = event
+	}
+	if got["session-a"].Generation != 3 || got["session-a"].EventCursor != 12 {
+		t.Fatalf("session-a coalesced hint lost latest state: %#v", got["session-a"])
+	}
+	if got["session-b"].Generation != 12 || got["session-b"].EventCursor != 102 {
+		t.Fatalf("session-b coalesced hint lost latest state: %#v", got["session-b"])
+	}
+}
+
 func TestServeClientConnClosesWhenWriterFails(t *testing.T) {
 	h := NewHandler("token", nil)
 	client := newFailingWriteClientConn(errors.New("write failed"))
@@ -240,6 +455,123 @@ func TestServeClientConnClosesWhenWriterFails(t *testing.T) {
 	}
 	if !client.closed() {
 		t.Fatal("writer failure did not close client connection")
+	}
+}
+
+func TestServeClientConnDoesNotStopReadingWhenNormalWriteQueueIsFull(t *testing.T) {
+	h := newTestHandler()
+	store, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new file store: %v", err)
+	}
+	h.SessionStore = store
+	t.Cleanup(h.Close)
+	client := newBlockingWriteClientConn(gatewayWriteQueueSize*3 + gatewayPriorityWriteQueueSize + 16)
+	done := make(chan struct{})
+
+	go func() {
+		h.ServeClientConn(context.Background(), client)
+		close(done)
+	}()
+	t.Cleanup(func() {
+		_ = client.Close()
+		<-done
+	})
+
+	select {
+	case <-client.writeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("writer did not start")
+	}
+
+	events := make([]any, 0, gatewayWriteQueueSize*2)
+	for i := 0; i < gatewayWriteQueueSize*2; i++ {
+		events = append(events, protocol.NewLogEvent("", fmt.Sprintf("stream output %d", i), "stdout"))
+	}
+	runner := newInteractiveHoldingStubRunner(events...)
+	h.NewPtyRunner = func() engine.Runner { return runner }
+	client.send(map[string]any{
+		"action": "session_create",
+		"title":  "backpressure-session",
+	})
+	client.send(map[string]any{
+		"action": "ai_turn",
+		"data":   "start stream",
+		"engine": "claude",
+	})
+	runner.WaitStarted(t)
+
+	client.send(map[string]any{"action": "ping", "pingId": "after-write-backpressure"})
+
+	select {
+	case <-client.pingRead:
+	case <-time.After(time.Second):
+		t.Fatal("handler stopped reading while normal write queue was full")
+	}
+}
+
+func TestServeClientConnClosesWhenRequiredNormalEventQueueIsFull(t *testing.T) {
+	h := newTestHandler()
+	t.Cleanup(h.Close)
+	client := newBlockingWriteClientConn(gatewayWriteQueueSize*3 + gatewayPriorityWriteQueueSize + 16)
+	done := make(chan struct{})
+
+	go func() {
+		h.ServeClientConn(context.Background(), client)
+		close(done)
+	}()
+
+	select {
+	case <-client.writeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("writer did not start")
+	}
+
+	for i := 0; i < gatewayWriteQueueSize*2; i++ {
+		client.send(map[string]any{
+			"action": "runtime_info",
+			"query":  fmt.Sprintf("queue-required-%d", i),
+		})
+	}
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("required runtime_info_result backpressure did not close connection")
+	}
+}
+
+func TestServeClientConnClosesWhenFreshnessPriorityQueueIsFull(t *testing.T) {
+	h := newTestHandler()
+	store, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new file store: %v", err)
+	}
+	h.SessionStore = store
+	t.Cleanup(h.Close)
+	client := newBlockingWriteClientConn(gatewayWriteQueueSize + gatewayPriorityWriteQueueSize + 16)
+	done := make(chan struct{})
+
+	go func() {
+		h.ServeClientConn(context.Background(), client)
+		close(done)
+	}()
+
+	select {
+	case <-client.writeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("writer did not start")
+	}
+
+	for i := 0; i < gatewayPriorityWriteQueueSize+1; i++ {
+		sessionID := fmt.Sprintf("fresh-session-%d", i)
+		h.publishFreshnessEvent(protocol.NewSessionUpdatedEvent(sessionID, uint64(i+1), int64(i), "test_backpressure"))
+	}
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("full freshness priority queue did not close connection")
 	}
 }
 

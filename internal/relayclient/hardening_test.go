@@ -461,6 +461,69 @@ func TestGatewayConnWaitsForE2EEBeforeWritingProductionForward(t *testing.T) {
 	}
 }
 
+func TestGatewayConnWaitsUntilReadyBeforeServingHandler(t *testing.T) {
+	serverConn, clientConn := newRelayClientTestConns(t)
+	defer serverConn.Close()
+	handshake, clientEphemeral := testPairingHandshakeHandler(t)
+	gateway := newGatewayConnWithE2EE(clientConn, "rs_gateway", handshake)
+	t.Cleanup(func() { _ = gateway.Close() })
+
+	ready := make(chan error, 1)
+	go func() {
+		ready <- gateway.waitReadyForHandler()
+	}()
+
+	select {
+	case err := <-ready:
+		t.Fatalf("handler readiness completed before client attach: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := serverConn.WriteJSON(relay.ClientAttachedFrame{
+		Type: relay.TypeClientAttached, Version: relay.Version,
+		SessionID: "rs_gateway", ClientID: "rc_attached",
+	}); err != nil {
+		t.Fatalf("write attached: %v", err)
+	}
+	select {
+	case err := <-ready:
+		t.Fatalf("handler readiness completed before e2ee activation: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	driveGatewayE2EEHandshake(t, serverConn, clientEphemeral)
+	select {
+	case err := <-ready:
+		if err != nil {
+			t.Fatalf("handler readiness after e2ee activation: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("handler readiness did not complete after e2ee activation")
+	}
+}
+
+func TestGatewayConnWaitReadyForHandlerUnblocksOnClose(t *testing.T) {
+	serverConn, clientConn := newRelayClientTestConns(t)
+	defer serverConn.Close()
+	handshake, _ := testPairingHandshakeHandler(t)
+	gateway := newGatewayConnWithE2EE(clientConn, "rs_gateway", handshake)
+
+	ready := make(chan error, 1)
+	go func() {
+		ready <- gateway.waitReadyForHandler()
+	}()
+	if err := gateway.Close(); err != nil {
+		t.Fatalf("close gateway: %v", err)
+	}
+	select {
+	case err := <-ready:
+		if err == nil || !strings.Contains(err.Error(), "relay connection closed") {
+			t.Fatalf("expected explicit close readiness error, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("handler readiness stayed blocked after close")
+	}
+}
+
 func TestGatewayConnResetsE2EEWhenClientReattaches(t *testing.T) {
 	serverConn, clientConn := newRelayClientTestConns(t)
 	defer serverConn.Close()
@@ -577,6 +640,29 @@ func TestGatewayConnReattachWakesOldE2EEReadyWaiters(t *testing.T) {
 	}
 	if nextReadyCh == oldReadyCh {
 		t.Fatal("reattach kept old e2ee ready channel")
+	}
+}
+
+func TestGatewayConnWriteTimesOutWaitingForE2EEReady(t *testing.T) {
+	serverConn, clientConn := newRelayClientTestConns(t)
+	defer serverConn.Close()
+	handshake, _ := testPairingHandshakeHandler(t)
+	gateway := newGatewayConnWithE2EE(clientConn, "rs_gateway", handshake)
+	gateway.e2eeReadyTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { _ = gateway.Close() })
+
+	if err := serverConn.WriteJSON(relay.ClientAttachedFrame{
+		Type: relay.TypeClientAttached, Version: relay.Version,
+		SessionID: "rs_gateway", ClientID: "rc_attached",
+	}); err != nil {
+		t.Fatalf("write attached: %v", err)
+	}
+	err := gateway.WriteJSON(map[string]string{"event": "blocked"})
+	if err == nil {
+		t.Fatal("expected e2ee readiness timeout")
+	}
+	if !strings.Contains(err.Error(), relay.CodeE2EEHandshakeFailed) || !strings.Contains(err.Error(), "did not become ready") {
+		t.Fatalf("unexpected e2ee readiness timeout error: %v", err)
 	}
 }
 
