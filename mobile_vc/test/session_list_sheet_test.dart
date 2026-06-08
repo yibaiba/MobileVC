@@ -104,6 +104,42 @@ void main() {
     expect(find.byType(SnackBar), findsNothing);
   });
 
+  testWidgets('MobileVC 项目标题不是删除入口，只有会话卡片可删除', (tester) async {
+    String deletedSessionId = '';
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SessionListSheet(
+            sessions: const [
+              SessionSummary(
+                id: 'session-1',
+                title: 'MobileVC session',
+                source: 'mobilevc',
+                ownership: 'mobilevc',
+                runtime: RuntimeMeta(cwd: '/workspace/MobileVC'),
+              ),
+            ],
+            selectedSessionId: '',
+            cwd: '/workspace/MobileVC',
+            onCreate: () {},
+            onLoad: (_) {},
+            onDelete: (id) => deletedSessionId = id,
+          ),
+        ),
+      ),
+    );
+
+    expect(find.text('MobileVC'), findsWidgets);
+    expect(find.byIcon(Icons.delete_outline), findsOneWidget);
+    expect(find.byTooltip('删除此会话'), findsOneWidget);
+
+    await tester.tap(find.byTooltip('删除此会话'));
+    await tester.pump();
+
+    expect(deletedSessionId, 'session-1');
+  });
+
   testWidgets('会话列表按项目分组并把当前项目置顶', (tester) async {
     await tester.pumpWidget(
       MaterialApp(

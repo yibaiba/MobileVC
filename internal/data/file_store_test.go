@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -1548,6 +1549,138 @@ func TestFileStoreSaveSessionContextDoesNotDecodeExistingHistoryRows(t *testing.
 	}
 	if runtimeMeta.Record.Projection.Runtime.CWD != "/tmp/project" || len(diffPage.Diffs) != 1 {
 		t.Fatalf("context sidecar update should preserve other domains, runtime=%#v diff=%#v", runtimeMeta, diffPage)
+	}
+}
+
+func TestFileStoreRebuildsMissingProjectionSidecarsFromLegacyRecord(t *testing.T) {
+	fs, err := NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new file store: %v", err)
+	}
+	now := mustTime("2026-06-07T07:48:16Z")
+	record := SessionRecord{
+		Summary: SessionSummary{
+			ID:         "session-legacy-sidecars",
+			Title:      "legacy sidecars",
+			CreatedAt:  now,
+			UpdatedAt:  now,
+			EntryCount: 2,
+			Runtime: SessionRuntime{
+				Command: "claude --session-id legacy",
+				Engine:  "claude",
+				CWD:     "/tmp/project",
+				Source:  "mobilevc",
+			},
+			Source:    "mobilevc",
+			Ownership: "mobilevc",
+		},
+		Projection: ProjectionSnapshot{
+			Runtime: SessionRuntime{
+				Command: "claude --session-id legacy",
+				Engine:  "claude",
+				CWD:     "/tmp/project",
+				Source:  "mobilevc",
+			},
+			Controller: ControllerSnapshot{
+				SessionID:      "session-legacy-sidecars",
+				State:          ControllerStateWaitInput,
+				CurrentCommand: "claude --session-id legacy",
+			},
+			SessionContext: SessionContext{
+				EnabledSkillNames: []string{"review"},
+				Configured:        true,
+			},
+			SessionContextSet:      true,
+			PermissionRulesEnabled: true,
+			PermissionRules: []PermissionRule{{
+				ID:          "rule-1",
+				Kind:        PermissionKindShell,
+				CommandHead: "go",
+				Enabled:     true,
+			}},
+			Diffs:               []DiffContext{{ContextID: "diff-1", Path: "main.go", Diff: "+ok"}},
+			RawTerminalByStream: map[string]string{"stdout": "legacy stdout", "stderr": ""},
+			TerminalExecutions:  []TerminalExecution{{ExecutionID: "exec-1", Command: "go test", Stdout: "ok"}},
+			LogEntries: []SnapshotLogEntry{
+				{Kind: "user", Message: "one", Timestamp: now.Format(time.RFC3339)},
+				{Kind: "markdown", Message: "two", Timestamp: now.Add(time.Second).Format(time.RFC3339)},
+			},
+		},
+	}
+	sidecars := sidecarsFromRecord(record)
+	data, err := json.Marshal(record)
+	if err != nil {
+		t.Fatalf("marshal legacy record: %v", err)
+	}
+	if err := os.WriteFile(fs.sessionPath(record.Summary.ID), data, 0o644); err != nil {
+		t.Fatalf("write legacy record: %v", err)
+	}
+	if err := fs.writeSessionLogEntriesLocked(record.Summary.ID, record.Projection.LogEntries); err != nil {
+		t.Fatalf("write log sidecar: %v", err)
+	}
+	if err := fs.writeJSONFileLocked(fs.sessionRuntimeMetaPath(record.Summary.ID), sidecars.RuntimeMeta, "encode session runtime metadata sidecar"); err != nil {
+		t.Fatalf("write runtime sidecar: %v", err)
+	}
+	indexData, err := json.Marshal(fileIndex{Sessions: []SessionSummary{record.Summary}})
+	if err != nil {
+		t.Fatalf("marshal index: %v", err)
+	}
+	if err := os.WriteFile(fs.indexPath, indexData, 0o644); err != nil {
+		t.Fatalf("write index: %v", err)
+	}
+	for _, path := range []string{
+		fs.sessionContextPath(record.Summary.ID),
+		fs.sessionPermissionPath(record.Summary.ID),
+		fs.sessionDiffsPath(record.Summary.ID),
+		fs.sessionTerminalPath(record.Summary.ID),
+		fs.sessionTerminalExecutionsPath(record.Summary.ID),
+	} {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("remove projection sidecar %s: %v", path, err)
+		}
+	}
+
+	runtimeMeta, err := fs.GetSessionRuntimeMetadata(context.Background(), record.Summary.ID)
+	if err != nil {
+		t.Fatalf("get rebuilt runtime metadata: %v", err)
+	}
+	if runtimeMeta.Record.Projection.Runtime.CWD != "/tmp/project" || runtimeMeta.Latest.LogEntryCount != 2 {
+		t.Fatalf("unexpected rebuilt runtime metadata: %#v", runtimeMeta)
+	}
+	permission, err := fs.GetSessionPermissionRuleSnapshot(context.Background(), record.Summary.ID)
+	if err != nil {
+		t.Fatalf("get rebuilt permission rules: %v", err)
+	}
+	if !permission.Enabled || len(permission.Items) != 1 {
+		t.Fatalf("unexpected rebuilt permission rules: %#v", permission)
+	}
+	diffPage, err := fs.GetSessionDiffPage(context.Background(), SessionDiffPageRequest{
+		SessionID: record.Summary.ID,
+		Before:    1,
+		Limit:     1,
+	})
+	if err != nil {
+		t.Fatalf("get rebuilt diff page: %v", err)
+	}
+	terminalRange, err := fs.GetSessionTerminalRange(context.Background(), SessionTerminalRangeRequest{
+		SessionID: record.Summary.ID,
+		Stream:    "stdout",
+		Limit:     len("legacy stdout"),
+	})
+	if err != nil {
+		t.Fatalf("get rebuilt terminal range: %v", err)
+	}
+	execPage, err := fs.GetSessionTerminalExecutionPage(context.Background(), SessionTerminalExecutionPageRequest{
+		SessionID:     record.Summary.ID,
+		Before:        1,
+		Limit:         1,
+		IncludeOutput: true,
+	})
+	if err != nil {
+		t.Fatalf("get rebuilt terminal execution page: %v", err)
+	}
+	if len(diffPage.Diffs) != 1 || terminalRange.Content != "legacy stdout" || len(execPage.TerminalExecutions) != 1 {
+		t.Fatalf("unexpected rebuilt side domains: diff=%#v terminal=%#v exec=%#v", diffPage, terminalRange, execPage)
 	}
 }
 

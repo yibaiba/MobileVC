@@ -3414,19 +3414,13 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				emit(protocol.NewErrorEventWithCode(selectedSessionID, "session ID is required", "", "session_delete_failed"))
 				continue
 			}
-			metaStore, ok := h.SessionStore.(data.SessionRuntimeMetaStore)
-			if !ok {
-				emit(protocol.NewErrorEventWithCode(selectedSessionID, "session runtime metadata store unavailable", "", "session_delete_failed"))
-				continue
-			}
-			meta, err := metaStore.GetSessionRuntimeMetadata(context.WithoutCancel(ctx), deletedSessionID)
+			summary, err := lookupSessionSummaryForDelete(context.WithoutCancel(ctx), h.SessionStore, deletedSessionID)
 			if err != nil {
 				logx.Warn("ws", "delete session lookup failed: connectionID=%s sessionID=%s requestedSessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, deletedSessionID, remoteAddr, err)
 				emit(protocol.NewErrorEventWithCode(selectedSessionID, err.Error(), "", "session_delete_failed"))
 				continue
 			}
-			record := meta.Record
-			if record.Summary.External || strings.EqualFold(strings.TrimSpace(record.Summary.Source), "codex-native") {
+			if isExternalNativeSessionSummary(summary) {
 				emit(protocol.NewErrorEventWithCode(selectedSessionID, "Codex 原生会话仅支持恢复，不支持在 MobileVC 内删除", "", "session_delete_failed"))
 				continue
 			}
@@ -6813,6 +6807,20 @@ func isExternalNativeSessionSummary(item data.SessionSummary) bool {
 		strings.EqualFold(strings.TrimSpace(item.Source), "claude-native") ||
 		claudesync.IsMirrorSessionID(item.ID) ||
 		codexsync.IsMirrorSessionID(item.ID)
+}
+
+func lookupSessionSummaryForDelete(ctx context.Context, sessionStore data.Store, sessionID string) (data.SessionSummary, error) {
+	if sessionStore == nil {
+		return data.SessionSummary{}, fmt.Errorf("session store unavailable")
+	}
+	if summaryStore, ok := sessionStore.(data.SessionSummaryStore); ok {
+		return summaryStore.GetSessionSummary(ctx, sessionID)
+	}
+	record, err := sessionStore.GetSession(ctx, sessionID)
+	if err != nil {
+		return data.SessionSummary{}, err
+	}
+	return record.Summary, nil
 }
 
 func summaryCodexThreadID(item data.SessionSummary) string {

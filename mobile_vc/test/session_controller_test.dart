@@ -3431,14 +3431,17 @@ void main() {
       final actions =
           service.sentPayloads.map((item) => item['action']).toList();
       actions.remove('context_window_usage_get');
-      expect(actions, [
-        'session_create',
-        'session_context_get',
-        'permission_rule_list',
-        'exec',
-      ]);
+      expect(actions, ['session_create', 'exec']);
       expect(service.sentPayloads.last['cmd'], 'pwd');
       expect(controller.selectedSessionId, 'session-new');
+
+      await Future<void>.delayed(const Duration(milliseconds: 520));
+      await _flushEvents();
+
+      final delayedActions =
+          service.sentPayloads.map((item) => item['action']).toList();
+      expect(delayedActions, contains('session_context_get'));
+      expect(delayedActions, contains('permission_rule_list'));
     });
 
     test('session_list 已同步且当前无会话时，首条 claude 输入会先自动创建会话再启动 Claude', () async {
@@ -3481,18 +3484,21 @@ void main() {
       final actions =
           service.sentPayloads.map((item) => item['action']).toList();
       actions.remove('context_window_usage_get');
-      expect(actions, [
-        'session_create',
-        'session_context_get',
-        'permission_rule_list',
-        'ai_turn',
-      ]);
+      expect(actions, ['session_create', 'ai_turn']);
       final aiTurn = service.sentPayloads.singleWhere(
         (payload) => payload['action'] == 'ai_turn',
       );
       expect(aiTurn['engine'], 'claude');
       expect(aiTurn['data'], '请帮我总结当前问题\n');
       expect(controller.selectedSessionId, 'session-new');
+
+      await Future<void>.delayed(const Duration(milliseconds: 520));
+      await _flushEvents();
+
+      final delayedActions =
+          service.sentPayloads.map((item) => item['action']).toList();
+      expect(delayedActions, contains('session_context_get'));
+      expect(delayedActions, contains('permission_rule_list'));
     });
 
     test('已有选中会话时发送首条输入不会自动创建新会话', () async {
@@ -6563,20 +6569,11 @@ void main() {
       expect(controller.terminalExecutions, isEmpty);
       expect(controller.sessionContext.enabledSkillNames, isEmpty);
 
-      var refreshActions = service.sentPayloads
+      final refreshActions = service.sentPayloads
           .map((item) => (item['action'] ?? '').toString())
           .toList();
       expect(refreshActions, isNot(contains('session_context_get')));
       expect(refreshActions, isNot(contains('permission_rule_list')));
-
-      await Future<void>.delayed(const Duration(milliseconds: 520));
-      await _flushEvents();
-
-      refreshActions = service.sentPayloads
-          .map((item) => (item['action'] ?? '').toString())
-          .toList();
-      expect(refreshActions, contains('session_context_get'));
-      expect(refreshActions, contains('permission_rule_list'));
 
       service.sentPayloads.clear();
       controller.sendInputText('codex');
@@ -7804,6 +7801,49 @@ void main() {
       await _flushEvents();
 
       expect(controller.timeline.any((item) => item.body == 'stale reply'),
+          isFalse);
+    });
+
+    test('deleteSession 删除当前会话后会忽略迟到历史快照', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      service.emit(
+        SessionCreatedEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-a',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_created'},
+          summary: const SessionSummary(id: 'session-a', title: 'Session A'),
+        ),
+      );
+      await _flushEvents();
+
+      controller.deleteSession('session-a');
+      await _flushEvents();
+
+      service.emit(
+        SessionHistoryEvent(
+          timestamp: _timestamp.add(const Duration(seconds: 1)),
+          sessionId: 'session-a',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_history'},
+          summary: const SessionSummary(id: 'session-a', title: 'Session A'),
+          logEntries: const [
+            HistoryLogEntry(
+              kind: 'markdown',
+              message: 'stale history',
+              timestamp: '2026-06-08T00:00:00Z',
+            ),
+          ],
+        ),
+      );
+      await _flushEvents();
+
+      expect(controller.selectedSessionId, isEmpty);
+      expect(controller.timeline.any((item) => item.body == 'stale history'),
           isFalse);
     });
 
@@ -13471,7 +13511,7 @@ Flutter 打出来的 app-release.apk 在 mobile_vc/build/ 下，是 ignored 构�
 
       controller.requestMediaPreview(attachment);
       expect(service.sentPayloads.last['action'], 'media_preview');
-      expect(service.sentPayloads.last['attachmentId'], 'att-1');
+      expect(service.sentPayloads.last['attachmentId'], '/tmp/screen.png');
       expect(service.sentPayloads.last['path'], '/tmp/screen.png');
 
       service.emit(MediaPreviewResultEvent(
@@ -13479,16 +13519,136 @@ Flutter 打出来的 app-release.apk 在 mobile_vc/build/ 下，是 ignored 构�
         sessionId: 'session-current',
         runtimeMeta: const RuntimeMeta(),
         raw: const {'type': 'media_preview_result'},
-        attachmentId: 'att-1',
+        attachmentId: '/tmp/screen.png',
         path: '/tmp/screen.png',
         content: base64Encode(utf8.encode('png-bytes')),
         status: 'ok',
       ));
       await _flushEvents();
 
-      final preview = controller.mediaPreviewStates['att-1'];
+      final preview = controller.mediaPreviewStates['/tmp/screen.png'];
       expect(preview?.ok, isTrue);
       expect(utf8.decode(preview!.bytes!), 'png-bytes');
+    });
+
+    test('session_history 同一路径图片附件和文本路径只显示一张', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        logEntries: const [
+          HistoryLogEntry(
+            kind: 'user',
+            message: '看图\n\nAttached local image files:\n- /tmp/screen.png',
+            timestamp: '2026-05-27T05:20:00Z',
+            attachments: [
+              TimelineAttachment(
+                id: 'att-1',
+                kind: 'image',
+                name: 'screen.png',
+                mimeType: 'image/png',
+                size: 9,
+                path: '/tmp/screen.png',
+                previewStatus: 'available',
+                source: 'user_upload',
+              ),
+            ],
+          ),
+        ],
+        resumeRuntimeMeta: RuntimeMeta(command: 'codex', engine: 'codex'),
+      ));
+      await _flushEvents();
+
+      expect(controller.timeline, hasLength(1));
+      final item = controller.timeline.single;
+      expect(item.attachments, hasLength(1));
+      final attachment = item.attachments.single;
+      expect(attachment.id, 'att-1');
+      expect(attachment.path, '/tmp/screen.png');
+      expect(attachment.source, 'user_upload');
+      expect(controller.mediaPreviewKey(attachment), '/tmp/screen.png');
+    });
+
+    test('session_delta 正式图片历史会替换本地乐观图片气泡', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.saveConfig(const AppConfig(host: '192.168.0.2'));
+      await controller.connect();
+      service.emit(SessionCreatedEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(),
+        raw: const {'type': 'session_created'},
+        summary: const SessionSummary(
+          id: 'session-current',
+          title: '当前会话',
+          runtime: RuntimeMeta(command: 'codex', engine: 'codex'),
+        ),
+      ));
+      await _flushEvents();
+      service.sentPayloads.clear();
+
+      controller.sendInputTextWithImages(
+        '看图',
+        [
+          ChatImageAttachment(
+            name: 'screen.png',
+            mimeType: 'image/png',
+            bytes: utf8.encode('png-bytes'),
+          ),
+        ],
+      );
+      await _flushEvents();
+      expect(controller.timeline.where((item) => item.kind == 'user'),
+          hasLength(1));
+
+      service.emit(SessionDeltaEvent(
+        timestamp: _timestamp.add(const Duration(seconds: 1)),
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'session_delta'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        appendLogEntries: const [
+          HistoryLogEntry(
+            kind: 'user',
+            message: '看图\n\nAttached local image files:\n- /tmp/screen.png',
+            timestamp: '2026-05-27T05:20:00Z',
+            attachments: [
+              TimelineAttachment(
+                id: 'att-1',
+                kind: 'image',
+                name: 'screen.png',
+                mimeType: 'image/png',
+                size: 9,
+                path: '/tmp/screen.png',
+                previewStatus: 'available',
+                source: 'user_upload',
+              ),
+            ],
+          ),
+        ],
+        resumeRuntimeMeta: RuntimeMeta(command: 'codex', engine: 'codex'),
+      ));
+      await _flushEvents();
+
+      final userItems =
+          controller.timeline.where((item) => item.kind == 'user').toList();
+      expect(userItems, hasLength(1));
+      expect(userItems.single.id.startsWith('history-user-'), isTrue);
+      expect(userItems.single.attachments, hasLength(1));
+      expect(userItems.single.attachments.single.id, 'att-1');
+      expect(userItems.single.attachments.single.path, '/tmp/screen.png');
     });
 
     test('Codex 原生历史会从本地图片路径恢复附件卡片', () async {

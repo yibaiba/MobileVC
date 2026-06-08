@@ -400,6 +400,7 @@ class SessionController extends ChangeNotifier {
   final List<SessionSummary> _sessions = [];
   final Map<String, SessionSummary> _pendingDeletedSessions =
       <String, SessionSummary>{};
+  final Set<String> _deletedSessionTombstones = <String>{};
   final List<RelayTrustedDevice> _relayDevices = [];
   final List<SkillDefinition> _skills = [];
   final List<MemoryItem> _memoryItems = [];
@@ -1849,11 +1850,11 @@ class SessionController extends ChangeNotifier {
       _mediaPreviewKey(attachment);
 
   String _mediaPreviewKey(TimelineAttachment attachment) {
-    final id = attachment.id.trim();
-    if (id.isNotEmpty) {
-      return id;
+    final path = attachment.path.trim();
+    if (path.isNotEmpty) {
+      return path;
     }
-    return attachment.path.trim();
+    return attachment.id.trim();
   }
 
   void _handleMediaPreviewResult(MediaPreviewResultEvent preview) {
@@ -1960,6 +1961,7 @@ class SessionController extends ChangeNotifier {
         timestamp: DateTime.now(),
         body: body,
         attachments: attachments,
+        animateBody: true,
       ),
       emitNotifications: false,
     );
@@ -1976,6 +1978,7 @@ class SessionController extends ChangeNotifier {
     return rawAttachments.whereType<Map<String, dynamic>>().map((json) {
       final id = _localAttachmentId(json);
       final data = (json['data'] ?? '').toString();
+      final path = (json['path'] ?? '').toString().trim();
       final bytes = _decodeBase64Bytes(data);
       if (bytes != null) {
         _mediaPreviewStates[id] = MediaPreviewState(
@@ -1983,6 +1986,13 @@ class SessionController extends ChangeNotifier {
           status: 'ok',
           bytes: bytes,
         );
+        if (path.isNotEmpty) {
+          _mediaPreviewStates[path] = MediaPreviewState(
+            key: path,
+            status: 'ok',
+            bytes: bytes,
+          );
+        }
       }
       return TimelineAttachment(
         id: id,
@@ -1990,6 +2000,7 @@ class SessionController extends ChangeNotifier {
         name: (json['name'] ?? '').toString(),
         mimeType: (json['mimeType'] ?? '').toString(),
         size: _base64PayloadSize(data),
+        path: path,
         previewStatus: 'local',
         source: 'user_upload',
       );
@@ -2579,6 +2590,9 @@ class SessionController extends ChangeNotifier {
         _flushPendingOutboundActions();
         if (_activeTransportPath == ActiveTransportPath.relay) {
           _startLanReturnProbe();
+          if (canManageRelayDevices) {
+            requestRelayDeviceList();
+          }
         }
       }
       if (shouldRetrySilently) {
@@ -3411,9 +3425,11 @@ class SessionController extends ChangeNotifier {
       _sessionRuntimeAlive = false;
       _resetRuntimeProcessState();
       _clearStoppingState();
-      _beginSessionLoading();
+      _clearTimelineItems();
+      _syncDerivedState();
     }
     _clearLastSelectedSessionIfMatches(targetId);
+    _deletedSessionTombstones.add(targetId);
     if (target != null) {
       _pendingDeletedSessions[targetId] = target;
       _pushSystem('system', '正在删除会话：${sessionDisplayTitle(target)}');
@@ -3578,6 +3594,9 @@ class SessionController extends ChangeNotifier {
     }
     if (normalized.isEmpty) {
       return _selectedSessionId.trim().isEmpty && !_isLoadingSession;
+    }
+    if (_deletedSessionTombstones.contains(normalized)) {
+      return false;
     }
     final selected = _selectedSessionId.trim();
     if (selected.isEmpty) {
@@ -6859,6 +6878,9 @@ class SessionController extends ChangeNotifier {
       handled = true;
       final restored = _pendingDeletedSessions.values.toList();
       _pendingDeletedSessions.clear();
+      for (final summary in restored) {
+        _deletedSessionTombstones.remove(summary.id);
+      }
       for (final summary in restored.reversed) {
         _upsertSession(summary);
       }
@@ -7217,10 +7239,17 @@ class SessionController extends ChangeNotifier {
   }
 
   bool _isSessionRecoveryEventForActiveSession(String sessionId) {
-    if (_isLoadingSession || _pendingSessionTargetId.trim().isNotEmpty) {
-      return _isHistoryEventForActiveTarget(sessionId);
+    final normalized = sessionId.trim();
+    if (normalized.isEmpty || _deletedSessionTombstones.contains(normalized)) {
+      return false;
     }
-    return _eventTargetsCurrentSession(sessionId);
+    if (_isLoadingSession || _pendingSessionTargetId.trim().isNotEmpty) {
+      return _isHistoryEventForActiveTarget(normalized);
+    }
+    if (_selectedSessionId.trim().isEmpty) {
+      return true;
+    }
+    return _eventTargetsCurrentSession(normalized);
   }
 
   Future<void> _refreshContextAfterHistoryLoaded({
@@ -8084,18 +8113,21 @@ class SessionController extends ChangeNotifier {
     RuntimeMeta resumeMeta,
   ) {
     final restoredBody = _restoredHistoryBody(entry);
+    final visibleBody = entry.kind == 'user'
+        ? _normalizeUserAttachmentBody(restoredBody)
+        : restoredBody;
     final restoredKind = _restoredHistoryKind(entry, restoredBody);
     final attachments = _mergeTimelineAttachments(
       entry.attachments,
       _timelineAttachmentsFromText(restoredBody),
     );
     return TimelineItem(
-      id: 'history-$restoredKind-${entry.timestamp}-${restoredBody.hashCode}',
+      id: 'history-$restoredKind-${entry.timestamp}-${visibleBody.hashCode}',
       kind: restoredKind,
       timestamp:
           DateTime.tryParse(entry.timestamp)?.toLocal() ?? DateTime.now(),
       title: entry.label,
-      body: restoredBody,
+      body: visibleBody,
       stream: entry.stream,
       status: entry.context?.status ?? '',
       trigger: entry.context?.trigger ?? '',
@@ -8345,7 +8377,9 @@ class SessionController extends ChangeNotifier {
       if (kind != 'user') {
         continue;
       }
-      final body = _restoredHistoryBody(entry).trim();
+      final body = _normalizeUserAttachmentBody(
+        _restoredHistoryBody(entry),
+      ).trim();
       if (body.isEmpty ||
           looksLikeSessionNoiseText(body) ||
           looksLikeSessionBootstrapCommand(body) ||
@@ -8414,6 +8448,9 @@ class SessionController extends ChangeNotifier {
     }
     if (_isLiveAssistantReplayTailOfRestoredItem(item)) {
       return false;
+    }
+    if (_reconcileUserAttachmentTimelineItem(item)) {
+      return true;
     }
     if (_isDuplicateUserTimelineItem(item)) {
       return false;
@@ -8819,6 +8856,128 @@ class SessionController extends ChangeNotifier {
     }).join(' ');
   }
 
+  bool _reconcileUserAttachmentTimelineItem(TimelineItem item) {
+    if (item.kind != 'user' || item.attachments.isEmpty) {
+      return false;
+    }
+    var inspected = 0;
+    for (var index = _timeline.length - 1;
+        index >= 0 && inspected < 12;
+        index--) {
+      final previous = _timeline[index];
+      inspected++;
+      if (!_isEquivalentUserAttachmentItem(previous, item)) {
+        continue;
+      }
+      _replaceTimelineItemAt(
+        index,
+        item.copyWith(
+          attachments: item.attachments,
+          animateBody: previous.animateBody && item.animateBody,
+        ),
+      );
+      return true;
+    }
+    return false;
+  }
+
+  bool _isEquivalentUserAttachmentItem(
+    TimelineItem previous,
+    TimelineItem item,
+  ) {
+    if (previous.kind != 'user') {
+      return false;
+    }
+    final previousBody = _normalizeUserAttachmentBody(previous.body);
+    final itemBody = _normalizeUserAttachmentBody(item.body);
+    if (previousBody != itemBody) {
+      return false;
+    }
+    if (previous.attachments.isEmpty || item.attachments.isEmpty) {
+      return false;
+    }
+    if (_timelineAttachmentKeys(previous.attachments)
+        .intersection(_timelineAttachmentKeys(item.attachments))
+        .isNotEmpty) {
+      return true;
+    }
+    if (_timelineAttachmentFingerprints(previous.attachments)
+        .intersection(_timelineAttachmentFingerprints(item.attachments))
+        .isNotEmpty) {
+      return true;
+    }
+    return _hasMatchingImageAttachmentPayload(
+      previous.attachments,
+      item.attachments,
+    );
+  }
+
+  Set<String> _timelineAttachmentKeys(List<TimelineAttachment> attachments) {
+    return attachments
+        .map(_mediaPreviewKey)
+        .where((key) => key.trim().isNotEmpty)
+        .toSet();
+  }
+
+  Set<String> _timelineAttachmentFingerprints(
+    List<TimelineAttachment> attachments,
+  ) {
+    final fingerprints = <String>{};
+    for (final attachment in attachments) {
+      final fingerprint = _timelineAttachmentFingerprint(attachment);
+      if (fingerprint.isNotEmpty) {
+        fingerprints.add(fingerprint);
+      }
+    }
+    return fingerprints;
+  }
+
+  String _timelineAttachmentFingerprint(TimelineAttachment attachment) {
+    final name = attachment.displayName.trim().toLowerCase();
+    final mimeType = attachment.mimeType.trim().toLowerCase();
+    if (name.isEmpty && mimeType.isEmpty && attachment.size <= 0) {
+      return '';
+    }
+    return '$name|$mimeType|${attachment.size}';
+  }
+
+  bool _hasMatchingImageAttachmentPayload(
+    List<TimelineAttachment> previous,
+    List<TimelineAttachment> next,
+  ) {
+    for (final left in previous) {
+      for (final right in next) {
+        if (!left.isImage || !right.isImage) {
+          continue;
+        }
+        if (left.size <= 0 || left.size != right.size) {
+          continue;
+        }
+        final leftMime = left.mimeType.trim().toLowerCase();
+        final rightMime = right.mimeType.trim().toLowerCase();
+        if (leftMime.isNotEmpty &&
+            rightMime.isNotEmpty &&
+            leftMime == rightMime) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  String _normalizeUserAttachmentBody(String value) {
+    final withoutInjectedList = value.replaceAll(
+      RegExp(
+        r'\n*Attached local image files:\s*(?:\n-\s+[^\n]+)+',
+        caseSensitive: false,
+      ),
+      '',
+    );
+    return withoutInjectedList.trim().split(RegExp(r'\s+')).where((part) {
+      return part.isNotEmpty;
+    }).join(' ');
+  }
+
   int _timelineBodyOverlapLength(String previous, String next) {
     final maxOverlap =
         previous.length < next.length ? previous.length : next.length;
@@ -8851,11 +9010,22 @@ class SessionController extends ChangeNotifier {
     }
     final merged = <TimelineAttachment>[];
     final seen = <String>{};
+    final seenFingerprints = <String>{};
     for (final attachment in [...previous, ...next]) {
       final key = _mediaPreviewKey(attachment);
-      if (key.isEmpty || seen.add(key)) {
-        merged.add(attachment);
+      final fingerprint = _timelineAttachmentFingerprint(attachment);
+      if (key.isNotEmpty && !seen.add(key)) {
+        continue;
       }
+      if (key.isEmpty &&
+          fingerprint.isNotEmpty &&
+          !seenFingerprints.add(fingerprint)) {
+        continue;
+      }
+      if (key.isNotEmpty && fingerprint.isNotEmpty) {
+        seenFingerprints.add(fingerprint);
+      }
+      merged.add(attachment);
     }
     return merged;
   }

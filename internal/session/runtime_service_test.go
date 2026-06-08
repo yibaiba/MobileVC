@@ -13,6 +13,7 @@ import (
 )
 
 type resumeStubRunner struct {
+	mu            sync.Mutex
 	interactive   bool
 	claudeSession string
 	writeErr      error
@@ -47,6 +48,12 @@ func (s *resumeStubRunner) Run(ctx context.Context, req engine.ExecRequest, sink
 }
 
 func (s *resumeStubRunner) Write(ctx context.Context, data []byte) error {
+	s.mu.Lock()
+	interactive := s.interactive
+	s.mu.Unlock()
+	if !interactive {
+		return ErrRunnerNotInteractive
+	}
 	if s.writeDelay > 0 {
 		timer := time.NewTimer(s.writeDelay)
 		select {
@@ -59,6 +66,8 @@ func (s *resumeStubRunner) Write(ctx context.Context, data []byte) error {
 	if s.writeErr != nil {
 		return s.writeErr
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.writes = append(s.writes, append([]byte(nil), data...))
 	return nil
 }
@@ -72,7 +81,15 @@ func (s *resumeStubRunner) Close() error {
 }
 
 func (s *resumeStubRunner) CanAcceptInteractiveInput() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.interactive
+}
+
+func (s *resumeStubRunner) setInteractive(value bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.interactive = value
 }
 
 func (s *resumeStubRunner) ClaudeSessionID() string {
@@ -264,7 +281,7 @@ func TestExecuteClaudeLifecycleTransitionsFromStarting(t *testing.T) {
 	pty.runFn = func(ctx context.Context, req engine.ExecRequest, sink engine.EventSink) error {
 		sink(protocol.NewSessionStateEvent("s1", "active", "command started"))
 		sink(protocol.NewStepUpdateEvent("s1", "Running TodoWrite", "running", "TodoWrite", "TodoWrite", "Running TodoWrite"))
-		pty.interactive = true
+		pty.setInteractive(true)
 		sink(protocol.NewPromptRequestEvent("s1", "继续输入", nil))
 		return nil
 	}
@@ -448,6 +465,51 @@ func TestSendInputOrResumeAllowsSlowDetachedResumeStartup(t *testing.T) {
 		t.Fatalf("send input or resume: %v", err)
 	}
 	if len(resumed.writes) != 1 || string(resumed.writes[0]) != "slow hello\n" {
+		t.Fatalf("unexpected resumed runner writes: %#v", resumed.writes)
+	}
+}
+
+func TestSendInputOrResumeWaitsForInteractiveBeforeSingleWrite(t *testing.T) {
+	resumed := newResumeStubRunner("resume-detached", false)
+	svc := NewService("s1", Dependencies{
+		NewExecRunner: func() engine.Runner { return newResumeStubRunner("", true) },
+		NewPtyRunner:  func() engine.Runner { return resumed },
+	})
+	svc.manager.updateResumeSessionID("resume-detached")
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- svc.SendInputOrResume(context.Background(), "s1", ExecuteRequest{
+			Command:        "claude",
+			CWD:            "/tmp",
+			Mode:           engine.ModePTY,
+			PermissionMode: "default",
+			RuntimeMeta:    protocol.RuntimeMeta{Command: "claude", CWD: "/tmp", PermissionMode: "default", ResumeSessionID: "resume-detached"},
+		}, InputRequest{Data: "one write only\n", RuntimeMeta: protocol.RuntimeMeta{Source: "input"}}, func(any) {})
+	}()
+
+	waitSignal(t, resumed.started, "detached resume runner start")
+	time.Sleep(100 * time.Millisecond)
+	resumed.mu.Lock()
+	writesBeforeReady := len(resumed.writes)
+	resumed.mu.Unlock()
+	if writesBeforeReady != 0 {
+		t.Fatalf("expected no writes before interactive readiness, got %d", writesBeforeReady)
+	}
+
+	resumed.setInteractive(true)
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("send input or resume: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for resumed input send")
+	}
+
+	resumed.mu.Lock()
+	defer resumed.mu.Unlock()
+	if len(resumed.writes) != 1 || string(resumed.writes[0]) != "one write only\n" {
 		t.Fatalf("unexpected resumed runner writes: %#v", resumed.writes)
 	}
 }
@@ -656,7 +718,7 @@ func TestCompactWaitsForDetachedCodexResumeRunnerToBecomeInteractive(t *testing.
 		default:
 		}
 		time.AfterFunc(120*time.Millisecond, func() {
-			resumed.interactive = true
+			resumed.setInteractive(true)
 		})
 		<-ctx.Done()
 		return nil

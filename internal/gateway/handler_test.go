@@ -11855,6 +11855,44 @@ func TestHandlerSessionDeleteRejectsNativeCodexMirror(t *testing.T) {
 	}
 }
 
+func TestHandlerSessionDeleteRemovesMobileVCLegacySessionWithoutRuntimeMeta(t *testing.T) {
+	h := newTestHandler()
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	h.SessionStore = tempStore
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+
+	sessionID := createHistorySessionForHandlerTest(t, h, conn, "legacy-mobilevc")
+	if err := os.Remove(filepath.Join(tempStore.BaseDir(), sessionID+".runtime_meta.json")); err != nil {
+		t.Fatalf("remove runtime metadata sidecar: %v", err)
+	}
+
+	if err := conn.WriteJSON(protocol.SessionDeleteRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_delete"},
+		SessionID:   sessionID,
+	}); err != nil {
+		t.Fatalf("write session_delete request: %v", err)
+	}
+
+	listEvent := readUntilType(t, conn, protocol.EventTypeSessionListResult)
+	items, ok := listEvent["items"].([]any)
+	if !ok {
+		t.Fatalf("expected session list items, got %#v", listEvent)
+	}
+	for _, raw := range items {
+		item, _ := raw.(map[string]any)
+		if item["id"] == sessionID {
+			t.Fatalf("expected deleted legacy MobileVC session removed from list, got %#v", items)
+		}
+	}
+	if _, err := h.SessionStore.GetSession(context.Background(), sessionID); err == nil {
+		t.Fatal("expected deleted legacy MobileVC session lookup to fail")
+	}
+}
+
 func TestHandlerSessionDeleteCurrentSessionCleansRuntimeAndFallsBack(t *testing.T) {
 	runnerA := newSwitchableStubRunner()
 	firstRunner := runnerA

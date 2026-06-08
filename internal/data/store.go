@@ -450,6 +450,10 @@ type ProjectionOptionStore interface {
 	SaveProjectionWithOptions(ctx context.Context, sessionID string, projection ProjectionSnapshot, opts ...ProjectionSaveOption) (SessionSummary, error)
 }
 
+type SessionSummaryStore interface {
+	GetSessionSummary(ctx context.Context, sessionID string) (SessionSummary, error)
+}
+
 type SessionLogEntryAppendStore interface {
 	AppendSessionLogEntries(ctx context.Context, sessionID string, entries []SnapshotLogEntry, opts ...ProjectionSaveOption) (SessionSummary, error)
 }

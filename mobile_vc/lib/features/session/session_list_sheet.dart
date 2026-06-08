@@ -324,7 +324,7 @@ class _SessionListTile extends StatelessWidget {
                 child: Icon(Icons.check_circle, size: 18),
               ),
             IconButton(
-              tooltip: _canDeleteSession(item) ? '删除会话' : '不能删除电脑端原生会话',
+              tooltip: _canDeleteSession(item) ? '删除此会话' : '不能删除电脑端原生会话',
               onPressed: () {
                 if (!_canDeleteSession(item)) {
                   _showDeleteUnavailable(context, item);
