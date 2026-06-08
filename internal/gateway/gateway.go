@@ -7030,6 +7030,14 @@ func trackedMobileVCClaudeSessions(ctx context.Context, sessionStore data.Store,
 
 func mergeSessionSummaries(ctx context.Context, sessionStore data.Store, items []data.SessionSummary, filterCWD string) ([]data.SessionSummary, error) {
 	filteredStoreItems := filterStoreSessionsByCWD(items, filterCWD)
+	deletedNative := data.NativeSessionDeletionSet{}
+	if deletionStore, ok := sessionStore.(data.NativeSessionDeletionStore); ok {
+		var err error
+		deletedNative, err = deletionStore.DeletedNativeSessionIDs(ctx)
+		if err != nil {
+			return nil, err
+		}
+	}
 	hiddenThreadIDs, err := codexsync.ListNativeHiddenThreadIDs(ctx, filterCWD)
 	if err != nil {
 		logx.Warn("ws", "list hidden codex sessions failed: cwd=%q err=%v", filterCWD, err)
@@ -7051,6 +7059,9 @@ func mergeSessionSummaries(ctx context.Context, sessionStore data.Store, items [
 	merged := make([]data.SessionSummary, 0, len(filteredStoreItems)+len(nativeThreads)+len(nativeClaude))
 	seen := make(map[string]struct{}, len(filteredStoreItems)+len(nativeThreads)+len(nativeClaude))
 	for _, item := range filteredStoreItems {
+		if isDeletedNativeSummary(item, deletedNative) {
+			continue
+		}
 		if isExternalCodexSummary(item) {
 			if _, ok := trackedThreads[summaryCodexThreadID(item)]; ok {
 				continue
@@ -7071,6 +7082,9 @@ func mergeSessionSummaries(ctx context.Context, sessionStore data.Store, items [
 		seen[item.ID] = struct{}{}
 	}
 	for _, thread := range nativeThreads {
+		if _, ok := deletedNative.CodexThreadIDs[strings.TrimSpace(thread.ThreadID)]; ok {
+			continue
+		}
 		record := codexsync.MirrorRecord(thread)
 		if _, ok := seen[record.Summary.ID]; ok {
 			continue
@@ -7084,6 +7098,9 @@ func mergeSessionSummaries(ctx context.Context, sessionStore data.Store, items [
 		seen[record.Summary.ID] = struct{}{}
 	}
 	for _, native := range nativeClaude {
+		if _, ok := deletedNative.ClaudeSessionIDs[strings.TrimSpace(native.SessionID)]; ok {
+			continue
+		}
 		if _, ok := trackedClaudeSessions[strings.TrimSpace(native.SessionID)]; ok {
 			continue
 		}
@@ -7103,6 +7120,20 @@ func mergeSessionSummaries(ctx context.Context, sessionStore data.Store, items [
 		return merged[i].UpdatedAt.After(merged[j].UpdatedAt)
 	})
 	return dedupeCodexThreadSummaries(merged), nil
+}
+
+func isDeletedNativeSummary(item data.SessionSummary, deleted data.NativeSessionDeletionSet) bool {
+	if isExternalClaudeSummary(item) {
+		if _, ok := deleted.ClaudeSessionIDs[summaryClaudeSessionID(item)]; ok {
+			return true
+		}
+	}
+	if isCodexNativeSummary(item) {
+		if _, ok := deleted.CodexThreadIDs[summaryCodexThreadID(item)]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func loadSessionRecord(ctx context.Context, sessionStore data.Store, sessionID string) (data.SessionRecord, error) {

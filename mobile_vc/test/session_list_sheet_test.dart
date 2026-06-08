@@ -72,6 +72,38 @@ void main() {
     expect(find.text('电脑 Claude 只能恢复，不能在 MobileVC 内删除'), findsOneWidget);
   });
 
+  testWidgets('电脑原生会话主标题和顶部标题一致，原始标题显示为副标题', (tester) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SessionListSheet(
+            sessions: const [
+              SessionSummary(
+                id: 'codex-thread:1',
+                title: '这里有问题不能删除mobilevc喃',
+                source: 'codex-native',
+                external: true,
+                runtime: RuntimeMeta(
+                  source: 'codex-native',
+                  engine: 'codex',
+                  cwd: '/workspace/MobileVC',
+                ),
+              ),
+            ],
+            selectedSessionId: '',
+            cwd: '/workspace/MobileVC',
+            onCreate: () {},
+            onLoad: (_) {},
+            onDelete: (_) {},
+          ),
+        ),
+      ),
+    );
+
+    expect(find.text('电脑 Codex'), findsOneWidget);
+    expect(find.text('这里有问题不能删除mobilevc喃'), findsOneWidget);
+  });
+
   testWidgets('MobileVC 会话点击删除会触发 onDelete', (tester) async {
     String deletedSessionId = '';
 
@@ -255,6 +287,7 @@ void main() {
     );
 
     expect(find.byType(DropdownButtonFormField<String>), findsOneWidget);
+    expect(find.text('电脑 Codex'), findsWidgets);
     expect(find.text('Project23 session'), findsOneWidget);
     expect(find.widgetWithText(ChoiceChip, 'Project23'), findsNothing);
   });
@@ -355,18 +388,18 @@ void main() {
     await tester.tap(find.widgetWithText(ChoiceChip, 'Claude'));
     await tester.pumpAndSettle();
 
-    expect(find.text('Claude item'), findsOneWidget);
+    expect(find.text('电脑 Claude'), findsOneWidget);
     expect(find.text('MobileVC Claude item'), findsOneWidget);
-    expect(find.text('Codex item'), findsNothing);
+    expect(find.text('电脑 Codex'), findsNothing);
     expect(find.text('MobileVC Codex item'), findsNothing);
     expect(find.text('Gemini item'), findsNothing);
 
     await tester.tap(find.widgetWithText(ChoiceChip, 'Codex'));
     await tester.pumpAndSettle();
 
-    expect(find.text('Codex item'), findsOneWidget);
+    expect(find.text('电脑 Codex'), findsOneWidget);
     expect(find.text('MobileVC Codex item'), findsOneWidget);
-    expect(find.text('Claude item'), findsNothing);
+    expect(find.text('电脑 Claude'), findsNothing);
     expect(find.text('MobileVC Claude item'), findsNothing);
     expect(find.text('Gemini item'), findsNothing);
 
@@ -374,9 +407,9 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.text('Gemini item'), findsOneWidget);
-    expect(find.text('Codex item'), findsNothing);
+    expect(find.text('电脑 Codex'), findsNothing);
     expect(find.text('MobileVC Codex item'), findsNothing);
-    expect(find.text('Claude item'), findsNothing);
+    expect(find.text('电脑 Claude'), findsNothing);
     expect(find.text('MobileVC Claude item'), findsNothing);
     expect(find.widgetWithText(ChoiceChip, 'MobileVC'), findsNothing);
     expect(find.text('MobileVC'), findsOneWidget);

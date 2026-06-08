@@ -13,16 +13,17 @@ import (
 func TestToProtocolSummary(t *testing.T) {
 	created := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
 	in := data.SessionSummary{
-		ID:              "s1",
-		Title:           "title",
-		CreatedAt:       created,
-		UpdatedAt:       created,
-		LastPreview:     "hi",
-		EntryCount:      3,
-		Source:          "mobilevc",
-		External:        true,
-		Ownership:       "user",
-		ExecutionActive: true,
+		ID:                "s1",
+		Title:             "title",
+		CreatedAt:         created,
+		UpdatedAt:         created,
+		LastPreview:       "hi",
+		EntryCount:        3,
+		Source:            "mobilevc",
+		External:          true,
+		Ownership:         "user",
+		ExecutionActive:   true,
+		ClaudeSessionUUID: "claude-uuid-1",
 		Runtime: data.SessionRuntime{
 			ResumeSessionID: "r1",
 			Command:         "claude",
@@ -42,6 +43,9 @@ func TestToProtocolSummary(t *testing.T) {
 	}
 	if got.Runtime.ResumeSessionID != "r1" || got.Runtime.Command != "claude" || got.Runtime.Engine != "claude" {
 		t.Errorf("runtime: %+v", got.Runtime)
+	}
+	if got.Runtime.ClaudeSessionUUID != "claude-uuid-1" {
+		t.Errorf("claude session uuid: %+v", got.Runtime)
 	}
 	if !strings.HasPrefix(got.CreatedAt, "2026-01-01") {
 		t.Errorf("created at format: %q", got.CreatedAt)

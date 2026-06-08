@@ -54,6 +54,43 @@ func TestFileStoreDeleteSessionRemovesRecordAndIndex(t *testing.T) {
 	}
 }
 
+func TestFileStoreDeleteSessionRecordsNativeClaudeTombstone(t *testing.T) {
+	fs, err := NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new file store: %v", err)
+	}
+	created, err := fs.CreateSession(context.Background(), "delete claude")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	record, err := fs.GetSession(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	record.Summary.Runtime = SessionRuntime{
+		ResumeSessionID: record.Summary.ClaudeSessionUUID,
+		Command:         "claude --resume " + record.Summary.ClaudeSessionUUID,
+		Engine:          "claude",
+		Source:          "mobilevc",
+	}
+	record.Projection.Runtime = record.Summary.Runtime
+	if _, err := fs.UpsertSession(context.Background(), record); err != nil {
+		t.Fatalf("upsert claude session: %v", err)
+	}
+
+	if err := fs.DeleteSession(context.Background(), created.ID); err != nil {
+		t.Fatalf("delete session: %v", err)
+	}
+
+	deleted, err := fs.DeletedNativeSessionIDs(context.Background())
+	if err != nil {
+		t.Fatalf("deleted native session ids: %v", err)
+	}
+	if _, ok := deleted.ClaudeSessionIDs[record.Summary.ClaudeSessionUUID]; !ok {
+		t.Fatalf("expected deleted Claude UUID %q, got %#v", record.Summary.ClaudeSessionUUID, deleted.ClaudeSessionIDs)
+	}
+}
+
 func TestFileStoreDeleteSessionDoesNotDecodeHistoryRows(t *testing.T) {
 	fs, err := NewFileStore(t.TempDir())
 	if err != nil {

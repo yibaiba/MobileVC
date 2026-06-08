@@ -34,7 +34,9 @@ type FileStore struct {
 }
 
 type fileIndex struct {
-	Sessions []SessionSummary `json:"sessions"`
+	Sessions            []SessionSummary `json:"sessions"`
+	DeletedNativeClaude []string         `json:"deletedNativeClaude,omitempty"`
+	DeletedNativeCodex  []string         `json:"deletedNativeCodex,omitempty"`
 }
 
 type sessionRecordMeta struct {
@@ -846,7 +848,8 @@ func (s *FileStore) DeleteSession(ctx context.Context, sessionID string) error {
 		return ctx.Err()
 	default:
 	}
-	if _, err := s.readSessionWithoutLogEntriesLocked(sessionID); err != nil {
+	record, err := s.readSessionWithoutLogEntriesLocked(sessionID)
+	if err != nil {
 		return err
 	}
 	if err := os.Remove(s.sessionPath(sessionID)); err != nil {
@@ -884,11 +887,27 @@ func (s *FileStore) DeleteSession(ctx context.Context, sessionID string) error {
 		return err
 	}
 	index.Sessions = filterOut(index.Sessions, sessionID)
+	index = addDeletedNativeSessionMarkers(index, nativeDeletionMarkersForSummary(record.Summary))
 	if err := s.writeIndexLocked(index); err != nil {
 		return err
 	}
 	delete(s.sessionMetaCache, sessionID)
 	return nil
+}
+
+func (s *FileStore) DeletedNativeSessionIDs(ctx context.Context) (NativeSessionDeletionSet, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	select {
+	case <-ctx.Done():
+		return NativeSessionDeletionSet{}, ctx.Err()
+	default:
+	}
+	index, err := s.readIndexLocked()
+	if err != nil {
+		return NativeSessionDeletionSet{}, err
+	}
+	return nativeDeletionSetFromIndex(index), nil
 }
 
 func (s *FileStore) ListSkillCatalog(ctx context.Context) ([]SkillDefinition, error) {
@@ -2412,6 +2431,118 @@ func filterOut(items []SessionSummary, id string) []SessionSummary {
 		}
 	}
 	return out
+}
+
+type nativeDeletionMarkers struct {
+	ClaudeSessionIDs []string
+	CodexThreadIDs   []string
+}
+
+func nativeDeletionMarkersForSummary(summary SessionSummary) nativeDeletionMarkers {
+	if isExternalNativeSummary(summary) {
+		return nativeDeletionMarkers{}
+	}
+	runtime := mergeSessionRuntime(summary.Runtime, SessionRuntime{})
+	markers := nativeDeletionMarkers{}
+	if isClaudeRuntimeSummary(summary, runtime) {
+		markers.ClaudeSessionIDs = appendIfNonEmpty(markers.ClaudeSessionIDs, summary.ClaudeSessionUUID)
+		markers.ClaudeSessionIDs = appendIfNonEmpty(markers.ClaudeSessionIDs, runtime.ResumeSessionID)
+	}
+	if isCodexRuntimeSummary(summary, runtime) {
+		markers.CodexThreadIDs = appendIfNonEmpty(markers.CodexThreadIDs, runtime.ResumeSessionID)
+	}
+	return markers
+}
+
+func isExternalNativeSummary(summary SessionSummary) bool {
+	source := strings.TrimSpace(strings.ToLower(summary.Source))
+	ownership := strings.TrimSpace(strings.ToLower(summary.Ownership))
+	runtimeSource := strings.TrimSpace(strings.ToLower(summary.Runtime.Source))
+	return summary.External ||
+		source == "claude-native" ||
+		source == "codex-native" ||
+		ownership == "claude-native" ||
+		ownership == "codex-native" ||
+		runtimeSource == "claude-native" ||
+		runtimeSource == "codex-native"
+}
+
+func isClaudeRuntimeSummary(summary SessionSummary, runtime SessionRuntime) bool {
+	if strings.TrimSpace(summary.ClaudeSessionUUID) != "" {
+		return true
+	}
+	if strings.EqualFold(strings.TrimSpace(runtime.Engine), "claude") ||
+		strings.EqualFold(strings.TrimSpace(runtime.Source), "claude-native") {
+		return true
+	}
+	return commandHeadIs(runtime.Command, "claude")
+}
+
+func isCodexRuntimeSummary(summary SessionSummary, runtime SessionRuntime) bool {
+	if strings.EqualFold(strings.TrimSpace(runtime.Engine), "codex") ||
+		strings.EqualFold(strings.TrimSpace(runtime.Source), "codex-native") {
+		return true
+	}
+	return commandHeadIs(runtime.Command, "codex")
+}
+
+func commandHeadIs(command, want string) bool {
+	fields := strings.Fields(strings.TrimSpace(command))
+	if len(fields) == 0 {
+		return false
+	}
+	head := strings.ToLower(filepath.Base(fields[0]))
+	return head == want || head == want+".exe"
+}
+
+func appendIfNonEmpty(items []string, value string) []string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return items
+	}
+	return append(items, trimmed)
+}
+
+func addDeletedNativeSessionMarkers(index fileIndex, markers nativeDeletionMarkers) fileIndex {
+	index.DeletedNativeClaude = mergeStringSet(index.DeletedNativeClaude, markers.ClaudeSessionIDs)
+	index.DeletedNativeCodex = mergeStringSet(index.DeletedNativeCodex, markers.CodexThreadIDs)
+	return index
+}
+
+func mergeStringSet(existing, added []string) []string {
+	seen := make(map[string]struct{}, len(existing)+len(added))
+	out := make([]string, 0, len(existing)+len(added))
+	for _, value := range append(append([]string{}, existing...), added...) {
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			continue
+		}
+		if _, ok := seen[trimmed]; ok {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		out = append(out, trimmed)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func nativeDeletionSetFromIndex(index fileIndex) NativeSessionDeletionSet {
+	return NativeSessionDeletionSet{
+		ClaudeSessionIDs: stringSet(index.DeletedNativeClaude),
+		CodexThreadIDs:   stringSet(index.DeletedNativeCodex),
+	}
+}
+
+func stringSet(items []string) map[string]struct{} {
+	result := make(map[string]struct{}, len(items))
+	for _, value := range items {
+		trimmed := strings.TrimSpace(value)
+		if trimmed != "" {
+			result[trimmed] = struct{}{}
+		}
+	}
+	return result
 }
 
 func sessionMetaFromRecord(record SessionRecord) sessionRecordMeta {

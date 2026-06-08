@@ -9349,6 +9349,59 @@ func TestMergeSessionSummariesEmptyCWDIncludesNativeProjects(t *testing.T) {
 	}
 }
 
+func TestMergeSessionSummariesSkipsNativeClaudeAfterMobileVCDelete(t *testing.T) {
+	homeDir := t.TempDir()
+	projectDir := filepath.Join(homeDir, "workspace", "MobileVC")
+	if err := os.MkdirAll(projectDir, 0o755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
+	}
+	t.Setenv("HOME", homeDir)
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	created, err := tempStore.CreateSession(context.Background(), "MobileVC Claude")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	record, err := tempStore.GetSession(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	claudeID := record.Summary.ClaudeSessionUUID
+	record.Summary.Runtime = data.SessionRuntime{
+		ResumeSessionID: claudeID,
+		Command:         "claude --resume " + claudeID,
+		Engine:          "claude",
+		CWD:             projectDir,
+		Source:          "mobilevc",
+	}
+	record.Projection.Runtime = record.Summary.Runtime
+	if _, err := tempStore.UpsertSession(context.Background(), record); err != nil {
+		t.Fatalf("upsert MobileVC Claude session: %v", err)
+	}
+	if err := claudesync.WriteSessionToJSONL(projectDir, claudeID, []claudesync.JSONLEvent{
+		{Type: "user", Text: "original prompt"},
+	}); err != nil {
+		t.Fatalf("write native claude jsonl: %v", err)
+	}
+	if err := tempStore.DeleteSession(context.Background(), created.ID); err != nil {
+		t.Fatalf("delete MobileVC session: %v", err)
+	}
+
+	items, err := tempStore.ListSessions(context.Background())
+	if err != nil {
+		t.Fatalf("list stored sessions: %v", err)
+	}
+	merged, err := mergeSessionSummaries(context.Background(), tempStore, items, projectDir)
+	if err != nil {
+		t.Fatalf("merge session summaries: %v", err)
+	}
+	if containsSessionSummaryID(merged, "claude-session:"+claudeID) {
+		t.Fatalf("did not expect deleted MobileVC Claude to reappear as native mirror, got %#v", merged)
+	}
+}
+
 func TestMergeSessionSummariesListsAllVisibleCodexTUIThreads(t *testing.T) {
 	homeDir := t.TempDir()
 	projectDir := filepath.Join(homeDir, "workspace", "MobileVC")

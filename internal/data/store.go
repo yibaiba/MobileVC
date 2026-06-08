@@ -454,6 +454,15 @@ type SessionSummaryStore interface {
 	GetSessionSummary(ctx context.Context, sessionID string) (SessionSummary, error)
 }
 
+type NativeSessionDeletionStore interface {
+	DeletedNativeSessionIDs(ctx context.Context) (NativeSessionDeletionSet, error)
+}
+
+type NativeSessionDeletionSet struct {
+	ClaudeSessionIDs map[string]struct{}
+	CodexThreadIDs   map[string]struct{}
+}
+
 type SessionLogEntryAppendStore interface {
 	AppendSessionLogEntries(ctx context.Context, sessionID string, entries []SnapshotLogEntry, opts ...ProjectionSaveOption) (SessionSummary, error)
 }

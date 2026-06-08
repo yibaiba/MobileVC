@@ -7847,6 +7847,70 @@ void main() {
           isFalse);
     });
 
+    test('deleteSession 不会把同一 Claude UUID 重新显示成电脑 Claude', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      service.emit(
+        SessionListResultEvent(
+          timestamp: _timestamp,
+          sessionId: '',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_list_result'},
+          items: const [
+            SessionSummary(
+              id: 'session-a',
+              title: 'MobileVC Claude',
+              ownership: 'mobilevc',
+              source: 'mobilevc',
+              runtime: RuntimeMeta(
+                engine: 'claude',
+                command: 'claude',
+                claudeSessionUuid: 'native-claude-1',
+                source: 'mobilevc',
+              ),
+            ),
+            SessionSummary(id: 'session-b', title: 'Session B'),
+          ],
+        ),
+      );
+      await _flushEvents();
+
+      controller.deleteSession('session-a');
+      await _flushEvents();
+
+      service.emit(
+        SessionListResultEvent(
+          timestamp: _timestamp.add(const Duration(seconds: 1)),
+          sessionId: '',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_list_result'},
+          items: const [
+            SessionSummary(
+              id: 'claude-session:native-claude-1',
+              title: '电脑 Claude',
+              external: true,
+              source: 'claude-native',
+              runtime: RuntimeMeta(
+                engine: 'claude',
+                command: 'claude',
+                resumeSessionId: 'native-claude-1',
+                source: 'claude-native',
+              ),
+            ),
+            SessionSummary(id: 'session-b', title: 'Session B'),
+          ],
+        ),
+      );
+      await _flushEvents();
+
+      expect(controller.sessions.map((item) => item.id).toList(), [
+        'session-b',
+      ]);
+    });
+
     test('deleteSession 失败时恢复本地会话并显示错误', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);
@@ -8049,9 +8113,47 @@ void main() {
       );
       await _flushEvents();
 
+      expect(controller.selectedSessionTitle, '电脑 Codex');
       expect(controller.timeline, hasLength(1));
       expect(controller.timeline.single.kind, 'user');
       expect(controller.timeline.single.body, '修一下登录页按钮间距');
+    });
+
+    test('外部 Codex 会话恢复后左上角标题使用电脑来源名称', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      service.emit(
+        SessionHistoryEvent(
+          timestamp: _timestamp,
+          sessionId: 'codex-thread:3',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_history'},
+          summary: const SessionSummary(
+            id: 'codex-thread:3',
+            title: '这里有问题不能删除mobilevc喃',
+            source: 'codex-native',
+            external: true,
+            runtime: RuntimeMeta(
+              source: 'codex-native',
+              engine: 'codex',
+              cwd: '/workspace/MobileVC',
+            ),
+          ),
+          resumeRuntimeMeta: const RuntimeMeta(
+            source: 'codex-native',
+            engine: 'codex',
+            command: 'codex',
+            resumeSessionId: 'thread-3',
+          ),
+        ),
+      );
+      await _flushEvents();
+
+      expect(controller.selectedSessionTitle, '电脑 Codex');
+      expect(controller.sessions.single.title, '这里有问题不能删除mobilevc喃');
     });
 
     test('外部 Codex 会话只有空白历史项时仍会补可见预览', () async {

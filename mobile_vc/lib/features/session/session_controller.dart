@@ -401,6 +401,7 @@ class SessionController extends ChangeNotifier {
   final Map<String, SessionSummary> _pendingDeletedSessions =
       <String, SessionSummary>{};
   final Set<String> _deletedSessionTombstones = <String>{};
+  final Set<String> _deletedNativeSessionTombstones = <String>{};
   final List<RelayTrustedDevice> _relayDevices = [];
   final List<SkillDefinition> _skills = [];
   final List<MemoryItem> _memoryItems = [];
@@ -1396,6 +1397,128 @@ class SessionController extends ChangeNotifier {
     return source == 'codex-native' ||
         ownership == 'codex-native' ||
         runtimeSource == 'codex-native';
+  }
+
+  bool _sessionSummaryIsClaude(SessionSummary summary) {
+    final engine = summary.runtime.engine.trim().toLowerCase();
+    if (engine == 'claude') {
+      return true;
+    }
+    final source = summary.source.trim().toLowerCase();
+    final ownership = summary.ownership.trim().toLowerCase();
+    final runtimeSource = summary.runtime.source.trim().toLowerCase();
+    if (source == 'claude-native' ||
+        ownership == 'claude-native' ||
+        runtimeSource == 'claude-native') {
+      return true;
+    }
+    final command = summary.runtime.command.trim().toLowerCase();
+    return command == 'claude' ||
+        command.startsWith('claude ') ||
+        command.endsWith('/claude') ||
+        command.endsWith(r'\claude') ||
+        command == 'claude.exe';
+  }
+
+  bool _sessionSummaryIsNative(SessionSummary summary) {
+    if (summary.external) {
+      return true;
+    }
+    final source = summary.source.trim().toLowerCase();
+    final ownership = summary.ownership.trim().toLowerCase();
+    final runtimeSource = summary.runtime.source.trim().toLowerCase();
+    return source == 'codex-native' ||
+        source == 'claude-native' ||
+        ownership == 'codex-native' ||
+        ownership == 'claude-native' ||
+        runtimeSource == 'codex-native' ||
+        runtimeSource == 'claude-native' ||
+        summary.id.trim().toLowerCase().startsWith('codex-thread:') ||
+        summary.id.trim().toLowerCase().startsWith('claude-session:');
+  }
+
+  Set<String> _sessionDeleteTombstoneIds(SessionSummary summary) {
+    final ids = <String>{};
+    final id = summary.id.trim();
+    if (id.isNotEmpty) {
+      ids.add(id);
+    }
+    for (final nativeId in _sessionNativeDeleteTombstoneIds(summary)) {
+      if (nativeId.startsWith('claude:')) {
+        final claudeId = nativeId.substring('claude:'.length);
+        if (claudeId.isNotEmpty) {
+          ids.add('claude-session:$claudeId');
+        }
+      } else if (nativeId.startsWith('codex:')) {
+        final codexId = nativeId.substring('codex:'.length);
+        if (codexId.isNotEmpty) {
+          ids.add('codex-thread:$codexId');
+        }
+      }
+    }
+    return ids;
+  }
+
+  Set<String> _sessionNativeDeleteTombstoneIds(SessionSummary summary) {
+    if (_sessionSummaryIsNative(summary)) {
+      return const <String>{};
+    }
+    final ids = <String>{};
+    if (_sessionSummaryIsClaude(summary)) {
+      final claudeId = _summaryClaudeSessionId(summary);
+      if (claudeId.isNotEmpty) {
+        ids.add('claude:$claudeId');
+      }
+    }
+    if (_sessionSummaryIsCodex(summary)) {
+      final codexId = _summaryCodexThreadId(summary);
+      if (codexId.isNotEmpty) {
+        ids.add('codex:$codexId');
+      }
+    }
+    return ids;
+  }
+
+  String _summaryClaudeSessionId(SessionSummary summary) {
+    final id = summary.id.trim();
+    if (id.startsWith('claude-session:')) {
+      return id.substring('claude-session:'.length).trim();
+    }
+    final claudeUuid = summary.runtime.claudeSessionUuid.trim();
+    if (claudeUuid.isNotEmpty) {
+      return claudeUuid;
+    }
+    final resume = summary.runtime.resumeSessionId.trim();
+    if (resume.isNotEmpty) {
+      return resume;
+    }
+    return '';
+  }
+
+  String _summaryCodexThreadId(SessionSummary summary) {
+    final id = summary.id.trim();
+    if (id.startsWith('codex-thread:')) {
+      return id.substring('codex-thread:'.length).trim();
+    }
+    return summary.runtime.resumeSessionId.trim();
+  }
+
+  bool _shouldKeepListedSessionSummary(SessionSummary summary) {
+    if (_pendingDeletedSessions.containsKey(summary.id) ||
+        _deletedSessionTombstones.contains(summary.id)) {
+      return false;
+    }
+    final claudeId = _summaryClaudeSessionId(summary);
+    if (claudeId.isNotEmpty &&
+        _deletedNativeSessionTombstones.contains('claude:$claudeId')) {
+      return false;
+    }
+    final codexId = _summaryCodexThreadId(summary);
+    if (codexId.isNotEmpty &&
+        _deletedNativeSessionTombstones.contains('codex:$codexId')) {
+      return false;
+    }
+    return true;
   }
 
   bool get inClaudeMode {
@@ -3430,6 +3553,12 @@ class SessionController extends ChangeNotifier {
     }
     _clearLastSelectedSessionIfMatches(targetId);
     _deletedSessionTombstones.add(targetId);
+    if (target != null) {
+      _deletedSessionTombstones.addAll(_sessionDeleteTombstoneIds(target));
+      _deletedNativeSessionTombstones.addAll(
+        _sessionNativeDeleteTombstoneIds(target),
+      );
+    }
     if (target != null) {
       _pendingDeletedSessions[targetId] = target;
       _pushSystem('system', '正在删除会话：${sessionDisplayTitle(target)}');
@@ -5812,7 +5941,7 @@ class SessionController extends ChangeNotifier {
           for (final item in _sessions) item.id: item,
         };
         final mergedItems = list.items
-            .where((item) => !_pendingDeletedSessions.containsKey(item.id))
+            .where(_shouldKeepListedSessionSummary)
             .map((item) => _mergedSessionSummary(existingById[item.id], item))
             .toList();
         final mergedIds = {
@@ -6879,7 +7008,12 @@ class SessionController extends ChangeNotifier {
       final restored = _pendingDeletedSessions.values.toList();
       _pendingDeletedSessions.clear();
       for (final summary in restored) {
-        _deletedSessionTombstones.remove(summary.id);
+        for (final id in _sessionDeleteTombstoneIds(summary)) {
+          _deletedSessionTombstones.remove(id);
+        }
+        for (final id in _sessionNativeDeleteTombstoneIds(summary)) {
+          _deletedNativeSessionTombstones.remove(id);
+        }
       }
       for (final summary in restored.reversed) {
         _upsertSession(summary);
