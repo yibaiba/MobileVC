@@ -31,6 +31,7 @@ type gatewayConn struct {
 	routePolicy      relay.SelectedRoutePolicy
 	clientID         string
 	mu               sync.Mutex
+	writeMu          sync.Mutex
 	attachCh         chan struct{}
 	attachOnce       sync.Once
 	readCh           chan readResult
@@ -848,12 +849,12 @@ func (c *gatewayConn) writeForward(payload []byte) error {
 }
 
 func (c *gatewayConn) writeControl(frame any) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	return c.writeJSONLocked(frame)
 }
 
 func (c *gatewayConn) writeJSONLocked(frame any) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 	if err := c.conn.SetWriteDeadline(time.Now().Add(relayWriteTimeout)); err != nil {
 		return err
 	}
@@ -914,14 +915,16 @@ func (c *gatewayConn) currentE2EEReadyCh() (chan struct{}, error) {
 
 func (c *gatewayConn) tryWriteEncryptedForward(payload []byte, readyCh chan struct{}) (bool, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if readyCh != nil && c.e2eeReadyCh != readyCh {
+		c.mu.Unlock()
 		return false, nil
 	}
-	if c.stream == nil {
+	codec := c.stream
+	c.mu.Unlock()
+	if codec == nil {
 		return false, nil
 	}
-	frame, err := c.stream.Encode("msg_"+uuid.NewString(), payload)
+	frame, err := codec.Encode("msg_"+uuid.NewString(), payload)
 	if err != nil {
 		return false, fmt.Errorf("%s: %w", relay.CodeE2EEDecryptFailed, err)
 	}

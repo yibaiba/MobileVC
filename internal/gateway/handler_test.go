@@ -850,6 +850,15 @@ type blockingSessionLoadStore struct {
 	once            sync.Once
 }
 
+type blockingSessionListStore struct {
+	data.Store
+	mu        sync.Mutex
+	started   chan struct{}
+	release   chan struct{}
+	once      sync.Once
+	listCalls int
+}
+
 type blockingTargetGetStore struct {
 	data.Store
 	targetSessionID string
@@ -907,6 +916,14 @@ func newBlockingSessionLoadStore(store data.Store, targetSessionID string) *bloc
 		targetSessionID: targetSessionID,
 		started:         make(chan struct{}),
 		release:         make(chan struct{}),
+	}
+}
+
+func newBlockingSessionListStore(store data.Store) *blockingSessionListStore {
+	return &blockingSessionListStore{
+		Store:   store,
+		started: make(chan struct{}),
+		release: make(chan struct{}),
 	}
 }
 
@@ -1366,6 +1383,22 @@ func (s *blockingSessionLoadStore) GetSession(ctx context.Context, sessionID str
 	return s.Store.GetSession(ctx, sessionID)
 }
 
+func (s *blockingSessionListStore) ListSessions(ctx context.Context) ([]data.SessionSummary, error) {
+	s.mu.Lock()
+	s.listCalls++
+	s.once.Do(func() {
+		close(s.started)
+	})
+	release := s.release
+	s.mu.Unlock()
+	select {
+	case <-release:
+		return s.Store.ListSessions(ctx)
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
 func (s *targetGetCountingStore) GetSession(ctx context.Context, sessionID string) (data.SessionRecord, error) {
 	if strings.TrimSpace(sessionID) == strings.TrimSpace(s.targetSessionID) {
 		s.mu.Lock()
@@ -1731,6 +1764,57 @@ func (s *blockingSessionLoadStore) ReleaseLoad() {
 	default:
 		close(s.release)
 	}
+}
+
+func (s *blockingSessionListStore) ListCallCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.listCalls
+}
+
+func (s *blockingSessionListStore) WaitListStarted(t *testing.T) {
+	t.Helper()
+	s.mu.Lock()
+	started := s.started
+	s.mu.Unlock()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for session list to block")
+	}
+}
+
+func (s *blockingSessionListStore) WaitListCallCount(t *testing.T, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if got := s.ListCallCount(); got >= want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for session list calls: got=%d want=%d", s.ListCallCount(), want)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func (s *blockingSessionListStore) ReleaseList() {
+	s.mu.Lock()
+	release := s.release
+	s.mu.Unlock()
+	select {
+	case <-release:
+	default:
+		close(release)
+	}
+}
+
+func (s *blockingSessionListStore) ResetListBlock() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.started = make(chan struct{})
+	s.release = make(chan struct{})
+	s.once = sync.Once{}
 }
 
 func (s *countingStore) ListSessions(ctx context.Context) ([]data.SessionSummary, error) {
@@ -10950,6 +11034,189 @@ func TestHandlerSessionLoadDoesNotBlockPingPong(t *testing.T) {
 	history := readUntilSessionHistory(t, conn)
 	if history["sessionId"] != record.Summary.ID {
 		t.Fatalf("expected loaded history for %q, got %#v", record.Summary.ID, history)
+	}
+}
+
+func TestHandlerInitialSessionListDoesNotBlockPingPong(t *testing.T) {
+	fileStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	blockingStore := newBlockingSessionListStore(fileStore)
+	h := newTestHandler()
+	h.SessionStore = blockingStore
+	conn := newTestConn(t, h)
+
+	blockingStore.WaitListStarted(t)
+	if err := conn.WriteJSON(map[string]any{"action": "ping", "pingId": "during-initial-session-list"}); err != nil {
+		t.Fatalf("write ping request: %v", err)
+	}
+	pong := readUntilPongID(t, conn, "during-initial-session-list")
+	if pong["type"] != "pong" {
+		t.Fatalf("expected pong, got %#v", pong)
+	}
+
+	blockingStore.ReleaseList()
+	list := readUntilType(t, conn, protocol.EventTypeSessionListResult)
+	if list["type"] != protocol.EventTypeSessionListResult {
+		t.Fatalf("expected session list result, got %#v", list)
+	}
+}
+
+func TestHandlerSessionListDoesNotBlockPingPong(t *testing.T) {
+	fileStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	blockingStore := newBlockingSessionListStore(fileStore)
+	h := newTestHandler()
+	h.SessionStore = blockingStore
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+	blockingStore.WaitListStarted(t)
+	blockingStore.ReleaseList()
+	_ = readUntilType(t, conn, protocol.EventTypeSessionListResult)
+
+	blockingStore.ResetListBlock()
+	filterDir := filepath.Join(t.TempDir(), "filtered-project")
+	if err := os.MkdirAll(filterDir, 0o755); err != nil {
+		t.Fatalf("mkdir filter dir: %v", err)
+	}
+	if err := conn.WriteJSON(protocol.SessionListRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_list"},
+		CWD:         filterDir,
+	}); err != nil {
+		t.Fatalf("write session_list request: %v", err)
+	}
+	blockingStore.WaitListStarted(t)
+	if err := conn.WriteJSON(map[string]any{"action": "ping", "pingId": "during-session-list"}); err != nil {
+		t.Fatalf("write ping request: %v", err)
+	}
+	pong := readUntilPongID(t, conn, "during-session-list")
+	if pong["type"] != "pong" {
+		t.Fatalf("expected pong, got %#v", pong)
+	}
+
+	blockingStore.ReleaseList()
+	_ = readUntilType(t, conn, protocol.EventTypeSessionListResult)
+}
+
+func TestHandlerExplicitSessionListDuplicateInFlightReturnsBusyError(t *testing.T) {
+	fileStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	blockingStore := newBlockingSessionListStore(fileStore)
+	h := newTestHandler()
+	h.SessionStore = blockingStore
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+	blockingStore.WaitListStarted(t)
+	blockingStore.ReleaseList()
+	_ = readUntilType(t, conn, protocol.EventTypeSessionListResult)
+
+	blockingStore.ResetListBlock()
+	firstDir := filepath.Join(t.TempDir(), "first-project")
+	secondDir := filepath.Join(t.TempDir(), "second-project")
+	for _, dir := range []string{firstDir, secondDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir filter dir: %v", err)
+		}
+	}
+	if err := conn.WriteJSON(protocol.SessionListRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_list"},
+		CWD:         firstDir,
+	}); err != nil {
+		t.Fatalf("write first session_list request: %v", err)
+	}
+	blockingStore.WaitListStarted(t)
+	callsAfterFirst := blockingStore.ListCallCount()
+
+	if err := conn.WriteJSON(protocol.SessionListRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_list"},
+		CWD:         secondDir,
+	}); err != nil {
+		t.Fatalf("write duplicate session_list request: %v", err)
+	}
+	errorEvent := readUntilType(t, conn, protocol.EventTypeError)
+	msg, _ := errorEvent["msg"].(string)
+	if !strings.Contains(msg, "session list is already running") {
+		t.Fatalf("expected busy session list error, got %#v", errorEvent)
+	}
+	if got := blockingStore.ListCallCount(); got != callsAfterFirst {
+		t.Fatalf("duplicate explicit session_list started another scan: before=%d after=%d", callsAfterFirst, got)
+	}
+
+	blockingStore.ReleaseList()
+	_ = readUntilType(t, conn, protocol.EventTypeSessionListResult)
+}
+
+func TestHandlerInternalSessionListRefreshCoalescesWhileInFlight(t *testing.T) {
+	fileStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	blockingStore := newBlockingSessionListStore(fileStore)
+	h := newTestHandler()
+	h.SessionStore = blockingStore
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+	blockingStore.WaitListStarted(t)
+	blockingStore.ReleaseList()
+	_ = readUntilType(t, conn, protocol.EventTypeSessionListResult)
+
+	blockingStore.ResetListBlock()
+	if err := conn.WriteJSON(protocol.SessionCreateRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_create"},
+		Title:       "coalesced-session-a",
+	}); err != nil {
+		t.Fatalf("write first session_create request: %v", err)
+	}
+	firstCreated := readUntilSessionCreated(t, conn)
+	firstSummary, _ := firstCreated["summary"].(map[string]any)
+	firstSessionID, _ := firstSummary["id"].(string)
+	if firstSessionID == "" {
+		t.Fatalf("expected first session id, got %#v", firstCreated)
+	}
+	blockingStore.WaitListStarted(t)
+	callsAfterFirst := blockingStore.ListCallCount()
+
+	if err := conn.WriteJSON(protocol.SessionCreateRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "session_create"},
+		Title:       "coalesced-session-b",
+	}); err != nil {
+		t.Fatalf("write second session_create request: %v", err)
+	}
+	secondCreated := readUntilSessionCreated(t, conn)
+	secondSummary, _ := secondCreated["summary"].(map[string]any)
+	secondSessionID, _ := secondSummary["id"].(string)
+	if secondSessionID == "" {
+		t.Fatalf("expected second session id, got %#v", secondCreated)
+	}
+	if got := blockingStore.ListCallCount(); got != callsAfterFirst {
+		t.Fatalf("internal coalesced refresh started before first scan completed: before=%d after=%d", callsAfterFirst, got)
+	}
+
+	blockingStore.ReleaseList()
+	blockingStore.WaitListCallCount(t, callsAfterFirst+1)
+	blockingStore.ReleaseList()
+	listEvent := readUntilType(t, conn, protocol.EventTypeSessionListResult)
+	items, ok := listEvent["items"].([]any)
+	if !ok {
+		t.Fatalf("expected session list items, got %#v", listEvent)
+	}
+	var foundFirst, foundSecond bool
+	for _, raw := range items {
+		item, _ := raw.(map[string]any)
+		switch item["id"] {
+		case firstSessionID:
+			foundFirst = true
+		case secondSessionID:
+			foundSecond = true
+		}
+	}
+	if !foundFirst || !foundSecond {
+		t.Fatalf("expected final coalesced list to include both sessions first=%v second=%v items=%#v", foundFirst, foundSecond, items)
 	}
 }
 
