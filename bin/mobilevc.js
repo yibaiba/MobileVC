@@ -223,10 +223,6 @@ function parseInvocation(args) {
   const command = hasExplicitCommand ? args[0] : 'start';
   const optionArgs = args.slice(hasExplicitCommand ? 1 : 0);
   const options = parseOptions(optionArgs);
-  if (command === 'public' && optionArgs[0] && !optionArgs[0].startsWith('-')) {
-    options.public = true;
-    options.relay = optionArgs[0];
-  }
   if (!hasExplicitCommand) {
     options.guided = true;
   }
