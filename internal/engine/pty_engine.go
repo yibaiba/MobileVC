@@ -2263,6 +2263,7 @@ type claudeCatalogAuthoringPayload struct {
 }
 
 func (r *PtyRunner) readClaudeStreamJSON(ctx context.Context, reader io.Reader, sessionID string, sink EventSink) {
+	thinkingSeq := 0
 	err := forEachLine(reader, func(rawLine []byte) error {
 		select {
 		case <-ctx.Done():
@@ -2393,9 +2394,15 @@ func (r *PtyRunner) readClaudeStreamJSON(ctx context.Context, reader io.Reader, 
 				switch block.Type {
 				case "thinking":
 					if text := strings.TrimSpace(block.Text); text != "" {
+						event := protocol.NewThinkingEvent(sessionID, text)
+						thinkingSeq++
 						sendEvent(sink, protocol.ApplyRuntimeMeta(
-							protocol.NewThinkingEvent(sessionID, text),
-							protocol.RuntimeMeta{ResumeSessionID: envelope.SessionID, Engine: r.pendingReq.Engine},
+							event,
+							protocol.RuntimeMeta{
+								ResumeSessionID: envelope.SessionID,
+								Engine:          r.pendingReq.Engine,
+								ContextID:       claudeThinkingContextID(envelope.SessionID, sessionID, thinkingSeq, i, event.Timestamp),
+							},
 						))
 					}
 				case "tool_use":
@@ -2525,6 +2532,17 @@ func (r *PtyRunner) readClaudeStreamJSON(ctx context.Context, reader io.Reader, 
 		return
 	}
 	logx.Info("pty", "claude stream reader finished cleanly: sessionID=%s", sessionID)
+}
+
+func claudeThinkingContextID(claudeSessionID, sessionID string, seq, blockIndex int, timestamp time.Time) string {
+	identity := strings.TrimSpace(claudeSessionID)
+	if identity == "" {
+		identity = strings.TrimSpace(sessionID)
+	}
+	if identity == "" {
+		identity = "unknown"
+	}
+	return fmt.Sprintf("claude-thinking:%s:%d:%d:%s", identity, seq, blockIndex, timestamp.UTC().Format(time.RFC3339Nano))
 }
 
 func shouldEmitClaudeReadyPrompt(envelope claudeStreamEnvelope) bool {

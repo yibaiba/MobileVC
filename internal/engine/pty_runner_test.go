@@ -795,6 +795,57 @@ func TestPtyRunnerSuppressesDuplicateResultAfterAssistantText(t *testing.T) {
 	}
 }
 
+func TestPtyRunnerClaudeThinkingEventsCarryStableContextID(t *testing.T) {
+	runner := NewPtyRunner()
+	runner.pendingReq = ExecRequest{RuntimeMeta: protocol.RuntimeMeta{Engine: "claude"}}
+	var events []any
+	sink := func(event any) { events = append(events, event) }
+
+	envelope, err := json.Marshal(map[string]any{
+		"type":       "assistant",
+		"session_id": "claude-session-1",
+		"message": map[string]any{
+			"content": []map[string]any{
+				{
+					"type": "thinking",
+					"text": "第一段思考",
+				},
+				{
+					"type": "thinking",
+					"text": "第二段思考",
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal assistant envelope: %v", err)
+	}
+
+	runner.readClaudeStreamJSON(context.Background(), strings.NewReader(string(envelope)+"\n"), "s-thinking", sink)
+
+	var thinking []protocol.ThinkingEvent
+	for _, event := range events {
+		if v, ok := event.(protocol.ThinkingEvent); ok {
+			thinking = append(thinking, v)
+		}
+	}
+	if len(thinking) != 2 {
+		t.Fatalf("expected two thinking events, got %#v", thinking)
+	}
+	firstID := strings.TrimSpace(thinking[0].ContextID)
+	secondID := strings.TrimSpace(thinking[1].ContextID)
+	if firstID == "" || secondID == "" {
+		t.Fatalf("expected context ids on thinking events: %#v", thinking)
+	}
+	if firstID == secondID {
+		t.Fatalf("expected distinct context ids, got %q", firstID)
+	}
+	if !strings.HasPrefix(firstID, "claude-thinking:claude-session-1:") ||
+		!strings.HasPrefix(secondID, "claude-thinking:claude-session-1:") {
+		t.Fatalf("unexpected context ids: %q %q", firstID, secondID)
+	}
+}
+
 func TestPtyRunnerEmitsReadyPromptAfterResult(t *testing.T) {
 	runner := NewPtyRunner()
 	var events []any

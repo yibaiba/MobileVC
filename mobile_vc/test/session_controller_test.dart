@@ -6310,6 +6310,49 @@ void main() {
       expect(thinkingItems.single.meta.contextId, contextId);
     });
 
+    test('同 timestamp 但不同 contextId 的 live thinking 会保留两条', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      service.emit(
+        ThinkingEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-thinking-live-contexts',
+          runtimeMeta: const RuntimeMeta(
+            engine: 'claude',
+            contextId: 'claude-thinking:session-1:1:0:2026-01-01T00:00:00Z',
+          ),
+          raw: const {'type': 'thinking'},
+          content: '第一段思考摘要',
+        ),
+      );
+      await _flushEvents();
+      service.emit(
+        ThinkingEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-thinking-live-contexts',
+          runtimeMeta: const RuntimeMeta(
+            engine: 'claude',
+            contextId: 'claude-thinking:session-1:2:1:2026-01-01T00:00:00Z',
+          ),
+          raw: const {'type': 'thinking'},
+          content: '第二段思考摘要',
+        ),
+      );
+      await _flushEvents();
+
+      final thinkingItems =
+          controller.timeline.where((item) => item.kind == 'thinking').toList();
+      expect(thinkingItems, hasLength(2));
+      expect(thinkingItems[0].body, '第一段思考摘要');
+      expect(thinkingItems[1].body, '第二段思考摘要');
+      expect(thinkingItems[0].id, isNot(thinkingItems[1].id));
+      expect(thinkingItems[0].id, startsWith('thinking-claude-thinking:'));
+      expect(thinkingItems[1].id, startsWith('thinking-claude-thinking:'));
+    });
+
     test('恢复历史 thinking 会使用 contextId 作为稳定 item id', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);
