@@ -1810,7 +1810,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 		}
 		executionID := strings.TrimSpace(item.ExecutionID)
 		if executionID == "" {
-			return data.TerminalExecution{}, "", fmt.Errorf("runtime process %d has no execution id; captured logs are unavailable", item.PID)
+			return data.TerminalExecution{}, "该进程没有可用的终端执行日志", nil
 		}
 		if h.SessionStore == nil {
 			return data.TerminalExecution{}, "", fmt.Errorf("session store unavailable")
@@ -1825,6 +1825,9 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 			IncludeOutput: true,
 		})
 		if err != nil {
+			if isSessionTerminalExecutionNotFoundError(err, executionID, sessionID) {
+				return data.TerminalExecution{}, "该进程没有可用的终端执行日志", nil
+			}
 			return data.TerminalExecution{}, "", err
 		}
 		execution := snapshot.TerminalExecution
@@ -5799,6 +5802,18 @@ func findRuntimeProcessItem(items []protocol.RuntimeProcessItem, pid int) (proto
 		}
 	}
 	return protocol.RuntimeProcessItem{}, false
+}
+
+func isSessionTerminalExecutionNotFoundError(err error, executionID, sessionID string) bool {
+	if err == nil {
+		return false
+	}
+	executionID = strings.TrimSpace(executionID)
+	sessionID = strings.TrimSpace(sessionID)
+	if executionID == "" || sessionID == "" {
+		return false
+	}
+	return strings.Contains(err.Error(), fmt.Sprintf("terminal execution %s not found for session %s", executionID, sessionID))
 }
 
 func upsertLocalSkill(sessionStore data.Store, ctx context.Context, item protocol.SkillDefinition) error {

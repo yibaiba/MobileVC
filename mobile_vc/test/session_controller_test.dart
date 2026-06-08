@@ -9287,6 +9287,69 @@ Flutter 打出来的 app-release.apk 在 mobile_vc/build/ 下，是 ignored 构�
       expect(service.sentPayloads.last['pid'], 202);
     });
 
+    test('runtime_process_log_result 不可用消息不会渲染为错误 timeline', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.sentPayloads.clear();
+
+      service.emit(
+        RuntimeProcessListResultEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-1',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'runtime_process_list_result'},
+          rootPid: 101,
+          items: const [
+            RuntimeProcessItem(
+              pid: 101,
+              ppid: 1,
+              state: 'Ss',
+              elapsed: '00:12',
+              command: 'codex exec',
+              cwd: '/workspace',
+              executionId: 'exec-missing',
+              source: 'codex',
+              root: true,
+              logAvailable: true,
+            ),
+          ],
+        ),
+      );
+      await _flushEvents();
+
+      expect(controller.runtimeProcessLogLoading, isTrue);
+      service.emit(
+        RuntimeProcessLogResultEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-1',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'runtime_process_log_result'},
+          pid: 101,
+          executionId: 'exec-missing',
+          command: 'codex exec',
+          cwd: '/workspace',
+          source: 'codex',
+          message: '该进程没有可用的终端执行日志',
+        ),
+      );
+      await _flushEvents();
+
+      expect(controller.runtimeProcessLogLoading, isFalse);
+      expect(controller.activeRuntimeProcessPid, 101);
+      expect(controller.activeRuntimeProcessStdout, isEmpty);
+      expect(controller.activeRuntimeProcessStderr, isEmpty);
+      expect(
+        controller.activeRuntimeProcessMessage,
+        '该进程没有可用的终端执行日志',
+      );
+      expect(
+          controller.timeline.where((item) => item.kind == 'error'), isEmpty);
+    });
+
     test('session_history 会清空旧的 runtime process 状态', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);

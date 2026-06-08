@@ -5676,7 +5676,7 @@ func TestHandlerRuntimeProcessListAndLogUseGeneratedExecutionIDForPty(t *testing
 	}
 }
 
-func TestHandlerRuntimeProcessLogWithoutExecutionIDFailsExplicitlyWithoutFullProjectionLoad(t *testing.T) {
+func TestHandlerRuntimeProcessLogWithoutExecutionIDReturnsUnavailableResultWithoutFullProjectionLoad(t *testing.T) {
 	execRunner := newHoldingStubRunner()
 	execRunner.processRef = engine.ProcessRef{
 		RootPID: os.Getpid(),
@@ -5715,15 +5715,90 @@ func TestHandlerRuntimeProcessLogWithoutExecutionIDFailsExplicitlyWithoutFullPro
 		t.Fatalf("write runtime_process_log_get request: %v", err)
 	}
 
-	errEvent := readUntilType(t, conn, protocol.EventTypeError)
-	if errEvent["code"] != "runtime_process_log_unavailable" {
-		t.Fatalf("expected runtime process log unavailable code, got %#v", errEvent)
+	logEvent := readUntilType(t, conn, protocol.EventTypeRuntimeProcessLog)
+	if got := int(logEvent["pid"].(float64)); got != os.Getpid() {
+		t.Fatalf("expected pid %d, got %#v", os.Getpid(), logEvent["pid"])
 	}
-	if msg := fmt.Sprint(errEvent["msg"], errEvent["message"]); !strings.Contains(msg, "execution id") {
-		t.Fatalf("expected execution id error, got %#v", errEvent)
+	if _, ok := logEvent["executionId"]; ok {
+		t.Fatalf("expected empty executionId to be omitted, got %#v", logEvent)
+	}
+	if logEvent["command"] != "legacy process" {
+		t.Fatalf("expected process command, got %#v", logEvent["command"])
+	}
+	if msg := fmt.Sprint(logEvent["msg"]); !strings.Contains(msg, "没有可用的终端执行日志") {
+		t.Fatalf("expected unavailable message, got %#v", logEvent)
 	}
 	if got := counting.getCallCount(); got != beforeGets {
 		t.Fatalf("runtime_process_log_get without execution id should not call GetSession, got %d before=%d", got, beforeGets)
+	}
+}
+
+func TestHandlerRuntimeProcessLogMissingExecutionReturnsUnavailableResultWithoutFullProjectionLoad(t *testing.T) {
+	execRunner := newHoldingStubRunner()
+	execRunner.processRef = engine.ProcessRef{
+		RootPID:     os.Getpid(),
+		ExecutionID: "exec-missing",
+		Command:     "codex exec",
+		CWD:         "/tmp/mobilevc",
+		Source:      "codex",
+	}
+
+	h := newTestHandler()
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	counting := &countingStore{inner: tempStore}
+	h.SessionStore = counting
+	h.NewExecRunner = func() engine.Runner { return execRunner }
+
+	conn := newTestConn(t, h)
+	_, _ = readInitialEvents(t, conn)
+	sessionID := createHistorySessionForHandlerTest(t, h, conn, "runtime-process-log-missing-exec")
+
+	if _, err := tempStore.SaveProjection(context.Background(), sessionID, session.NormalizeProjectionSnapshot(data.ProjectionSnapshot{})); err != nil {
+		t.Fatalf("save empty projection: %v", err)
+	}
+
+	if err := conn.WriteJSON(protocol.ExecRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "exec"},
+		Command:     "printf 'keep running'",
+	}); err != nil {
+		t.Fatalf("write exec request: %v", err)
+	}
+
+	requireAgentState(t, readUntilType(t, conn, protocol.EventTypeAgentState), "THINKING", false)
+	execRunner.WaitStarted(t)
+	beforeGets := counting.getCallCount()
+
+	if err := conn.WriteJSON(protocol.RuntimeProcessLogRequestEvent{
+		ClientEvent: protocol.ClientEvent{Action: "runtime_process_log_get"},
+		PID:         os.Getpid(),
+	}); err != nil {
+		t.Fatalf("write runtime_process_log_get request: %v", err)
+	}
+
+	logEvent := readUntilType(t, conn, protocol.EventTypeRuntimeProcessLog)
+	if got := int(logEvent["pid"].(float64)); got != os.Getpid() {
+		t.Fatalf("expected pid %d, got %#v", os.Getpid(), logEvent["pid"])
+	}
+	if logEvent["executionId"] != "exec-missing" {
+		t.Fatalf("expected executionId exec-missing, got %#v", logEvent["executionId"])
+	}
+	if logEvent["command"] != "codex exec" {
+		t.Fatalf("expected command fallback, got %#v", logEvent["command"])
+	}
+	if logEvent["cwd"] != "/tmp/mobilevc" {
+		t.Fatalf("expected cwd fallback, got %#v", logEvent["cwd"])
+	}
+	if logEvent["source"] != "codex" {
+		t.Fatalf("expected source codex, got %#v", logEvent["source"])
+	}
+	if msg := fmt.Sprint(logEvent["msg"]); !strings.Contains(msg, "没有可用的终端执行日志") {
+		t.Fatalf("expected unavailable message, got %#v", logEvent)
+	}
+	if got := counting.getCallCount(); got != beforeGets {
+		t.Fatalf("runtime_process_log_get with missing execution should not call GetSession, got %d before=%d", got, beforeGets)
 	}
 }
 

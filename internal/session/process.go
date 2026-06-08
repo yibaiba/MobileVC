@@ -58,10 +58,13 @@ func snapshotProcessTree(ctx context.Context, ref engine.ProcessRef) ([]protocol
 		return []protocol.RuntimeProcessItem{}, nil
 	}
 	root.Root = true
+	if command := strings.TrimSpace(ref.Command); command != "" {
+		root.Command = command
+	}
 	root.ExecutionID = strings.TrimSpace(ref.ExecutionID)
 	root.CWD = strings.TrimSpace(ref.CWD)
 	root.Source = strings.TrimSpace(ref.Source)
-	root.LogAvailable = true
+	root.LogAvailable = root.ExecutionID != ""
 	all[ref.RootPID] = root
 
 	visited := map[int]struct{}{}
