@@ -514,10 +514,7 @@ class SessionController extends ChangeNotifier {
   AppConfig get config => _config;
   SessionConnectionStage get connectionStage => _connectionStage;
   String get configuredAiEngine => _resolvedConfiguredAiEngine(_config.engine);
-  String get currentAiEngine => _resolvedAiEngine(
-        command: currentMeta.command,
-        engine: currentMeta.engine,
-      );
+  String get currentAiEngine => _currentSessionAiEngine(currentMeta);
   String get displayAiEngine => currentAiEngine;
   String get selectedAiModel => _resolvedAiModel(
         currentAiEngine,
@@ -1384,32 +1381,29 @@ class SessionController extends ChangeNotifier {
     if (summary == null) {
       return false;
     }
+    final nativeSource = sessionNativeSource(summary);
+    if (nativeSource == 'codex-native') {
+      return true;
+    }
+    if (nativeSource == 'claude-native') {
+      return false;
+    }
     if (_runtimeMetaIsCodex(summary.runtime)) {
       return true;
     }
-    final sessionId = summary.id.trim().toLowerCase();
-    if (sessionId.startsWith('codex-thread:')) {
-      return true;
-    }
-    final source = summary.source.trim().toLowerCase();
-    final ownership = summary.ownership.trim().toLowerCase();
-    final runtimeSource = summary.runtime.source.trim().toLowerCase();
-    return source == 'codex-native' ||
-        ownership == 'codex-native' ||
-        runtimeSource == 'codex-native';
+    return false;
   }
 
   bool _sessionSummaryIsClaude(SessionSummary summary) {
-    final engine = summary.runtime.engine.trim().toLowerCase();
-    if (engine == 'claude') {
+    final nativeSource = sessionNativeSource(summary);
+    if (nativeSource == 'claude-native') {
       return true;
     }
-    final source = summary.source.trim().toLowerCase();
-    final ownership = summary.ownership.trim().toLowerCase();
-    final runtimeSource = summary.runtime.source.trim().toLowerCase();
-    if (source == 'claude-native' ||
-        ownership == 'claude-native' ||
-        runtimeSource == 'claude-native') {
+    if (nativeSource == 'codex-native') {
+      return false;
+    }
+    final engine = summary.runtime.engine.trim().toLowerCase();
+    if (engine == 'claude') {
       return true;
     }
     final command = summary.runtime.command.trim().toLowerCase();
@@ -1421,20 +1415,7 @@ class SessionController extends ChangeNotifier {
   }
 
   bool _sessionSummaryIsNative(SessionSummary summary) {
-    if (summary.external) {
-      return true;
-    }
-    final source = summary.source.trim().toLowerCase();
-    final ownership = summary.ownership.trim().toLowerCase();
-    final runtimeSource = summary.runtime.source.trim().toLowerCase();
-    return source == 'codex-native' ||
-        source == 'claude-native' ||
-        ownership == 'codex-native' ||
-        ownership == 'claude-native' ||
-        runtimeSource == 'codex-native' ||
-        runtimeSource == 'claude-native' ||
-        summary.id.trim().toLowerCase().startsWith('codex-thread:') ||
-        summary.id.trim().toLowerCase().startsWith('claude-session:');
+    return sessionNativeSource(summary).isNotEmpty;
   }
 
   Set<String> _sessionDeleteTombstoneIds(SessionSummary summary) {
@@ -1523,6 +1504,11 @@ class SessionController extends ChangeNotifier {
 
   bool get inClaudeMode {
     if (_isLoadingSession) {
+      return false;
+    }
+    final selectedSummary = _selectedSessionSummary;
+    if (selectedSummary != null &&
+        sessionNativeSource(selectedSummary) == 'codex-native') {
       return false;
     }
     const claudeStates = <String>{
@@ -2486,6 +2472,22 @@ class SessionController extends ChangeNotifier {
     final summary = _findSessionSummary(_sessions, normalizedSessionId);
     return normalizedSessionId.toLowerCase().startsWith('codex-thread:') ||
         _sessionSummaryIsCodex(summary);
+  }
+
+  String _currentSessionAiEngine(RuntimeMeta meta) {
+    final summary = _selectedSessionSummary;
+    if (summary != null) {
+      switch (sessionNativeSource(summary)) {
+        case 'codex-native':
+          return 'codex';
+        case 'claude-native':
+          return 'claude';
+      }
+    }
+    return _resolvedAiEngine(
+      command: meta.command,
+      engine: meta.engine,
+    );
   }
 
   void _applyCodexSandboxModeIfNeeded(Map<String, dynamic> payload) {
@@ -4833,14 +4835,12 @@ class SessionController extends ChangeNotifier {
     if (value.isEmpty && imageAttachments.isEmpty) {
       return;
     }
-    final continuationEngine = _resolvedAiEngine(
-      command: (meta ?? currentMeta).command,
-      engine: (meta ?? currentMeta).engine,
-    );
+    final resolvedMeta = meta ?? currentMeta;
+    final continuationEngine = _currentSessionAiEngine(resolvedMeta);
     _beginUserSubmission();
     final payload = _aiTurnPayload(
       engine: continuationEngine,
-      meta: meta ?? currentMeta,
+      meta: resolvedMeta,
       permissionMode: _config.permissionMode,
       data: '$value\n',
       imageAttachments: imageAttachments,
@@ -8304,8 +8304,8 @@ class SessionController extends ChangeNotifier {
     if (_timeline.any(_hasVisibleTimelineContent)) {
       return;
     }
-    final isExternal = summary.source == 'codex-native' ||
-        summary.external ||
+    final nativeSource = sessionNativeSource(summary);
+    final isExternal = nativeSource.isNotEmpty ||
         history.resumeRuntimeMeta.engine.trim().toLowerCase() == 'codex' ||
         history.resumeRuntimeMeta.engine.trim().toLowerCase() == 'claude';
     if (!isExternal) {
@@ -8322,10 +8322,7 @@ class SessionController extends ChangeNotifier {
     _appendTimelineItem(
       TimelineItem(
         id: 'history-fallback-${summary.id}',
-        kind: hasExplicitPreview &&
-                (summary.source == 'codex-native' || summary.external)
-            ? 'user'
-            : 'system',
+        kind: hasExplicitPreview && nativeSource.isNotEmpty ? 'user' : 'system',
         timestamp: summary.updatedAt ?? summary.createdAt ?? DateTime.now(),
         body: fallbackMessage,
         meta: history.resumeRuntimeMeta,
@@ -8385,22 +8382,7 @@ class SessionController extends ChangeNotifier {
   }
 
   bool _isExternalNativeSession(SessionSummary summary) {
-    final ownership = summary.ownership.trim().toLowerCase();
-    // Authoritative ownership field set by backend at session creation.
-    if (ownership == 'mobilevc') {
-      return false;
-    }
-    if (ownership == 'claude-native' || ownership == 'codex-native') {
-      return true;
-    }
-    // Fallback for legacy sessions without ownership field.
-    final source = summary.source.trim().toLowerCase();
-    final runtimeSource = summary.runtime.source.trim().toLowerCase();
-    return summary.external ||
-        source == 'codex-native' ||
-        source == 'claude-native' ||
-        runtimeSource == 'codex-native' ||
-        runtimeSource == 'claude-native';
+    return sessionNativeSource(summary).isNotEmpty;
   }
 
   SessionSummary _resolvedHistorySummary(

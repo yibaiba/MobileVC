@@ -2737,21 +2737,21 @@ func normalizeLogEntryText(text string) string {
 func normalizeSessionRecord(record SessionRecord) SessionRecord {
 	record.Projection = normalizeProjection(record.Projection)
 	record.ClientActions = normalizeClientActionRecords(record.ClientActions, time.Time{}, 0, 0)
-	runtimeSource := strings.ToLower(strings.TrimSpace(firstNonEmptyString(
-		record.Projection.Runtime.Source,
-		record.Summary.Runtime.Source,
-		record.Summary.Source,
-	)))
+	nativeSource := inferNativeSource(record)
 	defaultSource := "mobilevc"
-	if record.Summary.External || runtimeSource == "codex-native" {
+	if nativeSource != "" {
 		record.Summary.External = true
-		defaultSource = "codex-native"
+		defaultSource = nativeSource
 	}
 	if record.Summary.Ownership == "" {
-		if record.Summary.External {
-			record.Summary.Ownership = "claude-native"
-		} else {
+		if nativeSource != "" {
+			record.Summary.Ownership = nativeSource
+		} else if !record.Summary.External {
 			record.Summary.Ownership = "mobilevc"
+		}
+	} else if nativeSource != "" && nativeSourceFromValue(record.Summary.Ownership) == "" {
+		if strings.EqualFold(strings.TrimSpace(record.Summary.Ownership), "claude-native") {
+			record.Summary.Ownership = nativeSource
 		}
 	}
 	record.Projection.Runtime = mergeSessionRuntime(record.Summary.Runtime, record.Projection.Runtime)
@@ -2781,21 +2781,21 @@ func normalizeSessionRecordLightweight(record SessionRecord) SessionRecord {
 	record.Projection = normalizeProjection(record.Projection)
 	record.Projection.LogEntries = nil
 	record.ClientActions = normalizeClientActionRecords(record.ClientActions, time.Time{}, 0, 0)
-	runtimeSource := strings.ToLower(strings.TrimSpace(firstNonEmptyString(
-		record.Projection.Runtime.Source,
-		record.Summary.Runtime.Source,
-		record.Summary.Source,
-	)))
+	nativeSource := inferNativeSource(record)
 	defaultSource := "mobilevc"
-	if record.Summary.External || runtimeSource == "codex-native" {
+	if nativeSource != "" {
 		record.Summary.External = true
-		defaultSource = "codex-native"
+		defaultSource = nativeSource
 	}
 	if record.Summary.Ownership == "" {
-		if record.Summary.External {
-			record.Summary.Ownership = "claude-native"
-		} else {
+		if nativeSource != "" {
+			record.Summary.Ownership = nativeSource
+		} else if !record.Summary.External {
 			record.Summary.Ownership = "mobilevc"
+		}
+	} else if nativeSource != "" && nativeSourceFromValue(record.Summary.Ownership) == "" {
+		if strings.EqualFold(strings.TrimSpace(record.Summary.Ownership), "claude-native") {
+			record.Summary.Ownership = nativeSource
 		}
 	}
 	record.Projection.Runtime = mergeSessionRuntime(record.Summary.Runtime, record.Projection.Runtime)
@@ -2816,6 +2816,70 @@ func normalizeSessionRecordLightweight(record SessionRecord) SessionRecord {
 		record.Summary.ExecutionActive = true
 	}
 	return record
+}
+
+func inferNativeSource(record SessionRecord) string {
+	if isMobileVCOwnedSummary(record.Summary) {
+		return ""
+	}
+	if source := nativeSourceFromValue(record.Summary.Source); source != "" {
+		return source
+	}
+	if source := nativeSourceFromValue(record.Summary.Runtime.Source); source != "" {
+		return source
+	}
+	if source := nativeSourceFromValue(record.Projection.Runtime.Source); source != "" {
+		return source
+	}
+	if source := nativeSourceFromValue(record.Projection.Controller.ActiveMeta.Source); source != "" {
+		return source
+	}
+	if source := nativeSourceFromValue(record.Summary.Ownership); source != "" {
+		return source
+	}
+
+	sessionID := strings.TrimSpace(record.Summary.ID)
+	if strings.HasPrefix(sessionID, "codex-thread:") {
+		return "codex-native"
+	}
+	if strings.HasPrefix(sessionID, "claude-session:") {
+		return "claude-native"
+	}
+
+	if !record.Summary.External {
+		return ""
+	}
+	runtime := mergeSessionRuntime(record.Summary.Runtime, record.Projection.Runtime)
+	engine := strings.ToLower(strings.TrimSpace(runtime.Engine))
+	command := strings.ToLower(strings.TrimSpace(firstNonEmptyString(
+		runtime.Command,
+		record.Projection.Controller.CurrentCommand,
+		record.Projection.Controller.ActiveMeta.Command,
+	)))
+	if engine == "codex" || command == "codex" || strings.HasPrefix(command, "codex ") {
+		return "codex-native"
+	}
+	if engine == "claude" || command == "claude" || strings.HasPrefix(command, "claude ") {
+		return "claude-native"
+	}
+	return ""
+}
+
+func nativeSourceFromValue(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "codex-native":
+		return "codex-native"
+	case "claude-native":
+		return "claude-native"
+	default:
+		return ""
+	}
+}
+
+func isMobileVCOwnedSummary(summary SessionSummary) bool {
+	return strings.EqualFold(strings.TrimSpace(summary.Ownership), "mobilevc") ||
+		strings.EqualFold(strings.TrimSpace(summary.Source), "mobilevc") ||
+		strings.EqualFold(strings.TrimSpace(summary.Runtime.Source), "mobilevc")
 }
 
 func normalizeClientActionRecords(items []ClientActionRecord, now time.Time, ttl time.Duration, limit int) []ClientActionRecord {

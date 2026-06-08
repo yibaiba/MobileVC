@@ -92,10 +92,11 @@ String sessionSourceLabel(SessionSummary item) {
 }
 
 String sessionNativeSourceLabel(SessionSummary item) {
-  if (_isClaudeNativeSession(item)) {
+  final source = sessionNativeSource(item);
+  if (source == 'claude-native') {
     return '电脑 Claude';
   }
-  if (_isCodexNativeSession(item)) {
+  if (source == 'codex-native') {
     return '电脑 Codex';
   }
   return '';
@@ -191,30 +192,50 @@ bool looksLikeSessionBootstrapCommand(String text) {
       lower.contains(' --dangerously-skip-permissions');
 }
 
-bool _isClaudeNativeSession(SessionSummary item) {
+String sessionNativeSource(SessionSummary item) {
+  if (sessionIsMobileVcOwned(item)) {
+    return '';
+  }
   final source = item.source.trim().toLowerCase();
-  final runtimeSource = item.runtime.source.trim().toLowerCase();
-  final ownership = item.ownership.trim().toLowerCase();
+  if (source == 'codex-native' || source == 'claude-native') {
+    return source;
+  }
   final id = item.id.trim().toLowerCase();
-  return source == 'claude-native' ||
-      runtimeSource == 'claude-native' ||
-      ownership == 'claude-native' ||
-      (!_isMobileVcOwnedSession(item) && id.startsWith('claude-session:'));
+  if (id.startsWith('codex-thread:')) {
+    return 'codex-native';
+  }
+  if (id.startsWith('claude-session:')) {
+    return 'claude-native';
+  }
+  final engine = item.runtime.engine.trim().toLowerCase();
+  final command = item.runtime.command.trim().toLowerCase();
+  if (item.external &&
+      (engine == 'codex' ||
+          command == 'codex' ||
+          command.startsWith('codex '))) {
+    return 'codex-native';
+  }
+  if (item.external &&
+      (engine == 'claude' ||
+          command == 'claude' ||
+          command.startsWith('claude '))) {
+    return 'claude-native';
+  }
+  final runtimeSource = item.runtime.source.trim().toLowerCase();
+  if (runtimeSource == 'codex-native' || runtimeSource == 'claude-native') {
+    return runtimeSource;
+  }
+  final ownership = item.ownership.trim().toLowerCase();
+  if (ownership == 'codex-native' || ownership == 'claude-native') {
+    return ownership;
+  }
+  if (item.external) {
+    return 'codex-native';
+  }
+  return '';
 }
 
-bool _isCodexNativeSession(SessionSummary item) {
-  final source = item.source.trim().toLowerCase();
-  final runtimeSource = item.runtime.source.trim().toLowerCase();
-  final ownership = item.ownership.trim().toLowerCase();
-  final id = item.id.trim().toLowerCase();
-  return source == 'codex-native' ||
-      runtimeSource == 'codex-native' ||
-      ownership == 'codex-native' ||
-      (item.external && !_isMobileVcOwnedSession(item)) ||
-      (!_isMobileVcOwnedSession(item) && id.startsWith('codex-thread:'));
-}
-
-bool _isMobileVcOwnedSession(SessionSummary item) {
+bool sessionIsMobileVcOwned(SessionSummary item) {
   final source = item.source.trim().toLowerCase();
   final runtimeSource = item.runtime.source.trim().toLowerCase();
   final ownership = item.ownership.trim().toLowerCase();

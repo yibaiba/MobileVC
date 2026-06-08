@@ -7503,7 +7503,7 @@ func mergeSessionSummaries(ctx context.Context, sessionStore data.Store, items [
 		}
 		if metaStore, ok := sessionStore.(data.SessionRuntimeMetaStore); ok {
 			if stored, getErr := metaStore.GetSessionRuntimeMetadata(ctx, record.Summary.ID); getErr == nil {
-				record = stored.Record
+				record = mergeNativeMirrorRecord(record, stored.Record, "codex-native")
 			}
 		}
 		merged = append(merged, record.Summary)
@@ -7522,7 +7522,7 @@ func mergeSessionSummaries(ctx context.Context, sessionStore data.Store, items [
 		}
 		if metaStore, ok := sessionStore.(data.SessionRuntimeMetaStore); ok {
 			if stored, getErr := metaStore.GetSessionRuntimeMetadata(ctx, record.Summary.ID); getErr == nil {
-				record = stored.Record
+				record = mergeNativeMirrorRecord(record, stored.Record, "claude-native")
 			}
 		}
 		merged = append(merged, record.Summary)
@@ -7675,11 +7675,9 @@ func mergeNativeMirrorRecord(fresh data.SessionRecord, existing data.SessionReco
 	if fresh.Summary.Runtime.Source == "" {
 		fresh.Summary.Runtime.Source = source
 	}
-	fresh.Summary.Source = firstNonEmptyString(fresh.Summary.Source, existing.Summary.Source, source)
+	fresh.Summary.Source = source
 	fresh.Summary.External = true
-	if fresh.Summary.Ownership == "" {
-		fresh.Summary.Ownership = source
-	}
+	fresh.Summary.Ownership = source
 	fresh.ClientActions = existing.ClientActions
 	return fresh
 }

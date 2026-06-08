@@ -547,16 +547,14 @@ bool _matchesFilter(SessionSummary item, _SessionProviderFilter filter) {
 }
 
 _SessionProviderFilter? _sessionEngine(SessionSummary item) {
-  final source = item.source.trim().toLowerCase();
-  final runtimeSource = item.runtime.source.trim().toLowerCase();
+  switch (sessionNativeSource(item)) {
+    case 'codex-native':
+      return _SessionProviderFilter.codex;
+    case 'claude-native':
+      return _SessionProviderFilter.claude;
+  }
   final engine = item.runtime.engine.trim().toLowerCase();
   final command = item.runtime.command.trim().toLowerCase();
-  if (source == 'codex-native' || runtimeSource == 'codex-native') {
-    return _SessionProviderFilter.codex;
-  }
-  if (source == 'claude-native' || runtimeSource == 'claude-native') {
-    return _SessionProviderFilter.claude;
-  }
   if (engine == 'codex' || command == 'codex' || command.startsWith('codex ')) {
     return _SessionProviderFilter.codex;
   }
@@ -596,26 +594,13 @@ String _projectLabel(String path) {
 }
 
 bool _canDeleteSession(SessionSummary item) {
-  final source = item.source.trim().toLowerCase();
-  final runtimeSource = item.runtime.source.trim().toLowerCase();
-  if (source == 'codex-native' ||
-      source == 'claude-native' ||
-      runtimeSource == 'codex-native' ||
-      runtimeSource == 'claude-native') {
-    return false;
-  }
-  final ownership = item.ownership.trim().toLowerCase();
-  if (ownership == 'codex-native' || ownership == 'claude-native') {
-    return false;
-  }
-  if (ownership == 'mobilevc') {
+  if (sessionIsMobileVcOwned(item)) {
     return true;
   }
-  return !item.external &&
-      source != 'codex-native' &&
-      source != 'claude-native' &&
-      runtimeSource != 'codex-native' &&
-      runtimeSource != 'claude-native';
+  if (sessionNativeSource(item).isNotEmpty) {
+    return false;
+  }
+  return !item.external;
 }
 
 void _showDeleteUnavailable(BuildContext context, SessionSummary item) {

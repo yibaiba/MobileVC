@@ -9765,6 +9765,80 @@ func TestMergeSessionSummariesEmptyCWDIncludesNativeProjects(t *testing.T) {
 	}
 }
 
+func TestMergeSessionSummariesCodexNativeScanOverridesStaleClaudeSidecar(t *testing.T) {
+	homeDir := t.TempDir()
+	projectDir := filepath.Join(homeDir, "workspace", "MobileVC")
+	if err := os.MkdirAll(projectDir, 0o755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
+	}
+	t.Setenv("HOME", homeDir)
+	threadID := seedNativeCodexSessionFixture(t, homeDir, projectDir)
+	sessionID := "codex-thread:" + threadID
+
+	tempStore, err := data.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new temp store: %v", err)
+	}
+	if _, err := tempStore.UpsertSession(context.Background(), data.SessionRecord{
+		Summary: data.SessionSummary{
+			ID:        sessionID,
+			Title:     "Stale mirror",
+			CreatedAt: time.Date(2026, 3, 30, 10, 0, 0, 0, time.UTC),
+			UpdatedAt: time.Date(2026, 3, 30, 10, 0, 0, 0, time.UTC),
+			Runtime: data.SessionRuntime{
+				ResumeSessionID: threadID,
+				Command:         "claude",
+				Engine:          "claude",
+				CWD:             projectDir,
+				Source:          "claude-native",
+			},
+			Source:    "claude-native",
+			External:  true,
+			Ownership: "claude-native",
+		},
+		Projection: data.ProjectionSnapshot{
+			Runtime: data.SessionRuntime{
+				ResumeSessionID: threadID,
+				Command:         "claude",
+				Engine:          "claude",
+				CWD:             projectDir,
+				Source:          "claude-native",
+			},
+			Controller: session.ControllerSnapshot{
+				SessionID:      sessionID,
+				CurrentCommand: "claude",
+				ResumeSession:  threadID,
+				ActiveMeta: protocol.RuntimeMeta{
+					ResumeSessionID: threadID,
+					Command:         "claude",
+					Engine:          "claude",
+					CWD:             projectDir,
+					Source:          "claude-native",
+				},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("upsert stale sidecar session: %v", err)
+	}
+
+	merged, err := mergeSessionSummaries(context.Background(), tempStore, nil, projectDir)
+	if err != nil {
+		t.Fatalf("merge session summaries: %v", err)
+	}
+	if len(merged) != 1 {
+		t.Fatalf("expected one merged native session, got %#v", merged)
+	}
+	item := merged[0]
+	if item.ID != sessionID ||
+		item.Source != "codex-native" ||
+		item.Ownership != "codex-native" ||
+		item.Runtime.Source != "codex-native" ||
+		item.Runtime.Engine != "codex" ||
+		!strings.HasPrefix(item.Runtime.Command, "codex") {
+		t.Fatalf("expected fresh codex native metadata to win, got %#v", item)
+	}
+}
+
 func TestMergeSessionSummariesSkipsNativeClaudeAfterMobileVCDelete(t *testing.T) {
 	homeDir := t.TempDir()
 	projectDir := filepath.Join(homeDir, "workspace", "MobileVC")

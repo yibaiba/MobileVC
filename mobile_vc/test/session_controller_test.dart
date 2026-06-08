@@ -8156,6 +8156,71 @@ void main() {
       expect(controller.sessions.single.title, '这里有问题不能删除mobilevc喃');
     });
 
+    test('Codex mirror id 恢复时优先于旧 Claude runtime source', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.saveConfig(const AppConfig(
+        engine: 'claude',
+        permissionMode: 'bypassPermissions',
+        codexSandboxMode: 'danger-full-access',
+      ));
+      await controller.connect();
+      service.emit(
+        SessionHistoryEvent(
+          timestamp: _timestamp,
+          sessionId: 'codex-thread:stale-runtime',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_history'},
+          summary: const SessionSummary(
+            id: 'codex-thread:stale-runtime',
+            title: '修复会话来源',
+            external: true,
+            runtime: RuntimeMeta(
+              source: 'claude-native',
+              engine: 'claude',
+              command: 'claude --resume stale-runtime',
+            ),
+          ),
+          runtimeAlive: true,
+          resumeRuntimeMeta: const RuntimeMeta(
+            source: 'claude-native',
+            engine: 'claude',
+            command: 'claude --resume stale-runtime',
+            resumeSessionId: 'stale-runtime',
+            claudeLifecycle: 'waiting_input',
+          ),
+        ),
+      );
+      await _flushEvents();
+
+      expect(controller.selectedSessionTitle, '电脑 Codex');
+      expect(controller.shouldShowClaudeMode, isFalse);
+      expect(controller.isSessionReadOnly, isTrue);
+
+      service.sentPayloads.clear();
+      controller.continueSameSessionFromPhone();
+
+      final resumes = service.sentPayloads
+          .where((payload) => payload['action'] == 'session_resume')
+          .toList();
+      expect(resumes, hasLength(1));
+      expect(resumes.single['engine'], 'codex');
+      expect(resumes.single['codexSandboxMode'], 'danger-full-access');
+      expect(resumes.single['permissionMode'], 'bypassPermissions');
+
+      service.sentPayloads.clear();
+      controller.sendInputText('继续处理');
+
+      final turns = service.sentPayloads
+          .where((payload) => payload['action'] == 'ai_turn')
+          .toList();
+      expect(turns, hasLength(1));
+      expect(turns.single['engine'], 'codex');
+    });
+
     test('外部 Codex 会话只有空白历史项时仍会补可见预览', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);

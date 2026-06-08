@@ -2068,6 +2068,58 @@ func TestFileStoreMemoryCatalogUpsertReadBackIncludesNewItem(t *testing.T) {
 	}
 }
 
+func TestFileStoreNormalizesExternalCodexOwnershipFromRuntime(t *testing.T) {
+	record := normalizeSessionRecord(SessionRecord{
+		Summary: SessionSummary{
+			ID:        "codex-thread:thread-ownership",
+			Title:     "Codex 会话",
+			CreatedAt: mustTime("2026-04-04T02:00:00Z"),
+			UpdatedAt: mustTime("2026-04-04T02:00:00Z"),
+			External:  true,
+			Runtime: SessionRuntime{
+				ResumeSessionID: "thread-ownership",
+				Command:         "codex",
+				Engine:          "codex",
+				CWD:             "/tmp/project",
+				Source:          "codex-native",
+			},
+		},
+		Projection: ProjectionSnapshot{
+			Runtime: SessionRuntime{
+				ResumeSessionID: "thread-ownership",
+				Command:         "codex",
+				Engine:          "codex",
+				CWD:             "/tmp/project",
+				Source:          "codex-native",
+			},
+		},
+	})
+
+	if record.Summary.Source != "codex-native" ||
+		record.Summary.Runtime.Source != "codex-native" ||
+		record.Summary.Ownership != "codex-native" {
+		t.Fatalf("expected codex-native ownership/source, got %#v", record.Summary)
+	}
+}
+
+func TestFileStoreDoesNotInferClaudeOwnershipForUnknownExternalSession(t *testing.T) {
+	record := normalizeSessionRecord(SessionRecord{
+		Summary: SessionSummary{
+			ID:        "external-session",
+			Title:     "External session",
+			CreatedAt: mustTime("2026-04-04T02:00:00Z"),
+			UpdatedAt: mustTime("2026-04-04T02:00:00Z"),
+			External:  true,
+		},
+	})
+
+	if record.Summary.Ownership == "claude-native" ||
+		record.Summary.Source == "claude-native" ||
+		record.Summary.Runtime.Source == "claude-native" {
+		t.Fatalf("unknown external session must not default to claude-native: %#v", record.Summary)
+	}
+}
+
 func TestFileStoreMemoryCatalogNormalizationDefaultsDomainAndSyncState(t *testing.T) {
 	fs, err := NewFileStore(t.TempDir())
 	if err != nil {

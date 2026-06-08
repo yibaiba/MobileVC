@@ -49,7 +49,7 @@ void main() {
                 id: 'claude-thread:1',
                 title: 'Desktop Claude',
                 source: 'claude-native',
-                ownership: 'mobilevc',
+                ownership: 'claude-native',
                 runtime: RuntimeMeta(source: 'claude-native'),
               ),
             ],
@@ -134,6 +134,78 @@ void main() {
 
     expect(deletedSessionId, 'session-1');
     expect(find.byType(SnackBar), findsNothing);
+  });
+
+  testWidgets('MobileVC ownership 优先于旧 native runtime source，仍可删除',
+      (tester) async {
+    String deletedSessionId = '';
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SessionListSheet(
+            sessions: const [
+              SessionSummary(
+                id: 'session-stale-runtime',
+                title: 'MobileVC stale runtime',
+                source: 'mobilevc',
+                ownership: 'mobilevc',
+                runtime: RuntimeMeta(source: 'claude-native', engine: 'codex'),
+              ),
+            ],
+            selectedSessionId: '',
+            cwd: '/workspace',
+            onCreate: () {},
+            onLoad: (_) {},
+            onDelete: (id) => deletedSessionId = id,
+          ),
+        ),
+      ),
+    );
+
+    expect(find.text('MobileVC stale runtime'), findsOneWidget);
+    expect(find.text('电脑 Claude'), findsNothing);
+
+    await tester.tap(find.byTooltip('删除此会话'));
+    await tester.pump();
+
+    expect(deletedSessionId, 'session-stale-runtime');
+    expect(find.byType(SnackBar), findsNothing);
+  });
+
+  testWidgets('Codex mirror id 优先于旧 claude runtime source', (tester) async {
+    String deletedSessionId = '';
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SessionListSheet(
+            sessions: const [
+              SessionSummary(
+                id: 'codex-thread:stale-runtime',
+                title: '修复会话来源',
+                external: true,
+                runtime: RuntimeMeta(source: 'claude-native', engine: 'claude'),
+              ),
+            ],
+            selectedSessionId: '',
+            cwd: '/workspace',
+            onCreate: () {},
+            onLoad: (_) {},
+            onDelete: (id) => deletedSessionId = id,
+          ),
+        ),
+      ),
+    );
+
+    expect(find.text('电脑 Codex'), findsOneWidget);
+    expect(find.text('修复会话来源'), findsOneWidget);
+    expect(find.text('电脑 Claude'), findsNothing);
+
+    await tester.tap(find.byTooltip('不能删除电脑端原生会话'));
+    await tester.pump();
+
+    expect(deletedSessionId, isEmpty);
   });
 
   testWidgets('MobileVC 项目标题不是删除入口，只有会话卡片可删除', (tester) async {
