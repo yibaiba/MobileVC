@@ -618,6 +618,146 @@ void main() {
     );
   });
 
+  testWidgets('thinking 后面已有助手结果时默认折叠', (tester) async {
+    const detail = 'DETAIL_SEGMENT_TIMELINE_COLLAPSED';
+    const thinkingBody = '模型正在分析上下文，这段完整思考摘要应该在结果出现后默认收起，只留下单行预览。'
+        '\n\n$detail';
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SizedBox(
+            height: 420,
+            child: ChatTimeline(
+              sessionId: 'thinking-collapse-session',
+              items: [
+                TimelineItem(
+                  id: 'thinking-1',
+                  kind: 'thinking',
+                  timestamp: DateTime(2026, 1, 1),
+                  body: thinkingBody,
+                ),
+                TimelineItem(
+                  id: 'result-1',
+                  kind: 'markdown',
+                  timestamp: DateTime(2026, 1, 1, 0, 0, 1),
+                  body: '最终结果已经生成。',
+                  animateBody: false,
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+
+    expect(find.textContaining(detail), findsNothing);
+    expect(find.byIcon(Icons.expand_more_rounded), findsOneWidget);
+    expect(find.text('最终结果已经生成。'), findsOneWidget);
+  });
+
+  testWidgets('最新 thinking 没有后续助手结果时保持展开', (tester) async {
+    const thinkingBody = '模型仍在思考中，最新思考摘要应该保持展开方便查看实时进度。';
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SizedBox(
+            height: 420,
+            child: ChatTimeline(
+              sessionId: 'thinking-expanded-session',
+              items: [
+                TimelineItem(
+                  id: 'previous-result',
+                  kind: 'markdown',
+                  timestamp: DateTime(2026, 1, 1),
+                  body: '上一轮结果。',
+                  animateBody: false,
+                ),
+                TimelineItem(
+                  id: 'thinking-latest',
+                  kind: 'thinking',
+                  timestamp: DateTime(2026, 1, 1, 0, 0, 1),
+                  body: thinkingBody,
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+
+    expect(find.text(thinkingBody), findsOneWidget);
+    expect(find.byIcon(Icons.expand_less_rounded), findsOneWidget);
+  });
+
+  testWidgets('前插历史消息时 thinking 展开状态不串行', (tester) async {
+    const detail = 'DETAIL_SEGMENT_PREPEND_STABLE';
+    const thinkingBody = '这条思考已经被用户手动展开，前插历史后还应该保持展开。'
+        '\n\n$detail';
+    final activeItems = [
+      TimelineItem(
+        id: 'thinking-stable',
+        kind: 'thinking',
+        timestamp: DateTime(2026, 1, 1),
+        body: thinkingBody,
+      ),
+      TimelineItem(
+        id: 'result-stable',
+        kind: 'markdown',
+        timestamp: DateTime(2026, 1, 1, 0, 0, 1),
+        body: '对应结果。',
+        animateBody: false,
+      ),
+    ];
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SizedBox(
+            height: 420,
+            child: ChatTimeline(
+              sessionId: 'thinking-prepend-session',
+              items: activeItems,
+            ),
+          ),
+        ),
+      ),
+    );
+
+    expect(find.textContaining(detail), findsNothing);
+    await tester.tap(find.byKey(const ValueKey('thinkingToggle')));
+    await tester.pump();
+    expect(find.textContaining(detail), findsOneWidget);
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SizedBox(
+            height: 420,
+            child: ChatTimeline(
+              sessionId: 'thinking-prepend-session',
+              items: [
+                TimelineItem(
+                  id: 'older-message',
+                  kind: 'markdown',
+                  timestamp: DateTime(2025, 12, 31, 23, 59),
+                  body: '更早历史消息。',
+                  animateBody: false,
+                ),
+                ...activeItems,
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+
+    expect(find.text('更早历史消息。'), findsOneWidget);
+    expect(find.textContaining(detail), findsOneWidget);
+    expect(find.byIcon(Icons.expand_less_rounded), findsOneWidget);
+  });
+
   testWidgets('正常对话流式回复逐字渲染变高时继续贴住底部', (tester) async {
     final items = List<TimelineItem>.generate(
       18,

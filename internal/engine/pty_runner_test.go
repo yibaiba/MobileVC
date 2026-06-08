@@ -37,6 +37,25 @@ func (r *chunkReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
+func installBlockingFakeClaude(t *testing.T) {
+	t.Helper()
+	dir := t.TempDir()
+	if runtime.GOOS == "windows" {
+		path := filepath.Join(dir, "claude.cmd")
+		script := "@echo off\r\n:loop\r\nset /p line=\r\nif errorlevel 1 exit /b 0\r\nping -n 2 127.0.0.1 >nul\r\ngoto loop\r\n"
+		if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+			t.Fatalf("write fake claude: %v", err)
+		}
+	} else {
+		path := filepath.Join(dir, "claude")
+		script := "#!/bin/sh\ntrap 'exit 0' TERM INT\nwhile IFS= read -r _line; do sleep 1; done\n"
+		if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+			t.Fatalf("write fake claude: %v", err)
+		}
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
 func TestPtyRunnerPromptAndInput(t *testing.T) {
 	runner := NewPtyRunner()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -373,6 +392,7 @@ func TestPtyRunnerLazyStartIgnoresEmptyFirstInput(t *testing.T) {
 }
 
 func TestPtyRunnerSuppressesLazyStreamExitNoiseAfterClose(t *testing.T) {
+	installBlockingFakeClaude(t)
 	runner := NewPtyRunner()
 	runner.mu.Lock()
 	runner.lazyStart = true
@@ -971,6 +991,7 @@ func TestPtyRunnerCatalogAuthoringEmitsStructuredEvent(t *testing.T) {
 }
 
 func TestPtyRunnerClaudeStreamSuppressesExitNoiseAfterClose(t *testing.T) {
+	installBlockingFakeClaude(t)
 	runner := NewPtyRunner()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -980,8 +1001,12 @@ func TestPtyRunnerClaudeStreamSuppressesExitNoiseAfterClose(t *testing.T) {
 	go func() {
 		errCh <- runner.runClaudeStream(ctx, ExecRequest{
 			SessionID: "s-close-stream",
-			Command:   "claude --print --output-format stream-json --input-format stream-json --permission-prompt-tool stdio",
-			Mode:      ModePTY,
+			Command: shellTestCommand(
+				"sh -c 'while IFS= read -r _line; do sleep 1; done' sh",
+				"while ($null -ne ($line = [Console]::In.ReadLine())) { Start-Sleep -Seconds 1 }",
+				"cmd /C more >nul",
+			),
+			Mode: ModePTY,
 		}, ".", func(event any) {
 			eventsCh <- event
 		})
@@ -2449,6 +2474,206 @@ func TestCodexAppSessionPreservesAssistantChunkNewlineBoundary(t *testing.T) {
 			}
 			if got := strings.Join(logMessages(logs), ""); got != "hello\nworld" {
 				t.Fatalf("unexpected newline assistant chunks: %q from %#v", got, logMessages(logs))
+			}
+			return
+		}
+	}
+}
+
+func TestCodexAppSessionEmitsReasoningSummaryThinkingEvents(t *testing.T) {
+	eventsCh := make(chan any, 8)
+	app := &codexAppSession{
+		runner:    NewPtyRunner(),
+		sessionID: "s-codex-reasoning-summary",
+		sink:      func(event any) { eventsCh <- event },
+	}
+	app.setThreadID("thread-123")
+	app.setActiveTurnID("turn-1")
+
+	for _, step := range []struct {
+		method string
+		params map[string]any
+	}{
+		{
+			method: "item/reasoning/summaryTextDelta",
+			params: map[string]any{
+				"threadId":     "thread-123",
+				"turnId":       "turn-1",
+				"itemId":       "reasoning-1",
+				"summaryIndex": 0,
+				"delta":        "checking",
+			},
+		},
+		{
+			method: "item/reasoning/summaryTextDelta",
+			params: map[string]any{
+				"threadId":     "thread-123",
+				"turnId":       "turn-1",
+				"itemId":       "reasoning-1",
+				"summaryIndex": 0,
+				"delta":        " ",
+			},
+		},
+		{
+			method: "item/reasoning/summaryTextDelta",
+			params: map[string]any{
+				"threadId":     "thread-123",
+				"turnId":       "turn-1",
+				"itemId":       "reasoning-1",
+				"summaryIndex": 0,
+				"delta":        "context",
+			},
+		},
+		{
+			method: "item/reasoning/summaryPartAdded",
+			params: map[string]any{
+				"threadId":     "thread-123",
+				"turnId":       "turn-1",
+				"itemId":       "reasoning-1",
+				"summaryIndex": 1,
+			},
+		},
+		{
+			method: "item/reasoning/summaryTextDelta",
+			params: map[string]any{
+				"threadId":     "thread-123",
+				"turnId":       "turn-1",
+				"itemId":       "reasoning-1",
+				"summaryIndex": 1,
+				"delta":        "准备修复",
+			},
+		},
+	} {
+		raw, err := json.Marshal(step.params)
+		if err != nil {
+			t.Fatalf("marshal reasoning event: %v", err)
+		}
+		app.handleNotification(codexRPCMessage{Method: step.method, Params: raw})
+	}
+
+	var thinking []protocol.ThinkingEvent
+	for {
+		select {
+		case event := <-eventsCh:
+			if item, ok := event.(protocol.ThinkingEvent); ok {
+				thinking = append(thinking, item)
+			}
+		default:
+			if len(thinking) != 3 {
+				t.Fatalf("expected three cumulative thinking events, got %#v", thinking)
+			}
+			last := thinking[len(thinking)-1]
+			if last.Content != "checking context\n\n准备修复" {
+				t.Fatalf("unexpected reasoning summary content: %q", last.Content)
+			}
+			if last.Engine != "codex" || last.Source != "codex/reasoning-summary" {
+				t.Fatalf("expected codex reasoning metadata, got %#v", last.RuntimeMeta)
+			}
+			if last.ExecutionID != "turn-1" {
+				t.Fatalf("expected turn execution id, got %#v", last.RuntimeMeta)
+			}
+			if last.ContextID != "codex-reasoning:turn-1:reasoning-1" {
+				t.Fatalf("expected stable reasoning context id, got %#v", last.RuntimeMeta)
+			}
+			return
+		}
+	}
+}
+
+func TestCodexAppSessionCompletedReasoningRecoversAndDedupesSummary(t *testing.T) {
+	eventsCh := make(chan any, 8)
+	app := &codexAppSession{
+		runner:    NewPtyRunner(),
+		sessionID: "s-codex-reasoning-completed",
+		sink:      func(event any) { eventsCh <- event },
+	}
+	app.setThreadID("thread-123")
+	app.setActiveTurnID("turn-1")
+
+	streaming, err := json.Marshal(map[string]any{
+		"threadId":     "thread-123",
+		"turnId":       "turn-1",
+		"itemId":       "reasoning-1",
+		"summaryIndex": 0,
+		"delta":        "正在定位",
+	})
+	if err != nil {
+		t.Fatalf("marshal streaming: %v", err)
+	}
+	app.handleNotification(codexRPCMessage{Method: "item/reasoning/summaryTextDelta", Params: streaming})
+
+	completedSame, err := json.Marshal(map[string]any{
+		"threadId": "thread-123",
+		"turnId":   "turn-1",
+		"item": map[string]any{
+			"type": "reasoning",
+			"id":   "reasoning-1",
+			"summary": []map[string]any{
+				{"text": "正在定位"},
+			},
+			"content": []map[string]any{
+				{"text": "raw hidden chain"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal completed same: %v", err)
+	}
+	app.handleNotification(codexRPCMessage{Method: "item/completed", Params: completedSame})
+
+	completedRicher, err := json.Marshal(map[string]any{
+		"threadId": "thread-123",
+		"turnId":   "turn-1",
+		"item": map[string]any{
+			"type": "reasoning",
+			"id":   "reasoning-1",
+			"summary": []map[string]any{
+				{"text": "正在定位"},
+				{"text": "准备修复"},
+			},
+			"content": []map[string]any{
+				{"text": "raw hidden chain"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal completed richer: %v", err)
+	}
+	app.handleNotification(codexRPCMessage{Method: "item/completed", Params: completedRicher})
+
+	rawDelta, err := json.Marshal(map[string]any{
+		"threadId":     "thread-123",
+		"turnId":       "turn-1",
+		"itemId":       "reasoning-1",
+		"contentIndex": 0,
+		"delta":        "raw hidden chain",
+	})
+	if err != nil {
+		t.Fatalf("marshal raw delta: %v", err)
+	}
+	app.handleNotification(codexRPCMessage{Method: "item/reasoning/textDelta", Params: rawDelta})
+
+	var thinking []protocol.ThinkingEvent
+	for {
+		select {
+		case event := <-eventsCh:
+			if item, ok := event.(protocol.ThinkingEvent); ok {
+				thinking = append(thinking, item)
+			}
+		default:
+			if len(thinking) != 2 {
+				t.Fatalf("expected streaming plus richer completed thinking, got %#v", thinking)
+			}
+			if thinking[0].Content != "正在定位" {
+				t.Fatalf("unexpected streaming content: %#v", thinking)
+			}
+			if thinking[1].Content != "正在定位\n\n准备修复" {
+				t.Fatalf("unexpected completed content: %#v", thinking)
+			}
+			for _, item := range thinking {
+				if strings.Contains(item.Content, "raw hidden") {
+					t.Fatalf("raw reasoning content leaked into thinking event: %#v", item)
+				}
 			}
 			return
 		}

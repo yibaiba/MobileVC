@@ -8271,17 +8271,22 @@ class SessionController extends ChangeNotifier {
       entry.attachments,
       _timelineAttachmentsFromText(restoredBody),
     );
+    final meta = _historyRuntimeMetaForEntry(entry, resumeMeta);
+    final timestamp = DateTime.tryParse(entry.timestamp)?.toLocal() ??
+        DateTime.fromMillisecondsSinceEpoch(0);
+    final id = restoredKind == 'thinking'
+        ? _thinkingTimelineItemId(meta, timestamp)
+        : 'history-$restoredKind-${entry.timestamp}-${visibleBody.hashCode}';
     return TimelineItem(
-      id: 'history-$restoredKind-${entry.timestamp}-${visibleBody.hashCode}',
+      id: id,
       kind: restoredKind,
-      timestamp:
-          DateTime.tryParse(entry.timestamp)?.toLocal() ?? DateTime.now(),
+      timestamp: timestamp,
       title: entry.label,
       body: visibleBody,
       stream: entry.stream,
       status: entry.context?.status ?? '',
       trigger: entry.context?.trigger ?? '',
-      meta: _historyRuntimeMetaForEntry(entry, resumeMeta),
+      meta: meta,
       context: entry.context,
       attachments: attachments,
       animateBody: false,
@@ -9455,15 +9460,44 @@ class SessionController extends ChangeNotifier {
     if (content.isEmpty) {
       return;
     }
-    _pushTimelineItem(
-      TimelineItem(
-        id: 'thinking-${thinking.timestamp.microsecondsSinceEpoch}',
-        kind: 'thinking',
-        timestamp: thinking.timestamp,
-        body: content,
-        meta: thinking.runtimeMeta,
-      ),
+    final item = TimelineItem(
+      id: _thinkingTimelineItemId(thinking.runtimeMeta, thinking.timestamp),
+      kind: 'thinking',
+      timestamp: thinking.timestamp,
+      body: content,
+      meta: thinking.runtimeMeta,
     );
+    if (_upsertThinkingTimelineItem(item)) {
+      notifyListeners();
+      return;
+    }
+    _pushTimelineItem(item);
+  }
+
+  String _thinkingTimelineItemId(RuntimeMeta meta, DateTime timestamp) {
+    final contextId = meta.contextId.trim();
+    if (contextId.isNotEmpty) {
+      return 'thinking-$contextId';
+    }
+    return 'thinking-${timestamp.microsecondsSinceEpoch}';
+  }
+
+  bool _upsertThinkingTimelineItem(TimelineItem item) {
+    if (item.id.trim().isEmpty) {
+      return false;
+    }
+    for (var index = _timeline.length - 1; index >= 0; index--) {
+      final previous = _timeline[index];
+      if (previous.kind != 'thinking' || previous.id != item.id) {
+        continue;
+      }
+      _replaceTimelineItemAt(
+        index,
+        item.copyWith(animateBody: previous.animateBody || item.animateBody),
+      );
+      return true;
+    }
+    return false;
   }
 
   String _sanitizeAiBootstrapLogMessage(String message, RuntimeMeta meta) {

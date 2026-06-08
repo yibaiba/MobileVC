@@ -221,6 +221,25 @@ func ApplyEventToProjection(snapshot data.ProjectionSnapshot, event any) (data.P
 			})
 		}
 		return snapshot, true
+	case protocol.ThinkingEvent:
+		msg := strings.TrimSpace(e.Content)
+		if msg == "" {
+			return snapshot, false
+		}
+		entry := data.SnapshotLogEntry{
+			Kind:        "thinking",
+			Message:     msg,
+			Text:        msg,
+			Timestamp:   e.Timestamp.Format(time.RFC3339),
+			ExecutionID: e.ExecutionID,
+			Context:     thinkingSnapshotContextFromEvent(e),
+		}
+		if merged, ok := upsertThinkingLogEntry(snapshot.LogEntries, entry); ok {
+			snapshot.LogEntries = merged
+			return snapshot, true
+		}
+		snapshot.LogEntries = append(snapshot.LogEntries, entry)
+		return snapshot, true
 	case protocol.ErrorEvent:
 		ctx := &data.SnapshotContext{ID: firstNonEmptyString(e.ContextID, fmt.Sprintf("error:%s", e.Timestamp.Format(time.RFC3339Nano))), Message: e.Message, Stack: e.Stack, Code: e.Code, TargetPath: firstNonEmptyString(e.TargetPath, e.RuntimeMeta.TargetPath), RelatedStep: e.Step, Command: e.Command, Timestamp: e.Timestamp.Format(time.RFC3339), Title: firstNonEmptyString(e.ContextTitle, e.Message)}
 		snapshot.LatestError = ctx
@@ -531,6 +550,48 @@ func logSnapshotContextFromEvent(event protocol.LogEvent) *data.SnapshotContext 
 		SkillName:   skillName,
 		ExecutionID: event.ExecutionID,
 	}
+}
+
+func thinkingSnapshotContextFromEvent(event protocol.ThinkingEvent) *data.SnapshotContext {
+	source := strings.TrimSpace(event.Source)
+	skillName := strings.TrimSpace(event.SkillName)
+	contextID := strings.TrimSpace(event.ContextID)
+	if contextID == "" && source == "" && skillName == "" && strings.TrimSpace(event.ExecutionID) == "" {
+		return nil
+	}
+	return &data.SnapshotContext{
+		ID:          firstNonEmptyString(contextID, fmt.Sprintf("thinking:%s", event.Timestamp.Format(time.RFC3339Nano))),
+		Type:        "thinking",
+		Message:     event.Content,
+		Title:       firstNonEmptyString(event.ContextTitle, "思考过程"),
+		Timestamp:   event.Timestamp.Format(time.RFC3339),
+		Source:      source,
+		SkillName:   skillName,
+		ExecutionID: event.ExecutionID,
+	}
+}
+
+func upsertThinkingLogEntry(entries []data.SnapshotLogEntry, entry data.SnapshotLogEntry) ([]data.SnapshotLogEntry, bool) {
+	contextID := ""
+	if entry.Context != nil {
+		contextID = strings.TrimSpace(entry.Context.ID)
+	}
+	if contextID == "" {
+		return entries, false
+	}
+	for index := len(entries) - 1; index >= 0; index-- {
+		current := entries[index]
+		if current.Kind != "thinking" || current.Context == nil {
+			continue
+		}
+		if strings.TrimSpace(current.Context.ID) != contextID {
+			continue
+		}
+		next := append([]data.SnapshotLogEntry(nil), entries...)
+		next[index] = entry
+		return next, true
+	}
+	return entries, false
 }
 
 func mergeAssistantReplyLogEntry(entries []data.SnapshotLogEntry, event protocol.LogEvent, context *data.SnapshotContext, phase string) ([]data.SnapshotLogEntry, bool) {

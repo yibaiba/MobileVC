@@ -95,12 +95,20 @@ type codexAppSession struct {
 	compactionStatus             string
 	compactionEventID            string
 	contextWindowReadUnsupported bool
+	reasoningSummaries           map[string]*codexReasoningSummaryState
 }
 
 type codexPendingApproval struct {
 	id          json.RawMessage
 	method      string
 	permissions json.RawMessage
+}
+
+type codexReasoningSummaryState struct {
+	turnID      string
+	itemID      string
+	parts       []string
+	lastEmitted string
 }
 
 type codexThreadEnvelope struct {
@@ -143,6 +151,21 @@ type codexAgentDeltaNotification struct {
 	TurnID   string `json:"turnId"`
 	ItemID   string `json:"itemId"`
 	Delta    string `json:"delta"`
+}
+
+type codexReasoningSummaryDeltaNotification struct {
+	ThreadID     string `json:"threadId"`
+	TurnID       string `json:"turnId"`
+	ItemID       string `json:"itemId"`
+	SummaryIndex int    `json:"summaryIndex"`
+	Delta        string `json:"delta"`
+}
+
+type codexReasoningSummaryPartNotification struct {
+	ThreadID     string `json:"threadId"`
+	TurnID       string `json:"turnId"`
+	ItemID       string `json:"itemId"`
+	SummaryIndex int    `json:"summaryIndex"`
 }
 
 type codexTurnDiffNotification struct {
@@ -250,7 +273,7 @@ func newCodexAppSession(processCtx context.Context, rpcCtx context.Context, runn
 	defaults, err := loadCodexConfigDefaults()
 	if err != nil {
 		_ = stdin.Close()
-		_ = cmd.Process.Kill()
+		killCommandProcess(cmd)
 		return nil, err
 	}
 
@@ -273,12 +296,12 @@ func newCodexAppSession(processCtx context.Context, rpcCtx context.Context, runn
 
 	if err := app.initialize(rpcCtx); err != nil {
 		_ = stdin.Close()
-		_ = cmd.Process.Kill()
+		killCommandProcess(cmd)
 		return nil, err
 	}
 	if err := app.startOrResumeThread(rpcCtx, resumeSessionID); err != nil {
 		_ = stdin.Close()
-		_ = cmd.Process.Kill()
+		killCommandProcess(cmd)
 		return nil, err
 	}
 	return app, nil
@@ -554,7 +577,7 @@ func (s *codexAppSession) Close() error {
 		_ = s.stdin.Close()
 	}
 	if s.cmd != nil && s.cmd.Process != nil {
-		return s.cmd.Process.Kill()
+		killCommandProcess(s.cmd)
 	}
 	return nil
 }
@@ -653,6 +676,10 @@ func (s *codexAppSession) handleNotification(message codexRPCMessage) {
 				s.emitAssistantChunk(chunk, payload.TurnID)
 			}
 		}
+	case "item/reasoning/summaryTextDelta":
+		s.handleReasoningSummaryDelta(message.Params)
+	case "item/reasoning/summaryPartAdded":
+		s.handleReasoningSummaryPartAdded(message.Params)
 	case "item/started":
 		s.handleItemEvent(message.Params, "running")
 	case "item/completed":
@@ -815,6 +842,10 @@ func (s *codexAppSession) handleItemEvent(raw json.RawMessage, status string) {
 		}
 		return
 	}
+	if status == "done" && itemType == "reasoning" {
+		s.handleCompletedReasoningItem(payload)
+		return
+	}
 	if status == "done" {
 		return
 	}
@@ -862,6 +893,10 @@ func (s *codexAppSession) handleCompactionItem(payload codexItemNotification, st
 func (s *codexAppSession) handleRawResponseItemCompleted(raw json.RawMessage) {
 	var payload codexItemNotification
 	if err := json.Unmarshal(raw, &payload); err != nil {
+		return
+	}
+	if strings.TrimSpace(asString(payload.Item["type"])) == "reasoning" {
+		s.handleCompletedReasoningItem(payload)
 		return
 	}
 	text := codexItemText(payload.Item)
@@ -1016,6 +1051,106 @@ func (s *codexAppSession) emitAssistantCompletedText(text string, turnID string)
 	s.emitAssistantChunk(text, turnID)
 }
 
+func (s *codexAppSession) handleReasoningSummaryDelta(raw json.RawMessage) {
+	var payload codexReasoningSummaryDeltaNotification
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return
+	}
+	if payload.Delta == "" {
+		return
+	}
+	state := s.ensureReasoningSummaryState(payload.TurnID, payload.ItemID)
+	if state == nil {
+		return
+	}
+	state.appendDelta(payload.SummaryIndex, payload.Delta)
+	s.emitReasoningSummaryState(state, false)
+}
+
+func (s *codexAppSession) handleReasoningSummaryPartAdded(raw json.RawMessage) {
+	var payload codexReasoningSummaryPartNotification
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return
+	}
+	state := s.ensureReasoningSummaryState(payload.TurnID, payload.ItemID)
+	if state == nil {
+		return
+	}
+	state.ensurePart(payload.SummaryIndex)
+}
+
+func (s *codexAppSession) handleCompletedReasoningItem(payload codexItemNotification) {
+	itemID := strings.TrimSpace(asString(payload.Item["id"]))
+	if itemID == "" {
+		itemID = strings.TrimSpace(payload.TurnID)
+	}
+	text := codexReasoningSummaryText(payload.Item)
+	if strings.TrimSpace(text) == "" {
+		return
+	}
+	state := s.ensureReasoningSummaryState(payload.TurnID, itemID)
+	if state == nil {
+		return
+	}
+	state.setCompletedSummary(text)
+	s.emitReasoningSummaryState(state, true)
+}
+
+func (s *codexAppSession) ensureReasoningSummaryState(turnID, itemID string) *codexReasoningSummaryState {
+	turnID = strings.TrimSpace(firstNonEmptyString(turnID, s.activeTurn()))
+	itemID = strings.TrimSpace(itemID)
+	if turnID == "" || itemID == "" {
+		return nil
+	}
+	key := codexReasoningSummaryKey(turnID, itemID)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.reasoningSummaries == nil {
+		s.reasoningSummaries = make(map[string]*codexReasoningSummaryState)
+	}
+	state := s.reasoningSummaries[key]
+	if state == nil {
+		state = &codexReasoningSummaryState{
+			turnID: turnID,
+			itemID: itemID,
+		}
+		s.reasoningSummaries[key] = state
+	}
+	return state
+}
+
+func (s *codexAppSession) emitReasoningSummaryState(state *codexReasoningSummaryState, completed bool) {
+	content := state.content()
+	if strings.TrimSpace(content) == "" {
+		return
+	}
+	if completed && strings.TrimSpace(state.lastEmitted) != "" &&
+		codexAssistantDedupeText(content) == codexAssistantDedupeText(state.lastEmitted) {
+		return
+	}
+	if !completed && content == state.lastEmitted {
+		return
+	}
+	state.lastEmitted = content
+	meta := s.reasoningRuntimeMeta(state.turnID, state.itemID)
+	sendEvent(s.sink, protocol.ApplyRuntimeMeta(
+		protocol.NewThinkingEvent(s.sessionID, content),
+		meta,
+	))
+}
+
+func (s *codexAppSession) reasoningRuntimeMeta(turnID, itemID string) protocol.RuntimeMeta {
+	meta := s.runtimeMeta("active")
+	if trimmed := strings.TrimSpace(turnID); trimmed != "" {
+		meta.ExecutionID = trimmed
+	}
+	meta.Engine = "codex"
+	meta.Source = "codex/reasoning-summary"
+	meta.ContextID = codexReasoningSummaryKey(meta.ExecutionID, itemID)
+	meta.ContextTitle = "Codex reasoning summary"
+	return meta
+}
+
 func (s *codexAppSession) emitReadyPromptAfterReply() {
 	sessionID := s.sessionID
 	sink := s.sink
@@ -1077,6 +1212,95 @@ func codexItemText(item map[string]any) string {
 		return strings.TrimSpace(strings.Join(parts, "\n"))
 	}
 	return ""
+}
+
+func codexReasoningSummaryText(item map[string]any) string {
+	parts := codexReasoningSummaryParts(item["summary"])
+	return strings.TrimSpace(strings.Join(parts, "\n\n"))
+}
+
+func codexReasoningSummaryParts(value any) []string {
+	switch v := value.(type) {
+	case string:
+		if text := strings.TrimSpace(v); text != "" {
+			return []string{text}
+		}
+	case []any:
+		parts := make([]string, 0, len(v))
+		for _, entry := range v {
+			if text := codexReasoningSummaryPartText(entry); text != "" {
+				parts = append(parts, text)
+			}
+		}
+		return parts
+	case map[string]any:
+		if text := codexReasoningSummaryPartText(v); text != "" {
+			return []string{text}
+		}
+	}
+	return nil
+}
+
+func codexReasoningSummaryPartText(value any) string {
+	switch v := value.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case map[string]any:
+		for _, key := range []string{"text", "summary", "content"} {
+			if text := strings.TrimSpace(asString(v[key])); text != "" {
+				return text
+			}
+		}
+	}
+	return ""
+}
+
+func codexReasoningSummaryKey(turnID, itemID string) string {
+	turnID = strings.TrimSpace(turnID)
+	itemID = strings.TrimSpace(itemID)
+	if turnID == "" {
+		return "codex-reasoning:" + itemID
+	}
+	return "codex-reasoning:" + turnID + ":" + itemID
+}
+
+func (s *codexReasoningSummaryState) appendDelta(summaryIndex int, delta string) {
+	if summaryIndex < 0 {
+		summaryIndex = 0
+	}
+	s.ensurePart(summaryIndex)
+	s.parts[summaryIndex] += delta
+}
+
+func (s *codexReasoningSummaryState) ensurePart(summaryIndex int) {
+	if summaryIndex < 0 {
+		summaryIndex = 0
+	}
+	for len(s.parts) <= summaryIndex {
+		s.parts = append(s.parts, "")
+	}
+}
+
+func (s *codexReasoningSummaryState) setCompletedSummary(summary string) {
+	parts := strings.Split(strings.ReplaceAll(summary, "\r\n", "\n"), "\n\n")
+	s.parts = make([]string, 0, len(parts))
+	for _, part := range parts {
+		text := strings.TrimSpace(part)
+		if text == "" {
+			continue
+		}
+		s.parts = append(s.parts, text)
+	}
+}
+
+func (s *codexReasoningSummaryState) content() string {
+	parts := make([]string, 0, len(s.parts))
+	for i := range s.parts {
+		if text := strings.TrimSpace(s.parts[i]); text != "" {
+			parts = append(parts, text)
+		}
+	}
+	return strings.TrimSpace(strings.Join(parts, "\n\n"))
 }
 
 func (s *codexAppSession) handleDiffUpdate(turnID, diff string) {

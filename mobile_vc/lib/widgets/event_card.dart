@@ -17,6 +17,7 @@ class EventCard extends StatefulWidget {
     this.onOpenAttachment,
     this.onRequestMediaPreview,
     this.onAnimatedBodyProgress,
+    this.collapseThinkingByDefault = false,
   });
 
   final TimelineItem item;
@@ -26,6 +27,7 @@ class EventCard extends StatefulWidget {
   final ValueChanged<TimelineAttachment>? onOpenAttachment;
   final ValueChanged<TimelineAttachment>? onRequestMediaPreview;
   final VoidCallback? onAnimatedBodyProgress;
+  final bool collapseThinkingByDefault;
 
   @override
   State<EventCard> createState() => _EventCardState();
@@ -33,10 +35,14 @@ class EventCard extends StatefulWidget {
 
 class _EventCardState extends State<EventCard> {
   bool _selectionMode = false;
+  late bool _thinkingCollapsed;
+  bool _thinkingManuallyToggled = false;
 
   @override
   void initState() {
     super.initState();
+    _thinkingCollapsed =
+        widget.item.kind == 'thinking' && widget.collapseThinkingByDefault;
     _requestMissingAttachmentPreviews();
   }
 
@@ -45,6 +51,14 @@ class _EventCardState extends State<EventCard> {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.item.id != widget.item.id) {
       _selectionMode = false;
+      _thinkingManuallyToggled = false;
+      _thinkingCollapsed =
+          widget.item.kind == 'thinking' && widget.collapseThinkingByDefault;
+    } else if (widget.item.kind == 'thinking' &&
+        oldWidget.collapseThinkingByDefault !=
+            widget.collapseThinkingByDefault &&
+        !_thinkingManuallyToggled) {
+      _thinkingCollapsed = widget.collapseThinkingByDefault;
     }
     _requestMissingAttachmentPreviews();
   }
@@ -90,6 +104,7 @@ class _EventCardState extends State<EventCard> {
     final isMarkdown = widget.item.kind == 'markdown';
     final isCompaction = widget.item.kind == 'compaction';
     final isCodexToolGroup = widget.item.kind == 'codex_tool_group';
+    final isThinking = widget.item.kind == 'thinking';
 
     if (isCompaction) {
       return _CompactionMarker(item: widget.item);
@@ -101,6 +116,19 @@ class _EventCardState extends State<EventCard> {
         child: ConstrainedBox(
           constraints: const BoxConstraints(maxWidth: 760),
           child: _CodexToolGroupCard(item: widget.item, style: style),
+        ),
+      );
+    }
+
+    if (isThinking) {
+      return Align(
+        alignment: Alignment.centerLeft,
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 760),
+          child: _wrapWithLongPress(
+            context,
+            _buildThinkingCard(context, style),
+          ),
         ),
       );
     }
@@ -428,6 +456,102 @@ class _EventCardState extends State<EventCard> {
         ),
       ],
     );
+  }
+
+  Widget _buildThinkingCard(BuildContext context, _EventCardStyle style) {
+    final scheme = Theme.of(context).colorScheme;
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        key: const ValueKey('thinkingToggle'),
+        onTap: _selectionMode ? null : _toggleThinkingCollapsed,
+        borderRadius: BorderRadius.circular(style.radius),
+        child: Ink(
+          decoration: BoxDecoration(
+            color: style.background,
+            borderRadius: BorderRadius.circular(style.radius),
+            border: Border.all(color: style.border),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    _LeadingBadge(item: widget.item, style: style),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            widget.item.title.isEmpty
+                                ? _titleForKind(widget.item.kind)
+                                : widget.item.title,
+                            style: Theme.of(context)
+                                .textTheme
+                                .labelLarge
+                                ?.copyWith(
+                                  fontWeight: FontWeight.w800,
+                                  color: style.titleColor,
+                                ),
+                          ),
+                          if (_thinkingCollapsed)
+                            Text(
+                              _collapsedThinkingPreview(widget.item.body),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: Theme.of(context)
+                                  .textTheme
+                                  .bodySmall
+                                  ?.copyWith(color: style.subtitleColor),
+                            ),
+                        ],
+                      ),
+                    ),
+                    Icon(
+                      _thinkingCollapsed
+                          ? Icons.expand_more_rounded
+                          : Icons.expand_less_rounded,
+                      color: scheme.onSurfaceVariant,
+                    ),
+                  ],
+                ),
+                if (!_thinkingCollapsed && widget.item.body.isNotEmpty) ...[
+                  const SizedBox(height: 8),
+                  _BodyContent(
+                    item: widget.item,
+                    style: style,
+                    selectable: _selectionMode,
+                    contextMenuBuilder: _buildEditableContextMenu,
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _toggleThinkingCollapsed() {
+    setState(() {
+      _thinkingManuallyToggled = true;
+      _thinkingCollapsed = !_thinkingCollapsed;
+    });
+  }
+
+  String _collapsedThinkingPreview(String body) {
+    final text = body.trim().replaceAll(RegExp(r'\s+'), ' ');
+    if (text.isEmpty) {
+      return '已折叠';
+    }
+    final runeCount = text.runes.length;
+    if (runeCount <= 48) {
+      return text;
+    }
+    return '${String.fromCharCodes(text.runes.take(48))}...';
   }
 
   Widget _buildEditableContextMenu(

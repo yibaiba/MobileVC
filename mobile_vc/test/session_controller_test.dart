@@ -6264,6 +6264,101 @@ void main() {
       expect(controller.timeline.single.animateBody, isFalse);
     });
 
+    test('同一 contextId 的 thinking 事件会更新同一条 timeline', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      const contextId = 'codex-reasoning:turn-1:reasoning-1';
+      service.emit(
+        ThinkingEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-thinking-live',
+          runtimeMeta: const RuntimeMeta(
+            engine: 'codex',
+            source: 'codex/reasoning-summary',
+            executionId: 'turn-1',
+            contextId: contextId,
+          ),
+          raw: const {'type': 'thinking'},
+          content: '正在定位问题',
+        ),
+      );
+      await _flushEvents();
+      service.emit(
+        ThinkingEvent(
+          timestamp: _timestamp.add(const Duration(milliseconds: 1)),
+          sessionId: 'session-thinking-live',
+          runtimeMeta: const RuntimeMeta(
+            engine: 'codex',
+            source: 'codex/reasoning-summary',
+            executionId: 'turn-1',
+            contextId: contextId,
+          ),
+          raw: const {'type': 'thinking'},
+          content: '正在定位问题\n已经找到相关文件',
+        ),
+      );
+      await _flushEvents();
+
+      final thinkingItems =
+          controller.timeline.where((item) => item.kind == 'thinking').toList();
+      expect(thinkingItems, hasLength(1));
+      expect(thinkingItems.single.id, 'thinking-$contextId');
+      expect(thinkingItems.single.body, contains('已经找到相关文件'));
+      expect(thinkingItems.single.meta.contextId, contextId);
+    });
+
+    test('恢复历史 thinking 会使用 contextId 作为稳定 item id', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      const contextId = 'codex-reasoning:turn-2:reasoning-1';
+      service.emit(
+        SessionHistoryEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-thinking-history',
+          runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+          raw: const {'type': 'session_history'},
+          summary: const SessionSummary(
+            id: 'session-thinking-history',
+            title: '历史会话',
+          ),
+          logEntries: const [
+            HistoryLogEntry(
+              kind: 'thinking',
+              message: '恢复出来的思考摘要',
+              timestamp: '2026-01-01T00:00:00Z',
+              executionId: 'turn-2',
+              context: HistoryContext(
+                id: contextId,
+                type: 'thinking',
+                title: '思考过程',
+                message: '恢复出来的思考摘要',
+                source: 'codex/reasoning-summary',
+                executionId: 'turn-2',
+              ),
+            ),
+          ],
+          resumeRuntimeMeta: const RuntimeMeta(
+            command: 'codex',
+            engine: 'codex',
+          ),
+        ),
+      );
+      await _flushEvents();
+
+      expect(controller.timeline, hasLength(1));
+      final item = controller.timeline.single;
+      expect(item.kind, 'thinking');
+      expect(item.id, 'thinking-$contextId');
+      expect(item.meta.contextId, contextId);
+      expect(item.animateBody, isFalse);
+    });
+
     test('恢复态 runtime meta 会直接恢复 AI continuation 模式', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);

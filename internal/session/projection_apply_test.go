@@ -665,6 +665,53 @@ func TestApplyEventToProjection_LogVisibleAssistantReply(t *testing.T) {
 	}
 }
 
+func TestApplyEventToProjection_PersistsAndUpsertsThinkingEvent(t *testing.T) {
+	base := protocol.Event{
+		Type:      protocol.EventTypeThinking,
+		SessionID: "s1",
+		Timestamp: time.Now(),
+		RuntimeMeta: protocol.RuntimeMeta{
+			Engine:      "codex",
+			Source:      "codex/reasoning-summary",
+			ExecutionID: "turn-1",
+			ContextID:   "codex-reasoning:turn-1:reasoning-1",
+		},
+	}
+	snapshot, applied := ApplyEventToProjection(data.ProjectionSnapshot{}, protocol.ThinkingEvent{
+		Event:   base,
+		Content: "正在定位",
+	})
+	if !applied {
+		t.Fatal("expected first thinking event applied")
+	}
+	snapshot, applied = ApplyEventToProjection(snapshot, protocol.ThinkingEvent{
+		Event:   base,
+		Content: "正在定位\n\n准备修复",
+	})
+	if !applied {
+		t.Fatal("expected second thinking event applied")
+	}
+	if len(snapshot.LogEntries) != 1 {
+		t.Fatalf("expected one upserted thinking entry, got %+v", snapshot.LogEntries)
+	}
+	entry := snapshot.LogEntries[0]
+	if entry.Kind != "thinking" || entry.Message != "正在定位\n\n准备修复" {
+		t.Fatalf("unexpected thinking entry: %+v", entry)
+	}
+	if entry.ExecutionID != "turn-1" {
+		t.Fatalf("expected thinking execution id, got %+v", entry)
+	}
+	if entry.Context == nil {
+		t.Fatal("expected thinking context")
+	}
+	if entry.Context.ID != "codex-reasoning:turn-1:reasoning-1" ||
+		entry.Context.Type != "thinking" ||
+		entry.Context.Source != "codex/reasoning-summary" ||
+		entry.Context.ExecutionID != "turn-1" {
+		t.Fatalf("unexpected thinking context: %+v", entry.Context)
+	}
+}
+
 func TestApplyEventToProjection_MergesStreamingAssistantReplyByExecutionID(t *testing.T) {
 	base := protocol.Event{
 		Type:        "log",

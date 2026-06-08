@@ -874,9 +874,7 @@ func (r *PtyRunner) Close() error {
 	if outputCloser != nil {
 		_ = outputCloser.Close()
 	}
-	if cmd != nil && cmd.Process != nil {
-		_ = cmd.Process.Kill()
-	}
+	killCommandProcess(cmd)
 	return nil
 }
 

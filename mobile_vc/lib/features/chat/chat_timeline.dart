@@ -289,6 +289,12 @@ class _ChatTimelineState extends State<ChatTimeline> {
           reviewAnchorIndex: reviewAnchorIndex,
           extraItems: extraItems,
         );
+        final collapseThinkingByDefault = _shouldCollapseThinkingByDefault(
+          index,
+          reviewAnchorIndex: reviewAnchorIndex,
+          extraItems: extraItems,
+          resolvedItemCount: resolvedItemCount,
+        );
         final itemKey = ValueKey<String>(_timelineChildKey(item));
         if (item.kind == 'file_diff') {
           return KeyedSubtree(
@@ -343,6 +349,7 @@ class _ChatTimelineState extends State<ChatTimeline> {
           key: itemKey,
           child: EventCard(
             item: item,
+            collapseThinkingByDefault: collapseThinkingByDefault,
             mediaPreviewStates: widget.mediaPreviewStates,
             onOpenAttachment: widget.onOpenAttachment,
             onRequestMediaPreview: widget.onRequestMediaPreview,
@@ -477,6 +484,39 @@ class _ChatTimelineState extends State<ChatTimeline> {
       return widget.items[index];
     }
     return extraItems[index - widget.items.length];
+  }
+
+  bool _shouldCollapseThinkingByDefault(
+    int index, {
+    required int reviewAnchorIndex,
+    required List<TimelineItem> extraItems,
+    required int resolvedItemCount,
+  }) {
+    final item = _timelineItemAt(
+      index,
+      reviewAnchorIndex: reviewAnchorIndex,
+      extraItems: extraItems,
+    );
+    if (item.kind != 'thinking') {
+      return false;
+    }
+    for (var nextIndex = index + 1;
+        nextIndex < resolvedItemCount;
+        nextIndex++) {
+      final next = _timelineItemAt(
+        nextIndex,
+        reviewAnchorIndex: reviewAnchorIndex,
+        extraItems: extraItems,
+      );
+      if (_isVisibleAssistantResult(next)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool _isVisibleAssistantResult(TimelineItem item) {
+    return item.kind == 'markdown' && item.body.trim().isNotEmpty;
   }
 
   TimelineItem _reviewSummaryItem(TimelineItem? anchor) {
