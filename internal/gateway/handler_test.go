@@ -5154,6 +5154,78 @@ func TestRuntimeBufferedSinkDoesNotRunDetachedProcessorInline(t *testing.T) {
 	runtimeSession.shutdownSink()
 }
 
+func TestRuntimeSessionReleaseDoesNotCleanupRunningOrphan(t *testing.T) {
+	runnerStub := newSwitchableStubRunner()
+	registry := newRuntimeSessionRegistry(func(sessionID string) *session.Service {
+		return session.NewService(sessionID, session.Dependencies{
+			NewPtyRunner: func() engine.Runner { return runnerStub },
+		})
+	}, 20*time.Millisecond, nil)
+
+	entry := registry.Attach("running-orphan", "conn-1", func(any) {})
+	entry.service.SetSink(entry.EnsureBufferedSink())
+	if err := entry.service.Execute(context.Background(), "running-orphan", session.ExecuteRequest{
+		Command: "codex",
+		Mode:    engine.ModePTY,
+	}, func(any) {}); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	runnerStub.WaitStarted(t)
+
+	registry.Release("running-orphan", "conn-1", false)
+	time.Sleep(80 * time.Millisecond)
+
+	select {
+	case <-runnerStub.closed:
+		t.Fatal("expected running orphan runtime to survive release timer")
+	default:
+	}
+	if got := registry.Get("running-orphan"); got == nil || !got.service.IsRunning() {
+		t.Fatalf("expected running orphan runtime to remain registered, got %#v", got)
+	}
+	registry.CleanupSession("running-orphan")
+}
+
+func TestRuntimeSessionReleaseCleansOrphanAfterRunnerStops(t *testing.T) {
+	runnerStub := newSwitchableStubRunner()
+	cleaned := make(chan struct{}, 1)
+	registry := newRuntimeSessionRegistry(func(sessionID string) *session.Service {
+		return session.NewService(sessionID, session.Dependencies{
+			NewPtyRunner: func() engine.Runner { return runnerStub },
+		})
+	}, 20*time.Millisecond, func(sessionID string) {
+		if sessionID == "stopped-orphan" {
+			cleaned <- struct{}{}
+		}
+	})
+
+	entry := registry.Attach("stopped-orphan", "conn-1", func(any) {})
+	entry.service.SetSink(entry.EnsureBufferedSink())
+	if err := entry.service.Execute(context.Background(), "stopped-orphan", session.ExecuteRequest{
+		Command: "codex",
+		Mode:    engine.ModePTY,
+	}, func(any) {}); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	runnerStub.WaitStarted(t)
+
+	registry.Release("stopped-orphan", "conn-1", false)
+	time.Sleep(50 * time.Millisecond)
+	if got := registry.Get("stopped-orphan"); got == nil || !got.service.IsRunning() {
+		t.Fatalf("expected active orphan to remain before runner stops, got %#v", got)
+	}
+
+	entry.service.StopActive("stopped-orphan", func(any) {})
+	select {
+	case <-cleaned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected stopped orphan runtime to be cleaned by next release timer")
+	}
+	if got := registry.Get("stopped-orphan"); got != nil {
+		t.Fatalf("expected stopped orphan runtime to be removed, got %#v", got)
+	}
+}
+
 func TestHandlerPublishesSessionUpdatedAcrossConnections(t *testing.T) {
 	runnerStub := newSwitchableStubRunner()
 	h := newTestHandler()

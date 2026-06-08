@@ -492,9 +492,7 @@ func (r *runtimeSessionRegistry) Release(sessionID, listenerID string, cleanupIf
 	if entry.releaseTimer != nil {
 		entry.releaseTimer.Stop()
 	}
-	entry.releaseTimer = time.AfterFunc(r.releaseAfter, func() {
-		r.cleanupIfOrphaned(sessionID, entry)
-	})
+	r.scheduleOrphanCleanupLocked(sessionID, entry)
 	r.mu.Unlock()
 }
 
@@ -530,10 +528,24 @@ func (r *runtimeSessionRegistry) cleanupIfOrphaned(sessionID string, target *run
 		r.mu.Unlock()
 		return
 	}
+	if current.service != nil && current.service.IsRunning() {
+		r.scheduleOrphanCleanupLocked(sessionID, current)
+		r.mu.Unlock()
+		return
+	}
 	delete(r.sessions, sessionID)
 	current.releaseTimer = nil
 	r.mu.Unlock()
 	r.cleanupEntry(sessionID, current)
+}
+
+func (r *runtimeSessionRegistry) scheduleOrphanCleanupLocked(sessionID string, entry *runtimeSession) {
+	if entry == nil {
+		return
+	}
+	entry.releaseTimer = time.AfterFunc(r.releaseAfter, func() {
+		r.cleanupIfOrphaned(sessionID, entry)
+	})
 }
 
 func (r *runtimeSessionRegistry) CleanupAll() {
