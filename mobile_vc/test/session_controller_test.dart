@@ -6359,6 +6359,54 @@ void main() {
       expect(item.animateBody, isFalse);
     });
 
+    test('恢复无 context 的同秒 thinking 历史不会合并成一条', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      service.emit(
+        SessionHistoryEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-thinking-contextless-history',
+          runtimeMeta: const RuntimeMeta(command: 'claude', engine: 'claude'),
+          raw: const {'type': 'session_history'},
+          summary: const SessionSummary(
+            id: 'session-thinking-contextless-history',
+            title: '历史会话',
+          ),
+          logEntries: const [
+            HistoryLogEntry(
+              kind: 'thinking',
+              message: '第一段思考摘要，正在定位历史恢复身份',
+              timestamp: '2026-01-01T00:00:00Z',
+            ),
+            HistoryLogEntry(
+              kind: 'thinking',
+              message: '第二段思考摘要，正在验证同秒恢复',
+              timestamp: '2026-01-01T00:00:00Z',
+            ),
+          ],
+          resumeRuntimeMeta: const RuntimeMeta(
+            command: 'claude',
+            engine: 'claude',
+          ),
+        ),
+      );
+      await _flushEvents();
+
+      final thinkingItems =
+          controller.timeline.where((item) => item.kind == 'thinking').toList();
+      expect(thinkingItems, hasLength(2));
+      expect(thinkingItems[0].body, '第一段思考摘要，正在定位历史恢复身份');
+      expect(thinkingItems[1].body, '第二段思考摘要，正在验证同秒恢复');
+      expect(thinkingItems[0].id, isNot(thinkingItems[1].id));
+      expect(thinkingItems[0].meta.contextId, isEmpty);
+      expect(thinkingItems[1].meta.contextId, isEmpty);
+      expect(thinkingItems[0].animateBody, isFalse);
+      expect(thinkingItems[1].animateBody, isFalse);
+    });
+
     test('恢复态 runtime meta 会直接恢复 AI continuation 模式', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);

@@ -712,6 +712,54 @@ func TestApplyEventToProjection_PersistsAndUpsertsThinkingEvent(t *testing.T) {
 	}
 }
 
+func TestApplyEventToProjection_PersistsContextlessThinkingWithStableContext(t *testing.T) {
+	firstTimestamp := time.Date(2026, 1, 1, 0, 0, 0, 100, time.UTC)
+	secondTimestamp := firstTimestamp.Add(200 * time.Nanosecond)
+	snapshot, applied := ApplyEventToProjection(data.ProjectionSnapshot{}, protocol.ThinkingEvent{
+		Event: protocol.Event{
+			Type:      protocol.EventTypeThinking,
+			SessionID: "s1",
+			Timestamp: firstTimestamp,
+		},
+		Content: "第一段思考",
+	})
+	if !applied {
+		t.Fatal("expected first contextless thinking event applied")
+	}
+	snapshot, applied = ApplyEventToProjection(snapshot, protocol.ThinkingEvent{
+		Event: protocol.Event{
+			Type:      protocol.EventTypeThinking,
+			SessionID: "s1",
+			Timestamp: secondTimestamp,
+		},
+		Content: "第二段思考",
+	})
+	if !applied {
+		t.Fatal("expected second contextless thinking event applied")
+	}
+	if len(snapshot.LogEntries) != 2 {
+		t.Fatalf("expected two distinct thinking entries, got %+v", snapshot.LogEntries)
+	}
+	firstEntry := snapshot.LogEntries[0]
+	secondEntry := snapshot.LogEntries[1]
+	if firstEntry.Kind != "thinking" || secondEntry.Kind != "thinking" {
+		t.Fatalf("expected thinking entries, got %+v", snapshot.LogEntries)
+	}
+	if firstEntry.Context == nil || secondEntry.Context == nil {
+		t.Fatalf("expected context for both thinking entries: %+v", snapshot.LogEntries)
+	}
+	if firstEntry.Context.ID == "" || secondEntry.Context.ID == "" {
+		t.Fatalf("expected non-empty context ids: %+v %+v", firstEntry.Context, secondEntry.Context)
+	}
+	if firstEntry.Context.ID == secondEntry.Context.ID {
+		t.Fatalf("expected distinct context ids, got %q", firstEntry.Context.ID)
+	}
+	if firstEntry.Timestamp != firstTimestamp.Format(time.RFC3339Nano) ||
+		secondEntry.Timestamp != secondTimestamp.Format(time.RFC3339Nano) {
+		t.Fatalf("expected RFC3339Nano timestamps, got %+v", snapshot.LogEntries)
+	}
+}
+
 func TestApplyEventToProjection_MergesStreamingAssistantReplyByExecutionID(t *testing.T) {
 	base := protocol.Event{
 		Type:        "log",

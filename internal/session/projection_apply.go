@@ -230,7 +230,7 @@ func ApplyEventToProjection(snapshot data.ProjectionSnapshot, event any) (data.P
 			Kind:        "thinking",
 			Message:     msg,
 			Text:        msg,
-			Timestamp:   e.Timestamp.Format(time.RFC3339),
+			Timestamp:   e.Timestamp.Format(time.RFC3339Nano),
 			ExecutionID: e.ExecutionID,
 			Context:     thinkingSnapshotContextFromEvent(e),
 		}
@@ -556,15 +556,12 @@ func thinkingSnapshotContextFromEvent(event protocol.ThinkingEvent) *data.Snapsh
 	source := strings.TrimSpace(event.Source)
 	skillName := strings.TrimSpace(event.SkillName)
 	contextID := strings.TrimSpace(event.ContextID)
-	if contextID == "" && source == "" && skillName == "" && strings.TrimSpace(event.ExecutionID) == "" {
-		return nil
-	}
 	return &data.SnapshotContext{
 		ID:          firstNonEmptyString(contextID, fmt.Sprintf("thinking:%s", event.Timestamp.Format(time.RFC3339Nano))),
 		Type:        "thinking",
-		Message:     event.Content,
+		Message:     strings.TrimSpace(event.Content),
 		Title:       firstNonEmptyString(event.ContextTitle, "思考过程"),
-		Timestamp:   event.Timestamp.Format(time.RFC3339),
+		Timestamp:   event.Timestamp.Format(time.RFC3339Nano),
 		Source:      source,
 		SkillName:   skillName,
 		ExecutionID: event.ExecutionID,

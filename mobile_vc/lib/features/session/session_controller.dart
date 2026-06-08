@@ -8275,7 +8275,7 @@ class SessionController extends ChangeNotifier {
     final timestamp = DateTime.tryParse(entry.timestamp)?.toLocal() ??
         DateTime.fromMillisecondsSinceEpoch(0);
     final id = restoredKind == 'thinking'
-        ? _thinkingTimelineItemId(meta, timestamp)
+        ? _thinkingHistoryTimelineItemId(entry, meta, timestamp)
         : 'history-$restoredKind-${entry.timestamp}-${visibleBody.hashCode}';
     return TimelineItem(
       id: id,
@@ -8849,6 +8849,9 @@ class SessionController extends ChangeNotifier {
   }
 
   bool _isAssistantReplyTimelineItem(TimelineItem item) {
+    if (item.kind == 'thinking') {
+      return false;
+    }
     final body = item.body.trim();
     if (body.isEmpty) {
       return false;
@@ -8865,6 +8868,9 @@ class SessionController extends ChangeNotifier {
   bool _shouldMergeTimelineBodies(TimelineItem previous, TimelineItem item) {
     if (previous.kind == 'codex_tool_group' ||
         item.kind == 'codex_tool_group') {
+      return false;
+    }
+    if (previous.kind == 'thinking' || item.kind == 'thinking') {
       return false;
     }
     if (_continuesMarkdownLink(previous.body, item.body)) {
@@ -9480,6 +9486,27 @@ class SessionController extends ChangeNotifier {
       return 'thinking-$contextId';
     }
     return 'thinking-${timestamp.microsecondsSinceEpoch}';
+  }
+
+  String _thinkingHistoryTimelineItemId(
+    HistoryLogEntry entry,
+    RuntimeMeta meta,
+    DateTime timestamp,
+  ) {
+    final contextId = meta.contextId.trim();
+    if (contextId.isNotEmpty) {
+      return 'thinking-$contextId';
+    }
+    return 'thinking-history-${timestamp.microsecondsSinceEpoch}-${_stableTimelineHash(_historyLogEntryKey(entry))}';
+  }
+
+  String _stableTimelineHash(String value) {
+    var hash = 0x811c9dc5;
+    for (var index = 0; index < value.length; index++) {
+      hash ^= value.codeUnitAt(index);
+      hash = (hash * 0x01000193) & 0xffffffff;
+    }
+    return hash.toRadixString(16).padLeft(8, '0');
   }
 
   bool _upsertThinkingTimelineItem(TimelineItem item) {
