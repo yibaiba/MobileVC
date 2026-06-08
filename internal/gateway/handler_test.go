@@ -11175,7 +11175,7 @@ func TestHandlerSessionListDoesNotBlockPingPong(t *testing.T) {
 	_ = readUntilType(t, conn, protocol.EventTypeSessionListResult)
 }
 
-func TestHandlerExplicitSessionListDuplicateInFlightReturnsBusyError(t *testing.T) {
+func TestHandlerExplicitSessionListDuplicateInFlightCoalescesRefresh(t *testing.T) {
 	fileStore, err := data.NewFileStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("new temp store: %v", err)
@@ -11212,15 +11212,20 @@ func TestHandlerExplicitSessionListDuplicateInFlightReturnsBusyError(t *testing.
 	}); err != nil {
 		t.Fatalf("write duplicate session_list request: %v", err)
 	}
-	errorEvent := readUntilType(t, conn, protocol.EventTypeError)
-	msg, _ := errorEvent["msg"].(string)
-	if !strings.Contains(msg, "session list is already running") {
-		t.Fatalf("expected busy session list error, got %#v", errorEvent)
+	if err := conn.WriteJSON(map[string]any{"action": "ping", "pingId": "session-list-duplicate"}); err != nil {
+		t.Fatalf("write duplicate ping request: %v", err)
+	}
+	pong := readUntilPongIDWithoutError(t, conn, "session-list-duplicate")
+	if pong["type"] != "pong" {
+		t.Fatalf("expected pong, got %#v", pong)
 	}
 	if got := blockingStore.ListCallCount(); got != callsAfterFirst {
-		t.Fatalf("duplicate explicit session_list started another scan: before=%d after=%d", callsAfterFirst, got)
+		t.Fatalf("coalesced explicit session_list started before first scan completed: before=%d after=%d", callsAfterFirst, got)
 	}
 
+	blockingStore.ReleaseList()
+	_ = readUntilType(t, conn, protocol.EventTypeSessionListResult)
+	blockingStore.WaitListCallCount(t, callsAfterFirst+1)
 	blockingStore.ReleaseList()
 	_ = readUntilType(t, conn, protocol.EventTypeSessionListResult)
 }

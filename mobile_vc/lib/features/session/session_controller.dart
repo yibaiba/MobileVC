@@ -6401,6 +6401,13 @@ class SessionController extends ChangeNotifier {
         if (error.code == 'ws_not_connected') {
           break;
         }
+        if (_isSessionListOperationAlreadyRunning(error)) {
+          _pushDebug(
+            'session_list 已在刷新',
+            'waiting for existing session_list_result',
+          );
+          break;
+        }
         if (error.code == 'ws_closed' ||
             error.code == 'ws_stream_error' ||
             error.code == 'ws_send_error' ||
@@ -7071,6 +7078,15 @@ class SessionController extends ChangeNotifier {
         message.contains('session resume is already running') ||
         message.contains('session history window unavailable') ||
         message.contains('session history window store unavailable');
+  }
+
+  bool _isSessionListOperationAlreadyRunning(ErrorEvent error) {
+    final code = error.code.trim();
+    if (code == 'session_list_busy') {
+      return true;
+    }
+    final message = error.message.trim().toLowerCase();
+    return message.contains('session list is already running');
   }
 
   bool _isIdleLikeState(String state) {

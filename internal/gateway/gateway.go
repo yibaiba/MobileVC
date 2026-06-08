@@ -2597,7 +2597,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 	var pendingSessionList *pendingSessionListRequest
 	sessionDeltaPending := make(map[string]gatewaySessionDeltaPendingRequest)
 	var emitAndPersistFor func(sessionID string) func(any)
-	var startSessionListWithAfter func(filterCWD string, after func(gatewaySessionListResult), allowPending bool)
+	var startSessionListWithAfter func(filterCWD string, after func(gatewaySessionListResult))
 	invalidateSessionListCacheForMutation := func() {
 		invalidateSessionListCache()
 		h.bumpSessionListGeneration()
@@ -2619,7 +2619,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 		if len(pending.actions) == 0 {
 			after = nil
 		}
-		startSessionListWithAfter(pending.filterCWD, after, true)
+		startSessionListWithAfter(pending.filterCWD, after)
 	}
 
 	applySessionListResult := func(result gatewaySessionListResult) {
@@ -2637,7 +2637,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 		sessionListFilterCWD = normalizeSessionCWD(result.filterCWD)
 		if result.err != nil {
 			logx.Error("ws", "list sessions failed: connectionID=%s sessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, remoteAddr, result.err)
-			emit(protocol.NewErrorEvent(selectedSessionID, result.err.Error(), ""))
+			emit(protocol.NewErrorEventWithCode(selectedSessionID, result.err.Error(), "", "session_list_failed"))
 			drainPendingSessionList()
 			return
 		}
@@ -2656,10 +2656,10 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 		drainPendingSessionList()
 	}
 
-	startSessionListWithAfter = func(filterCWD string, after func(gatewaySessionListResult), allowPending bool) {
+	startSessionListWithAfter = func(filterCWD string, after func(gatewaySessionListResult)) {
 		if h.SessionStore == nil {
 			logx.Warn("ws", "session list requested but session store unavailable: connectionID=%s sessionID=%s remoteAddr=%s", connectionID, selectedSessionID, remoteAddr)
-			emit(protocol.NewErrorEvent(selectedSessionID, "session store unavailable", ""))
+			emit(protocol.NewErrorEventWithCode(selectedSessionID, "session store unavailable", "", "session_list_failed"))
 			return
 		}
 		requestedFilterCWD := normalizeSessionCWD(filterCWD)
@@ -2687,16 +2687,12 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 		actionKey := connectionID + ":session_list"
 		sessionIDSnapshot := strings.TrimSpace(selectedSessionID)
 		if _, exists := asyncEventInFlight[actionKey]; exists {
-			if allowPending {
-				if pendingSessionList == nil || pendingSessionList.filterCWD != requestedFilterCWD {
-					pendingSessionList = &pendingSessionListRequest{filterCWD: requestedFilterCWD}
-				}
-				if after != nil {
-					pendingSessionList.actions = append(pendingSessionList.actions, after)
-				}
-				return
+			if pendingSessionList == nil || pendingSessionList.filterCWD != requestedFilterCWD {
+				pendingSessionList = &pendingSessionListRequest{filterCWD: requestedFilterCWD}
 			}
-			emit(protocol.NewErrorEvent(selectedSessionID, "session list is already running for this connection", ""))
+			if after != nil {
+				pendingSessionList.actions = append(pendingSessionList.actions, after)
+			}
 			return
 		}
 		latestSessionListSequence++
@@ -2705,46 +2701,46 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 		if after != nil {
 			postSessionListActions[actionKey] = append(postSessionListActions[actionKey], after)
 		}
-		if !h.tryStartAsyncAction(ctx, gatewayAsyncActionOptions{
-			Action:       "session_list",
-			SessionID:    actionKey,
-			ConnectionID: connectionID,
-			RemoteAddr:   remoteAddr,
-			OnBusy: func() {
-				select {
-				case sessionListResultCh <- gatewaySessionListResult{actionKey: actionKey, sequence: listSequence, filterCWD: requestedFilterCWD, generation: generation, err: errors.New("session list is already running for this connection")}:
-				case <-ctx.Done():
+		go func() {
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					stack := logx.StackTrace()
+					logx.Error(
+						"ws",
+						"session_list async action panic recovered: connectionID=%s sessionID=%s remoteAddr=%s panic=%v\n%s",
+						connectionID,
+						actionKey,
+						remoteAddr,
+						recovered,
+						stack,
+					)
+					select {
+					case sessionListResultCh <- gatewaySessionListResult{actionKey: actionKey, sequence: listSequence, filterCWD: requestedFilterCWD, generation: generation, err: fmt.Errorf("internal server error")}:
+					case <-ctx.Done():
+					}
 				}
-			},
-			OnPanic: func(any, string) {
-				select {
-				case sessionListResultCh <- gatewaySessionListResult{actionKey: actionKey, sequence: listSequence, filterCWD: requestedFilterCWD, generation: generation, err: fmt.Errorf("internal server error")}:
-				case <-ctx.Done():
-				}
-			},
-			Run: func() {
-				result := buildSessionList(ctx, requestedFilterCWD, sessionIDSnapshot)
-				result.actionKey = actionKey
-				result.sequence = listSequence
-				if result.generation == 0 {
-					result.generation = generation
-				}
-				select {
-				case sessionListResultCh <- result:
-				case <-ctx.Done():
-				}
-			},
-		}) {
-			delete(asyncEventInFlight, actionKey)
-			delete(postSessionListActions, actionKey)
-		}
+			}()
+			if ctx.Err() != nil {
+				return
+			}
+			result := buildSessionList(ctx, requestedFilterCWD, sessionIDSnapshot)
+			result.actionKey = actionKey
+			result.sequence = listSequence
+			if result.generation == 0 {
+				result.generation = generation
+			}
+			select {
+			case sessionListResultCh <- result:
+			case <-ctx.Done():
+			}
+		}()
 	}
 
 	startSessionList := func(filterCWD string) {
-		startSessionListWithAfter(filterCWD, nil, true)
+		startSessionListWithAfter(filterCWD, nil)
 	}
 	startExplicitSessionList := func(filterCWD string) {
-		startSessionListWithAfter(filterCWD, nil, false)
+		startSessionListWithAfter(filterCWD, nil)
 	}
 
 	emitEmptySessionState := func() {
@@ -3874,7 +3870,7 @@ func (h *Handler) ServeClientConn(parentCtx context.Context, client ClientConn) 
 				windowErr := fmt.Errorf("session history window unavailable for fallback session %s", fallbackSessionID)
 				logx.Warn("ws", "load fallback session window after delete unavailable: connectionID=%s sessionID=%s fallbackSessionID=%s remoteAddr=%s err=%v", connectionID, selectedSessionID, fallbackSessionID, remoteAddr, windowErr)
 				emit(protocol.NewErrorEvent(selectedSessionID, windowErr.Error(), ""))
-			}, true)
+			})
 		case "session_context_get":
 			targetSessionID := strings.TrimSpace(selectedSessionID)
 			if targetSessionID == "" {

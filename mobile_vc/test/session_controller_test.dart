@@ -14309,6 +14309,34 @@ Flutter 打出来的 app-release.apk 在 mobile_vc/build/ 下，是 ignored 构�
       expect(controller.isLoadingSession, isTrue);
     });
 
+    test('session_list already running 不渲染为错误消息', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(ErrorEvent(
+        timestamp: _timestamp.add(const Duration(seconds: 1)),
+        sessionId: '',
+        runtimeMeta: const RuntimeMeta(),
+        raw: const {'type': 'error'},
+        message: 'session list is already running for this connection',
+      ));
+      await _flushEvents();
+
+      expect(controller.latestError, isNull);
+      expect(controller.connected, isTrue);
+      expect(
+        controller.timeline.where((item) => item.kind == 'error'),
+        isEmpty,
+      );
+      expect(
+        controller.debugLogs.any((item) => item.contains('session_list 已在刷新')),
+        isTrue,
+      );
+    });
+
     test('e2ee_decrypt_failed 会立即结束会话 loading', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);
