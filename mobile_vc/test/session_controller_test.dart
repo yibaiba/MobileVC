@@ -183,9 +183,10 @@ Future<void> _servePairingE2eeRelay(
         if (decoded['type'] == 'ping') {
           socket.add(jsonEncode(await relayCodec.encodeJson(
             messageId: 'msg_server_ack',
-            payload: const <String, dynamic>{
+            payload: <String, dynamic>{
               'type': 'pong',
               'sessionId': 'session-test',
+              'pingId': (decoded['pingId'] ?? '').toString(),
             },
           )));
         }
@@ -315,9 +316,10 @@ Future<void> _serveReconnectE2eeRelay({
         if (decoded['type'] == 'ping') {
           socket.add(jsonEncode(await relayCodec.encodeJson(
             messageId: 'msg_reconnect_ack',
-            payload: const <String, dynamic>{
+            payload: <String, dynamic>{
               'type': 'pong',
               'sessionId': 'session-reconnect',
+              'pingId': (decoded['pingId'] ?? '').toString(),
             },
           )));
         }
@@ -354,6 +356,33 @@ class _MemoryRelaySecureStore implements RelaySecureStore {
   Future<void> delete(String key) async {
     values.remove(key);
   }
+}
+
+class _BlockingFirstReadRelaySecureStore implements RelaySecureStore {
+  _BlockingFirstReadRelaySecureStore(this.delegate);
+
+  final _MemoryRelaySecureStore delegate;
+  final Completer<void> firstReadStarted = Completer<void>();
+  final Completer<void> releaseFirstRead = Completer<void>();
+  var _blocked = false;
+
+  @override
+  Future<String?> read(String key) async {
+    if (!_blocked) {
+      _blocked = true;
+      if (!firstReadStarted.isCompleted) {
+        firstReadStarted.complete();
+      }
+      await releaseFirstRead.future;
+    }
+    return delegate.read(key);
+  }
+
+  @override
+  Future<void> write(String key, String value) => delegate.write(key, value);
+
+  @override
+  Future<void> delete(String key) => delegate.delete(key);
 }
 
 String _testHex(Uint8List bytes) {
@@ -835,6 +864,100 @@ void main() {
 
       expect(service.hasRelayE2eeHandshake, isTrue);
       expect(service.takeRelaySession()?.clientId, 'rc_test');
+    });
+
+    test('stale E2EE reconnect handshake cannot poison replacement connection',
+        () async {
+      final nodeIdentity = await RelayE2eeHandshake.newEphemeralKeyPair();
+      final nodeFingerprint = await RelayE2eeCrypto.fingerprint(
+        nodeIdentity.publicKey,
+      );
+      final firstServer =
+          await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(firstServer.close);
+      final firstSockets = <WebSocket>[];
+      firstServer.transform(WebSocketTransformer()).listen((socket) {
+        firstSockets.add(socket);
+        socket.listen((_) {
+          socket.add(jsonEncode(const <String, dynamic>{
+            'type': 'client.paired',
+            'version': 1,
+            'sessionId': 'rs_test',
+            'clientId': 'rc_test',
+          }));
+        });
+      });
+      final secondServer =
+          await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(secondServer.close);
+      final observedPlaintexts = <Map<String, dynamic>>[];
+      secondServer.transform(WebSocketTransformer()).listen((socket) {
+        _servePairingE2eeRelay(
+          socket,
+          nodeIdentity,
+          null,
+          observedPlaintexts,
+        );
+      });
+
+      final memoryStore = _MemoryRelaySecureStore();
+      final blockingStore = _BlockingFirstReadRelaySecureStore(memoryStore);
+      final service = MobileVcWsService(
+        relayDeviceIdentityStore: RelayDeviceIdentityStore(
+          secureStore: blockingStore,
+          random: Random(201),
+        ),
+        relayDeviceCredentialStore: RelayDeviceCredentialStore(
+          secureStore: memoryStore,
+          random: Random(202),
+        ),
+      );
+      addTearDown(service.dispose);
+      final events = <AppEvent>[];
+      final subscription = service.events.listen(events.add);
+      addTearDown(subscription.cancel);
+
+      final staleConnect = service.connectRelay(
+        relayUrl: 'ws://127.0.0.1:${firstServer.port}',
+        sessionId: 'rs_test',
+        clientId: 'rc_test',
+        clientReconnectSecret: 'reconnect_secret',
+        nodeFingerprintHex: _testHex(nodeFingerprint),
+        relayCapabilities: RelayE2eeCapabilitySet.production(),
+      );
+      await blockingStore.firstReadStarted.future.timeout(
+        const Duration(seconds: 2),
+      );
+
+      await service.connectRelay(
+        relayUrl: 'ws://127.0.0.1:${secondServer.port}',
+        sessionId: 'rs_test',
+        pairingSecret: 'pair-secret-128-bit-minimum',
+        nodeFingerprintHex: _testHex(nodeFingerprint),
+        relayCapabilities: RelayE2eeCapabilitySet.production(),
+      );
+      expect(service.hasRelayE2eeHandshake, isTrue);
+
+      for (final socket in firstSockets) {
+        await socket.close();
+      }
+      blockingStore.releaseFirstRead.complete();
+      await expectLater(staleConnect, throwsStateError);
+
+      expect(service.hasRelayE2eeHandshake, isTrue);
+      expect(service.send(const <String, dynamic>{'type': 'ping'}), isTrue);
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+
+      expect(
+        events
+            .whereType<ErrorEvent>()
+            .where((event) => event.code == 'e2ee_decrypt_failed'),
+        isEmpty,
+      );
+      expect(
+        observedPlaintexts.any((event) => event['type'] == 'ping'),
+        isTrue,
+      );
     });
 
     test('relay E2EE encrypts forward payloads after handshake', () async {
@@ -2202,6 +2325,67 @@ void main() {
           hasLength(1));
     });
 
+    test('relay health monitor requires matching pong before miss reconnect',
+        () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(
+        service: service,
+        connectionHealthInterval: const Duration(milliseconds: 40),
+        maxMissedHealthPongs: 2,
+      );
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.saveConfig(const AppConfig(
+        connectionMode: 'relay',
+        relayUrl: 'wss://relay.example.test',
+        relaySessionId: 'rs_test',
+        relayClientId: 'rc_test',
+        relayClientReconnectSecret: 'reconnect_secret',
+      ));
+      await controller.connect();
+      service.sentPayloads.clear();
+      service.emit(
+        SessionCreatedEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-health',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_created'},
+          summary: const SessionSummary(id: 'session-health', title: 'Relay'),
+        ),
+      );
+      await _flushEvents();
+
+      await Future<void>.delayed(const Duration(milliseconds: 45));
+      await _flushEvents();
+      final firstPing = service.sentPayloads.singleWhere(
+        (payload) => payload['action'] == 'ping',
+      );
+      final firstPingId = firstPing['pingId'] as String;
+      expect(firstPingId, isNotEmpty);
+
+      service.emit(PongEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 30)),
+        sessionId: 'session-health',
+        runtimeMeta: const RuntimeMeta(),
+        raw: {'type': 'pong', 'pingId': firstPingId},
+        pingId: firstPingId,
+      ));
+      await _flushEvents();
+      await Future<void>.delayed(const Duration(milliseconds: 45));
+      await _flushEvents();
+
+      expect(service.disconnectCalls, 0);
+      expect(controller.connected, isTrue);
+
+      await Future<void>.delayed(const Duration(milliseconds: 130));
+      await _flushEvents();
+
+      expect(service.disconnectCalls, greaterThanOrEqualTo(1));
+      expect(service.connectCalls, greaterThanOrEqualTo(2));
+      expect(controller.connectionStage, isNot(SessionConnectionStage.failed));
+    });
+
     test('relay reconnect uses persisted client credentials', () async {
       SharedPreferences.setMockInitialValues({
         'mobilevc.app_config': jsonEncode(const AppConfig(
@@ -3247,14 +3431,17 @@ void main() {
       final actions =
           service.sentPayloads.map((item) => item['action']).toList();
       actions.remove('context_window_usage_get');
-      expect(actions, [
-        'session_create',
-        'session_context_get',
-        'permission_rule_list',
-        'exec',
-      ]);
+      expect(actions, ['session_create', 'exec']);
       expect(service.sentPayloads.last['cmd'], 'pwd');
       expect(controller.selectedSessionId, 'session-new');
+
+      await Future<void>.delayed(const Duration(milliseconds: 520));
+      await _flushEvents();
+
+      final delayedActions =
+          service.sentPayloads.map((item) => item['action']).toList();
+      expect(delayedActions, contains('session_context_get'));
+      expect(delayedActions, contains('permission_rule_list'));
     });
 
     test('session_list 已同步且当前无会话时，首条 claude 输入会先自动创建会话再启动 Claude', () async {
@@ -3297,18 +3484,21 @@ void main() {
       final actions =
           service.sentPayloads.map((item) => item['action']).toList();
       actions.remove('context_window_usage_get');
-      expect(actions, [
-        'session_create',
-        'session_context_get',
-        'permission_rule_list',
-        'ai_turn',
-      ]);
+      expect(actions, ['session_create', 'ai_turn']);
       final aiTurn = service.sentPayloads.singleWhere(
         (payload) => payload['action'] == 'ai_turn',
       );
       expect(aiTurn['engine'], 'claude');
       expect(aiTurn['data'], '请帮我总结当前问题\n');
       expect(controller.selectedSessionId, 'session-new');
+
+      await Future<void>.delayed(const Duration(milliseconds: 520));
+      await _flushEvents();
+
+      final delayedActions =
+          service.sentPayloads.map((item) => item['action']).toList();
+      expect(delayedActions, contains('session_context_get'));
+      expect(delayedActions, contains('permission_rule_list'));
     });
 
     test('已有选中会话时发送首条输入不会自动创建新会话', () async {
@@ -6074,6 +6264,192 @@ void main() {
       expect(controller.timeline.single.animateBody, isFalse);
     });
 
+    test('同一 contextId 的 thinking 事件会更新同一条 timeline', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      const contextId = 'codex-reasoning:turn-1:reasoning-1';
+      service.emit(
+        ThinkingEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-thinking-live',
+          runtimeMeta: const RuntimeMeta(
+            engine: 'codex',
+            source: 'codex/reasoning-summary',
+            executionId: 'turn-1',
+            contextId: contextId,
+          ),
+          raw: const {'type': 'thinking'},
+          content: '正在定位问题',
+        ),
+      );
+      await _flushEvents();
+      service.emit(
+        ThinkingEvent(
+          timestamp: _timestamp.add(const Duration(milliseconds: 1)),
+          sessionId: 'session-thinking-live',
+          runtimeMeta: const RuntimeMeta(
+            engine: 'codex',
+            source: 'codex/reasoning-summary',
+            executionId: 'turn-1',
+            contextId: contextId,
+          ),
+          raw: const {'type': 'thinking'},
+          content: '正在定位问题\n已经找到相关文件',
+        ),
+      );
+      await _flushEvents();
+
+      final thinkingItems =
+          controller.timeline.where((item) => item.kind == 'thinking').toList();
+      expect(thinkingItems, hasLength(1));
+      expect(thinkingItems.single.id, 'thinking-$contextId');
+      expect(thinkingItems.single.body, contains('已经找到相关文件'));
+      expect(thinkingItems.single.meta.contextId, contextId);
+    });
+
+    test('同 timestamp 但不同 contextId 的 live thinking 会保留两条', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      service.emit(
+        ThinkingEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-thinking-live-contexts',
+          runtimeMeta: const RuntimeMeta(
+            engine: 'claude',
+            contextId: 'claude-thinking:session-1:1:0:2026-01-01T00:00:00Z',
+          ),
+          raw: const {'type': 'thinking'},
+          content: '第一段思考摘要',
+        ),
+      );
+      await _flushEvents();
+      service.emit(
+        ThinkingEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-thinking-live-contexts',
+          runtimeMeta: const RuntimeMeta(
+            engine: 'claude',
+            contextId: 'claude-thinking:session-1:2:1:2026-01-01T00:00:00Z',
+          ),
+          raw: const {'type': 'thinking'},
+          content: '第二段思考摘要',
+        ),
+      );
+      await _flushEvents();
+
+      final thinkingItems =
+          controller.timeline.where((item) => item.kind == 'thinking').toList();
+      expect(thinkingItems, hasLength(2));
+      expect(thinkingItems[0].body, '第一段思考摘要');
+      expect(thinkingItems[1].body, '第二段思考摘要');
+      expect(thinkingItems[0].id, isNot(thinkingItems[1].id));
+      expect(thinkingItems[0].id, startsWith('thinking-claude-thinking:'));
+      expect(thinkingItems[1].id, startsWith('thinking-claude-thinking:'));
+    });
+
+    test('恢复历史 thinking 会使用 contextId 作为稳定 item id', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      const contextId = 'codex-reasoning:turn-2:reasoning-1';
+      service.emit(
+        SessionHistoryEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-thinking-history',
+          runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+          raw: const {'type': 'session_history'},
+          summary: const SessionSummary(
+            id: 'session-thinking-history',
+            title: '历史会话',
+          ),
+          logEntries: const [
+            HistoryLogEntry(
+              kind: 'thinking',
+              message: '恢复出来的思考摘要',
+              timestamp: '2026-01-01T00:00:00Z',
+              executionId: 'turn-2',
+              context: HistoryContext(
+                id: contextId,
+                type: 'thinking',
+                title: '思考过程',
+                message: '恢复出来的思考摘要',
+                source: 'codex/reasoning-summary',
+                executionId: 'turn-2',
+              ),
+            ),
+          ],
+          resumeRuntimeMeta: const RuntimeMeta(
+            command: 'codex',
+            engine: 'codex',
+          ),
+        ),
+      );
+      await _flushEvents();
+
+      expect(controller.timeline, hasLength(1));
+      final item = controller.timeline.single;
+      expect(item.kind, 'thinking');
+      expect(item.id, 'thinking-$contextId');
+      expect(item.meta.contextId, contextId);
+      expect(item.animateBody, isFalse);
+    });
+
+    test('恢复无 context 的同秒 thinking 历史不会合并成一条', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      service.emit(
+        SessionHistoryEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-thinking-contextless-history',
+          runtimeMeta: const RuntimeMeta(command: 'claude', engine: 'claude'),
+          raw: const {'type': 'session_history'},
+          summary: const SessionSummary(
+            id: 'session-thinking-contextless-history',
+            title: '历史会话',
+          ),
+          logEntries: const [
+            HistoryLogEntry(
+              kind: 'thinking',
+              message: '第一段思考摘要，正在定位历史恢复身份',
+              timestamp: '2026-01-01T00:00:00Z',
+            ),
+            HistoryLogEntry(
+              kind: 'thinking',
+              message: '第二段思考摘要，正在验证同秒恢复',
+              timestamp: '2026-01-01T00:00:00Z',
+            ),
+          ],
+          resumeRuntimeMeta: const RuntimeMeta(
+            command: 'claude',
+            engine: 'claude',
+          ),
+        ),
+      );
+      await _flushEvents();
+
+      final thinkingItems =
+          controller.timeline.where((item) => item.kind == 'thinking').toList();
+      expect(thinkingItems, hasLength(2));
+      expect(thinkingItems[0].body, '第一段思考摘要，正在定位历史恢复身份');
+      expect(thinkingItems[1].body, '第二段思考摘要，正在验证同秒恢复');
+      expect(thinkingItems[0].id, isNot(thinkingItems[1].id));
+      expect(thinkingItems[0].meta.contextId, isEmpty);
+      expect(thinkingItems[1].meta.contextId, isEmpty);
+      expect(thinkingItems[0].animateBody, isFalse);
+      expect(thinkingItems[1].animateBody, isFalse);
+    });
+
     test('恢复态 runtime meta 会直接恢复 AI continuation 模式', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);
@@ -6382,8 +6758,8 @@ void main() {
       final refreshActions = service.sentPayloads
           .map((item) => (item['action'] ?? '').toString())
           .toList();
-      expect(refreshActions, contains('session_context_get'));
-      expect(refreshActions, contains('permission_rule_list'));
+      expect(refreshActions, isNot(contains('session_context_get')));
+      expect(refreshActions, isNot(contains('permission_rule_list')));
 
       service.sentPayloads.clear();
       controller.sendInputText('codex');
@@ -6407,6 +6783,294 @@ void main() {
         (item) => item['action'] == 'session_list',
       );
       expect(sessionListRequest, isNot(contains('cwd')));
+    });
+
+    test('session_updated 会合并刷新列表和当前会话 delta', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(
+        SessionCreatedEvent(
+          timestamp: _timestamp,
+          sessionId: 'conn-1',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_created'},
+          summary: const SessionSummary(
+            id: 'session-fresh',
+            title: 'Fresh',
+            ownership: 'mobilevc',
+          ),
+        ),
+      );
+      await _flushEvents();
+      service.sentPayloads.clear();
+
+      service.emit(SessionUpdatedEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-fresh',
+        runtimeMeta: const RuntimeMeta(),
+        raw: const {'type': 'session_updated'},
+        generation: 4,
+        eventCursor: 10,
+        reason: 'projection_persisted',
+      ));
+      service.emit(SessionUpdatedEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 1)),
+        sessionId: 'session-fresh',
+        runtimeMeta: const RuntimeMeta(),
+        raw: const {'type': 'session_updated'},
+        generation: 4,
+        eventCursor: 9,
+        reason: 'projection_persisted',
+      ));
+      service.emit(SessionUpdatedEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 2)),
+        sessionId: 'session-fresh',
+        runtimeMeta: const RuntimeMeta(),
+        raw: const {'type': 'session_updated'},
+        generation: 5,
+        eventCursor: 11,
+        reason: 'projection_persisted',
+      ));
+      await Future<void>.delayed(const Duration(milliseconds: 450));
+
+      final listRequests = service.sentPayloads
+          .where((payload) => payload['action'] == 'session_list')
+          .toList();
+      final deltaRequests = service.sentPayloads
+          .where((payload) => payload['action'] == 'session_delta_get')
+          .toList();
+      expect(listRequests, hasLength(1));
+      expect(deltaRequests, hasLength(1));
+      expect(deltaRequests.single['sessionId'], 'session-fresh');
+      expect(deltaRequests.single['reason'],
+          'session_updated:projection_persisted');
+    });
+
+    test('session_updated delta 被节流时会保留尾部刷新', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(
+        SessionCreatedEvent(
+          timestamp: _timestamp,
+          sessionId: 'conn-1',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_created'},
+          summary: const SessionSummary(
+            id: 'session-fresh',
+            title: 'Fresh',
+            ownership: 'mobilevc',
+          ),
+        ),
+      );
+      await _flushEvents();
+      service.sentPayloads.clear();
+
+      service.emit(SessionUpdatedEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-fresh',
+        runtimeMeta: const RuntimeMeta(),
+        raw: const {'type': 'session_updated'},
+        generation: 4,
+        eventCursor: 10,
+        reason: 'projection_persisted',
+      ));
+      await Future<void>.delayed(const Duration(milliseconds: 450));
+      expect(
+        service.sentPayloads
+            .where((payload) => payload['action'] == 'session_delta_get'),
+        hasLength(1),
+      );
+
+      service.emit(SessionUpdatedEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 1)),
+        sessionId: 'session-fresh',
+        runtimeMeta: const RuntimeMeta(),
+        raw: const {'type': 'session_updated'},
+        generation: 5,
+        eventCursor: 11,
+        reason: 'projection_persisted',
+      ));
+      await Future<void>.delayed(const Duration(milliseconds: 120));
+      expect(
+        service.sentPayloads
+            .where((payload) => payload['action'] == 'session_delta_get'),
+        hasLength(1),
+      );
+
+      await Future<void>.delayed(const Duration(milliseconds: 780));
+      final deltaRequests = service.sentPayloads
+          .where((payload) => payload['action'] == 'session_delta_get')
+          .toList();
+      expect(deltaRequests, hasLength(2));
+      expect(
+          deltaRequests.last['reason'], 'session_updated:projection_persisted');
+    });
+
+    test('session_updated 同一 generation 的新 cursor 只刷新当前会话 delta', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(
+        SessionCreatedEvent(
+          timestamp: _timestamp,
+          sessionId: 'conn-1',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_created'},
+          summary: const SessionSummary(
+            id: 'session-fresh',
+            title: 'Fresh',
+            ownership: 'mobilevc',
+          ),
+        ),
+      );
+      await _flushEvents();
+      service.sentPayloads.clear();
+
+      service.emit(SessionUpdatedEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-fresh',
+        runtimeMeta: const RuntimeMeta(),
+        raw: const {'type': 'session_updated'},
+        generation: 7,
+        eventCursor: 20,
+        reason: 'projection_persisted',
+      ));
+      await Future<void>.delayed(const Duration(milliseconds: 450));
+      expect(
+        service.sentPayloads
+            .where((payload) => payload['action'] == 'session_list'),
+        hasLength(1),
+      );
+      expect(
+        service.sentPayloads
+            .where((payload) => payload['action'] == 'session_delta_get'),
+        hasLength(1),
+      );
+
+      service.emit(SessionUpdatedEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 1)),
+        sessionId: 'session-fresh',
+        runtimeMeta: const RuntimeMeta(),
+        raw: const {'type': 'session_updated'},
+        generation: 7,
+        eventCursor: 21,
+        reason: 'projection_persisted',
+      ));
+      await Future<void>.delayed(const Duration(milliseconds: 900));
+
+      expect(
+        service.sentPayloads
+            .where((payload) => payload['action'] == 'session_list'),
+        hasLength(1),
+      );
+      final deltaRequests = service.sentPayloads
+          .where((payload) => payload['action'] == 'session_delta_get')
+          .toList();
+      expect(deltaRequests, hasLength(2));
+      expect(deltaRequests.last['sessionId'], 'session-fresh');
+    });
+
+    test('session_updated 当前会话新 cursor 会尽快拉取 delta', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(
+        SessionCreatedEvent(
+          timestamp: _timestamp,
+          sessionId: 'conn-1',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_created'},
+          summary: const SessionSummary(
+            id: 'session-fresh',
+            title: 'Fresh',
+            ownership: 'mobilevc',
+          ),
+        ),
+      );
+      await _flushEvents();
+      service.sentPayloads.clear();
+
+      service.emit(SessionUpdatedEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-fresh',
+        runtimeMeta: const RuntimeMeta(),
+        raw: const {'type': 'session_updated'},
+        generation: 8,
+        eventCursor: 30,
+        reason: 'projection_persisted',
+      ));
+      await Future<void>.delayed(const Duration(milliseconds: 120));
+
+      final deltaRequests = service.sentPayloads
+          .where((payload) => payload['action'] == 'session_delta_get')
+          .toList();
+      expect(deltaRequests, hasLength(1));
+      expect(deltaRequests.single['reason'],
+          'session_updated:projection_persisted');
+    });
+
+    test('当前会话 session_updated delta 会抢占已有列表刷新 debounce', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(
+        SessionCreatedEvent(
+          timestamp: _timestamp,
+          sessionId: 'conn-1',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_created'},
+          summary: const SessionSummary(
+            id: 'session-fresh',
+            title: 'Fresh',
+            ownership: 'mobilevc',
+          ),
+        ),
+      );
+      await _flushEvents();
+      service.sentPayloads.clear();
+
+      service.emit(SessionUpdatedEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-other',
+        runtimeMeta: const RuntimeMeta(),
+        raw: const {'type': 'session_updated'},
+        generation: 3,
+        eventCursor: 20,
+        reason: 'projection_persisted',
+      ));
+      service.emit(SessionUpdatedEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 1)),
+        sessionId: 'session-fresh',
+        runtimeMeta: const RuntimeMeta(),
+        raw: const {'type': 'session_updated'},
+        generation: 9,
+        eventCursor: 31,
+        reason: 'projection_persisted',
+      ));
+      await Future<void>.delayed(const Duration(milliseconds: 120));
+
+      final deltaRequests = service.sentPayloads
+          .where((payload) => payload['action'] == 'session_delta_get')
+          .toList();
+      expect(deltaRequests, hasLength(1));
+      expect(deltaRequests.single['sessionId'], 'session-fresh');
     });
 
     test('loadSessionFromSummary 会先切换到会话 cwd 再加载', () async {
@@ -7019,6 +7683,9 @@ void main() {
         service.sentPayloads.where((item) => item['action'] == 'session_list'),
         isNotEmpty,
       );
+      await Future<void>.delayed(const Duration(milliseconds: 520));
+      await _flushEvents();
+
       expect(
         service.sentPayloads
             .where((item) => item['action'] == 'session_context_get'),
@@ -7026,8 +7693,8 @@ void main() {
       );
       expect(
         service.sentPayloads
-            .where((item) => item['action'] == 'review_state_get'),
-        isNotEmpty,
+            .where((item) => item['action'] == 'session_diff_page_get'),
+        isEmpty,
       );
     });
 
@@ -7323,6 +7990,113 @@ void main() {
           isFalse);
     });
 
+    test('deleteSession 删除当前会话后会忽略迟到历史快照', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      service.emit(
+        SessionCreatedEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-a',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_created'},
+          summary: const SessionSummary(id: 'session-a', title: 'Session A'),
+        ),
+      );
+      await _flushEvents();
+
+      controller.deleteSession('session-a');
+      await _flushEvents();
+
+      service.emit(
+        SessionHistoryEvent(
+          timestamp: _timestamp.add(const Duration(seconds: 1)),
+          sessionId: 'session-a',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_history'},
+          summary: const SessionSummary(id: 'session-a', title: 'Session A'),
+          logEntries: const [
+            HistoryLogEntry(
+              kind: 'markdown',
+              message: 'stale history',
+              timestamp: '2026-06-08T00:00:00Z',
+            ),
+          ],
+        ),
+      );
+      await _flushEvents();
+
+      expect(controller.selectedSessionId, isEmpty);
+      expect(controller.timeline.any((item) => item.body == 'stale history'),
+          isFalse);
+    });
+
+    test('deleteSession 不会把同一 Claude UUID 重新显示成电脑 Claude', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      service.emit(
+        SessionListResultEvent(
+          timestamp: _timestamp,
+          sessionId: '',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_list_result'},
+          items: const [
+            SessionSummary(
+              id: 'session-a',
+              title: 'MobileVC Claude',
+              ownership: 'mobilevc',
+              source: 'mobilevc',
+              runtime: RuntimeMeta(
+                engine: 'claude',
+                command: 'claude',
+                claudeSessionUuid: 'native-claude-1',
+                source: 'mobilevc',
+              ),
+            ),
+            SessionSummary(id: 'session-b', title: 'Session B'),
+          ],
+        ),
+      );
+      await _flushEvents();
+
+      controller.deleteSession('session-a');
+      await _flushEvents();
+
+      service.emit(
+        SessionListResultEvent(
+          timestamp: _timestamp.add(const Duration(seconds: 1)),
+          sessionId: '',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_list_result'},
+          items: const [
+            SessionSummary(
+              id: 'claude-session:native-claude-1',
+              title: '电脑 Claude',
+              external: true,
+              source: 'claude-native',
+              runtime: RuntimeMeta(
+                engine: 'claude',
+                command: 'claude',
+                resumeSessionId: 'native-claude-1',
+                source: 'claude-native',
+              ),
+            ),
+            SessionSummary(id: 'session-b', title: 'Session B'),
+          ],
+        ),
+      );
+      await _flushEvents();
+
+      expect(controller.sessions.map((item) => item.id).toList(), [
+        'session-b',
+      ]);
+    });
+
     test('deleteSession 失败时恢复本地会话并显示错误', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);
@@ -7525,9 +8299,112 @@ void main() {
       );
       await _flushEvents();
 
+      expect(controller.selectedSessionTitle, '电脑 Codex');
       expect(controller.timeline, hasLength(1));
       expect(controller.timeline.single.kind, 'user');
       expect(controller.timeline.single.body, '修一下登录页按钮间距');
+    });
+
+    test('外部 Codex 会话恢复后左上角标题使用电脑来源名称', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      service.emit(
+        SessionHistoryEvent(
+          timestamp: _timestamp,
+          sessionId: 'codex-thread:3',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_history'},
+          summary: const SessionSummary(
+            id: 'codex-thread:3',
+            title: '这里有问题不能删除mobilevc喃',
+            source: 'codex-native',
+            external: true,
+            runtime: RuntimeMeta(
+              source: 'codex-native',
+              engine: 'codex',
+              cwd: '/workspace/MobileVC',
+            ),
+          ),
+          resumeRuntimeMeta: const RuntimeMeta(
+            source: 'codex-native',
+            engine: 'codex',
+            command: 'codex',
+            resumeSessionId: 'thread-3',
+          ),
+        ),
+      );
+      await _flushEvents();
+
+      expect(controller.selectedSessionTitle, '电脑 Codex');
+      expect(controller.sessions.single.title, '这里有问题不能删除mobilevc喃');
+    });
+
+    test('Codex mirror id 恢复时优先于旧 Claude runtime source', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.saveConfig(const AppConfig(
+        engine: 'claude',
+        permissionMode: 'bypassPermissions',
+        codexSandboxMode: 'danger-full-access',
+      ));
+      await controller.connect();
+      service.emit(
+        SessionHistoryEvent(
+          timestamp: _timestamp,
+          sessionId: 'codex-thread:stale-runtime',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'session_history'},
+          summary: const SessionSummary(
+            id: 'codex-thread:stale-runtime',
+            title: '修复会话来源',
+            external: true,
+            runtime: RuntimeMeta(
+              source: 'claude-native',
+              engine: 'claude',
+              command: 'claude --resume stale-runtime',
+            ),
+          ),
+          runtimeAlive: true,
+          resumeRuntimeMeta: const RuntimeMeta(
+            source: 'claude-native',
+            engine: 'claude',
+            command: 'claude --resume stale-runtime',
+            resumeSessionId: 'stale-runtime',
+            claudeLifecycle: 'waiting_input',
+          ),
+        ),
+      );
+      await _flushEvents();
+
+      expect(controller.selectedSessionTitle, '电脑 Codex');
+      expect(controller.shouldShowClaudeMode, isFalse);
+      expect(controller.isSessionReadOnly, isTrue);
+
+      service.sentPayloads.clear();
+      controller.continueSameSessionFromPhone();
+
+      final resumes = service.sentPayloads
+          .where((payload) => payload['action'] == 'session_resume')
+          .toList();
+      expect(resumes, hasLength(1));
+      expect(resumes.single['engine'], 'codex');
+      expect(resumes.single['codexSandboxMode'], 'danger-full-access');
+      expect(resumes.single['permissionMode'], 'bypassPermissions');
+
+      service.sentPayloads.clear();
+      controller.sendInputText('继续处理');
+
+      final turns = service.sentPayloads
+          .where((payload) => payload['action'] == 'ai_turn')
+          .toList();
+      expect(turns, hasLength(1));
+      expect(turns.single['engine'], 'codex');
     });
 
     test('外部 Codex 会话只有空白历史项时仍会补可见预览', () async {
@@ -7929,6 +8806,234 @@ void main() {
         controller.notificationSignal?.body,
         '**Code Updates** - Added permission fix. Push completed successfully.',
       );
+    });
+
+    test('codex 短 delta 分片第一块会立即进入 timeline', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      const meta = RuntimeMeta(
+        command: 'codex',
+        engine: 'codex',
+        source: 'codex/assistant',
+        executionId: 'turn-short-delta-1',
+      );
+      service.emit(LogEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-1',
+        runtimeMeta: meta,
+        raw: const {'type': 'log'},
+        message: 'Tip :',
+        stream: 'stdout',
+      ));
+      await _flushEvents();
+
+      expect(controller.timeline, hasLength(1));
+      expect(controller.timeline.single.kind, 'markdown');
+      expect(controller.timeline.single.body, 'Tip :');
+
+      service.emit(LogEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 120)),
+        sessionId: 'session-1',
+        runtimeMeta: meta,
+        raw: const {'type': 'log'},
+        message: 'hello world',
+        stream: 'stdout',
+      ));
+      await _flushEvents();
+
+      expect(controller.timeline, hasLength(1));
+      expect(controller.timeline.single.body, 'Tip : hello world');
+    });
+
+    test('codex 最终完整回复会覆盖已合并流式片段而不是重复拼接', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      const meta = RuntimeMeta(
+        command: 'codex',
+        engine: 'codex',
+        executionId: 'exec-codex-final-1',
+        contextId: 'turn-final-1',
+      );
+      service.emit(
+        LogEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-1',
+          runtimeMeta: meta,
+          raw: const {'type': 'log'},
+          message: '已修复 relay 重连问题，',
+          stream: 'stdout',
+        ),
+      );
+      service.emit(
+        LogEvent(
+          timestamp: _timestamp.add(const Duration(milliseconds: 120)),
+          sessionId: 'session-1',
+          runtimeMeta: meta,
+          raw: const {'type': 'log'},
+          message: '并补充了回归测试。',
+          stream: 'stdout',
+        ),
+      );
+      service.emit(
+        LogEvent(
+          timestamp: _timestamp.add(const Duration(milliseconds: 240)),
+          sessionId: 'session-1',
+          runtimeMeta: meta,
+          raw: const {'type': 'log'},
+          message: '已修复 relay 重连问题，并补充了回归测试。',
+          stream: 'stdout',
+        ),
+      );
+      await _flushEvents();
+
+      final markdownItems =
+          controller.timeline.where((item) => item.kind == 'markdown').toList();
+      expect(markdownItems, hasLength(1));
+      expect(markdownItems.single.body, '已修复 relay 重连问题，并补充了回归测试。');
+    });
+
+    test('session_delta 回放已实时显示的完整 assistant 回复时不会重复拼接', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      const meta = RuntimeMeta(
+        command: 'codex',
+        engine: 'codex',
+        executionId: 'exec-codex-delta-final-1',
+        contextId: 'turn-delta-final-1',
+      );
+      await controller.connect();
+      service.emit(SessionCreatedEvent(
+        timestamp: _timestamp,
+        sessionId: 'conn-1',
+        runtimeMeta: meta,
+        raw: const {'type': 'session_created'},
+        summary: const SessionSummary(id: 'session-1', title: 'Session 1'),
+      ));
+      await _flushEvents();
+
+      service.emit(LogEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 100)),
+        sessionId: 'session-1',
+        runtimeMeta: meta,
+        raw: const {'type': 'log'},
+        message: '手机发送后页面刷新慢，',
+        stream: 'stdout',
+      ));
+      service.emit(LogEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 200)),
+        sessionId: 'session-1',
+        runtimeMeta: meta,
+        raw: const {'type': 'log'},
+        message: '并且回复重复显示。',
+        stream: 'stdout',
+      ));
+      await _flushEvents();
+
+      service.emit(SessionDeltaEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 800)),
+        sessionId: 'session-1',
+        runtimeMeta: meta,
+        raw: const {'type': 'session_delta'},
+        summary: const SessionSummary(id: 'session-1', title: 'Session 1'),
+        base: const SessionDeltaKnown(eventCursor: 1, logEntryCount: 0),
+        latest: const SessionDeltaKnown(eventCursor: 2, logEntryCount: 1),
+        appendLogEntries: const [
+          HistoryLogEntry(
+            kind: 'markdown',
+            message: '手机发送后页面刷新慢，并且回复重复显示。',
+            timestamp: '2026-05-27T05:53:00Z',
+            executionId: 'exec-codex-delta-final-1',
+            context: HistoryContext(
+              id: 'turn-delta-final-1',
+              source: 'codex',
+              type: 'assistant',
+            ),
+          ),
+        ],
+        resumeRuntimeMeta: meta,
+      ));
+      await _flushEvents();
+
+      final markdownItems =
+          controller.timeline.where((item) => item.kind == 'markdown').toList();
+      expect(markdownItems, hasLength(1));
+      expect(markdownItems.single.body, '手机发送后页面刷新慢，并且回复重复显示。');
+    });
+
+    test('history 已恢复完整 assistant 回复后会吸收后到的同源 live 尾段', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      const meta = RuntimeMeta(
+        command: 'codex',
+        engine: 'codex',
+        executionId: 'exec-codex-restored-tail-1',
+        contextId: 'turn-restored-tail-1',
+      );
+      const fullReply = '''
+修改内容：
+
+- 修改了 mobile_vc/lib/features/session/session_controller.dart
+- 修改了 mobile_vc/test/session_controller_test.dart
+- 统计：283 insertions(+), 16 deletions(-)
+
+当前工作区是干净的，没有还能再提交的变更。
+Flutter 打出来的 app-release.apk 在 mobile_vc/build/ 下，是 ignored 构建产物，不会被正常 Git commit。''';
+      const tailReplay = '''
+- 统计：283 insertions(+), 16 deletions(-)
+
+当前工作区是干净的，没有还能再提交的变更。
+Flutter 打出来的 app-release.apk 在 mobile_vc/build/ 下，是 ignored 构建产物，不会被正常 Git commit。''';
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-1',
+        runtimeMeta: meta,
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-1', title: 'Session 1'),
+        logEntries: const [
+          HistoryLogEntry(
+            kind: 'markdown',
+            message: fullReply,
+            timestamp: '2026-06-06T15:39:00Z',
+            executionId: 'exec-codex-restored-tail-1',
+            context: HistoryContext(
+              id: 'turn-restored-tail-1',
+              source: 'codex',
+              type: 'assistant',
+            ),
+          ),
+        ],
+        resumeRuntimeMeta: meta,
+      ));
+      await _flushEvents();
+
+      service.emit(LogEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 500)),
+        sessionId: 'session-1',
+        runtimeMeta: meta,
+        raw: const {'type': 'log'},
+        message: tailReplay,
+        stream: 'stdout',
+      ));
+      await _flushEvents();
+
+      final markdownItems =
+          controller.timeline.where((item) => item.kind == 'markdown').toList();
+      expect(markdownItems, hasLength(1));
+      expect(markdownItems.single.body, fullReply);
     });
 
     test('codex 单行总结式回复不会再被误判为 terminal 输出', () async {
@@ -8366,6 +9471,69 @@ void main() {
         containsPair('action', 'runtime_process_log_get'),
       );
       expect(service.sentPayloads.last['pid'], 202);
+    });
+
+    test('runtime_process_log_result 不可用消息不会渲染为错误 timeline', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.sentPayloads.clear();
+
+      service.emit(
+        RuntimeProcessListResultEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-1',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'runtime_process_list_result'},
+          rootPid: 101,
+          items: const [
+            RuntimeProcessItem(
+              pid: 101,
+              ppid: 1,
+              state: 'Ss',
+              elapsed: '00:12',
+              command: 'codex exec',
+              cwd: '/workspace',
+              executionId: 'exec-missing',
+              source: 'codex',
+              root: true,
+              logAvailable: true,
+            ),
+          ],
+        ),
+      );
+      await _flushEvents();
+
+      expect(controller.runtimeProcessLogLoading, isTrue);
+      service.emit(
+        RuntimeProcessLogResultEvent(
+          timestamp: _timestamp,
+          sessionId: 'session-1',
+          runtimeMeta: const RuntimeMeta(),
+          raw: const {'type': 'runtime_process_log_result'},
+          pid: 101,
+          executionId: 'exec-missing',
+          command: 'codex exec',
+          cwd: '/workspace',
+          source: 'codex',
+          message: '该进程没有可用的终端执行日志',
+        ),
+      );
+      await _flushEvents();
+
+      expect(controller.runtimeProcessLogLoading, isFalse);
+      expect(controller.activeRuntimeProcessPid, 101);
+      expect(controller.activeRuntimeProcessStdout, isEmpty);
+      expect(controller.activeRuntimeProcessStderr, isEmpty);
+      expect(
+        controller.activeRuntimeProcessMessage,
+        '该进程没有可用的终端执行日志',
+      );
+      expect(
+          controller.timeline.where((item) => item.kind == 'error'), isEmpty);
     });
 
     test('session_history 会清空旧的 runtime process 状态', () async {
@@ -9079,7 +10247,7 @@ void main() {
       expect(prompt.options, hasLength(3));
     });
 
-    test('connect 时会补发 session_context_get 和 review_state_get', () async {
+    test('connect 时会补发 session_context_get，但不主动拉取 diff page', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);
       await controller.initialize();
@@ -9095,12 +10263,16 @@ void main() {
 
       await controller.connect();
 
+      await Future<void>.delayed(const Duration(milliseconds: 520));
+      await _flushEvents();
+
       final actions = service.sentPayloads
           .map((payload) => payload['action'])
           .whereType<String>()
           .toList();
       expect(actions, contains('session_context_get'));
-      expect(actions, contains('review_state_get'));
+      expect(actions, isNot(contains('review_state_get')));
+      expect(actions, isNot(contains('session_diff_page_get')));
     });
 
     test('review 决策后优先跳到同组下一个待审文件', () async {
@@ -11671,6 +12843,14 @@ void main() {
       addTearDown(controller.disposeController);
 
       await controller.connect();
+      service.emit(SessionCreatedEvent(
+        timestamp: _timestamp,
+        sessionId: 'conn-1',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_created'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+      ));
+      await _flushEvents();
       service.emit(SessionHistoryEvent(
         timestamp: _timestamp,
         sessionId: 'session-current',
@@ -11814,6 +12994,16 @@ void main() {
       addTearDown(controller.disposeController);
 
       await controller.connect();
+      service.emit(SessionCreatedEvent(
+        timestamp: _timestamp,
+        sessionId: 'conn-1',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_created'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+      ));
+      await _flushEvents();
+      service.sentPayloads.clear();
+
       service.emit(SessionHistoryEvent(
         timestamp: _timestamp,
         sessionId: 'session-current',
@@ -12169,6 +13359,45 @@ void main() {
       expect(service.sentPayloads.single['limit'], 120);
     });
 
+    test('connect 阶段延后非关键 bootstrap，避免 relay loading burst', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      final initialActions =
+          service.sentPayloads.map((payload) => payload['action']).toList();
+      expect(initialActions, contains('fs_list'));
+      expect(initialActions, contains('session_list'));
+      expect(initialActions, isNot(contains('session_delta_get')),
+          reason: 'no selected session exists during initial connect');
+      expect(initialActions, isNot(contains('runtime_info')));
+      expect(initialActions, isNot(contains('skill_catalog_get')));
+      expect(initialActions, isNot(contains('memory_list')));
+      expect(initialActions, isNot(contains('adb_devices')));
+      expect(initialActions, isNot(contains('session_context_get')));
+      expect(initialActions, isNot(contains('permission_rule_list')));
+      expect(initialActions, isNot(contains('session_diff_page_get')));
+      expect(initialActions, isNot(contains('task_snapshot_get')));
+      expect(initialActions, isNot(contains('context_window_usage_get')));
+
+      await Future<void>.delayed(const Duration(milliseconds: 520));
+      await _flushEvents();
+
+      final delayedActions =
+          service.sentPayloads.map((payload) => payload['action']).toList();
+      expect(delayedActions, contains('runtime_info'));
+      expect(delayedActions, contains('skill_catalog_get'));
+      expect(delayedActions, contains('memory_list'));
+      expect(delayedActions, contains('adb_devices'));
+      expect(delayedActions, contains('session_context_get'));
+      expect(delayedActions, contains('permission_rule_list'));
+      expect(delayedActions, contains('task_snapshot_get'));
+      expect(delayedActions, contains('context_window_usage_get'));
+      expect(delayedActions, isNot(contains('relay_device_list')));
+    });
+
     test('会话历史窗口使用配置里的条数', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);
@@ -12430,6 +13659,995 @@ void main() {
       expect(group.body, contains('- **functions.exec_command**'));
     });
 
+    test('session_delta 补完成状态时更新 Codex 原生操作组而不是重复追加', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      const started = HistoryLogEntry(
+        kind: 'system',
+        message: 'task started',
+        timestamp: '2026-05-27T05:21:01Z',
+        context: HistoryContext(
+          source: 'codex-native',
+          type: 'codex_task',
+          status: 'started',
+        ),
+      );
+      const toolCall = HistoryLogEntry(
+        kind: 'system',
+        message: '调用 shell',
+        timestamp: '2026-05-27T05:21:02Z',
+        context: HistoryContext(
+          source: 'codex-native',
+          type: 'codex_tool_call',
+          tool: 'functions.exec_command',
+        ),
+      );
+      const completed = HistoryLogEntry(
+        kind: 'system',
+        message: 'task completed',
+        timestamp: '2026-05-27T05:21:03Z',
+        context: HistoryContext(
+          source: 'codex-native',
+          type: 'codex_task',
+          status: 'completed',
+        ),
+      );
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        logEntries: const [started, toolCall],
+        latest: const SessionDeltaKnown(eventCursor: 2, logEntryCount: 2),
+        resumeRuntimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+      ));
+      await _flushEvents();
+
+      expect(
+        controller.timeline.where((item) => item.kind == 'codex_tool_group'),
+        hasLength(1),
+      );
+
+      service.emit(SessionDeltaEvent(
+        timestamp: _timestamp.add(const Duration(seconds: 1)),
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'session_delta'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        base: const SessionDeltaKnown(eventCursor: 2, logEntryCount: 2),
+        latest: const SessionDeltaKnown(eventCursor: 3, logEntryCount: 3),
+        appendLogEntries: const [started, toolCall, completed],
+        resumeRuntimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+      ));
+      await _flushEvents();
+
+      final groups = controller.timeline
+          .where((item) => item.kind == 'codex_tool_group')
+          .toList(growable: false);
+      expect(groups, hasLength(1));
+      expect(groups.single.codexSteps, contains('Codex 任务已完成'));
+      expect(groups.single.body, contains('## 工具调用 (1)'));
+      expect(groups.single.body, contains('## 任务状态 (2)'));
+      expect('## 工具调用'.allMatches(groups.single.body), hasLength(1));
+      expect(
+        controller.timeline.map((item) => item.kind).toList(),
+        ['codex_tool_group'],
+      );
+    });
+
+    test('session_delta 只补 completed 时保留已有 Codex 原生操作细节', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      const toolCall = HistoryLogEntry(
+        kind: 'system',
+        message: '调用 shell',
+        timestamp: '2026-05-27T05:22:02Z',
+        context: HistoryContext(
+          source: 'codex-native',
+          type: 'codex_tool_call',
+          tool: 'functions.exec_command',
+          command: '{"cmd":"sed -n \'1,20p\' lib/main.dart"}',
+        ),
+      );
+      const completed = HistoryLogEntry(
+        kind: 'system',
+        message: 'task completed',
+        timestamp: '2026-05-27T05:22:06Z',
+        context: HistoryContext(
+          source: 'codex-native',
+          type: 'codex_task',
+          status: 'completed',
+        ),
+      );
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        logEntries: const [toolCall],
+        latest: const SessionDeltaKnown(eventCursor: 1, logEntryCount: 1),
+        resumeRuntimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+      ));
+      await _flushEvents();
+
+      service.emit(SessionDeltaEvent(
+        timestamp: _timestamp.add(const Duration(seconds: 1)),
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'session_delta'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        base: const SessionDeltaKnown(eventCursor: 1, logEntryCount: 1),
+        latest: const SessionDeltaKnown(eventCursor: 2, logEntryCount: 2),
+        appendLogEntries: const [completed],
+        resumeRuntimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+      ));
+      await _flushEvents();
+
+      final groups = controller.timeline
+          .where((item) => item.kind == 'codex_tool_group')
+          .toList(growable: false);
+      expect(groups, hasLength(1));
+      expect(groups.single.codexSteps, contains('正在读取 main.dart'));
+      expect(groups.single.codexSteps, contains('Codex 任务已完成'));
+      expect(groups.single.body, contains('## 工具调用 (1)'));
+      expect(groups.single.body, contains('## 任务状态 (1)'));
+    });
+
+    test('session_delta 后到 completed 和旧回复片段不会追加到最终回答后', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      const meta = RuntimeMeta(
+        command: 'codex',
+        engine: 'codex',
+        executionId: 'turn-completed-after-answer',
+        contextId: 'turn-completed-after-answer',
+      );
+      const toolCall = HistoryLogEntry(
+        kind: 'system',
+        message: '调用 shell',
+        timestamp: '2026-05-27T05:22:02Z',
+        context: HistoryContext(
+          source: 'codex-native',
+          type: 'codex_tool_call',
+          tool: 'functions.exec_command',
+          command:
+              '{"cmd":"dart analyze mobile_vc/lib/features/session/session_controller.dart"}',
+        ),
+      );
+      const completed = HistoryLogEntry(
+        kind: 'system',
+        message: 'task completed',
+        timestamp: '2026-05-27T05:22:03Z',
+        context: HistoryContext(
+          source: 'codex-native',
+          type: 'codex_task',
+          status: 'completed',
+        ),
+      );
+      const staleReply = HistoryLogEntry(
+        kind: 'markdown',
+        message: 'dart analyze 已通过。',
+        timestamp: '2026-05-27T05:22:04Z',
+        executionId: 'turn-completed-after-answer',
+        context: HistoryContext(
+          id: 'turn-completed-after-answer',
+          source: 'codex',
+          type: 'assistant',
+        ),
+      );
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: meta,
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        logEntries: const [toolCall],
+        latest: const SessionDeltaKnown(eventCursor: 1, logEntryCount: 1),
+        resumeRuntimeMeta: meta,
+      ));
+      await _flushEvents();
+
+      service.emit(LogEvent(
+        timestamp: DateTime.parse('2026-05-27T05:22:05Z'),
+        sessionId: 'session-current',
+        runtimeMeta: meta,
+        raw: const {'type': 'log'},
+        message: '已提交，验证也都通过了。',
+        stream: 'stdout',
+      ));
+      await _flushEvents();
+
+      service.emit(SessionDeltaEvent(
+        timestamp: _timestamp.add(const Duration(seconds: 1)),
+        sessionId: 'session-current',
+        runtimeMeta: meta,
+        raw: const {'type': 'session_delta'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        base: const SessionDeltaKnown(eventCursor: 1, logEntryCount: 1),
+        latest: const SessionDeltaKnown(eventCursor: 3, logEntryCount: 3),
+        appendLogEntries: const [completed, staleReply],
+        resumeRuntimeMeta: meta,
+      ));
+      await _flushEvents();
+
+      final groups = controller.timeline
+          .where((item) => item.kind == 'codex_tool_group')
+          .toList(growable: false);
+      final markdownItems = controller.timeline
+          .where((item) => item.kind == 'markdown')
+          .toList(growable: false);
+
+      expect(groups, hasLength(1));
+      expect(groups.single.codexSteps, contains('Codex 任务已完成'));
+      expect(markdownItems, hasLength(1));
+      expect(markdownItems.single.body, '已提交，验证也都通过了。');
+      expect(controller.timeline.last.body, '已提交，验证也都通过了。');
+    });
+
+    test('session_delta 后到无 turn id 的旧回复片段不会插回最终回答后', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      const toolCall = HistoryLogEntry(
+        kind: 'system',
+        message: '调用 shell',
+        timestamp: '2026-05-27T05:22:02Z',
+        context: HistoryContext(
+          source: 'codex-native',
+          type: 'codex_tool_call',
+          tool: 'functions.exec_command',
+          command:
+              '{"cmd":"dart analyze mobile_vc/lib/features/session/session_controller.dart"}',
+        ),
+      );
+      const completed = HistoryLogEntry(
+        kind: 'system',
+        message: 'task completed',
+        timestamp: '2026-05-27T05:22:03Z',
+        context: HistoryContext(
+          source: 'codex-native',
+          type: 'codex_task',
+          status: 'completed',
+        ),
+      );
+      const staleReply = HistoryLogEntry(
+        kind: 'markdown',
+        message: 'dart analyze 已通过。',
+        timestamp: '2026-05-27T05:22:07Z',
+        context: HistoryContext(
+          source: 'codex',
+          type: 'assistant',
+        ),
+      );
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        logEntries: const [toolCall],
+        latest: const SessionDeltaKnown(eventCursor: 1, logEntryCount: 1),
+        resumeRuntimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+      ));
+      await _flushEvents();
+
+      service.emit(LogEvent(
+        timestamp: DateTime.parse('2026-05-27T05:22:05Z'),
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'log'},
+        message: '已提交，验证也都通过了。',
+        stream: 'stdout',
+      ));
+      await _flushEvents();
+
+      service.emit(SessionDeltaEvent(
+        timestamp: _timestamp.add(const Duration(seconds: 1)),
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'session_delta'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        base: const SessionDeltaKnown(eventCursor: 1, logEntryCount: 1),
+        latest: const SessionDeltaKnown(eventCursor: 3, logEntryCount: 3),
+        appendLogEntries: const [completed, staleReply],
+        resumeRuntimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+      ));
+      await _flushEvents();
+
+      final markdownItems = controller.timeline
+          .where((item) => item.kind == 'markdown')
+          .toList(growable: false);
+
+      expect(markdownItems, hasLength(1));
+      expect(markdownItems.single.body, '已提交，验证也都通过了。');
+      expect(controller.timeline.last.body, '已提交，验证也都通过了。');
+    });
+
+    test('session_delta 混合 thinking 时 completed 后旧回复仍不会插回最终回答后', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      const completed = HistoryLogEntry(
+        kind: 'system',
+        message: 'task completed',
+        timestamp: '2026-05-27T05:22:03Z',
+        context: HistoryContext(
+          source: 'codex-native',
+          type: 'codex_task',
+          status: 'completed',
+        ),
+      );
+      const thinking = HistoryLogEntry(
+        kind: 'thinking',
+        message: '正在复核 session_delta 渲染边界',
+        timestamp: '2026-05-27T05:22:04Z',
+        context: HistoryContext(
+          id: 'codex-thinking-mixed-delta',
+          source: 'codex',
+          type: 'thinking',
+        ),
+      );
+      const staleReply = HistoryLogEntry(
+        kind: 'markdown',
+        message: 'dart analyze 已通过。',
+        timestamp: '2026-05-27T05:22:07Z',
+        context: HistoryContext(
+          source: 'codex',
+          type: 'assistant',
+        ),
+      );
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        latest: const SessionDeltaKnown(eventCursor: 1, logEntryCount: 1),
+        resumeRuntimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+      ));
+      await _flushEvents();
+
+      service.emit(LogEvent(
+        timestamp: DateTime.parse('2026-05-27T05:22:05Z'),
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'log'},
+        message: '已提交，验证也都通过了。',
+        stream: 'stdout',
+      ));
+      await _flushEvents();
+
+      service.emit(SessionDeltaEvent(
+        timestamp: _timestamp.add(const Duration(seconds: 1)),
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'session_delta'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        base: const SessionDeltaKnown(eventCursor: 1, logEntryCount: 1),
+        latest: const SessionDeltaKnown(eventCursor: 4, logEntryCount: 4),
+        appendLogEntries: const [completed, thinking, staleReply],
+        resumeRuntimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+      ));
+      await _flushEvents();
+
+      final markdownItems = controller.timeline
+          .where((item) => item.kind == 'markdown')
+          .toList(growable: false);
+      final thinkingItems = controller.timeline
+          .where((item) => item.kind == 'thinking')
+          .toList(growable: false);
+
+      expect(markdownItems, hasLength(1));
+      expect(markdownItems.single.body, '已提交，验证也都通过了。');
+      expect(thinkingItems, hasLength(1));
+      expect(thinkingItems.single.body, '正在复核 session_delta 渲染边界');
+      expect(controller.timeline.last.body, '已提交，验证也都通过了。');
+    });
+
+    test('session_delta 同批旧回复时间早于 completed 也不会插回最终回答后', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      const staleReply = HistoryLogEntry(
+        kind: 'markdown',
+        message: 'dart analyze 已通过。',
+        timestamp: '2026-05-27T05:22:03Z',
+        context: HistoryContext(
+          source: 'codex',
+          type: 'assistant',
+        ),
+      );
+      const completed = HistoryLogEntry(
+        kind: 'system',
+        message: 'task completed',
+        timestamp: '2026-05-27T05:22:04Z',
+        context: HistoryContext(
+          source: 'codex-native',
+          type: 'codex_task',
+          status: 'completed',
+        ),
+      );
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        latest: const SessionDeltaKnown(eventCursor: 1, logEntryCount: 1),
+        resumeRuntimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+      ));
+      await _flushEvents();
+
+      service.emit(LogEvent(
+        timestamp: DateTime.parse('2026-05-27T05:22:05Z'),
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'log'},
+        message: '已提交，验证也都通过了。',
+        stream: 'stdout',
+      ));
+      await _flushEvents();
+
+      service.emit(SessionDeltaEvent(
+        timestamp: _timestamp.add(const Duration(seconds: 1)),
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'session_delta'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        base: const SessionDeltaKnown(eventCursor: 1, logEntryCount: 1),
+        latest: const SessionDeltaKnown(eventCursor: 3, logEntryCount: 3),
+        appendLogEntries: const [staleReply, completed],
+        resumeRuntimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+      ));
+      await _flushEvents();
+
+      final markdownItems = controller.timeline
+          .where((item) => item.kind == 'markdown')
+          .toList(growable: false);
+
+      expect(markdownItems, hasLength(1));
+      expect(markdownItems.single.body, '已提交，验证也都通过了。');
+      expect(controller.timeline.last.body, '已提交，验证也都通过了。');
+    });
+
+    test('session_delta 同批包含当前轮 user 时仍会抑制 completed 旧回复', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      const currentUser = HistoryLogEntry(
+        kind: 'user',
+        message: '在仔细检查一小',
+        timestamp: '2026-05-27T05:21:59Z',
+      );
+      const completed = HistoryLogEntry(
+        kind: 'system',
+        message: 'task completed',
+        timestamp: '2026-05-27T05:22:03Z',
+        context: HistoryContext(
+          source: 'codex-native',
+          type: 'codex_task',
+          status: 'completed',
+        ),
+      );
+      const staleReply = HistoryLogEntry(
+        kind: 'markdown',
+        message: 'dart analyze 已通过。',
+        timestamp: '2026-05-27T05:22:07Z',
+        context: HistoryContext(
+          source: 'codex',
+          type: 'assistant',
+        ),
+      );
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        latest: const SessionDeltaKnown(eventCursor: 1, logEntryCount: 1),
+        resumeRuntimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+      ));
+      await _flushEvents();
+
+      service.emit(LogEvent(
+        timestamp: DateTime.parse('2026-05-27T05:22:05Z'),
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'log'},
+        message: '已提交，验证也都通过了。',
+        stream: 'stdout',
+      ));
+      await _flushEvents();
+
+      service.emit(SessionDeltaEvent(
+        timestamp: _timestamp.add(const Duration(seconds: 1)),
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'session_delta'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        base: const SessionDeltaKnown(eventCursor: 1, logEntryCount: 1),
+        latest: const SessionDeltaKnown(eventCursor: 4, logEntryCount: 4),
+        appendLogEntries: const [currentUser, completed, staleReply],
+        resumeRuntimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+      ));
+      await _flushEvents();
+
+      final markdownItems = controller.timeline
+          .where((item) => item.kind == 'markdown')
+          .toList(growable: false);
+
+      expect(markdownItems, hasLength(1));
+      expect(markdownItems.single.body, '已提交，验证也都通过了。');
+      expect(
+        controller.timeline.where((item) => item.kind == 'user').single.body,
+        '在仔细检查一小',
+      );
+      expect(controller.timeline.last.body, '已提交，验证也都通过了。');
+    });
+
+    test('session_delta completed 后出现新 user 时不会抑制下一轮 assistant', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      const completed = HistoryLogEntry(
+        kind: 'system',
+        message: 'task completed',
+        timestamp: '2026-05-27T05:22:03Z',
+        context: HistoryContext(
+          source: 'codex-native',
+          type: 'codex_task',
+          status: 'completed',
+        ),
+      );
+      const staleReply = HistoryLogEntry(
+        kind: 'markdown',
+        message: 'dart analyze 已通过。',
+        timestamp: '2026-05-27T05:22:04Z',
+        context: HistoryContext(
+          source: 'codex',
+          type: 'assistant',
+        ),
+      );
+      const nextUser = HistoryLogEntry(
+        kind: 'user',
+        message: '继续检查',
+        timestamp: '2026-05-27T05:23:00Z',
+      );
+      const nextAssistant = HistoryLogEntry(
+        kind: 'markdown',
+        message: '继续检查也通过了。',
+        timestamp: '2026-05-27T05:23:05Z',
+        context: HistoryContext(
+          source: 'codex',
+          type: 'assistant',
+        ),
+      );
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        latest: const SessionDeltaKnown(eventCursor: 1, logEntryCount: 1),
+        resumeRuntimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+      ));
+      await _flushEvents();
+
+      service.emit(LogEvent(
+        timestamp: DateTime.parse('2026-05-27T05:22:05Z'),
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'log'},
+        message: '已提交，验证也都通过了。',
+        stream: 'stdout',
+      ));
+      await _flushEvents();
+
+      service.emit(SessionDeltaEvent(
+        timestamp: _timestamp.add(const Duration(seconds: 1)),
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'session_delta'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        base: const SessionDeltaKnown(eventCursor: 1, logEntryCount: 1),
+        latest: const SessionDeltaKnown(eventCursor: 5, logEntryCount: 5),
+        appendLogEntries: const [
+          completed,
+          staleReply,
+          nextUser,
+          nextAssistant,
+        ],
+        resumeRuntimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+      ));
+      await _flushEvents();
+
+      final markdownItems = controller.timeline
+          .where((item) => item.kind == 'markdown')
+          .toList(growable: false);
+
+      expect(markdownItems, hasLength(2));
+      expect(markdownItems.first.body, '已提交，验证也都通过了。');
+      expect(markdownItems.last.body, '继续检查也通过了。');
+      expect(
+        controller.timeline.where((item) => item.kind == 'user').single.body,
+        '继续检查',
+      );
+    });
+
+    test('session_delta 后到无 turn id 的完整回复会更新实时前缀', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      const completed = HistoryLogEntry(
+        kind: 'system',
+        message: 'task completed',
+        timestamp: '2026-05-27T05:22:06Z',
+        context: HistoryContext(
+          source: 'codex-native',
+          type: 'codex_task',
+          status: 'completed',
+        ),
+      );
+      const fullReply = HistoryLogEntry(
+        kind: 'markdown',
+        message: '已提交，验证也都通过了。',
+        timestamp: '2026-05-27T05:22:07Z',
+        context: HistoryContext(
+          source: 'codex',
+          type: 'assistant',
+        ),
+      );
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        latest: const SessionDeltaKnown(eventCursor: 1, logEntryCount: 1),
+        resumeRuntimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+      ));
+      await _flushEvents();
+
+      service.emit(LogEvent(
+        timestamp: DateTime.parse('2026-05-27T05:22:05Z'),
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'log'},
+        message: '已提交，',
+        stream: 'stdout',
+      ));
+      await _flushEvents();
+
+      service.emit(SessionDeltaEvent(
+        timestamp: _timestamp.add(const Duration(seconds: 1)),
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'session_delta'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        base: const SessionDeltaKnown(eventCursor: 1, logEntryCount: 1),
+        latest: const SessionDeltaKnown(eventCursor: 3, logEntryCount: 3),
+        appendLogEntries: const [completed, fullReply],
+        resumeRuntimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+      ));
+      await _flushEvents();
+
+      final markdownItems = controller.timeline
+          .where((item) => item.kind == 'markdown')
+          .toList(growable: false);
+
+      expect(markdownItems, hasLength(1));
+      expect(markdownItems.single.body, '已提交，验证也都通过了。');
+    });
+
+    test('session_delta 无 completed 时不会用无 turn id 回复覆盖 live 文本', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      const replayedReply = HistoryLogEntry(
+        kind: 'markdown',
+        message: '已提交，验证也都通过了。',
+        timestamp: '2026-05-27T05:22:07Z',
+        context: HistoryContext(
+          source: 'codex',
+          type: 'assistant',
+        ),
+      );
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        latest: const SessionDeltaKnown(eventCursor: 1, logEntryCount: 1),
+        resumeRuntimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+      ));
+      await _flushEvents();
+
+      service.emit(LogEvent(
+        timestamp: DateTime.parse('2026-05-27T05:22:05Z'),
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'log'},
+        message: '已提交，',
+        stream: 'stdout',
+      ));
+      await _flushEvents();
+
+      service.emit(SessionDeltaEvent(
+        timestamp: _timestamp.add(const Duration(seconds: 1)),
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'session_delta'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        base: const SessionDeltaKnown(eventCursor: 1, logEntryCount: 1),
+        latest: const SessionDeltaKnown(eventCursor: 2, logEntryCount: 2),
+        appendLogEntries: const [replayedReply],
+        resumeRuntimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+      ));
+      await _flushEvents();
+
+      final markdownItems = controller.timeline
+          .where((item) => item.kind == 'markdown')
+          .toList(growable: false);
+
+      expect(markdownItems, hasLength(2));
+      expect(markdownItems.first.body, '已提交，');
+      expect(markdownItems.last.body, '已提交，验证也都通过了。');
+    });
+
+    test('session_delta 后到 isolated completed 不会在最终回答后成卡', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      const completed = HistoryLogEntry(
+        kind: 'system',
+        message: 'task completed',
+        timestamp: '2026-05-27T05:22:06Z',
+        context: HistoryContext(
+          source: 'codex-native',
+          type: 'codex_task',
+          status: 'completed',
+        ),
+      );
+      const staleReply = HistoryLogEntry(
+        kind: 'markdown',
+        message: 'dart analyze 已通过。',
+        timestamp: '2026-05-27T05:22:07Z',
+        context: HistoryContext(
+          source: 'codex',
+          type: 'assistant',
+        ),
+      );
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        latest: const SessionDeltaKnown(eventCursor: 1, logEntryCount: 1),
+        resumeRuntimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+      ));
+      await _flushEvents();
+
+      service.emit(LogEvent(
+        timestamp: DateTime.parse('2026-05-27T05:22:05Z'),
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'log'},
+        message: '已提交，验证也都通过了。',
+        stream: 'stdout',
+      ));
+      await _flushEvents();
+
+      service.emit(SessionDeltaEvent(
+        timestamp: _timestamp.add(const Duration(seconds: 1)),
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'session_delta'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        base: const SessionDeltaKnown(eventCursor: 1, logEntryCount: 1),
+        latest: const SessionDeltaKnown(eventCursor: 3, logEntryCount: 3),
+        appendLogEntries: const [completed, staleReply],
+        resumeRuntimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+      ));
+      await _flushEvents();
+
+      expect(
+        controller.timeline.where((item) => item.kind == 'codex_tool_group'),
+        isEmpty,
+      );
+      expect(
+        controller.timeline.where((item) => item.kind == 'markdown'),
+        hasLength(1),
+      );
+      expect(controller.timeline.last.body, '已提交，验证也都通过了。');
+    });
+
+    test('session_delta 新一轮 Codex 原生工具调用不会并入上一组', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      const firstToolCall = HistoryLogEntry(
+        kind: 'system',
+        message: 'read first file',
+        timestamp: '2026-05-27T05:23:01Z',
+        context: HistoryContext(
+          source: 'codex-native',
+          type: 'codex_tool_call',
+          tool: 'functions.exec_command',
+          command: '{"cmd":"cat lib/first.dart"}',
+        ),
+      );
+      const secondToolCall = HistoryLogEntry(
+        kind: 'system',
+        message: 'read second file',
+        timestamp: '2026-05-27T05:24:01Z',
+        context: HistoryContext(
+          source: 'codex-native',
+          type: 'codex_tool_call',
+          tool: 'functions.exec_command',
+          command: '{"cmd":"cat lib/second.dart"}',
+        ),
+      );
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        logEntries: const [firstToolCall],
+        latest: const SessionDeltaKnown(eventCursor: 1, logEntryCount: 1),
+        resumeRuntimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+      ));
+      await _flushEvents();
+
+      service.emit(SessionDeltaEvent(
+        timestamp: _timestamp.add(const Duration(seconds: 1)),
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'session_delta'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        base: const SessionDeltaKnown(eventCursor: 1, logEntryCount: 1),
+        latest: const SessionDeltaKnown(eventCursor: 2, logEntryCount: 2),
+        appendLogEntries: const [secondToolCall],
+        resumeRuntimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+      ));
+      await _flushEvents();
+
+      final groups = controller.timeline
+          .where((item) => item.kind == 'codex_tool_group')
+          .toList(growable: false);
+      expect(groups, hasLength(2));
+      expect(groups.first.codexSteps, contains('正在读取 first.dart'));
+      expect(groups.last.codexSteps, contains('正在读取 second.dart'));
+    });
+
+    test('普通运行时事件游标不会提前标记 session_delta 已追上', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'codex-thread:observe',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'session_history', 'eventCursor': 1},
+        summary: const SessionSummary(
+          id: 'codex-thread:observe',
+          title: 'Native Codex',
+          source: 'codex-native',
+          external: true,
+          runtime: RuntimeMeta(command: 'codex', engine: 'codex'),
+        ),
+        logEntryTotal: 1,
+        logEntries: const [
+          HistoryLogEntry(
+            kind: 'markdown',
+            message: '已有回复',
+            timestamp: '2026-05-27T05:20:00Z',
+          ),
+        ],
+        resumeRuntimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+      ));
+      await _flushEvents();
+
+      service.emit(AIStatusEvent(
+        timestamp: _timestamp.add(const Duration(seconds: 1)),
+        sessionId: 'codex-thread:observe',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'ai_status', 'eventCursor': 8},
+        label: '处理中',
+        visible: true,
+      ));
+      await _flushEvents();
+
+      service.sentPayloads.clear();
+      controller.continueSameSessionFromPhone();
+      await _flushEvents();
+
+      final deltaPayload = service.sentPayloads.singleWhere(
+        (payload) =>
+            payload['action'] == 'session_delta_get' &&
+            payload['sessionId'] == 'codex-thread:observe',
+      );
+      final known = deltaPayload['known'] as Map<String, dynamic>;
+      expect(
+        known['eventCursor'],
+        1,
+        reason:
+            'AI/status/task cursors are resume replay cursors, not proof that '
+            'history/diff/terminal delta counters have caught up.',
+      );
+      expect(known['logEntryCount'], 1);
+
+      final resumePayload = service.sentPayloads.singleWhere(
+        (payload) =>
+            payload['action'] == 'session_resume' &&
+            payload['sessionId'] == 'codex-thread:observe',
+      );
+      expect(
+        resumePayload['lastSeenEventCursor'],
+        8,
+        reason:
+            'The socket replay cursor should still advance for resume replay.',
+      );
+    });
+
     test('session_history 会把 Codex 子智能体事件整理成可见状态', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);
@@ -12625,7 +14843,7 @@ void main() {
 
       controller.requestMediaPreview(attachment);
       expect(service.sentPayloads.last['action'], 'media_preview');
-      expect(service.sentPayloads.last['attachmentId'], 'att-1');
+      expect(service.sentPayloads.last['attachmentId'], '/tmp/screen.png');
       expect(service.sentPayloads.last['path'], '/tmp/screen.png');
 
       service.emit(MediaPreviewResultEvent(
@@ -12633,16 +14851,136 @@ void main() {
         sessionId: 'session-current',
         runtimeMeta: const RuntimeMeta(),
         raw: const {'type': 'media_preview_result'},
-        attachmentId: 'att-1',
+        attachmentId: '/tmp/screen.png',
         path: '/tmp/screen.png',
         content: base64Encode(utf8.encode('png-bytes')),
         status: 'ok',
       ));
       await _flushEvents();
 
-      final preview = controller.mediaPreviewStates['att-1'];
+      final preview = controller.mediaPreviewStates['/tmp/screen.png'];
       expect(preview?.ok, isTrue);
       expect(utf8.decode(preview!.bytes!), 'png-bytes');
+    });
+
+    test('session_history 同一路径图片附件和文本路径只显示一张', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        logEntries: const [
+          HistoryLogEntry(
+            kind: 'user',
+            message: '看图\n\nAttached local image files:\n- /tmp/screen.png',
+            timestamp: '2026-05-27T05:20:00Z',
+            attachments: [
+              TimelineAttachment(
+                id: 'att-1',
+                kind: 'image',
+                name: 'screen.png',
+                mimeType: 'image/png',
+                size: 9,
+                path: '/tmp/screen.png',
+                previewStatus: 'available',
+                source: 'user_upload',
+              ),
+            ],
+          ),
+        ],
+        resumeRuntimeMeta: RuntimeMeta(command: 'codex', engine: 'codex'),
+      ));
+      await _flushEvents();
+
+      expect(controller.timeline, hasLength(1));
+      final item = controller.timeline.single;
+      expect(item.attachments, hasLength(1));
+      final attachment = item.attachments.single;
+      expect(attachment.id, 'att-1');
+      expect(attachment.path, '/tmp/screen.png');
+      expect(attachment.source, 'user_upload');
+      expect(controller.mediaPreviewKey(attachment), '/tmp/screen.png');
+    });
+
+    test('session_delta 正式图片历史会替换本地乐观图片气泡', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.saveConfig(const AppConfig(host: '192.168.0.2'));
+      await controller.connect();
+      service.emit(SessionCreatedEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(),
+        raw: const {'type': 'session_created'},
+        summary: const SessionSummary(
+          id: 'session-current',
+          title: '当前会话',
+          runtime: RuntimeMeta(command: 'codex', engine: 'codex'),
+        ),
+      ));
+      await _flushEvents();
+      service.sentPayloads.clear();
+
+      controller.sendInputTextWithImages(
+        '看图',
+        [
+          ChatImageAttachment(
+            name: 'screen.png',
+            mimeType: 'image/png',
+            bytes: utf8.encode('png-bytes'),
+          ),
+        ],
+      );
+      await _flushEvents();
+      expect(controller.timeline.where((item) => item.kind == 'user'),
+          hasLength(1));
+
+      service.emit(SessionDeltaEvent(
+        timestamp: _timestamp.add(const Duration(seconds: 1)),
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'session_delta'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        appendLogEntries: const [
+          HistoryLogEntry(
+            kind: 'user',
+            message: '看图\n\nAttached local image files:\n- /tmp/screen.png',
+            timestamp: '2026-05-27T05:20:00Z',
+            attachments: [
+              TimelineAttachment(
+                id: 'att-1',
+                kind: 'image',
+                name: 'screen.png',
+                mimeType: 'image/png',
+                size: 9,
+                path: '/tmp/screen.png',
+                previewStatus: 'available',
+                source: 'user_upload',
+              ),
+            ],
+          ),
+        ],
+        resumeRuntimeMeta: RuntimeMeta(command: 'codex', engine: 'codex'),
+      ));
+      await _flushEvents();
+
+      final userItems =
+          controller.timeline.where((item) => item.kind == 'user').toList();
+      expect(userItems, hasLength(1));
+      expect(userItems.single.id.startsWith('history-user-'), isTrue);
+      expect(userItems.single.attachments, hasLength(1));
+      expect(userItems.single.attachments.single.id, 'att-1');
+      expect(userItems.single.attachments.single.path, '/tmp/screen.png');
     });
 
     test('Codex 原生历史会从本地图片路径恢复附件卡片', () async {
@@ -12795,6 +15133,274 @@ void main() {
       expect(sessionActions.single['sessionId'], 'session-new');
     });
 
+    test('loadSession 期间旧会话 full-sync delta 不会恢复旧会话', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-old',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-old', title: '旧会话'),
+        runtimeAlive: true,
+      ));
+      await _flushEvents();
+      expect(controller.selectedSessionId, 'session-old');
+
+      service.sentPayloads.clear();
+      controller.loadSession('session-new');
+      service.emit(SessionDeltaEvent(
+        timestamp: _timestamp.add(const Duration(seconds: 1)),
+        sessionId: 'session-old',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_delta'},
+        summary: const SessionSummary(id: 'session-old', title: '旧会话'),
+        requiresFullSync: true,
+      ));
+      await _flushEvents();
+
+      final sessionActions = service.sentPayloads
+          .where((payload) =>
+              payload['action'] == 'session_load' ||
+              payload['action'] == 'session_resume' ||
+              payload['action'] == 'session_delta_get')
+          .toList();
+      expect(sessionActions, hasLength(1));
+      expect(sessionActions.single['action'], 'session_load');
+      expect(sessionActions.single['sessionId'], 'session-new');
+      expect(controller.selectedSessionId, 'session-old');
+      expect(controller.isLoadingSession, isTrue);
+    });
+
+    test('loadSession 期间旧会话 runtime 事件不会重启 observe delta', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-old',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-old', title: '旧会话'),
+        runtimeAlive: true,
+      ));
+      await _flushEvents();
+      expect(controller.selectedSessionId, 'session-old');
+
+      service.sentPayloads.clear();
+      controller.loadSession('session-new');
+      service.emit(SessionStateEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 100)),
+        sessionId: 'session-old',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_state'},
+        state: 'RUNNING',
+      ));
+      await _flushEvents();
+
+      final deltaRequests = service.sentPayloads
+          .where((payload) => payload['action'] == 'session_delta_get')
+          .toList();
+      expect(deltaRequests, isEmpty);
+    });
+
+    test('loadSession 期间断线重连会重发 pending target load', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-old',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-old', title: '旧会话'),
+        runtimeAlive: true,
+      ));
+      await _flushEvents();
+
+      service.sentPayloads.clear();
+      controller.loadSession('session-new');
+      service.emit(ErrorEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 100)),
+        sessionId: 'session-old',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'error'},
+        code: 'ws_closed',
+        message: 'websocket closed',
+      ));
+      await _flushEvents();
+
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      await _flushEvents();
+
+      final loads = service.sentPayloads
+          .where((payload) => payload['action'] == 'session_load')
+          .toList();
+      expect(loads, hasLength(2));
+      expect(loads.last['sessionId'], 'session-new');
+      expect(loads.last['reason'], 'reconnect_pending_load');
+      expect(
+        service.sentPayloads
+            .where((payload) => payload['action'] == 'session_resume'),
+        isEmpty,
+      );
+      expect(controller.isLoadingSession, isTrue);
+    });
+
+    test('loadSession 目标 session_state 先到不会提前结束 loading', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-old',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-old', title: '旧会话'),
+      ));
+      await _flushEvents();
+
+      controller.loadSession('session-new');
+      service.emit(SessionStateEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 100)),
+        sessionId: 'session-new',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_state'},
+        state: 'IDLE',
+      ));
+      await _flushEvents();
+
+      expect(controller.isLoadingSession, isTrue);
+      expect(controller.selectedSessionId, 'session-old');
+
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 200)),
+        sessionId: 'session-new',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-new', title: '新会话'),
+        logEntries: const [
+          HistoryLogEntry(
+            kind: 'user',
+            message: '新会话 history',
+            timestamp: '2026-06-07T05:00:00Z',
+          ),
+        ],
+      ));
+      await _flushEvents();
+
+      expect(controller.selectedSessionId, 'session-new');
+      expect(controller.isLoadingSession, isFalse);
+      expect(
+        controller.timeline.map((item) => item.body),
+        contains('新会话 history'),
+      );
+    });
+
+    test('loadSession 超时会清 pending，迟到 history 不会切换会话', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(
+        service: service,
+        sessionLoadingTimeout: const Duration(milliseconds: 30),
+      );
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-old',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-old', title: '旧会话'),
+        runtimeAlive: true,
+      ));
+      await _flushEvents();
+
+      controller.loadSession('session-new');
+      await Future<void>.delayed(const Duration(milliseconds: 80));
+      await _flushEvents();
+      expect(controller.isLoadingSession, isFalse);
+      expect(controller.selectedSessionId, 'session-old');
+      expect(controller.isSessionBusy, isFalse);
+
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp.add(const Duration(seconds: 17)),
+        sessionId: 'session-new',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-new', title: '新会话'),
+        logEntries: const [
+          HistoryLogEntry(
+            kind: 'user',
+            message: '新会话历史',
+            timestamp: '2026-06-07T05:00:00Z',
+          ),
+        ],
+      ));
+      await _flushEvents();
+
+      expect(controller.selectedSessionId, 'session-old');
+      expect(
+        controller.timeline.map((item) => item.body),
+        isNot(contains('新会话历史')),
+      );
+    });
+
+    test('loadSession 目标 delta 成功应用会结束 loading', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-old',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-old', title: '旧会话'),
+        runtimeAlive: true,
+      ));
+      await _flushEvents();
+
+      controller.loadSession('session-new');
+      service.emit(SessionDeltaEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 100)),
+        sessionId: 'session-new',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_delta'},
+        summary: const SessionSummary(id: 'session-new', title: '新会话'),
+        latest: const SessionDeltaKnown(logEntryCount: 1),
+        appendLogEntries: const [
+          HistoryLogEntry(
+            kind: 'user',
+            message: '新会话 delta',
+            timestamp: '2026-06-07T05:00:00Z',
+          ),
+        ],
+      ));
+      await _flushEvents();
+
+      expect(controller.selectedSessionId, 'session-new');
+      expect(controller.isLoadingSession, isFalse);
+      expect(
+          controller.timeline.map((item) => item.body), contains('新会话 delta'));
+    });
+
     test('重复 loadSession 同一目标不会重复发送 session_load', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);
@@ -12813,6 +15419,128 @@ void main() {
           .toList();
       expect(loads, hasLength(1));
       expect(loads.single['sessionId'], 'session-target');
+    });
+
+    test('目标 session_load_failed 会立即结束 loading 并显示错误', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      controller.loadSession('session-target');
+      expect(controller.isLoadingSession, isTrue);
+
+      service.emit(ErrorEvent(
+        timestamp: _timestamp.add(const Duration(seconds: 1)),
+        sessionId: 'session-target',
+        runtimeMeta: const RuntimeMeta(),
+        raw: const {'type': 'error'},
+        code: 'session_load_failed',
+        message: 'session history window unavailable for session-target',
+      ));
+      await _flushEvents();
+
+      expect(controller.isLoadingSession, isFalse);
+      expect(controller.connectionStage, SessionConnectionStage.ready);
+      expect(
+        controller.timeline.where((item) =>
+            item.kind == 'error' &&
+            item.body.contains('session history window unavailable')),
+        isNotEmpty,
+      );
+    });
+
+    test('非目标 session_load_failed 不会结束当前 loading', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      controller.loadSession('session-target');
+      expect(controller.isLoadingSession, isTrue);
+
+      service.emit(ErrorEvent(
+        timestamp: _timestamp.add(const Duration(seconds: 1)),
+        sessionId: 'session-other',
+        runtimeMeta: const RuntimeMeta(),
+        raw: const {'type': 'error'},
+        code: 'session_load_failed',
+        message: 'session history window unavailable for session-other',
+      ));
+      await _flushEvents();
+
+      expect(controller.isLoadingSession, isTrue);
+    });
+
+    test('session_list already running 不渲染为错误消息', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(ErrorEvent(
+        timestamp: _timestamp.add(const Duration(seconds: 1)),
+        sessionId: '',
+        runtimeMeta: const RuntimeMeta(),
+        raw: const {'type': 'error'},
+        message: 'session list is already running for this connection',
+      ));
+      await _flushEvents();
+
+      expect(controller.latestError, isNull);
+      expect(controller.connected, isTrue);
+      expect(
+        controller.timeline.where((item) => item.kind == 'error'),
+        isEmpty,
+      );
+      expect(
+        controller.debugLogs.any((item) => item.contains('session_list 已在刷新')),
+        isTrue,
+      );
+    });
+
+    test('e2ee_decrypt_failed 会立即结束会话 loading', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.saveConfig(const AppConfig(
+        connectionMode: 'relay',
+        relayUrl: 'wss://relay.example.test',
+        relaySessionId: 'rs_test',
+        relayClientId: 'rc_test',
+        relayClientReconnectSecret: 'reconnect_secret',
+      ));
+      await controller.connect();
+      service.sentPayloads.clear();
+
+      controller.loadSession('session-target');
+      expect(controller.isLoadingSession, isTrue);
+
+      service.emit(ErrorEvent(
+        timestamp: _timestamp.add(const Duration(seconds: 1)),
+        sessionId: 'session-target',
+        runtimeMeta: const RuntimeMeta(),
+        raw: const {'type': 'error'},
+        code: 'e2ee_decrypt_failed',
+        message: 'Relay E2EE 解密失败',
+      ));
+      await _flushEvents();
+
+      expect(controller.isLoadingSession, isFalse);
+      expect(controller.connected, isFalse);
+      expect(controller.connectionStage, SessionConnectionStage.reconnecting);
+      expect(controller.connectionMessage, '恢复连接中...');
+      expect(controller.relayDeviceStatus, 'Relay E2EE 解密失败');
+      expect(
+        service.sentPayloads
+            .where((payload) => payload['action'] == 'session_load'),
+        hasLength(1),
+      );
     });
 
     test('loadSession history 后延后发送非关键 bootstrap 请求', () async {
@@ -12876,6 +15604,108 @@ void main() {
             payload['action'] == 'fs_list'),
         isTrue,
       );
+      expect(
+        service.sentPayloads
+            .where((payload) => payload['action'] == 'session_diff_page_get'),
+        isEmpty,
+        reason: 'diff hydration is user-triggered so relay bootstrap does not '
+            'queue a slow non-critical projection read after session switch',
+      );
+    });
+
+    test('loadSession 期间慢 bootstrap 请求不会发到旧会话', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-old',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-old', title: '旧会话'),
+        latest: const SessionDeltaKnown(
+          diffCount: 1,
+          terminalExecutionCount: 1,
+          terminalStdoutLength: 10,
+          terminalStderrLength: 5,
+        ),
+        resumeRuntimeMeta: const RuntimeMeta(cwd: '/workspace'),
+      ));
+      await _flushEvents();
+      service.sentPayloads.clear();
+
+      controller.loadSession('session-new');
+      controller.requestDiffPage();
+      controller.requestTerminalHydration();
+      controller.requestSessionContext();
+      controller.requestTaskSnapshot();
+      controller.requestContextWindowUsage();
+      controller.requestRuntimeProcessList();
+      controller.requestPermissionRuleList();
+      await _flushEvents();
+
+      final actions =
+          service.sentPayloads.map((payload) => payload['action']).toList();
+      expect(actions, contains('session_load'));
+      expect(actions, isNot(contains('session_diff_page_get')));
+      expect(actions, isNot(contains('session_terminal_range_get')));
+      expect(actions, isNot(contains('session_terminal_execution_page_get')));
+      expect(actions, isNot(contains('session_context_get')));
+      expect(actions, isNot(contains('task_snapshot_get')));
+      expect(actions, isNot(contains('context_window_usage_get')));
+      expect(actions, isNot(contains('runtime_process_list')));
+      expect(actions, isNot(contains('permission_rule_list')));
+    });
+
+    test('从长会话快速切短会话会取消长会话延迟 bootstrap', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.sentPayloads.clear();
+
+      controller.loadSession('session-long');
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-long',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-long', title: '长会话'),
+        logEntries: [
+          HistoryLogEntry(
+            kind: 'markdown',
+            message: '长会话首屏',
+            timestamp: _timestamp.toIso8601String(),
+          ),
+        ],
+        latest: const SessionDeltaKnown(logEntryCount: 17754),
+        resumeRuntimeMeta: const RuntimeMeta(cwd: '/workspace'),
+      ));
+      await _flushEvents();
+
+      service.sentPayloads.clear();
+      controller.loadSession('session-short');
+      await Future<void>.delayed(const Duration(milliseconds: 520));
+      await _flushEvents();
+
+      final actions =
+          service.sentPayloads.map((payload) => payload['action']).toList();
+      expect(actions, contains('session_load'));
+      expect(
+        service.sentPayloads
+            .where((payload) => payload['action'] == 'session_load')
+            .single['sessionId'],
+        'session-short',
+      );
+      expect(actions, isNot(contains('session_context_get')));
+      expect(actions, isNot(contains('permission_rule_list')));
+      expect(actions, isNot(contains('runtime_process_list')));
+      expect(actions, isNot(contains('task_snapshot_get')));
     });
 
     test('前台恢复只发 session_resume，history_loaded delta 仍会补齐', () async {
@@ -12946,6 +15776,7 @@ void main() {
       service.emit(SessionHistoryEvent(
         timestamp: _timestamp,
         sessionId: 'session-target',
+        runtimeMeta: const RuntimeMeta(),
         raw: const {'type': 'session_history'},
         summary: const SessionSummary(id: 'session-target', title: 'history'),
         runtimeAlive: true,
@@ -12996,6 +15827,7 @@ void main() {
       service.emit(SessionHistoryEvent(
         timestamp: _timestamp,
         sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(),
         raw: const {'type': 'session_history'},
         summary: const SessionSummary(id: 'session-current', title: 'current'),
         resumeRuntimeMeta: const RuntimeMeta(cwd: '/workspace'),
@@ -13085,6 +15917,178 @@ void main() {
       );
     });
 
+    test('oversized session_delta marker 会用窗口化 resume 重新同步当前会话', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionCreatedEvent(
+        timestamp: _timestamp,
+        sessionId: 'conn-1',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_created'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+      ));
+      await _flushEvents();
+      service.sentPayloads.clear();
+
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        logEntryStart: 120,
+        logEntryTotal: 240,
+        hasMoreBefore: true,
+        resumeRuntimeMeta: const RuntimeMeta(cwd: '/workspace'),
+      ));
+      await _flushEvents();
+
+      service.sentPayloads.clear();
+      service.emit(SessionDeltaEvent(
+        timestamp: _timestamp.add(const Duration(seconds: 1)),
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_delta'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        base: const SessionDeltaKnown(),
+        latest: const SessionDeltaKnown(logEntryCount: 240),
+        requiresFullSync: true,
+        resumeRuntimeMeta: const RuntimeMeta(cwd: '/workspace'),
+      ));
+      await _flushEvents();
+
+      final resumePayload = service.sentPayloads.singleWhere(
+        (payload) => payload['action'] == 'session_resume',
+      );
+      expect(resumePayload['sessionId'], 'session-current');
+      expect(resumePayload['reason'], 'delta_base_mismatch');
+      expect(resumePayload['limit'], 120);
+    });
+
+    test('payload-limited history 使用 latest known 避免继续请求巨量 delta', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionCreatedEvent(
+        timestamp: _timestamp,
+        sessionId: 'conn-1',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_created'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+      ));
+      await _flushEvents();
+      service.sentPayloads.clear();
+
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        logEntries: const [
+          HistoryLogEntry(
+            kind: 'markdown',
+            message: '窗口里的最后一条',
+            timestamp: '2026-05-27T05:53:00Z',
+          ),
+        ],
+        logEntryStart: 13728,
+        logEntryTotal: 13848,
+        hasMoreBefore: true,
+        latest: const SessionDeltaKnown(
+          eventCursor: 99,
+          logEntryCount: 13848,
+          diffCount: 7,
+          terminalExecutionCount: 3,
+          terminalStdoutLength: 2048,
+          terminalStderrLength: 12,
+        ),
+        payloadLimited: true,
+        payloadLimitReason: 'payload_budget_exceeded',
+        resumeRuntimeMeta: const RuntimeMeta(cwd: '/workspace'),
+      ));
+      await _flushEvents();
+
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      service.sentPayloads.clear();
+      service.emit(SessionUpdatedEvent(
+        timestamp: _timestamp.add(const Duration(seconds: 1)),
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_updated'},
+        generation: 1,
+        eventCursor: 100,
+        reason: 'projection_persisted',
+      ));
+      await Future<void>.delayed(const Duration(milliseconds: 900));
+
+      final deltaPayload = service.sentPayloads.singleWhere(
+        (payload) =>
+            payload['action'] == 'session_delta_get' &&
+            payload['reason'] == 'session_updated:projection_persisted',
+      );
+      final known = deltaPayload['known'] as Map<String, dynamic>;
+      expect(known['eventCursor'], 99);
+      expect(known['logEntryCount'], 13848);
+      expect(known['diffCount'], 7);
+      expect(known['terminalExecutionCount'], 3);
+      expect(known['terminalStdoutLength'], 2048);
+      expect(known['terminalStderrLength'], 12);
+    });
+
+    test('other-session full-sync delta marker 不会触发当前会话 resume', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionCreatedEvent(
+        timestamp: _timestamp,
+        sessionId: 'conn-1',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_created'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+      ));
+      await _flushEvents();
+      service.sentPayloads.clear();
+
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        resumeRuntimeMeta: const RuntimeMeta(cwd: '/workspace'),
+      ));
+      await _flushEvents();
+
+      service.sentPayloads.clear();
+      service.emit(SessionDeltaEvent(
+        timestamp: _timestamp.add(const Duration(seconds: 1)),
+        sessionId: 'session-other',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_delta'},
+        summary: const SessionSummary(id: 'session-other', title: '其他会话'),
+        requiresFullSync: true,
+      ));
+      await _flushEvents();
+
+      expect(
+        service.sentPayloads
+            .where((payload) => payload['action'] == 'session_resume'),
+        isEmpty,
+      );
+      expect(controller.selectedSessionId, 'session-current');
+    });
+
     test('session_delta 重放已恢复的历史 entry 时不会重复显示', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);
@@ -13126,6 +16130,275 @@ void main() {
       expect(
         controller.timeline.where((item) => item.body == '同一条原生历史回复').length,
         1,
+      );
+    });
+
+    test('lazy hydration events merge terminal diff and execution state',
+        () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        logEntries: const [
+          HistoryLogEntry(kind: 'markdown', message: 'visible'),
+        ],
+        latest: const SessionDeltaKnown(
+          eventCursor: 3,
+          logEntryCount: 1,
+          diffCount: 2,
+          terminalExecutionCount: 1,
+          terminalStdoutLength: 10,
+          terminalStderrLength: 6,
+        ),
+        resumeRuntimeMeta: const RuntimeMeta(cwd: '/workspace'),
+      ));
+      await _flushEvents();
+
+      service.sentPayloads.clear();
+      controller.requestTerminalHydration();
+      controller.requestDiffPage();
+
+      expect(
+        service.sentPayloads.where(
+            (payload) => payload['action'] == 'session_terminal_range_get'),
+        hasLength(2),
+      );
+      expect(
+        service.sentPayloads.where((payload) =>
+            payload['action'] == 'session_terminal_execution_page_get'),
+        hasLength(1),
+      );
+      expect(
+        service.sentPayloads
+            .where((payload) => payload['action'] == 'session_diff_page_get'),
+        hasLength(1),
+      );
+
+      service.emit(SessionTerminalRangeEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 1)),
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_terminal_range'},
+        stream: 'stdout',
+        start: 0,
+        end: 10,
+        total: 10,
+        content: '0123456789',
+        latest: const SessionDeltaKnown(
+          eventCursor: 4,
+          logEntryCount: 1,
+          diffCount: 2,
+          terminalExecutionCount: 1,
+          terminalStdoutLength: 10,
+          terminalStderrLength: 6,
+        ),
+      ));
+      service.emit(SessionDiffPageEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 2)),
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_diff_page'},
+        diffStart: 1,
+        diffTotal: 2,
+        hasMoreBefore: true,
+        diffs: const [
+          HistoryContext(
+            id: 'diff-2',
+            type: 'diff',
+            path: '/workspace/a.dart',
+            title: 'a.dart',
+            diff: '+new',
+            pendingReview: true,
+            groupId: 'group-1',
+          ),
+        ],
+        reviewGroups: const [
+          ReviewGroup(id: 'group-1', title: 'Review', pendingCount: 1),
+        ],
+        activeReviewGroup:
+            const ReviewGroup(id: 'group-1', title: 'Review', pendingCount: 1),
+        currentDiff: const HistoryContext(
+          id: 'diff-2',
+          type: 'diff',
+          path: '/workspace/a.dart',
+          title: 'a.dart',
+          diff: '+new',
+          pendingReview: true,
+          groupId: 'group-1',
+        ),
+      ));
+      service.emit(SessionTerminalExecutionPageEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 3)),
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_terminal_execution_page'},
+        executionStart: 0,
+        executionTotal: 1,
+        terminalExecutions: const [
+          TerminalExecution(
+            executionId: 'exec-1',
+            command: 'go test',
+          ),
+        ],
+      ));
+      await _flushEvents();
+
+      expect(controller.terminalStdout, '0123456789');
+      expect(controller.terminalExecutions.single.executionId, 'exec-1');
+      expect(controller.currentDiffContext?.id, 'diff-2');
+      expect(controller.reviewGroups, hasLength(1));
+      expect(controller.timeline.where((item) => item.body == 'visible'),
+          hasLength(1));
+    });
+
+    test('terminal range hydration counts inserted log separators as bytes',
+        () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      const firstLine = '2026/04/04 15:12:25 [INFO] 你好';
+      const secondLine = '2026/04/04 15:12:26 [INFO] abc';
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        latest: SessionDeltaKnown(
+          eventCursor: 3,
+          logEntryCount: 0,
+          terminalStdoutLength: utf8.encode('$firstLine\n$secondLine!').length,
+        ),
+        resumeRuntimeMeta: const RuntimeMeta(cwd: '/workspace'),
+      ));
+      await _flushEvents();
+
+      service.emit(LogEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 1)),
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'log'},
+        message: firstLine,
+        stream: 'stdout',
+      ));
+      service.emit(LogEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 2)),
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'log'},
+        message: secondLine,
+        stream: 'stdout',
+      ));
+      await _flushEvents();
+
+      expect(controller.terminalStdout, '$firstLine\n$secondLine');
+      service.sentPayloads.clear();
+      controller.requestTerminalRange('stdout');
+      expect(
+        service.sentPayloads.singleWhere(
+          (payload) => payload['action'] == 'session_terminal_range_get',
+        )['start'],
+        utf8.encode('$firstLine\n$secondLine').length,
+      );
+    });
+
+    test('terminal range hydration uses UTF-8 byte offsets', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        logEntries: const [
+          HistoryLogEntry(kind: 'markdown', message: 'visible'),
+        ],
+        latest: SessionDeltaKnown(
+          eventCursor: 3,
+          logEntryCount: 1,
+          terminalStdoutLength: utf8.encode('你好abc').length,
+        ),
+        resumeRuntimeMeta: const RuntimeMeta(cwd: '/workspace'),
+      ));
+      await _flushEvents();
+
+      service.sentPayloads.clear();
+      controller.requestTerminalRange('stdout');
+      expect(
+        service.sentPayloads.singleWhere(
+          (payload) => payload['action'] == 'session_terminal_range_get',
+        )['start'],
+        0,
+      );
+
+      service.emit(SessionTerminalRangeEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 1)),
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_terminal_range'},
+        stream: 'stdout',
+        start: 0,
+        end: utf8.encode('你好').length,
+        total: utf8.encode('你好abc').length,
+        content: '你好',
+        latest: SessionDeltaKnown(
+          eventCursor: 4,
+          logEntryCount: 1,
+          terminalStdoutLength: utf8.encode('你好abc').length,
+        ),
+      ));
+      await _flushEvents();
+
+      service.sentPayloads.clear();
+      controller.requestTerminalRange('stdout');
+      expect(
+        service.sentPayloads.singleWhere(
+          (payload) => payload['action'] == 'session_terminal_range_get',
+        )['start'],
+        utf8.encode('你好').length,
+      );
+
+      service.emit(SessionTerminalRangeEvent(
+        timestamp: _timestamp.add(const Duration(milliseconds: 2)),
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'claude'),
+        raw: const {'type': 'session_terminal_range'},
+        stream: 'stdout',
+        start: utf8.encode('你好').length,
+        end: utf8.encode('你好abc').length,
+        total: utf8.encode('你好abc').length,
+        content: 'abc',
+        latest: SessionDeltaKnown(
+          eventCursor: 5,
+          logEntryCount: 1,
+          terminalStdoutLength: utf8.encode('你好abc').length,
+        ),
+      ));
+      await _flushEvents();
+
+      expect(controller.terminalStdout, '你好abc');
+      service.sentPayloads.clear();
+      controller.requestTerminalRange('stdout');
+      expect(
+        service.sentPayloads.where(
+            (payload) => payload['action'] == 'session_terminal_range_get'),
+        isEmpty,
       );
     });
 

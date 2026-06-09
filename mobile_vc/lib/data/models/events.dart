@@ -48,13 +48,17 @@ class PongEvent extends AppEvent {
     required super.sessionId,
     required super.runtimeMeta,
     required super.raw,
+    this.pingId = '',
   }) : super(type: 'pong');
+
+  final String pingId;
 
   factory PongEvent.fromJson(Map<String, dynamic> json) => PongEvent(
         timestamp: _tryReadTimestamp(json['ts']) ?? _readTimestamp(json),
         sessionId: (json['sessionId'] ?? '').toString(),
         runtimeMeta: RuntimeMeta.fromJson(json),
         raw: json,
+        pingId: (json['pingId'] ?? '').toString(),
       );
 }
 
@@ -1303,9 +1307,12 @@ class SessionHistoryEvent extends AppEvent {
     this.canResume = false,
     this.runtimeAlive = false,
     this.resumeRuntimeMeta = const RuntimeMeta(),
+    this.latest = const SessionDeltaKnown(),
     this.logEntryStart = 0,
     this.logEntryTotal = 0,
     this.hasMoreBefore = false,
+    this.payloadLimited = false,
+    this.payloadLimitReason = '',
   }) : super(type: 'session_history');
 
   final SessionSummary summary;
@@ -1328,6 +1335,9 @@ class SessionHistoryEvent extends AppEvent {
   final bool canResume;
   final bool runtimeAlive;
   final RuntimeMeta resumeRuntimeMeta;
+  final SessionDeltaKnown latest;
+  final bool payloadLimited;
+  final String payloadLimitReason;
 
   factory SessionHistoryEvent.fromJson(Map<String, dynamic> json) =>
       SessionHistoryEvent(
@@ -1397,6 +1407,11 @@ class SessionHistoryEvent extends AppEvent {
             ? RuntimeMeta.fromJson(
                 json['resumeRuntimeMeta'] as Map<String, dynamic>)
             : const RuntimeMeta(),
+        latest: json['latest'] is Map<String, dynamic>
+            ? SessionDeltaKnown.fromJson(json['latest'] as Map<String, dynamic>)
+            : const SessionDeltaKnown(),
+        payloadLimited: json['payloadLimited'] == true,
+        payloadLimitReason: (json['payloadLimitReason'] ?? '').toString(),
       );
 }
 
@@ -1411,6 +1426,9 @@ class SessionHistoryPageEvent extends AppEvent {
     this.logEntryTotal = 0,
     this.hasMoreBefore = false,
     this.resumeRuntimeMeta = const RuntimeMeta(),
+    this.latest = const SessionDeltaKnown(),
+    this.payloadLimited = false,
+    this.payloadLimitReason = '',
   }) : super(type: 'session_history_page');
 
   final List<HistoryLogEntry> logEntries;
@@ -1418,6 +1436,9 @@ class SessionHistoryPageEvent extends AppEvent {
   final int logEntryTotal;
   final bool hasMoreBefore;
   final RuntimeMeta resumeRuntimeMeta;
+  final SessionDeltaKnown latest;
+  final bool payloadLimited;
+  final String payloadLimitReason;
 
   factory SessionHistoryPageEvent.fromJson(Map<String, dynamic> json) =>
       SessionHistoryPageEvent(
@@ -1436,6 +1457,11 @@ class SessionHistoryPageEvent extends AppEvent {
             ? RuntimeMeta.fromJson(
                 json['resumeRuntimeMeta'] as Map<String, dynamic>)
             : const RuntimeMeta(),
+        latest: json['latest'] is Map<String, dynamic>
+            ? SessionDeltaKnown.fromJson(json['latest'] as Map<String, dynamic>)
+            : const SessionDeltaKnown(),
+        payloadLimited: json['payloadLimited'] == true,
+        payloadLimitReason: (json['payloadLimitReason'] ?? '').toString(),
       );
 }
 
@@ -1481,6 +1507,163 @@ class SessionDeltaKnown {
       );
 }
 
+class SessionTerminalRangeEvent extends AppEvent {
+  const SessionTerminalRangeEvent({
+    required super.timestamp,
+    required super.sessionId,
+    required super.runtimeMeta,
+    required super.raw,
+    this.stream = '',
+    this.start = 0,
+    this.end = 0,
+    this.total = 0,
+    this.content = '',
+    this.latest = const SessionDeltaKnown(),
+    this.payloadLimited = false,
+    this.payloadLimitReason = '',
+    this.suggestedLimit = 0,
+  }) : super(type: 'session_terminal_range');
+
+  final String stream;
+  final int start;
+  final int end;
+  final int total;
+  final String content;
+  final SessionDeltaKnown latest;
+  final bool payloadLimited;
+  final String payloadLimitReason;
+  final int suggestedLimit;
+
+  factory SessionTerminalRangeEvent.fromJson(Map<String, dynamic> json) =>
+      SessionTerminalRangeEvent(
+        timestamp: _readTimestamp(json),
+        sessionId: (json['sessionId'] ?? '').toString(),
+        runtimeMeta: RuntimeMeta.fromJson(json),
+        raw: json,
+        stream: (json['stream'] ?? '').toString(),
+        start: (json['start'] as num?)?.toInt() ?? 0,
+        end: (json['end'] as num?)?.toInt() ?? 0,
+        total: (json['total'] as num?)?.toInt() ?? 0,
+        content: (json['content'] ?? '').toString(),
+        latest: json['latest'] is Map<String, dynamic>
+            ? SessionDeltaKnown.fromJson(json['latest'] as Map<String, dynamic>)
+            : const SessionDeltaKnown(),
+        payloadLimited: json['payloadLimited'] == true,
+        payloadLimitReason: (json['payloadLimitReason'] ?? '').toString(),
+        suggestedLimit: (json['suggestedLimit'] as num?)?.toInt() ?? 0,
+      );
+}
+
+class SessionDiffPageEvent extends AppEvent {
+  const SessionDiffPageEvent({
+    required super.timestamp,
+    required super.sessionId,
+    required super.runtimeMeta,
+    required super.raw,
+    this.diffs = const [],
+    this.diffStart = 0,
+    this.diffTotal = 0,
+    this.hasMoreBefore = false,
+    this.reviewGroups = const [],
+    this.activeReviewGroup,
+    this.currentDiff,
+    this.latest = const SessionDeltaKnown(),
+    this.payloadLimited = false,
+    this.payloadLimitReason = '',
+  }) : super(type: 'session_diff_page');
+
+  final List<HistoryContext> diffs;
+  final int diffStart;
+  final int diffTotal;
+  final bool hasMoreBefore;
+  final List<ReviewGroup> reviewGroups;
+  final ReviewGroup? activeReviewGroup;
+  final HistoryContext? currentDiff;
+  final SessionDeltaKnown latest;
+  final bool payloadLimited;
+  final String payloadLimitReason;
+
+  factory SessionDiffPageEvent.fromJson(Map<String, dynamic> json) =>
+      SessionDiffPageEvent(
+        timestamp: _readTimestamp(json),
+        sessionId: (json['sessionId'] ?? '').toString(),
+        runtimeMeta: RuntimeMeta.fromJson(json),
+        raw: json,
+        diffs: ((json['diffs'] as List?) ?? const [])
+            .whereType<Map<String, dynamic>>()
+            .map(HistoryContext.fromJson)
+            .toList(),
+        diffStart: (json['diffStart'] as num?)?.toInt() ?? 0,
+        diffTotal: (json['diffTotal'] as num?)?.toInt() ?? 0,
+        hasMoreBefore: json['hasMoreBefore'] == true,
+        reviewGroups: ((json['reviewGroups'] as List?) ?? const [])
+            .whereType<Map<String, dynamic>>()
+            .map(ReviewGroup.fromJson)
+            .toList(),
+        activeReviewGroup: json['activeReviewGroup'] is Map<String, dynamic>
+            ? ReviewGroup.fromJson(
+                json['activeReviewGroup'] as Map<String, dynamic>)
+            : null,
+        currentDiff: json['currentDiff'] is Map<String, dynamic>
+            ? HistoryContext.fromJson(
+                json['currentDiff'] as Map<String, dynamic>)
+            : null,
+        latest: json['latest'] is Map<String, dynamic>
+            ? SessionDeltaKnown.fromJson(json['latest'] as Map<String, dynamic>)
+            : const SessionDeltaKnown(),
+        payloadLimited: json['payloadLimited'] == true,
+        payloadLimitReason: (json['payloadLimitReason'] ?? '').toString(),
+      );
+}
+
+class SessionTerminalExecutionPageEvent extends AppEvent {
+  const SessionTerminalExecutionPageEvent({
+    required super.timestamp,
+    required super.sessionId,
+    required super.runtimeMeta,
+    required super.raw,
+    this.terminalExecutions = const [],
+    this.executionStart = 0,
+    this.executionTotal = 0,
+    this.hasMoreBefore = false,
+    this.includeOutput = false,
+    this.latest = const SessionDeltaKnown(),
+    this.payloadLimited = false,
+    this.payloadLimitReason = '',
+  }) : super(type: 'session_terminal_execution_page');
+
+  final List<TerminalExecution> terminalExecutions;
+  final int executionStart;
+  final int executionTotal;
+  final bool hasMoreBefore;
+  final bool includeOutput;
+  final SessionDeltaKnown latest;
+  final bool payloadLimited;
+  final String payloadLimitReason;
+
+  factory SessionTerminalExecutionPageEvent.fromJson(
+          Map<String, dynamic> json) =>
+      SessionTerminalExecutionPageEvent(
+        timestamp: _readTimestamp(json),
+        sessionId: (json['sessionId'] ?? '').toString(),
+        runtimeMeta: RuntimeMeta.fromJson(json),
+        raw: json,
+        terminalExecutions: ((json['terminalExecutions'] as List?) ?? const [])
+            .whereType<Map<String, dynamic>>()
+            .map(TerminalExecution.fromJson)
+            .toList(),
+        executionStart: (json['executionStart'] as num?)?.toInt() ?? 0,
+        executionTotal: (json['executionTotal'] as num?)?.toInt() ?? 0,
+        hasMoreBefore: json['hasMoreBefore'] == true,
+        includeOutput: json['includeOutput'] == true,
+        latest: json['latest'] is Map<String, dynamic>
+            ? SessionDeltaKnown.fromJson(json['latest'] as Map<String, dynamic>)
+            : const SessionDeltaKnown(),
+        payloadLimited: json['payloadLimited'] == true,
+        payloadLimitReason: (json['payloadLimitReason'] ?? '').toString(),
+      );
+}
+
 class SessionDeltaEvent extends AppEvent {
   const SessionDeltaEvent({
     required super.timestamp,
@@ -1507,6 +1690,8 @@ class SessionDeltaEvent extends AppEvent {
     this.runtimeAlive = false,
     this.resumeRuntimeMeta = const RuntimeMeta(),
     this.requiresFullSync = false,
+    this.payloadLimited = false,
+    this.payloadLimitReason = '',
   }) : super(type: 'session_delta');
 
   final SessionSummary summary;
@@ -1529,6 +1714,8 @@ class SessionDeltaEvent extends AppEvent {
   final bool runtimeAlive;
   final RuntimeMeta resumeRuntimeMeta;
   final bool requiresFullSync;
+  final bool payloadLimited;
+  final String payloadLimitReason;
 
   factory SessionDeltaEvent.fromJson(Map<String, dynamic> json) =>
       SessionDeltaEvent(
@@ -1602,6 +1789,39 @@ class SessionDeltaEvent extends AppEvent {
                 json['resumeRuntimeMeta'] as Map<String, dynamic>)
             : const RuntimeMeta(),
         requiresFullSync: json['requiresFullSync'] == true,
+        payloadLimited: json['payloadLimited'] == true,
+        payloadLimitReason: (json['payloadLimitReason'] ?? '').toString(),
+      );
+}
+
+class SessionUpdatedEvent extends AppEvent {
+  const SessionUpdatedEvent({
+    required super.timestamp,
+    required super.sessionId,
+    required super.runtimeMeta,
+    required super.raw,
+    this.generation = 0,
+    this.eventCursor = 0,
+    this.reason = '',
+  }) : super(type: 'session_updated');
+
+  final int generation;
+  final int eventCursor;
+  final String reason;
+
+  factory SessionUpdatedEvent.fromJson(Map<String, dynamic> json) =>
+      SessionUpdatedEvent(
+        timestamp: _readTimestamp(json),
+        sessionId: (json['sessionId'] ?? '').toString(),
+        runtimeMeta: RuntimeMeta.fromJson(json),
+        raw: json,
+        generation: (json['generation'] as num?)?.toInt() ??
+            int.tryParse((json['generation'] ?? '').toString()) ??
+            0,
+        eventCursor: (json['eventCursor'] as num?)?.toInt() ??
+            int.tryParse((json['eventCursor'] ?? '').toString()) ??
+            0,
+        reason: (json['reason'] ?? '').toString(),
       );
 }
 

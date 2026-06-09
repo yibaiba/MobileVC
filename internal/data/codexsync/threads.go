@@ -37,6 +37,8 @@ type NativeThread struct {
 	UpdatedAt        time.Time
 	FirstUserMessage string
 	RolloutPath      string
+	RolloutSize      int64
+	RolloutModTime   time.Time
 	HistoryPrompts   []NativePrompt
 	LogEntries       []data.SnapshotLogEntry
 	ControllerState  data.ControllerState
@@ -239,6 +241,7 @@ func FindNativeThread(ctx context.Context, sessionID string) (NativeThread, erro
 	if err != nil {
 		return NativeThread{}, err
 	}
+	thread = withRolloutFileFingerprint(thread)
 	prompts, err := loadHistoryForSession(historyPath, threadID)
 	if err != nil {
 		return NativeThread{}, err
@@ -280,12 +283,16 @@ func MirrorRecord(thread NativeThread) data.SessionRecord {
 		lifecycle = "resumable"
 	}
 	runtime := data.SessionRuntime{
-		ResumeSessionID: thread.ThreadID,
-		Command:         "codex",
-		Engine:          "codex",
-		CWD:             thread.CWD,
-		ClaudeLifecycle: lifecycle,
-		Source:          "codex-native",
+		ResumeSessionID:  thread.ThreadID,
+		Command:          "codex",
+		Engine:           "codex",
+		CWD:              thread.CWD,
+		ClaudeLifecycle:  lifecycle,
+		Source:           "codex-native",
+		SourcePath:       strings.TrimSpace(thread.RolloutPath),
+		SourceSize:       thread.RolloutSize,
+		SourceModUnixNS:  thread.RolloutModTime.UnixNano(),
+		SourceEntryCount: len(entries),
 	}
 	controllerState := thread.ControllerState
 	if controllerState == "" {
@@ -298,12 +305,16 @@ func MirrorRecord(thread NativeThread) data.SessionRecord {
 		ResumeSession:   thread.ThreadID,
 		ClaudeLifecycle: lifecycle,
 		ActiveMeta: protocol.RuntimeMeta{
-			ResumeSessionID: thread.ThreadID,
-			Command:         "codex",
-			Engine:          "codex",
-			Model:           thread.Model,
-			CWD:             thread.CWD,
-			ClaudeLifecycle: lifecycle,
+			ResumeSessionID:  thread.ThreadID,
+			Command:          "codex",
+			Engine:           "codex",
+			Model:            thread.Model,
+			CWD:              thread.CWD,
+			ClaudeLifecycle:  lifecycle,
+			SourcePath:       strings.TrimSpace(thread.RolloutPath),
+			SourceSize:       thread.RolloutSize,
+			SourceModUnixNS:  thread.RolloutModTime.UnixNano(),
+			SourceEntryCount: len(entries),
 		},
 	}
 	projection := data.ProjectionSnapshot{
@@ -522,6 +533,7 @@ func loadHistoryForSession(path, targetSessionID string) ([]NativePrompt, error)
 
 func hydrateNativeThread(thread NativeThread) NativeThread {
 	thread.MirrorSessionID = MirrorSessionID(thread.ThreadID)
+	thread = withRolloutFileFingerprint(thread)
 	if rollout, err := loadRollout(thread.RolloutPath); err == nil {
 		thread.LogEntries = rollout.LogEntries
 		thread.ControllerState = rollout.ControllerState
@@ -544,12 +556,27 @@ func hydrateNativeThread(thread NativeThread) NativeThread {
 
 func hydrateNativeThreadSummary(thread NativeThread) NativeThread {
 	thread.MirrorSessionID = MirrorSessionID(thread.ThreadID)
+	thread = withRolloutFileFingerprint(thread)
 	if !isMeaningfulPromptText(thread.Title) {
 		thread.Title = strings.TrimSpace(thread.FirstUserMessage)
 	}
 	if !isMeaningfulPromptText(thread.Title) {
 		thread.Title = "Codex 会话"
 	}
+	return thread
+}
+
+func withRolloutFileFingerprint(thread NativeThread) NativeThread {
+	path := strings.TrimSpace(thread.RolloutPath)
+	if path == "" {
+		return thread
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return thread
+	}
+	thread.RolloutSize = info.Size()
+	thread.RolloutModTime = info.ModTime().UTC()
 	return thread
 }
 

@@ -285,6 +285,8 @@ void main() {
       await tester.pump();
       expect(selectedDiffId, 'diff-2');
 
+      await tester.ensureVisible(find.text('进入 differ 逐个审核'));
+      await tester.pump();
       await tester.tap(find.text('进入 differ 逐个审核'));
       await tester.pump();
       expect(openedDiffList, isTrue);
@@ -322,6 +324,7 @@ Widget _buildTestApp({
           encoding: 'utf-8',
         ),
         loading: false,
+        saving: false,
         showReviewActions: showReviewActions,
         isDiffMode: isDiffMode,
         reviewDiff: reviewDiff,
@@ -342,6 +345,7 @@ Widget _buildTestApp({
         onSelectReviewDiff: onSelectReviewDiff ?? (_) {},
         onOpenDiffList: onOpenDiffList ?? () {},
         onUseAsContext: () {},
+        onSaveFile: (_, __) {},
         onSendFilePrompt: onSendFilePrompt ?? (_) {},
         onSubmitPrompt: onSubmitPrompt ?? (_) {},
       ),

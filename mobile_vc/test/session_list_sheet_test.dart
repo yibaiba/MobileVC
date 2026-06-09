@@ -49,7 +49,7 @@ void main() {
                 id: 'claude-thread:1',
                 title: 'Desktop Claude',
                 source: 'claude-native',
-                ownership: 'mobilevc',
+                ownership: 'claude-native',
                 runtime: RuntimeMeta(source: 'claude-native'),
               ),
             ],
@@ -70,6 +70,38 @@ void main() {
     expect(find.text('电脑 Claude'), findsOneWidget);
     expect(find.text('MobileVC'), findsNothing);
     expect(find.text('电脑 Claude 只能恢复，不能在 MobileVC 内删除'), findsOneWidget);
+  });
+
+  testWidgets('电脑原生会话主标题和顶部标题一致，原始标题显示为副标题', (tester) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SessionListSheet(
+            sessions: const [
+              SessionSummary(
+                id: 'codex-thread:1',
+                title: '这里有问题不能删除mobilevc喃',
+                source: 'codex-native',
+                external: true,
+                runtime: RuntimeMeta(
+                  source: 'codex-native',
+                  engine: 'codex',
+                  cwd: '/workspace/MobileVC',
+                ),
+              ),
+            ],
+            selectedSessionId: '',
+            cwd: '/workspace/MobileVC',
+            onCreate: () {},
+            onLoad: (_) {},
+            onDelete: (_) {},
+          ),
+        ),
+      ),
+    );
+
+    expect(find.text('电脑 Codex'), findsOneWidget);
+    expect(find.text('这里有问题不能删除mobilevc喃'), findsOneWidget);
   });
 
   testWidgets('MobileVC 会话点击删除会触发 onDelete', (tester) async {
@@ -102,6 +134,114 @@ void main() {
 
     expect(deletedSessionId, 'session-1');
     expect(find.byType(SnackBar), findsNothing);
+  });
+
+  testWidgets('MobileVC ownership 优先于旧 native runtime source，仍可删除',
+      (tester) async {
+    String deletedSessionId = '';
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SessionListSheet(
+            sessions: const [
+              SessionSummary(
+                id: 'session-stale-runtime',
+                title: 'MobileVC stale runtime',
+                source: 'mobilevc',
+                ownership: 'mobilevc',
+                runtime: RuntimeMeta(source: 'claude-native', engine: 'codex'),
+              ),
+            ],
+            selectedSessionId: '',
+            cwd: '/workspace',
+            onCreate: () {},
+            onLoad: (_) {},
+            onDelete: (id) => deletedSessionId = id,
+          ),
+        ),
+      ),
+    );
+
+    expect(find.text('MobileVC stale runtime'), findsOneWidget);
+    expect(find.text('电脑 Claude'), findsNothing);
+
+    await tester.tap(find.byTooltip('删除此会话'));
+    await tester.pump();
+
+    expect(deletedSessionId, 'session-stale-runtime');
+    expect(find.byType(SnackBar), findsNothing);
+  });
+
+  testWidgets('Codex mirror id 优先于旧 claude runtime source', (tester) async {
+    String deletedSessionId = '';
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SessionListSheet(
+            sessions: const [
+              SessionSummary(
+                id: 'codex-thread:stale-runtime',
+                title: '修复会话来源',
+                external: true,
+                runtime: RuntimeMeta(source: 'claude-native', engine: 'claude'),
+              ),
+            ],
+            selectedSessionId: '',
+            cwd: '/workspace',
+            onCreate: () {},
+            onLoad: (_) {},
+            onDelete: (id) => deletedSessionId = id,
+          ),
+        ),
+      ),
+    );
+
+    expect(find.text('电脑 Codex'), findsOneWidget);
+    expect(find.text('修复会话来源'), findsOneWidget);
+    expect(find.text('电脑 Claude'), findsNothing);
+
+    await tester.tap(find.byTooltip('不能删除电脑端原生会话'));
+    await tester.pump();
+
+    expect(deletedSessionId, isEmpty);
+  });
+
+  testWidgets('MobileVC 项目标题不是删除入口，只有会话卡片可删除', (tester) async {
+    String deletedSessionId = '';
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SessionListSheet(
+            sessions: const [
+              SessionSummary(
+                id: 'session-1',
+                title: 'MobileVC session',
+                source: 'mobilevc',
+                ownership: 'mobilevc',
+                runtime: RuntimeMeta(cwd: '/workspace/MobileVC'),
+              ),
+            ],
+            selectedSessionId: '',
+            cwd: '/workspace/MobileVC',
+            onCreate: () {},
+            onLoad: (_) {},
+            onDelete: (id) => deletedSessionId = id,
+          ),
+        ),
+      ),
+    );
+
+    expect(find.text('MobileVC'), findsWidgets);
+    expect(find.byIcon(Icons.delete_outline), findsOneWidget);
+    expect(find.byTooltip('删除此会话'), findsOneWidget);
+
+    await tester.tap(find.byTooltip('删除此会话'));
+    await tester.pump();
+
+    expect(deletedSessionId, 'session-1');
   });
 
   testWidgets('会话列表按项目分组并把当前项目置顶', (tester) async {
@@ -219,6 +359,7 @@ void main() {
     );
 
     expect(find.byType(DropdownButtonFormField<String>), findsOneWidget);
+    expect(find.text('电脑 Codex'), findsWidgets);
     expect(find.text('Project23 session'), findsOneWidget);
     expect(find.widgetWithText(ChoiceChip, 'Project23'), findsNothing);
   });
@@ -319,18 +460,18 @@ void main() {
     await tester.tap(find.widgetWithText(ChoiceChip, 'Claude'));
     await tester.pumpAndSettle();
 
-    expect(find.text('Claude item'), findsOneWidget);
+    expect(find.text('电脑 Claude'), findsOneWidget);
     expect(find.text('MobileVC Claude item'), findsOneWidget);
-    expect(find.text('Codex item'), findsNothing);
+    expect(find.text('电脑 Codex'), findsNothing);
     expect(find.text('MobileVC Codex item'), findsNothing);
     expect(find.text('Gemini item'), findsNothing);
 
     await tester.tap(find.widgetWithText(ChoiceChip, 'Codex'));
     await tester.pumpAndSettle();
 
-    expect(find.text('Codex item'), findsOneWidget);
+    expect(find.text('电脑 Codex'), findsOneWidget);
     expect(find.text('MobileVC Codex item'), findsOneWidget);
-    expect(find.text('Claude item'), findsNothing);
+    expect(find.text('电脑 Claude'), findsNothing);
     expect(find.text('MobileVC Claude item'), findsNothing);
     expect(find.text('Gemini item'), findsNothing);
 
@@ -338,9 +479,9 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.text('Gemini item'), findsOneWidget);
-    expect(find.text('Codex item'), findsNothing);
+    expect(find.text('电脑 Codex'), findsNothing);
     expect(find.text('MobileVC Codex item'), findsNothing);
-    expect(find.text('Claude item'), findsNothing);
+    expect(find.text('电脑 Claude'), findsNothing);
     expect(find.text('MobileVC Claude item'), findsNothing);
     expect(find.widgetWithText(ChoiceChip, 'MobileVC'), findsNothing);
     expect(find.text('MobileVC'), findsOneWidget);

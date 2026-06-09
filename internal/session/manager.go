@@ -887,33 +887,18 @@ func (s *Service) buildDetachedResumeRequest(req ExecuteRequest, targetPermissio
 }
 
 func (s *Service) sendInputWhenRunnerReady(ctx context.Context, sessionID string, req InputRequest, emit func(any)) error {
+	if err := s.waitForInteractive(ctx); err != nil {
+		return err
+	}
 	deadlineCtx, cancel := context.WithTimeout(ctx, resumedInputReadyTimeout)
 	defer cancel()
-	ticker := time.NewTicker(25 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		err := s.SendInput(deadlineCtx, sessionID, req, emit)
-		if err == nil {
-			return nil
-		}
-		if errors.Is(err, context.DeadlineExceeded) && errors.Is(deadlineCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
+	if err := s.SendInput(deadlineCtx, sessionID, req, emit); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
 			return ErrRunnerStartTimeout
 		}
-		if !errors.Is(err, ErrNoActiveRunner) && !errors.Is(err, ErrRunnerNotInteractive) {
-			return err
-		}
-		select {
-		case <-deadlineCtx.Done():
-			if errors.Is(deadlineCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
-				return ErrRunnerStartTimeout
-			}
-			if errors.Is(err, ErrRunnerNotInteractive) {
-				return ErrRunnerNotInteractive
-			}
-			return ErrNoActiveRunner
-		case <-ticker.C:
-		}
+		return err
 	}
+	return nil
 }
 
 func (s *Service) waitForRunnerStart(ctx context.Context) error {

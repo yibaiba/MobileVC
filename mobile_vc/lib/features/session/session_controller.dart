@@ -224,11 +224,19 @@ class SessionController extends ChangeNotifier {
     @visibleForTesting
     Duration outboundAckStaleTimeout = const Duration(seconds: 12),
     @visibleForTesting Duration? lanReturnProbeInterval,
+    @visibleForTesting Duration? connectionHealthInterval,
+    @visibleForTesting int maxMissedHealthPongs = _defaultMaxMissedHealthPongs,
+    @visibleForTesting Duration? sessionLoadingTimeout,
   })  : _service = service ?? MobileVcWsService(),
         _outboundAckRetryDelay = outboundAckRetryDelay,
         _outboundAckStaleTimeout = outboundAckStaleTimeout,
         _lanReturnProbeInterval =
-            lanReturnProbeInterval ?? _defaultLanReturnProbeInterval {
+            lanReturnProbeInterval ?? _defaultLanReturnProbeInterval,
+        _connectionHealthInterval =
+            connectionHealthInterval ?? _defaultConnectionHealthInterval,
+        _maxMissedHealthPongs = maxMissedHealthPongs,
+        _sessionLoadingTimeoutDuration =
+            sessionLoadingTimeout ?? _defaultSessionLoadingTimeoutDuration {
     _terminalExecutionsView = UnmodifiableListView(_terminalExecutions);
     _runtimeProcessesView = UnmodifiableListView(_runtimeProcesses);
     _codexModelCatalogView = UnmodifiableListView(_codexModelCatalog);
@@ -257,11 +265,16 @@ class SessionController extends ChangeNotifier {
   static const _prefsKey = 'mobilevc.app_config';
   static const _connectionIntentPrefsKey = 'mobilevc.connection_intent';
   static const int _maxForegroundReconnectAttempts = 4;
-  static const Duration _connectionHealthInterval = Duration(seconds: 10);
-  static const Duration _connectionSilenceTimeout = Duration(seconds: 45);
+  static const int _defaultMaxMissedHealthPongs = 2;
+  static const Duration _defaultConnectionHealthInterval =
+      Duration(seconds: 10);
   static const Duration _observedSessionSyncInterval = Duration(seconds: 3);
   static const Duration _sessionDeltaRequestCoalesceWindow =
       Duration(seconds: 2);
+  static const Duration _sessionUpdatedPullDebounce =
+      Duration(milliseconds: 350);
+  static const Duration _sessionUpdatedDeltaRequestCoalesceWindow =
+      Duration(milliseconds: 750);
   static const Duration _defaultLanReturnProbeInterval = Duration(seconds: 20);
   static const Duration _lanReturnCooldown = Duration(seconds: 30);
   final MobileVcWsService _service;
@@ -269,6 +282,8 @@ class SessionController extends ChangeNotifier {
   final Duration _outboundAckRetryDelay;
   final Duration _outboundAckStaleTimeout;
   final Duration _lanReturnProbeInterval;
+  final Duration _connectionHealthInterval;
+  final int _maxMissedHealthPongs;
   int get _historyWindowLimit =>
       AppConfig.parseHistoryWindowLimit(_config.historyWindowLimit);
 
@@ -285,7 +300,10 @@ class SessionController extends ChangeNotifier {
   Timer? _lanReturnProbeTimer;
   Timer? _observedSessionSyncTimer;
   Timer? _pendingOutboundRetryTimer;
-  DateTime? _lastServerEventAt;
+  Timer? _sessionUpdatedPullTimer;
+  int _connectionPingSequence = 0;
+  String _pendingHealthPingId = '';
+  int _missedHealthPongs = 0;
   final List<_PendingOutboundAction> _pendingOutboundActions =
       <_PendingOutboundAction>[];
   int _clientActionSequence = 0;
@@ -298,6 +316,11 @@ class SessionController extends ChangeNotifier {
       <String, SessionDeltaKnown>{};
   final Map<String, DateTime> _sessionDeltaLastRequestedAt =
       <String, DateTime>{};
+  final Map<String, int> _sessionUpdatedListGenerations = <String, int>{};
+  final Map<String, int> _sessionUpdatedCursors = <String, int>{};
+  bool _sessionUpdatedListDirty = false;
+  String _sessionUpdatedDeltaSessionId = '';
+  String _sessionUpdatedDeltaReason = '';
   bool _fileListLoading = false;
   Timer? _fileListLoadingTimeout;
   bool _fileReading = false;
@@ -313,7 +336,9 @@ class SessionController extends ChangeNotifier {
   bool _isCompacting = false;
   Timer? _sessionLoadingTimeout;
   Timer? _postHistoryBootstrapTimer;
-  static const Duration _sessionLoadingTimeoutDuration = Duration(seconds: 15);
+  static const Duration _defaultSessionLoadingTimeoutDuration =
+      Duration(seconds: 15);
+  final Duration _sessionLoadingTimeoutDuration;
   static const Duration _postHistoryBootstrapDelay =
       Duration(milliseconds: 450);
   String _connectionMessage = '未连接';
@@ -325,6 +350,8 @@ class SessionController extends ChangeNotifier {
   String _currentDirectoryPath = '';
   String _terminalStdout = '';
   String _terminalStderr = '';
+  int _terminalStdoutBytes = 0;
+  int _terminalStderrBytes = 0;
   String _activeTerminalExecutionId = '';
   String _lastAssistantReplyExecutionKey = '';
   // 用户点击发送后立即点亮的"提交保护锁"——后端流式 LogEvent 不会再瞬间打掉状态球。
@@ -373,6 +400,8 @@ class SessionController extends ChangeNotifier {
   final List<SessionSummary> _sessions = [];
   final Map<String, SessionSummary> _pendingDeletedSessions =
       <String, SessionSummary>{};
+  final Set<String> _deletedSessionTombstones = <String>{};
+  final Set<String> _deletedNativeSessionTombstones = <String>{};
   final List<RelayTrustedDevice> _relayDevices = [];
   final List<SkillDefinition> _skills = [];
   final List<MemoryItem> _memoryItems = [];
@@ -386,9 +415,17 @@ class SessionController extends ChangeNotifier {
   final Set<String> _requestedMediaPreviewKeys = <String>{};
   final Map<String, Set<String>> _visibleHistoryLogEntryKeys =
       <String, Set<String>>{};
+  final Map<String, Map<String, List<HistoryLogEntry>>>
+      _codexOperationalGroupEntriesBySession =
+      <String, Map<String, List<HistoryLogEntry>>>{};
   final Map<String, int> _historyLogEntryStartBySession = <String, int>{};
   final Map<String, int> _historyLogEntryTotalBySession = <String, int>{};
   final Set<String> _historyPageRequestsInFlight = <String>{};
+  final Set<String> _terminalRangeRequestsInFlight = <String>{};
+  final Set<String> _diffPageRequestsInFlight = <String>{};
+  final Set<String> _terminalExecutionPageRequestsInFlight = <String>{};
+  final Map<String, int> _diffPageStartBySession = <String, int>{};
+  final Map<String, int> _terminalExecutionPageStartBySession = <String, int>{};
   final List<ReviewGroup> _reviewGroups = [];
   final List<TerminalExecution> _terminalExecutions = [];
   final List<RuntimeProcessItem> _runtimeProcesses = [];
@@ -480,10 +517,7 @@ class SessionController extends ChangeNotifier {
   AppConfig get config => _config;
   SessionConnectionStage get connectionStage => _connectionStage;
   String get configuredAiEngine => _resolvedConfiguredAiEngine(_config.engine);
-  String get currentAiEngine => _resolvedAiEngine(
-        command: currentMeta.command,
-        engine: currentMeta.engine,
-      );
+  String get currentAiEngine => _currentSessionAiEngine(currentMeta);
   String get displayAiEngine => currentAiEngine;
   String get selectedAiModel => _resolvedAiModel(
         currentAiEngine,
@@ -636,7 +670,10 @@ class SessionController extends ChangeNotifier {
   String get relayDeviceStatus => _relayDeviceStatus;
   bool get canManageRelayDevices =>
       connected &&
+      !_connecting &&
+      !_isLoadingSession &&
       _activeTransportPath == ActiveTransportPath.relay &&
+      _service.hasRelayE2eeHandshake &&
       _service.hasRelayE2eeDeviceBinding;
   Future<RelaySecurityState> relaySecurityState() {
     final actualConnectionMode =
@@ -1040,6 +1077,9 @@ class SessionController extends ChangeNotifier {
       return;
     }
     _activeTerminalExecutionId = normalized;
+    requestTerminalExecutionPage(includeOutput: true);
+    requestTerminalRange('stdout');
+    requestTerminalRange('stderr');
     notifyListeners();
   }
 
@@ -1070,7 +1110,8 @@ class SessionController extends ChangeNotifier {
     final phase = _runtimeUiPhase;
     return phase == _RuntimeUiPhase.catchingUp ||
         phase == _RuntimeUiPhase.running ||
-        phase == _RuntimeUiPhase.stopping;
+        phase == _RuntimeUiPhase.stopping ||
+        (phase == _RuntimeUiPhase.observing && _runtimeHasRunningSignal);
   }
 
   bool get canStopCurrentRun {
@@ -1088,9 +1129,6 @@ class SessionController extends ChangeNotifier {
     if (_isStopping) {
       return _RuntimeUiPhase.stopping;
     }
-    if (isObservingRemoteActiveSession) {
-      return _RuntimeUiPhase.observing;
-    }
     if (_isSubmitting) {
       return _RuntimeUiPhase.running;
     }
@@ -1102,6 +1140,9 @@ class SessionController extends ChangeNotifier {
     }
     if (awaitInput || _isClaudePendingReadyForInput) {
       return _RuntimeUiPhase.waitingInput;
+    }
+    if (isObservingRemoteActiveSession) {
+      return _RuntimeUiPhase.observing;
     }
     if (_runtimeHasRunningSignal) {
       return _RuntimeUiPhase.running;
@@ -1132,6 +1173,9 @@ class SessionController extends ChangeNotifier {
         sessionState == 'WAIT_INPUT' ||
         awaitInput ||
         _isClaudePendingReadyForInput;
+    if (agentState == 'WAIT_INPUT') {
+      return false;
+    }
     if (_sessionRuntimeAlive && !hasDefinitiveIdleOrWaitingState) {
       return true;
     }
@@ -1340,23 +1384,134 @@ class SessionController extends ChangeNotifier {
     if (summary == null) {
       return false;
     }
+    final nativeSource = sessionNativeSource(summary);
+    if (nativeSource == 'codex-native') {
+      return true;
+    }
+    if (nativeSource == 'claude-native') {
+      return false;
+    }
     if (_runtimeMetaIsCodex(summary.runtime)) {
       return true;
     }
-    final sessionId = summary.id.trim().toLowerCase();
-    if (sessionId.startsWith('codex-thread:')) {
+    return false;
+  }
+
+  bool _sessionSummaryIsClaude(SessionSummary summary) {
+    final nativeSource = sessionNativeSource(summary);
+    if (nativeSource == 'claude-native') {
       return true;
     }
-    final source = summary.source.trim().toLowerCase();
-    final ownership = summary.ownership.trim().toLowerCase();
-    final runtimeSource = summary.runtime.source.trim().toLowerCase();
-    return source == 'codex-native' ||
-        ownership == 'codex-native' ||
-        runtimeSource == 'codex-native';
+    if (nativeSource == 'codex-native') {
+      return false;
+    }
+    final engine = summary.runtime.engine.trim().toLowerCase();
+    if (engine == 'claude') {
+      return true;
+    }
+    final command = summary.runtime.command.trim().toLowerCase();
+    return command == 'claude' ||
+        command.startsWith('claude ') ||
+        command.endsWith('/claude') ||
+        command.endsWith(r'\claude') ||
+        command == 'claude.exe';
+  }
+
+  bool _sessionSummaryIsNative(SessionSummary summary) {
+    return sessionNativeSource(summary).isNotEmpty;
+  }
+
+  Set<String> _sessionDeleteTombstoneIds(SessionSummary summary) {
+    final ids = <String>{};
+    final id = summary.id.trim();
+    if (id.isNotEmpty) {
+      ids.add(id);
+    }
+    for (final nativeId in _sessionNativeDeleteTombstoneIds(summary)) {
+      if (nativeId.startsWith('claude:')) {
+        final claudeId = nativeId.substring('claude:'.length);
+        if (claudeId.isNotEmpty) {
+          ids.add('claude-session:$claudeId');
+        }
+      } else if (nativeId.startsWith('codex:')) {
+        final codexId = nativeId.substring('codex:'.length);
+        if (codexId.isNotEmpty) {
+          ids.add('codex-thread:$codexId');
+        }
+      }
+    }
+    return ids;
+  }
+
+  Set<String> _sessionNativeDeleteTombstoneIds(SessionSummary summary) {
+    if (_sessionSummaryIsNative(summary)) {
+      return const <String>{};
+    }
+    final ids = <String>{};
+    if (_sessionSummaryIsClaude(summary)) {
+      final claudeId = _summaryClaudeSessionId(summary);
+      if (claudeId.isNotEmpty) {
+        ids.add('claude:$claudeId');
+      }
+    }
+    if (_sessionSummaryIsCodex(summary)) {
+      final codexId = _summaryCodexThreadId(summary);
+      if (codexId.isNotEmpty) {
+        ids.add('codex:$codexId');
+      }
+    }
+    return ids;
+  }
+
+  String _summaryClaudeSessionId(SessionSummary summary) {
+    final id = summary.id.trim();
+    if (id.startsWith('claude-session:')) {
+      return id.substring('claude-session:'.length).trim();
+    }
+    final claudeUuid = summary.runtime.claudeSessionUuid.trim();
+    if (claudeUuid.isNotEmpty) {
+      return claudeUuid;
+    }
+    final resume = summary.runtime.resumeSessionId.trim();
+    if (resume.isNotEmpty) {
+      return resume;
+    }
+    return '';
+  }
+
+  String _summaryCodexThreadId(SessionSummary summary) {
+    final id = summary.id.trim();
+    if (id.startsWith('codex-thread:')) {
+      return id.substring('codex-thread:'.length).trim();
+    }
+    return summary.runtime.resumeSessionId.trim();
+  }
+
+  bool _shouldKeepListedSessionSummary(SessionSummary summary) {
+    if (_pendingDeletedSessions.containsKey(summary.id) ||
+        _deletedSessionTombstones.contains(summary.id)) {
+      return false;
+    }
+    final claudeId = _summaryClaudeSessionId(summary);
+    if (claudeId.isNotEmpty &&
+        _deletedNativeSessionTombstones.contains('claude:$claudeId')) {
+      return false;
+    }
+    final codexId = _summaryCodexThreadId(summary);
+    if (codexId.isNotEmpty &&
+        _deletedNativeSessionTombstones.contains('codex:$codexId')) {
+      return false;
+    }
+    return true;
   }
 
   bool get inClaudeMode {
     if (_isLoadingSession) {
+      return false;
+    }
+    final selectedSummary = _selectedSessionSummary;
+    if (selectedSummary != null &&
+        sessionNativeSource(selectedSummary) == 'codex-native') {
       return false;
     }
     const claudeStates = <String>{
@@ -1563,6 +1718,7 @@ class SessionController extends ChangeNotifier {
     _postHistoryBootstrapTimer?.cancel();
     _aiStatusHideDebounce?.cancel();
     _activityHideDebounce?.cancel();
+    _sessionUpdatedPullTimer?.cancel();
     await _subscription?.cancel();
     await _adbWebRtc.dispose();
     await _service.dispose();
@@ -1693,6 +1849,7 @@ class SessionController extends ChangeNotifier {
     _connected = false;
     _connecting = false;
     _activeTransportPath = ActiveTransportPath.none;
+    _resetHealthPingState();
     _clearStoppingState();
     _connectionStage = SessionConnectionStage.disconnected;
     _latestError = null;
@@ -1805,11 +1962,11 @@ class SessionController extends ChangeNotifier {
       _mediaPreviewKey(attachment);
 
   String _mediaPreviewKey(TimelineAttachment attachment) {
-    final id = attachment.id.trim();
-    if (id.isNotEmpty) {
-      return id;
+    final path = attachment.path.trim();
+    if (path.isNotEmpty) {
+      return path;
     }
-    return attachment.path.trim();
+    return attachment.id.trim();
   }
 
   void _handleMediaPreviewResult(MediaPreviewResultEvent preview) {
@@ -1916,6 +2073,7 @@ class SessionController extends ChangeNotifier {
         timestamp: DateTime.now(),
         body: body,
         attachments: attachments,
+        animateBody: true,
       ),
       emitNotifications: false,
     );
@@ -1932,6 +2090,7 @@ class SessionController extends ChangeNotifier {
     return rawAttachments.whereType<Map<String, dynamic>>().map((json) {
       final id = _localAttachmentId(json);
       final data = (json['data'] ?? '').toString();
+      final path = (json['path'] ?? '').toString().trim();
       final bytes = _decodeBase64Bytes(data);
       if (bytes != null) {
         _mediaPreviewStates[id] = MediaPreviewState(
@@ -1939,6 +2098,13 @@ class SessionController extends ChangeNotifier {
           status: 'ok',
           bytes: bytes,
         );
+        if (path.isNotEmpty) {
+          _mediaPreviewStates[path] = MediaPreviewState(
+            key: path,
+            status: 'ok',
+            bytes: bytes,
+          );
+        }
       }
       return TimelineAttachment(
         id: id,
@@ -1946,6 +2112,7 @@ class SessionController extends ChangeNotifier {
         name: (json['name'] ?? '').toString(),
         mimeType: (json['mimeType'] ?? '').toString(),
         size: _base64PayloadSize(data),
+        path: path,
         previewStatus: 'local',
         source: 'user_upload',
       );
@@ -2041,6 +2208,17 @@ class SessionController extends ChangeNotifier {
     }
     _isSubmitting = false;
     _isSubmittingBaselineKey = '';
+  }
+
+  bool _shouldEndUserSubmissionForAwaitingRuntime(RuntimeMeta meta) {
+    if (!_isSubmitting) {
+      return false;
+    }
+    final key = _runtimeExecutionKey(meta);
+    if (_isSubmittingBaselineKey.isEmpty) {
+      return key.isNotEmpty;
+    }
+    return key.isNotEmpty && key != _isSubmittingBaselineKey;
   }
 
   bool _shouldEndUserSubmissionForAiStatus(AIStatusEvent status) {
@@ -2284,10 +2462,36 @@ class SessionController extends ChangeNotifier {
   }
 
   bool get _currentSessionShouldSendCodexSandboxMode =>
-      _runtimeMetaIsCodex(_liveRuntimeMeta) ||
-      _runtimeMetaIsCodex(_resumeRuntimeMeta) ||
-      _selectedSessionId.trim().toLowerCase().startsWith('codex-thread:') ||
-      _sessionSummaryIsCodex(_selectedSessionSummary);
+      _sessionShouldSendCodexSandboxMode(_selectedSessionId);
+
+  bool _sessionShouldSendCodexSandboxMode(String sessionId) {
+    final normalizedSessionId = sessionId.trim();
+    if (normalizedSessionId == _selectedSessionId.trim()) {
+      return _runtimeMetaIsCodex(_liveRuntimeMeta) ||
+          _runtimeMetaIsCodex(_resumeRuntimeMeta) ||
+          normalizedSessionId.toLowerCase().startsWith('codex-thread:') ||
+          _sessionSummaryIsCodex(_selectedSessionSummary);
+    }
+    final summary = _findSessionSummary(_sessions, normalizedSessionId);
+    return normalizedSessionId.toLowerCase().startsWith('codex-thread:') ||
+        _sessionSummaryIsCodex(summary);
+  }
+
+  String _currentSessionAiEngine(RuntimeMeta meta) {
+    final summary = _selectedSessionSummary;
+    if (summary != null) {
+      switch (sessionNativeSource(summary)) {
+        case 'codex-native':
+          return 'codex';
+        case 'claude-native':
+          return 'claude';
+      }
+    }
+    return _resolvedAiEngine(
+      command: meta.command,
+      engine: meta.engine,
+    );
+  }
 
   void _applyCodexSandboxModeIfNeeded(Map<String, dynamic> payload) {
     if (_currentSessionShouldSendCodexSandboxMode) {
@@ -2444,6 +2648,8 @@ class SessionController extends ChangeNotifier {
       unawaited(_saveConnectionIntent(true));
       _connected = true;
       _reconnectAttempt = 0;
+      _resetHealthPingState();
+      _startConnectionHealthMonitor();
       _connectionStage = SessionConnectionStage.connected;
       _connectionMessage = '已连接';
       _autoSessionRequested = false;
@@ -2464,20 +2670,11 @@ class SessionController extends ChangeNotifier {
       _relayDeviceStatus = '';
       _relayDeviceListLoading = false;
       await switchWorkingDirectory(_config.cwd);
-      requestRuntimeInfo('context');
-      requestSkillCatalog();
-      requestMemoryList();
       requestSessionList();
-      requestAdbDevices();
-      requestSessionContext();
-      requestPermissionRuleList();
-      requestReviewState();
-      requestTaskSnapshot();
-      requestContextWindowUsage();
-      if (canManageRelayDevices) {
-        requestRelayDeviceList();
-      }
-      if (_selectedSessionId.trim().isNotEmpty) {
+      final pendingLoadTarget = _pendingSessionTargetId.trim();
+      if (pendingLoadTarget.isNotEmpty) {
+        _resendPendingSessionLoad(pendingLoadTarget);
+      } else if (_selectedSessionId.trim().isNotEmpty) {
         final isRelayPath = _activeTransportPath == ActiveTransportPath.relay;
         _requestSessionResume(
           reason: silently ? 'reconnect' : 'connect',
@@ -2485,6 +2682,7 @@ class SessionController extends ChangeNotifier {
         );
       } else {
         _requestSessionDelta(reason: silently ? 'reconnect' : 'connect');
+        _schedulePostHistoryBootstrap(sessionId: '');
       }
       _sendCachedPushTokenIfPossible();
       _restorePendingNotificationSessionIfNeeded();
@@ -2520,6 +2718,9 @@ class SessionController extends ChangeNotifier {
         _flushPendingOutboundActions();
         if (_activeTransportPath == ActiveTransportPath.relay) {
           _startLanReturnProbe();
+          if (canManageRelayDevices) {
+            requestRelayDeviceList();
+          }
         }
       }
       if (shouldRetrySilently) {
@@ -2663,6 +2864,7 @@ class SessionController extends ChangeNotifier {
       );
       _activeTransportPath = ActiveTransportPath.lan;
       _connecting = false;
+      _resetHealthPingState();
       _lanReturnFailureCount = 0;
       _lanReturnProbeTimer?.cancel();
       _lanReturnProbeTimer = null;
@@ -2689,6 +2891,7 @@ class SessionController extends ChangeNotifier {
         _activeTransportPath = ActiveTransportPath.relay;
         _connected = true;
         _connecting = false;
+        _resetHealthPingState();
         _connectionStage = SessionConnectionStage.catchingUp;
         _connectionMessage = '已切回 Relay';
         _requestSessionResume(reason: 'lan_return_failed');
@@ -2712,12 +2915,14 @@ class SessionController extends ChangeNotifier {
     _stopAdbRefreshPolling();
     _connectionHealthTimer?.cancel();
     _connectionHealthTimer = null;
+    _resetHealthPingState();
     _lanReturnProbeTimer?.cancel();
     _lanReturnProbeTimer = null;
     _sessionLoadingTimeout?.cancel();
     _sessionLoadingTimeout = null;
     _postHistoryBootstrapTimer?.cancel();
     _postHistoryBootstrapTimer = null;
+    _clearSessionUpdatedPullState();
     await _adbWebRtc.stop();
     await _service.disconnect();
     _connected = false;
@@ -2754,7 +2959,7 @@ class SessionController extends ChangeNotifier {
     _sessionEventCursors.clear();
     _sessionDeltaKnown.clear();
     _visibleHistoryLogEntryKeys.clear();
-    _lastServerEventAt = null;
+    _clearProjectionHydrationState();
     _canResumeCurrentSession = false;
     _resumeRuntimeMeta = const RuntimeMeta();
     _contextWindowUsage = const ContextWindowUsage();
@@ -2817,22 +3022,30 @@ class SessionController extends ChangeNotifier {
     notifyListeners();
   }
 
-  void _handleUnexpectedSocketDisconnect(String message) {
+  void _handleUnexpectedSocketDisconnect(
+    String message, {
+    bool reconnectImmediately = true,
+  }) {
     final normalized = message.trim().isEmpty ? '连接已断开' : message.trim();
     final wasRecovering = reconnecting;
+    final interruptedLoadTarget =
+        _isLoadingSession ? _pendingSessionTargetId.trim() : '';
     final preserveRuntimeForRelayRecovery =
         _shouldPreserveRuntimeForRelayRecovery();
     _connected = false;
     _connecting = false;
     _activeTransportPath = ActiveTransportPath.none;
+    _resetHealthPingState();
     _clearStoppingState();
     _isLoadingSession = false;
     _sessionListSyncedSinceConnect = false;
-    _pendingSessionTargetId = '';
+    _pendingSessionTargetId =
+        _autoReconnectEnabled ? interruptedLoadTarget : '';
     _pendingNotificationSessionTargetId = '';
     _clearDeferredFirstInput();
     _sessionEventCursors.clear();
     _sessionDeltaKnown.clear();
+    _clearSessionUpdatedPullState();
     if (!preserveRuntimeForRelayRecovery) {
       _clearRuntimeContextAfterDisconnect();
     }
@@ -2843,7 +3056,9 @@ class SessionController extends ChangeNotifier {
           ? SessionConnectionStage.reconnecting
           : SessionConnectionStage.backgroundSuspended;
       _connectionMessage = _appInForeground ? '恢复连接中...' : '后台连接已暂停';
-      _scheduleReconnect(immediate: _appInForeground && !wasRecovering);
+      _scheduleReconnect(
+        immediate: reconnectImmediately && _appInForeground && !wasRecovering,
+      );
     } else {
       final alreadyDisconnected =
           !_connected && !_connecting && _connectionMessage == normalized;
@@ -2893,28 +3108,30 @@ class SessionController extends ChangeNotifier {
   void _requestSessionResume({
     String reason = '',
     bool allowWhileConnecting = false,
+    String sessionId = '',
   }) {
-    final sessionId = _selectedSessionId.trim();
+    final targetSessionId =
+        sessionId.trim().isEmpty ? _selectedSessionId.trim() : sessionId.trim();
     if (!_connected ||
         (_connecting && !allowWhileConnecting) ||
-        sessionId.isEmpty) {
+        targetSessionId.isEmpty) {
       return;
     }
     final pendingTargetId = _pendingSessionTargetId.trim();
     if (_isLoadingSession &&
         pendingTargetId.isNotEmpty &&
-        pendingTargetId != sessionId) {
+        pendingTargetId != targetSessionId) {
       return;
     }
-    final lastSeenCursor = _sessionEventCursors[sessionId] ?? 0;
+    final lastSeenCursor = _sessionEventCursors[targetSessionId] ?? 0;
     final runtimeState =
         (_agentState?.state ?? _sessionState?.state ?? '').trim();
     final shouldSendCodexRuntimeMeta =
-        _currentSessionShouldSendCodexSandboxMode;
+        _sessionShouldSendCodexSandboxMode(targetSessionId);
     _connectionStage = SessionConnectionStage.catchingUp;
     _service.send({
       'action': 'session_resume',
-      'sessionId': sessionId,
+      'sessionId': targetSessionId,
       'cwd': effectiveCwd,
       'limit': _historyWindowLimit,
       if (shouldSendCodexRuntimeMeta) ...{
@@ -2961,6 +3178,7 @@ class SessionController extends ChangeNotifier {
   void _syncObservedSessionPolling() {
     if (!_connected ||
         _connecting ||
+        _isLoadingSession ||
         !_appInForeground ||
         _selectedSessionId.trim().isEmpty ||
         (!_sessionRuntimeAlive && !_selectedSessionExternalNative)) {
@@ -3007,13 +3225,32 @@ class SessionController extends ChangeNotifier {
       return known;
     }
     return SessionDeltaKnown(
-      eventCursor: _sessionEventCursors[normalized] ?? 0,
+      eventCursor: 0,
       logEntryCount: 0,
       diffCount: 0,
       terminalExecutionCount: 0,
-      terminalStdoutLength: _terminalStdout.length,
-      terminalStderrLength: _terminalStderr.length,
+      terminalStdoutLength: _terminalStdoutBytes,
+      terminalStderrLength: _terminalStderrBytes,
     );
+  }
+
+  bool _sessionDeltaKnownIsEmpty(SessionDeltaKnown known) {
+    return known.eventCursor == 0 &&
+        known.logEntryCount == 0 &&
+        known.diffCount == 0 &&
+        known.terminalExecutionCount == 0 &&
+        known.terminalStdoutLength == 0 &&
+        known.terminalStderrLength == 0;
+  }
+
+  void _clearProjectionHydrationState() {
+    _terminalRangeRequestsInFlight.clear();
+    _diffPageRequestsInFlight.clear();
+    _terminalExecutionPageRequestsInFlight.clear();
+    _diffPageStartBySession.clear();
+    _terminalExecutionPageStartBySession.clear();
+    _terminalStdoutBytes = _terminalByteLength(_terminalStdout);
+    _terminalStderrBytes = _terminalByteLength(_terminalStderr);
   }
 
   Future<void> restoreSessionFromNotification(String sessionId) async {
@@ -3224,11 +3461,14 @@ class SessionController extends ChangeNotifier {
     if (_isLoadingSession && pendingTargetId == targetId) {
       return;
     }
-    if (!_isLoadingSession && selectedId == targetId) {
+    if (!_isLoadingSession &&
+        pendingTargetId.isEmpty &&
+        selectedId == targetId) {
       return;
     }
     _postHistoryBootstrapTimer?.cancel();
     _postHistoryBootstrapTimer = null;
+    _clearSessionUpdatedPullState();
     _stopObservedSessionSync();
     _sessionDeltaLastRequestedAt.clear();
     _connectionStage =
@@ -3239,6 +3479,24 @@ class SessionController extends ChangeNotifier {
       'sessionId': targetId,
       'cwd': effectiveCwd,
       'limit': _historyWindowLimit,
+    });
+  }
+
+  void _resendPendingSessionLoad(String sessionId) {
+    final targetId = sessionId.trim();
+    if (!_connected || targetId.isEmpty) {
+      return;
+    }
+    _isLoadingSession = true;
+    _connectionStage = SessionConnectionStage.catchingUp;
+    _agentPhaseLabel = '切换会话中';
+    _beginSessionLoading(targetId: targetId);
+    _service.send({
+      'action': 'session_load',
+      'sessionId': targetId,
+      'cwd': effectiveCwd,
+      'limit': _historyWindowLimit,
+      'reason': 'reconnect_pending_load',
     });
   }
 
@@ -3295,9 +3553,17 @@ class SessionController extends ChangeNotifier {
       _sessionRuntimeAlive = false;
       _resetRuntimeProcessState();
       _clearStoppingState();
-      _beginSessionLoading();
+      _clearTimelineItems();
+      _syncDerivedState();
     }
     _clearLastSelectedSessionIfMatches(targetId);
+    _deletedSessionTombstones.add(targetId);
+    if (target != null) {
+      _deletedSessionTombstones.addAll(_sessionDeleteTombstoneIds(target));
+      _deletedNativeSessionTombstones.addAll(
+        _sessionNativeDeleteTombstoneIds(target),
+      );
+    }
     if (target != null) {
       _pendingDeletedSessions[targetId] = target;
       _pushSystem('system', '正在删除会话：${sessionDisplayTitle(target)}');
@@ -3314,8 +3580,17 @@ class SessionController extends ChangeNotifier {
       if (!_isLoadingSession) {
         return;
       }
+      final timedOutTargetId = _pendingSessionTargetId.trim();
+      _sessionLoadingTimeout = null;
       _isLoadingSession = false;
       _pendingSessionTargetId = '';
+      if (timedOutTargetId.isNotEmpty &&
+          _pendingNotificationSessionTargetId.trim() == timedOutTargetId) {
+        _pendingNotificationSessionTargetId = '';
+      }
+      if (_connected && !_connecting) {
+        _connectionStage = SessionConnectionStage.ready;
+      }
       _agentPhaseLabel = '加载超时';
       _pushSystem('error', '会话加载超时，请检查网络后重试');
       _syncDerivedState();
@@ -3397,8 +3672,11 @@ class SessionController extends ChangeNotifier {
     _activeReviewDiffId = '';
     _clearTimelineItems();
     _visibleHistoryLogEntryKeys.clear();
+    _clearProjectionHydrationState();
     _terminalStdout = '';
     _terminalStderr = '';
+    _terminalStdoutBytes = 0;
+    _terminalStderrBytes = 0;
     _activeTerminalExecutionId = '';
     _lastAssistantReplyExecutionKey = '';
     _terminalExecutions.clear();
@@ -3445,8 +3723,14 @@ class SessionController extends ChangeNotifier {
 
   bool _eventTargetsCurrentSession(String sessionId) {
     final normalized = sessionId.trim();
+    if (_isLoadingSession || _pendingSessionTargetId.trim().isNotEmpty) {
+      return _isHistoryEventForActiveTarget(normalized);
+    }
     if (normalized.isEmpty) {
       return _selectedSessionId.trim().isEmpty && !_isLoadingSession;
+    }
+    if (_deletedSessionTombstones.contains(normalized)) {
+      return false;
     }
     final selected = _selectedSessionId.trim();
     if (selected.isEmpty) {
@@ -3456,12 +3740,16 @@ class SessionController extends ChangeNotifier {
   }
 
   void _finishSessionLoading({String sessionId = ''}) {
+    final normalized = sessionId.trim();
     if (!_isLoadingSession) {
+      if (normalized.isNotEmpty &&
+          _pendingSessionTargetId.trim() == normalized) {
+        _pendingSessionTargetId = '';
+      }
       return;
     }
     _sessionLoadingTimeout?.cancel();
     _sessionLoadingTimeout = null;
-    final normalized = sessionId.trim();
     if (normalized.isNotEmpty) {
       _pendingSessionTargetId = normalized;
     }
@@ -3476,18 +3764,29 @@ class SessionController extends ChangeNotifier {
     final normalizedSessionId = sessionId.trim();
     _postHistoryBootstrapTimer = Timer(_postHistoryBootstrapDelay, () {
       _postHistoryBootstrapTimer = null;
-      if (!_connected ||
-          _connecting ||
-          normalizedSessionId.isEmpty ||
-          _selectedSessionId.trim() != normalizedSessionId ||
-          _isLoadingSession) {
+      if (!_canRunPostHistoryBootstrap(normalizedSessionId)) {
         return;
       }
+      requestRuntimeInfo('context');
+      requestSkillCatalog();
+      requestMemoryList();
+      requestAdbDevices();
+      requestSessionContext();
       requestRuntimeProcessList();
       requestPermissionRuleList();
       requestTaskSnapshot();
       requestContextWindowUsage();
     });
+  }
+
+  bool _canRunPostHistoryBootstrap(String normalizedSessionId) {
+    if (!_connected || _connecting || _isLoadingSession) {
+      return false;
+    }
+    if (normalizedSessionId.isEmpty) {
+      return _selectedSessionId.trim().isEmpty;
+    }
+    return _selectedSessionId.trim() == normalizedSessionId;
   }
 
   void updatePermissionMode(String permissionMode) {
@@ -3960,15 +4259,118 @@ class SessionController extends ChangeNotifier {
   }
 
   void requestSessionContext() {
+    if (!_connected || _connecting || _isLoadingSession) {
+      return;
+    }
     _service.send({'action': 'session_context_get'});
   }
 
   void requestReviewState() {
-    _service.send({'action': 'review_state_get'});
+    requestDiffPage();
+  }
+
+  void requestDiffPage({int limit = 50, bool force = false}) {
+    final sessionId = _selectedSessionId.trim();
+    if (!_connected || _connecting || _isLoadingSession || sessionId.isEmpty) {
+      return;
+    }
+    final known = _currentSessionDeltaKnown(sessionId);
+    final total = known.diffCount;
+    if (!force && total <= 0 && _recentDiffs.isEmpty) {
+      return;
+    }
+    final before = total > 0 ? total : _recentDiffs.length;
+    final key = '$sessionId:$before:$limit';
+    if (!force && _diffPageRequestsInFlight.contains(key)) {
+      return;
+    }
+    _diffPageRequestsInFlight.add(key);
+    _service.send({
+      'action': 'session_diff_page_get',
+      'sessionId': sessionId,
+      'cwd': effectiveCwd,
+      'before': before,
+      'limit': limit,
+    });
+  }
+
+  void requestTerminalHydration({bool force = false}) {
+    requestTerminalRange('stdout', force: force);
+    requestTerminalRange('stderr', force: force);
+    requestTerminalExecutionPage(force: force);
+  }
+
+  void requestTerminalRange(
+    String stream, {
+    int limit = 256 * 1024,
+    bool force = false,
+  }) {
+    final sessionId = _selectedSessionId.trim();
+    if (!_connected || _connecting || _isLoadingSession || sessionId.isEmpty) {
+      return;
+    }
+    final normalizedStream =
+        stream.trim().toLowerCase() == 'stderr' ? 'stderr' : 'stdout';
+    final known = _currentSessionDeltaKnown(sessionId);
+    final currentLength = normalizedStream == 'stderr'
+        ? _terminalStderrBytes
+        : _terminalStdoutBytes;
+    final total = normalizedStream == 'stderr'
+        ? known.terminalStderrLength
+        : known.terminalStdoutLength;
+    if (!force && total <= currentLength) {
+      return;
+    }
+    final key = '$sessionId:$normalizedStream:$currentLength:$limit';
+    if (!force && _terminalRangeRequestsInFlight.contains(key)) {
+      return;
+    }
+    _terminalRangeRequestsInFlight.add(key);
+    _service.send({
+      'action': 'session_terminal_range_get',
+      'sessionId': sessionId,
+      'cwd': effectiveCwd,
+      'stream': normalizedStream,
+      'start': currentLength,
+      'limit': limit,
+    });
+  }
+
+  void requestTerminalExecutionPage({
+    int limit = 50,
+    bool includeOutput = false,
+    bool force = false,
+  }) {
+    final sessionId = _selectedSessionId.trim();
+    if (!_connected || _connecting || _isLoadingSession || sessionId.isEmpty) {
+      return;
+    }
+    final known = _currentSessionDeltaKnown(sessionId);
+    final total = known.terminalExecutionCount;
+    final activeNeedsOutput = includeOutput &&
+        (_resolvedActiveTerminalExecution()?.hasOutput == false ||
+            _terminalExecutions.isEmpty);
+    if (!force && !activeNeedsOutput && total <= _terminalExecutions.length) {
+      return;
+    }
+    final before = total > 0 ? total : _terminalExecutions.length;
+    final key = '$sessionId:$before:$limit:$includeOutput';
+    if (!force && _terminalExecutionPageRequestsInFlight.contains(key)) {
+      return;
+    }
+    _terminalExecutionPageRequestsInFlight.add(key);
+    _service.send({
+      'action': 'session_terminal_execution_page_get',
+      'sessionId': sessionId,
+      'cwd': effectiveCwd,
+      'before': before,
+      'limit': limit,
+      'includeOutput': includeOutput,
+    });
   }
 
   void requestTaskSnapshot() {
-    if (!_connected || _connecting) {
+    if (!_connected || _connecting || _isLoadingSession) {
       return;
     }
     _service.send({
@@ -3979,7 +4381,7 @@ class SessionController extends ChangeNotifier {
   }
 
   void requestContextWindowUsage() {
-    if (!_connected || _connecting) {
+    if (!_connected || _connecting || _isLoadingSession) {
       return;
     }
     _service.send({
@@ -4436,14 +4838,12 @@ class SessionController extends ChangeNotifier {
     if (value.isEmpty && imageAttachments.isEmpty) {
       return;
     }
-    final continuationEngine = _resolvedAiEngine(
-      command: (meta ?? currentMeta).command,
-      engine: (meta ?? currentMeta).engine,
-    );
+    final resolvedMeta = meta ?? currentMeta;
+    final continuationEngine = _currentSessionAiEngine(resolvedMeta);
     _beginUserSubmission();
     final payload = _aiTurnPayload(
       engine: continuationEngine,
-      meta: meta ?? currentMeta,
+      meta: resolvedMeta,
       permissionMode: _config.permissionMode,
       data: '$value\n',
       imageAttachments: imageAttachments,
@@ -5353,6 +5753,9 @@ class SessionController extends ChangeNotifier {
   }
 
   void requestRuntimeProcessList() {
+    if (_isLoadingSession) {
+      return;
+    }
     _requestRuntimeProcessList();
   }
 
@@ -5361,6 +5764,9 @@ class SessionController extends ChangeNotifier {
   }
 
   void requestPermissionRuleList() {
+    if (!_connected || _connecting || _isLoadingSession) {
+      return;
+    }
     _service.send({'action': 'permission_rule_list'});
   }
 
@@ -5471,10 +5877,13 @@ class SessionController extends ChangeNotifier {
   }
 
   void _handleEvent(AppEvent event) async {
-    _lastServerEventAt = DateTime.now();
     _trackSessionEventCursor(event);
     var needsDerivedSync = true;
     switch (event) {
+      case PongEvent pong:
+        needsDerivedSync = false;
+        _handleHealthPong(pong);
+        break;
       case ClientActionAckEvent ack:
         _handleClientActionAck(ack);
         break;
@@ -5517,10 +5926,8 @@ class SessionController extends ChangeNotifier {
         _sendCachedPushTokenIfPossible();
         _resetNewSessionState();
         _upsertSession(created.summary);
-        requestSessionContext();
-        requestPermissionRuleList();
-        requestContextWindowUsage();
         _finishSessionLoading(sessionId: created.summary.id);
+        _schedulePostHistoryBootstrap(sessionId: created.summary.id);
         _flushDeferredFirstInputIfNeeded();
         break;
       case SessionListResultEvent list:
@@ -5537,7 +5944,7 @@ class SessionController extends ChangeNotifier {
           for (final item in _sessions) item.id: item,
         };
         final mergedItems = list.items
-            .where((item) => !_pendingDeletedSessions.containsKey(item.id))
+            .where(_shouldKeepListedSessionSummary)
             .map((item) => _mergedSessionSummary(existingById[item.id], item))
             .toList();
         final mergedIds = {
@@ -5633,66 +6040,53 @@ class SessionController extends ChangeNotifier {
           ..clear()
           ..addAll(history.terminalExecutions);
         _restoreTerminalLogs(history.rawTerminalByStream);
-        _sessionDeltaKnown[resolvedHistorySummary.id] = SessionDeltaKnown(
-          eventCursor: _sessionEventCursors[resolvedHistorySummary.id] ?? 0,
-          logEntryCount: history.logEntryTotal > 0
-              ? history.logEntryTotal
-              : history.logEntries.length,
-          diffCount: history.diffs.length,
-          terminalExecutionCount: history.terminalExecutions.length,
-          terminalStdoutLength: _terminalStdout.length,
-          terminalStderrLength: _terminalStderr.length,
-        );
+        _diffPageStartBySession[resolvedHistorySummary.id] =
+            history.diffs.isEmpty ? history.latest.diffCount : 0;
+        _terminalExecutionPageStartBySession[resolvedHistorySummary.id] =
+            history.terminalExecutions.isEmpty
+                ? history.latest.terminalExecutionCount
+                : 0;
+        final historyLatest = history.latest;
+        if (_sessionDeltaKnownIsEmpty(historyLatest)) {
+          _sessionDeltaKnown[resolvedHistorySummary.id] = SessionDeltaKnown(
+            eventCursor: _sessionEventCursors[resolvedHistorySummary.id] ?? 0,
+            logEntryCount: history.logEntryTotal > 0
+                ? history.logEntryTotal
+                : history.logEntries.length,
+            diffCount: history.diffs.length,
+            terminalExecutionCount: history.terminalExecutions.length,
+            terminalStdoutLength: _terminalStdoutBytes,
+            terminalStderrLength: _terminalStderrBytes,
+          );
+        } else {
+          _sessionDeltaKnown[resolvedHistorySummary.id] = historyLatest;
+          if (historyLatest.eventCursor > 0) {
+            final previousCursor =
+                _sessionEventCursors[resolvedHistorySummary.id] ?? 0;
+            if (historyLatest.eventCursor > previousCursor) {
+              _sessionEventCursors[resolvedHistorySummary.id] =
+                  historyLatest.eventCursor;
+            }
+          }
+        }
         _syncActiveTerminalExecution();
         _resetRuntimeProcessState();
         if (history.currentDiff != null) {
           final current = _normalizeHistoryDiff(history.currentDiff!);
           _mergeRecentDiff(current);
-          _currentDiff = FileDiffEvent(
-            timestamp: DateTime.now(),
-            sessionId: resolvedHistorySummary.id,
-            runtimeMeta: history.resumeRuntimeMeta.merge(
-              RuntimeMeta(
-                contextId: current.id,
-                contextTitle: current.title,
-                targetPath: current.path,
-                targetDiff: current.diff,
-                targetTitle: current.title,
-                executionId: current.executionId,
-                groupId: current.groupId,
-                groupTitle: current.groupTitle,
-              ),
-            ),
-            raw: const {},
-            path: current.path,
-            title: current.title,
-            diff: current.diff,
-            lang: current.lang,
+          _currentDiff = _fileDiffFromHistoryContext(
+            resolvedHistorySummary.id,
+            current,
+            history.resumeRuntimeMeta,
           );
         } else {
           final resolved = _resolvedCurrentDiff();
           _currentDiff = resolved == null
               ? null
-              : FileDiffEvent(
-                  timestamp: DateTime.now(),
-                  sessionId: resolvedHistorySummary.id,
-                  runtimeMeta: history.resumeRuntimeMeta.merge(
-                    RuntimeMeta(
-                      contextId: resolved.id,
-                      contextTitle: resolved.title,
-                      targetPath: resolved.path,
-                      targetDiff: resolved.diff,
-                      targetTitle: resolved.title,
-                      executionId: resolved.executionId,
-                      groupId: resolved.groupId,
-                      groupTitle: resolved.groupTitle,
-                    ),
-                  ),
-                  raw: const {},
-                  path: resolved.path,
-                  title: resolved.title,
-                  diff: resolved.diff,
-                  lang: resolved.lang,
+              : _fileDiffFromHistoryContext(
+                  resolvedHistorySummary.id,
+                  resolved,
+                  history.resumeRuntimeMeta,
                 );
         }
         if (_matchesPendingSessionTarget(resolvedHistorySummary.id)) {
@@ -5722,8 +6116,20 @@ class SessionController extends ChangeNotifier {
       case SessionHistoryPageEvent page:
         _handleSessionHistoryPage(page);
         break;
+      case SessionTerminalRangeEvent range:
+        _handleSessionTerminalRange(range);
+        break;
+      case SessionDiffPageEvent page:
+        _handleSessionDiffPage(page);
+        break;
+      case SessionTerminalExecutionPageEvent page:
+        _handleSessionTerminalExecutionPage(page);
+        break;
       case SessionDeltaEvent delta:
         _handleSessionDelta(delta);
+        break;
+      case SessionUpdatedEvent updated:
+        _handleSessionUpdated(updated);
         break;
       case SessionResumeResultEvent result:
         if (!_eventTargetsCurrentSession(result.sessionId)) {
@@ -5788,10 +6194,6 @@ class SessionController extends ChangeNotifier {
           _clearStoppingState();
         }
 
-        if (_isLoadingSession &&
-            _matchesPendingSessionTarget(state.sessionId)) {
-          _finishSessionLoading(sessionId: state.sessionId);
-        }
         if (_connected) {
           _restorePendingNotificationSessionIfNeeded();
         }
@@ -5872,6 +6274,10 @@ class SessionController extends ChangeNotifier {
             agent.runtimeMeta,
             finishedAt: agent.timestamp,
           );
+          if (agent.awaitInput &&
+              _shouldEndUserSubmissionForAwaitingRuntime(agent.runtimeMeta)) {
+            _endUserSubmissionProtection();
+          }
         }
         if ((_isIdleLikeState(agent.state) || agent.awaitInput) &&
             !_shouldPreserveBlockingPrompt()) {
@@ -5977,7 +6383,32 @@ class SessionController extends ChangeNotifier {
               : error.message.trim();
         }
         final errorMessage = error.message.trim();
+        if (_shouldFinishSessionLoadingForError(error)) {
+          _finishSessionLoading(sessionId: error.sessionId);
+          if (_connected && !_connecting) {
+            _connectionStage = SessionConnectionStage.ready;
+          }
+          _agentPhaseLabel = '加载失败';
+        }
+        if (error.code.startsWith('e2ee_')) {
+          if (_isLoadingSession) {
+            _finishSessionLoading(sessionId: error.sessionId);
+          }
+          unawaited(_service.disconnect());
+          _handleUnexpectedSocketDisconnect(
+            errorMessage,
+            reconnectImmediately: false,
+          );
+          break;
+        }
         if (error.code == 'ws_not_connected') {
+          break;
+        }
+        if (_isSessionListOperationAlreadyRunning(error)) {
+          _pushDebug(
+            'session_list 已在刷新',
+            'waiting for existing session_list_result',
+          );
           break;
         }
         if (error.code == 'ws_closed' ||
@@ -6550,9 +6981,6 @@ class SessionController extends ChangeNotifier {
           _adbWebRtcStarting = false;
         }
         break;
-      case PongEvent _:
-        needsDerivedSync = false;
-        break;
       case UnknownEvent unknown:
         needsDerivedSync = false;
         _pushSystem('system', '收到未识别事件：${unknown.type}');
@@ -6589,6 +7017,14 @@ class SessionController extends ChangeNotifier {
       handled = true;
       final restored = _pendingDeletedSessions.values.toList();
       _pendingDeletedSessions.clear();
+      for (final summary in restored) {
+        for (final id in _sessionDeleteTombstoneIds(summary)) {
+          _deletedSessionTombstones.remove(id);
+        }
+        for (final id in _sessionNativeDeleteTombstoneIds(summary)) {
+          _deletedNativeSessionTombstones.remove(id);
+        }
+      }
       for (final summary in restored.reversed) {
         _upsertSession(summary);
       }
@@ -6627,6 +7063,33 @@ class SessionController extends ChangeNotifier {
       }
     }
     return handled;
+  }
+
+  bool _shouldFinishSessionLoadingForError(ErrorEvent error) {
+    if (!_isLoadingSession) {
+      return false;
+    }
+    if (!_isHistoryEventForActiveTarget(error.sessionId)) {
+      return false;
+    }
+    final code = error.code.trim();
+    if (code == 'session_load_failed' || code == 'session_resume_failed') {
+      return true;
+    }
+    final message = error.message.trim().toLowerCase();
+    return message.contains('session load is already running') ||
+        message.contains('session resume is already running') ||
+        message.contains('session history window unavailable') ||
+        message.contains('session history window store unavailable');
+  }
+
+  bool _isSessionListOperationAlreadyRunning(ErrorEvent error) {
+    final code = error.code.trim();
+    if (code == 'session_list_busy') {
+      return true;
+    }
+    final message = error.message.trim().toLowerCase();
+    return message.contains('session list is already running');
   }
 
   bool _isIdleLikeState(String state) {
@@ -6822,13 +7285,16 @@ class SessionController extends ChangeNotifier {
   }
 
   void _handleSessionDelta(SessionDeltaEvent delta) {
-    if (delta.requiresFullSync) {
-      _requestSessionResume(reason: 'delta_base_mismatch');
-      return;
-    }
     // 只处理当前会话或用户主动 loadSession 目标的 delta；否则后台/迟到的
     // 其他会话增量会覆盖 selected session 与运行时上下文。
     if (!_isSessionRecoveryEventForActiveSession(delta.sessionId)) {
+      return;
+    }
+    if (delta.requiresFullSync) {
+      _requestSessionResume(
+        reason: 'delta_base_mismatch',
+        sessionId: delta.sessionId,
+      );
       return;
     }
     final deltaSessionId = delta.sessionId.trim();
@@ -6881,6 +7347,9 @@ class SessionController extends ChangeNotifier {
     final appendLogEntries = _sortedHistoryLogEntries(delta.appendLogEntries);
     final shouldApplyAppendLogEntries =
         !_isStaleDeltaAppendForCurrentKnown(delta);
+    final suppressAssistantReplayUntilUserAfter = shouldApplyAppendLogEntries
+        ? _deltaAssistantReplaySuppressCutoff(appendLogEntries)
+        : null;
     if (delta.sessionId.trim().isNotEmpty) {
       _sessionDeltaKnown[delta.sessionId.trim()] = delta.latest;
     }
@@ -6890,6 +7359,8 @@ class SessionController extends ChangeNotifier {
           ? appendLogEntries
           : const <HistoryLogEntry>[],
       delta.resumeRuntimeMeta,
+      suppressAssistantReplayUntilUserAfter:
+          suppressAssistantReplayUntilUserAfter,
     );
     for (final diff in delta.upsertDiffs) {
       _mergeRecentDiff(diff);
@@ -6911,27 +7382,14 @@ class SessionController extends ChangeNotifier {
     if (delta.currentDiff != null) {
       final current = _normalizeHistoryDiff(delta.currentDiff!);
       _mergeRecentDiff(current);
-      _currentDiff = FileDiffEvent(
-        timestamp: DateTime.now(),
-        sessionId: delta.sessionId,
-        runtimeMeta: delta.resumeRuntimeMeta.merge(
-          RuntimeMeta(
-            contextId: current.id,
-            contextTitle: current.title,
-            targetPath: current.path,
-            targetDiff: current.diff,
-            targetTitle: current.title,
-            executionId: current.executionId,
-            groupId: current.groupId,
-            groupTitle: current.groupTitle,
-          ),
-        ),
-        raw: const {},
-        path: current.path,
-        title: current.title,
-        diff: current.diff,
-        lang: current.lang,
+      _currentDiff = _fileDiffFromHistoryContext(
+        delta.sessionId,
+        current,
+        delta.resumeRuntimeMeta,
       );
+    }
+    if (_matchesPendingSessionTarget(deltaSessionId)) {
+      _finishSessionLoading(sessionId: deltaSessionId);
     }
     _syncDerivedState();
     notifyListeners();
@@ -6939,10 +7397,17 @@ class SessionController extends ChangeNotifier {
   }
 
   bool _isSessionRecoveryEventForActiveSession(String sessionId) {
-    if (_isLoadingSession) {
-      return _isHistoryEventForActiveTarget(sessionId);
+    final normalized = sessionId.trim();
+    if (normalized.isEmpty || _deletedSessionTombstones.contains(normalized)) {
+      return false;
     }
-    return _eventTargetsCurrentSession(sessionId);
+    if (_isLoadingSession || _pendingSessionTargetId.trim().isNotEmpty) {
+      return _isHistoryEventForActiveTarget(normalized);
+    }
+    if (_selectedSessionId.trim().isEmpty) {
+      return true;
+    }
+    return _eventTargetsCurrentSession(normalized);
   }
 
   Future<void> _refreshContextAfterHistoryLoaded({
@@ -6996,6 +7461,9 @@ class SessionController extends ChangeNotifier {
     }
     _historyPageRequestsInFlight.remove(sessionId);
     _recordHistoryWindow(sessionId, page.logEntryStart, page.logEntryTotal);
+    if (!_sessionDeltaKnownIsEmpty(page.latest)) {
+      _sessionDeltaKnown[sessionId] = page.latest;
+    }
     _prependHistoryTimelineEntries(
       sessionId,
       _sortedHistoryLogEntries(page.logEntries),
@@ -7003,6 +7471,158 @@ class SessionController extends ChangeNotifier {
     );
     _syncDerivedState();
     notifyListeners();
+  }
+
+  void _handleSessionTerminalRange(SessionTerminalRangeEvent range) {
+    final sessionId = range.sessionId.trim();
+    final stream =
+        range.stream.trim().toLowerCase() == 'stderr' ? 'stderr' : 'stdout';
+    _terminalRangeRequestsInFlight.removeWhere(
+      (key) => key.startsWith('$sessionId:$stream:'),
+    );
+    if (!_eventTargetsCurrentSession(sessionId)) {
+      return;
+    }
+    if (!_sessionDeltaKnownIsEmpty(range.latest)) {
+      _sessionDeltaKnown[sessionId] = range.latest;
+    }
+    if (range.payloadLimited) {
+      _pushDebug(
+        'terminal range payload limited',
+        '${range.payloadLimitReason} suggested=${range.suggestedLimit}',
+      );
+      return;
+    }
+    final current = stream == 'stderr' ? _terminalStderr : _terminalStdout;
+    final currentBytes =
+        stream == 'stderr' ? _terminalStderrBytes : _terminalStdoutBytes;
+    final next = _mergedTerminalRange(
+      current,
+      currentBytes: currentBytes,
+      start: range.start,
+      end: range.end,
+      content: range.content,
+    );
+    if (next == null) {
+      _pushDebug(
+        'terminal range ignored',
+        'stream=$stream current=${current.length} start=${range.start} end=${range.end}',
+      );
+      return;
+    }
+    if (stream == 'stderr') {
+      _terminalStderr = next.text;
+      _terminalStderrBytes = next.bytes;
+    } else {
+      _terminalStdout = next.text;
+      _terminalStdoutBytes = next.bytes;
+    }
+    _syncActiveTerminalExecution();
+    _syncDerivedState();
+    notifyListeners();
+  }
+
+  void _handleSessionDiffPage(SessionDiffPageEvent page) {
+    final sessionId = page.sessionId.trim();
+    _diffPageRequestsInFlight
+        .removeWhere((key) => key.startsWith('$sessionId:'));
+    if (!_eventTargetsCurrentSession(sessionId)) {
+      return;
+    }
+    if (!_sessionDeltaKnownIsEmpty(page.latest)) {
+      _sessionDeltaKnown[sessionId] = page.latest;
+    }
+    _diffPageStartBySession[sessionId] = page.diffStart;
+    for (final diff in page.diffs) {
+      _mergeRecentDiff(diff);
+    }
+    if (page.reviewGroups.isNotEmpty || page.activeReviewGroup != null) {
+      _reviewGroups
+        ..clear()
+        ..addAll(page.reviewGroups.map(_normalizeReviewGroup));
+      _activeReviewGroupId = page.activeReviewGroup?.id ?? '';
+      _syncReviewGroupsFromRecentDiffs();
+      _syncActiveReviewSelection();
+    }
+    if (page.currentDiff != null) {
+      final current = _normalizeHistoryDiff(page.currentDiff!);
+      _mergeRecentDiff(current);
+      _currentDiff = _fileDiffFromHistoryContext(
+        sessionId,
+        current,
+        page.runtimeMeta,
+      );
+    }
+    _syncDerivedState();
+    notifyListeners();
+  }
+
+  void _handleSessionTerminalExecutionPage(
+    SessionTerminalExecutionPageEvent page,
+  ) {
+    final sessionId = page.sessionId.trim();
+    _terminalExecutionPageRequestsInFlight
+        .removeWhere((key) => key.startsWith('$sessionId:'));
+    if (!_eventTargetsCurrentSession(sessionId)) {
+      return;
+    }
+    if (!_sessionDeltaKnownIsEmpty(page.latest)) {
+      _sessionDeltaKnown[sessionId] = page.latest;
+    }
+    _terminalExecutionPageStartBySession[sessionId] = page.executionStart;
+    _mergeTerminalExecutions(page.terminalExecutions);
+    _syncDerivedState();
+    notifyListeners();
+  }
+
+  _TerminalBufferMerge? _mergedTerminalRange(
+    String current, {
+    required int currentBytes,
+    required int start,
+    required int end,
+    required String content,
+  }) {
+    final contentBytes = _terminalByteLength(content);
+    if (start < 0 || end < start || end - start != contentBytes) {
+      return null;
+    }
+    if (start == currentBytes) {
+      return _TerminalBufferMerge(current + content, end);
+    }
+    if (start == 0 && end >= currentBytes) {
+      return _TerminalBufferMerge(content, end);
+    }
+    return null;
+  }
+
+  int _terminalByteLength(String value) => utf8.encode(value).length;
+
+  FileDiffEvent _fileDiffFromHistoryContext(
+    String sessionId,
+    HistoryContext current,
+    RuntimeMeta meta,
+  ) {
+    return FileDiffEvent(
+      timestamp: DateTime.now(),
+      sessionId: sessionId,
+      runtimeMeta: meta.merge(
+        RuntimeMeta(
+          contextId: current.id,
+          contextTitle: current.title,
+          targetPath: current.path,
+          targetDiff: current.diff,
+          targetTitle: current.title,
+          executionId: current.executionId,
+          groupId: current.groupId,
+          groupTitle: current.groupTitle,
+        ),
+      ),
+      raw: const {},
+      path: current.path,
+      title: current.title,
+      diff: current.diff,
+      lang: current.lang,
+    );
   }
 
   void _prependHistoryTimelineEntries(
@@ -7042,6 +7662,118 @@ class SessionController extends ChangeNotifier {
     return indexed.map((entry) => entry.$2).toList(growable: false);
   }
 
+  void _handleSessionUpdated(SessionUpdatedEvent event) {
+    final updatedSessionId = event.sessionId.trim();
+    if (updatedSessionId.isEmpty || !_connected || _connecting) {
+      return;
+    }
+    if (_isLoadingSession &&
+        !_isHistoryEventForActiveTarget(updatedSessionId)) {
+      return;
+    }
+    final previousGeneration =
+        _sessionUpdatedListGenerations[updatedSessionId] ?? 0;
+    final previousCursor = _sessionUpdatedCursors[updatedSessionId] ?? 0;
+    if (event.generation > 0 && event.generation < previousGeneration) {
+      return;
+    }
+    var shouldRefreshList =
+        event.generation <= 0 || event.generation > previousGeneration;
+    var shouldRefreshDelta = false;
+    if (event.generation > previousGeneration) {
+      _sessionUpdatedListGenerations[updatedSessionId] = event.generation;
+    }
+    if (updatedSessionId == _selectedSessionId.trim()) {
+      shouldRefreshDelta = event.eventCursor <= 0 ||
+          previousCursor <= 0 ||
+          event.eventCursor > previousCursor;
+    }
+    if (event.eventCursor > previousCursor) {
+      _sessionUpdatedCursors[updatedSessionId] = event.eventCursor;
+    }
+    if (!shouldRefreshList && !shouldRefreshDelta) {
+      return;
+    }
+    if (shouldRefreshList) {
+      _sessionUpdatedListDirty = true;
+    }
+    if (shouldRefreshDelta) {
+      _sessionUpdatedDeltaSessionId = updatedSessionId;
+      _sessionUpdatedDeltaReason = event.reason.trim().isNotEmpty
+          ? 'session_updated:${event.reason.trim()}'
+          : 'session_updated';
+    }
+    if (shouldRefreshDelta) {
+      _scheduleSessionUpdatedPull(Duration.zero);
+    } else {
+      _scheduleSessionUpdatedPull();
+    }
+  }
+
+  void _scheduleSessionUpdatedPull([
+    Duration delay = _sessionUpdatedPullDebounce,
+  ]) {
+    if (!_connected || _connecting) {
+      return;
+    }
+    if (delay <= Duration.zero && _sessionUpdatedPullTimer != null) {
+      _sessionUpdatedPullTimer?.cancel();
+      _sessionUpdatedPullTimer = null;
+    }
+    if (_sessionUpdatedPullTimer != null) {
+      return;
+    }
+    _sessionUpdatedPullTimer = Timer(delay, () {
+      _sessionUpdatedPullTimer = null;
+      _flushSessionUpdatedPull();
+    });
+  }
+
+  void _flushSessionUpdatedPull() {
+    if (!_connected || _connecting) {
+      _clearSessionUpdatedPullState();
+      return;
+    }
+    if (_sessionUpdatedListDirty) {
+      _sessionUpdatedListDirty = false;
+      requestSessionList();
+    }
+    final deltaSessionId = _sessionUpdatedDeltaSessionId.trim();
+    var clearDeltaPull = true;
+    if (deltaSessionId.isNotEmpty &&
+        deltaSessionId == _selectedSessionId.trim()) {
+      final now = DateTime.now();
+      final lastRequestedAt = _sessionDeltaLastRequestedAt[deltaSessionId];
+      if (lastRequestedAt == null ||
+          now.difference(lastRequestedAt) >=
+              _sessionUpdatedDeltaRequestCoalesceWindow) {
+        _requestSessionDelta(
+          reason: _sessionUpdatedDeltaReason,
+          force: true,
+        );
+      } else {
+        clearDeltaPull = false;
+        final remaining = _sessionUpdatedDeltaRequestCoalesceWindow -
+            now.difference(lastRequestedAt);
+        _scheduleSessionUpdatedPull(remaining);
+      }
+    }
+    if (clearDeltaPull) {
+      _sessionUpdatedDeltaSessionId = '';
+      _sessionUpdatedDeltaReason = '';
+    }
+  }
+
+  void _clearSessionUpdatedPullState() {
+    _sessionUpdatedPullTimer?.cancel();
+    _sessionUpdatedPullTimer = null;
+    _sessionUpdatedListDirty = false;
+    _sessionUpdatedDeltaSessionId = '';
+    _sessionUpdatedDeltaReason = '';
+    _sessionUpdatedListGenerations.clear();
+    _sessionUpdatedCursors.clear();
+  }
+
   DateTime? _historyLogEntryTimestamp(HistoryLogEntry entry) {
     final direct = DateTime.tryParse(entry.timestamp.trim());
     if (direct != null) {
@@ -7073,11 +7805,96 @@ class SessionController extends ChangeNotifier {
     return false;
   }
 
+  DateTime? _deltaAssistantReplaySuppressCutoff(
+    List<HistoryLogEntry> entries,
+  ) {
+    final currentAssistantAt = _latestVisibleAssistantReplyForCurrentTurnAt();
+    if (currentAssistantAt == null) {
+      return null;
+    }
+    var hasCompletionStatus = false;
+    var hasAssistantReplay = false;
+    for (final entry in entries) {
+      if (_isUserHistoryBoundaryAfterAssistant(entry, currentAssistantAt)) {
+        break;
+      }
+      if (_isCodexNativeCompletionStatusHistoryEntry(entry)) {
+        hasCompletionStatus = true;
+        continue;
+      }
+      if (_isAssistantHistoryLogEntry(entry)) {
+        hasAssistantReplay = true;
+      }
+    }
+    return hasCompletionStatus && hasAssistantReplay
+        ? currentAssistantAt
+        : null;
+  }
+
+  bool _isUserHistoryLogEntry(HistoryLogEntry entry) {
+    return entry.kind.trim().toLowerCase() == 'user';
+  }
+
+  bool _isUserHistoryBoundaryAfterAssistant(
+    HistoryLogEntry entry,
+    DateTime currentAssistantAt,
+  ) {
+    if (!_isUserHistoryLogEntry(entry)) {
+      return false;
+    }
+    final entryAt = _historyLogEntryTimestamp(entry)?.toLocal();
+    return entryAt == null || entryAt.isAfter(currentAssistantAt.toLocal());
+  }
+
+  DateTime? _latestVisibleAssistantReplyForCurrentTurnAt() {
+    DateTime? latestUserAt;
+    DateTime? latestAssistantAt;
+    for (final item in _timeline) {
+      if (item.kind == 'user' && _hasVisibleTimelineContent(item)) {
+        if (latestUserAt == null || item.timestamp.isAfter(latestUserAt)) {
+          latestUserAt = item.timestamp;
+        }
+        continue;
+      }
+      if (_isAssistantReplyTimelineItem(item)) {
+        if (latestAssistantAt == null ||
+            item.timestamp.isAfter(latestAssistantAt)) {
+          latestAssistantAt = item.timestamp;
+        }
+      }
+    }
+    if (latestAssistantAt == null) {
+      return null;
+    }
+    if (latestUserAt != null && !latestAssistantAt.isAfter(latestUserAt)) {
+      return null;
+    }
+    return latestAssistantAt;
+  }
+
+  bool _isAssistantHistoryLogEntry(HistoryLogEntry entry) {
+    final body = _restoredHistoryBody(entry).trim();
+    if (body.isEmpty || entry.kind == 'thinking') {
+      return false;
+    }
+    if (entry.kind == 'markdown') {
+      return true;
+    }
+    final context = entry.context;
+    final type = context?.type.trim().toLowerCase() ?? '';
+    if (type == 'assistant') {
+      return true;
+    }
+    final source = context?.source.trim().toLowerCase() ?? '';
+    return source == 'codex/assistant' || source == 'claude/assistant';
+  }
+
   void _appendHistoryTimelineEntry(
     String sessionId,
     HistoryLogEntry entry,
-    RuntimeMeta resumeMeta,
-  ) {
+    RuntimeMeta resumeMeta, {
+    bool suppressUnmatchedAssistantReplay = false,
+  }) {
     if (_isVisibleHistoryLogEntry(sessionId, entry)) {
       return;
     }
@@ -7096,9 +7913,12 @@ class SessionController extends ChangeNotifier {
       _rememberVisibleHistoryLogEntry(sessionId, entry);
       return;
     }
-    final beforeCount = _timeline.length;
-    _appendTimelineItem(item, emitNotifications: false);
-    if (_timeline.length > beforeCount) {
+    final accepted = _appendTimelineItem(
+      item,
+      emitNotifications: false,
+      suppressUnmatchedAssistantReplay: suppressUnmatchedAssistantReplay,
+    );
+    if (accepted) {
       _rememberVisibleHistoryLogEntry(sessionId, entry);
     }
   }
@@ -7106,11 +7926,18 @@ class SessionController extends ChangeNotifier {
   void _appendHistoryTimelineEntries(
     String sessionId,
     List<HistoryLogEntry> entries,
-    RuntimeMeta resumeMeta,
-  ) {
+    RuntimeMeta resumeMeta, {
+    DateTime? suppressAssistantReplayUntilUserAfter,
+  }) {
     final pendingCodexOps = <HistoryLogEntry>[];
+    var suppressUnmatchedAssistantReplay =
+        suppressAssistantReplayUntilUserAfter != null;
+    var hasPassedCompletionStatus = false;
     for (final entry in entries) {
       if (_isCodexNativeOperationalHistoryEntry(entry)) {
+        if (_isCodexNativeCompletionStatusHistoryEntry(entry)) {
+          hasPassedCompletionStatus = true;
+        }
         if (!_isVisibleHistoryLogEntry(sessionId, entry)) {
           pendingCodexOps.add(entry);
         }
@@ -7121,7 +7948,15 @@ class SessionController extends ChangeNotifier {
         pendingCodexOps,
         resumeMeta,
       );
-      _appendHistoryTimelineEntry(sessionId, entry, resumeMeta);
+      if (hasPassedCompletionStatus && _isUserHistoryLogEntry(entry)) {
+        suppressUnmatchedAssistantReplay = false;
+      }
+      _appendHistoryTimelineEntry(
+        sessionId,
+        entry,
+        resumeMeta,
+        suppressUnmatchedAssistantReplay: suppressUnmatchedAssistantReplay,
+      );
     }
     _flushCodexNativeOperationalGroup(
       sessionId,
@@ -7139,9 +7974,25 @@ class SessionController extends ChangeNotifier {
       return;
     }
     final item = _codexNativeOperationalTimelineItem(entries, resumeMeta);
-    final beforeCount = _timeline.length;
-    _appendTimelineItem(item, emitNotifications: false);
-    if (_timeline.length > beforeCount) {
+    if (_reconcileCodexNativeOperationalGroup(
+      sessionId,
+      entries,
+      item,
+    )) {
+      entries.clear();
+      return;
+    }
+    if (_shouldSuppressIsolatedCodexNativeCompletionGroup(entries)) {
+      entries.clear();
+      return;
+    }
+    final accepted = _appendTimelineItem(item, emitNotifications: false);
+    if (accepted) {
+      _rememberCodexNativeOperationalGroupEntries(
+        sessionId,
+        item.id,
+        entries,
+      );
       for (final entry in entries) {
         _rememberVisibleHistoryLogEntry(sessionId, entry);
       }
@@ -7172,6 +8023,175 @@ class SessionController extends ChangeNotifier {
       codexSteps: visibleSteps,
       animateBody: false,
     );
+  }
+
+  bool _reconcileCodexNativeOperationalGroup(
+    String sessionId,
+    List<HistoryLogEntry> entries,
+    TimelineItem next,
+  ) {
+    final existingIndex = _findCodexNativeOperationalGroupIndex(
+      sessionId,
+      entries,
+    );
+    if (existingIndex == -1) {
+      return false;
+    }
+    final previous = _timeline[existingIndex];
+    final mergedEntries = _mergedCodexNativeOperationalEntries(
+      sessionId,
+      previous.id,
+      entries,
+    );
+    final merged = _codexNativeOperationalTimelineItem(
+      mergedEntries,
+      previous.meta.merge(next.meta),
+    );
+    _replaceTimelineItemAt(
+      existingIndex,
+      merged.copyWith(
+        id: previous.id,
+        meta: previous.meta.merge(next.meta),
+        attachments: _mergeTimelineAttachments(
+          previous.attachments,
+          next.attachments,
+        ),
+        animateBody: false,
+      ),
+    );
+    _rememberCodexNativeOperationalGroupEntries(
+      sessionId,
+      previous.id,
+      mergedEntries,
+    );
+    for (final entry in entries) {
+      _rememberVisibleHistoryLogEntry(sessionId, entry);
+    }
+    return true;
+  }
+
+  List<HistoryLogEntry> _mergedCodexNativeOperationalEntries(
+    String sessionId,
+    String groupId,
+    List<HistoryLogEntry> entries,
+  ) {
+    final existing = _codexOperationalGroupEntriesBySession[sessionId.trim()]
+            ?[groupId] ??
+        const <HistoryLogEntry>[];
+    final merged = <HistoryLogEntry>[];
+    final seen = <String>{};
+    for (final entry in [...existing, ...entries]) {
+      final key = _historyLogEntryKey(entry);
+      if (key.isNotEmpty && !seen.add(key)) {
+        continue;
+      }
+      merged.add(entry);
+    }
+    return _sortedHistoryLogEntries(merged);
+  }
+
+  void _rememberCodexNativeOperationalGroupEntries(
+    String sessionId,
+    String groupId,
+    List<HistoryLogEntry> entries,
+  ) {
+    final normalizedSessionId = sessionId.trim();
+    if (normalizedSessionId.isEmpty || groupId.isEmpty) {
+      return;
+    }
+    _codexOperationalGroupEntriesBySession.putIfAbsent(normalizedSessionId,
+            () => <String, List<HistoryLogEntry>>{})[groupId] =
+        List<HistoryLogEntry>.from(entries);
+  }
+
+  int _findCodexNativeOperationalGroupIndex(
+    String sessionId,
+    List<HistoryLogEntry> entries,
+  ) {
+    final visibleKeys = _visibleHistoryLogEntryKeys[sessionId.trim()];
+    if (visibleKeys == null || visibleKeys.isEmpty) {
+      return -1;
+    }
+    final hasSeenEntry = entries.any((entry) {
+      final key = _historyLogEntryKey(entry);
+      return key.isNotEmpty && visibleKeys.contains(key);
+    });
+    if (!hasSeenEntry && !_isTrailingCodexNativeCompletionGroup(entries)) {
+      return -1;
+    }
+    final canCrossVisibleContent = _isTrailingCodexNativeCompletionGroup(
+      entries,
+    );
+    var inspected = 0;
+    for (var index = _timeline.length - 1; index >= 0; index--) {
+      if (inspected >= 20) {
+        break;
+      }
+      inspected += 1;
+      final item = _timeline[index];
+      if (item.kind == 'codex_tool_group') {
+        return index;
+      }
+      if (_hasVisibleTimelineContent(item) && !canCrossVisibleContent) {
+        return -1;
+      }
+    }
+    return -1;
+  }
+
+  bool _isTrailingCodexNativeCompletionGroup(List<HistoryLogEntry> entries) {
+    if (entries.isEmpty) {
+      return false;
+    }
+    return entries.every(_isCodexNativeCompletionStatusHistoryEntry);
+  }
+
+  bool _isCodexNativeCompletionStatusHistoryEntry(HistoryLogEntry entry) {
+    final context = entry.context;
+    if (context == null || context.source.trim() != 'codex-native') {
+      return false;
+    }
+    final type = context.type.trim();
+    final status = context.status.trim().toLowerCase();
+    switch (type) {
+      case 'codex_task':
+        return status == 'completed' ||
+            status == 'aborted' ||
+            status == 'failed';
+      case 'codex_patch':
+        return status.isNotEmpty;
+      default:
+        return false;
+    }
+  }
+
+  bool _shouldSuppressIsolatedCodexNativeCompletionGroup(
+    List<HistoryLogEntry> entries,
+  ) {
+    if (!_isTrailingCodexNativeCompletionGroup(entries)) {
+      return false;
+    }
+    final latestEntryAt = _latestHistoryLogEntryTimestamp(entries);
+    if (latestEntryAt == null) {
+      return false;
+    }
+    return _timeline.any((item) =>
+        _isAssistantReplyTimelineItem(item) &&
+        item.timestamp.isAfter(latestEntryAt));
+  }
+
+  DateTime? _latestHistoryLogEntryTimestamp(List<HistoryLogEntry> entries) {
+    DateTime? latest;
+    for (final entry in entries) {
+      final timestamp = _historyLogEntryTimestamp(entry);
+      if (timestamp == null) {
+        continue;
+      }
+      if (latest == null || timestamp.isAfter(latest)) {
+        latest = timestamp;
+      }
+    }
+    return latest;
   }
 
   String _codexNativeOperationalSummary(List<HistoryLogEntry> entries) {
@@ -7541,22 +8561,30 @@ class SessionController extends ChangeNotifier {
     RuntimeMeta resumeMeta,
   ) {
     final restoredBody = _restoredHistoryBody(entry);
+    final visibleBody = entry.kind == 'user'
+        ? _normalizeUserAttachmentBody(restoredBody)
+        : restoredBody;
     final restoredKind = _restoredHistoryKind(entry, restoredBody);
     final attachments = _mergeTimelineAttachments(
       entry.attachments,
       _timelineAttachmentsFromText(restoredBody),
     );
+    final meta = _historyRuntimeMetaForEntry(entry, resumeMeta);
+    final timestamp = DateTime.tryParse(entry.timestamp)?.toLocal() ??
+        DateTime.fromMillisecondsSinceEpoch(0);
+    final id = restoredKind == 'thinking'
+        ? _thinkingHistoryTimelineItemId(entry, meta, timestamp)
+        : 'history-$restoredKind-${entry.timestamp}-${visibleBody.hashCode}';
     return TimelineItem(
-      id: 'history-$restoredKind-${entry.timestamp}-${restoredBody.hashCode}',
+      id: id,
       kind: restoredKind,
-      timestamp:
-          DateTime.tryParse(entry.timestamp)?.toLocal() ?? DateTime.now(),
+      timestamp: timestamp,
       title: entry.label,
-      body: restoredBody,
+      body: visibleBody,
       stream: entry.stream,
       status: entry.context?.status ?? '',
       trigger: entry.context?.trigger ?? '',
-      meta: _historyRuntimeMetaForEntry(entry, resumeMeta),
+      meta: meta,
       context: entry.context,
       attachments: attachments,
       animateBody: false,
@@ -7595,8 +8623,8 @@ class SessionController extends ChangeNotifier {
     if (_timeline.any(_hasVisibleTimelineContent)) {
       return;
     }
-    final isExternal = summary.source == 'codex-native' ||
-        summary.external ||
+    final nativeSource = sessionNativeSource(summary);
+    final isExternal = nativeSource.isNotEmpty ||
         history.resumeRuntimeMeta.engine.trim().toLowerCase() == 'codex' ||
         history.resumeRuntimeMeta.engine.trim().toLowerCase() == 'claude';
     if (!isExternal) {
@@ -7613,10 +8641,7 @@ class SessionController extends ChangeNotifier {
     _appendTimelineItem(
       TimelineItem(
         id: 'history-fallback-${summary.id}',
-        kind: hasExplicitPreview &&
-                (summary.source == 'codex-native' || summary.external)
-            ? 'user'
-            : 'system',
+        kind: hasExplicitPreview && nativeSource.isNotEmpty ? 'user' : 'system',
         timestamp: summary.updatedAt ?? summary.createdAt ?? DateTime.now(),
         body: fallbackMessage,
         meta: history.resumeRuntimeMeta,
@@ -7676,22 +8701,7 @@ class SessionController extends ChangeNotifier {
   }
 
   bool _isExternalNativeSession(SessionSummary summary) {
-    final ownership = summary.ownership.trim().toLowerCase();
-    // Authoritative ownership field set by backend at session creation.
-    if (ownership == 'mobilevc') {
-      return false;
-    }
-    if (ownership == 'claude-native' || ownership == 'codex-native') {
-      return true;
-    }
-    // Fallback for legacy sessions without ownership field.
-    final source = summary.source.trim().toLowerCase();
-    final runtimeSource = summary.runtime.source.trim().toLowerCase();
-    return summary.external ||
-        source == 'codex-native' ||
-        source == 'claude-native' ||
-        runtimeSource == 'codex-native' ||
-        runtimeSource == 'claude-native';
+    return sessionNativeSource(summary).isNotEmpty;
   }
 
   SessionSummary _resolvedHistorySummary(
@@ -7802,7 +8812,9 @@ class SessionController extends ChangeNotifier {
       if (kind != 'user') {
         continue;
       }
-      final body = _restoredHistoryBody(entry).trim();
+      final body = _normalizeUserAttachmentBody(
+        _restoredHistoryBody(entry),
+      ).trim();
       if (body.isEmpty ||
           looksLikeSessionNoiseText(body) ||
           looksLikeSessionBootstrapCommand(body) ||
@@ -7836,6 +8848,7 @@ class SessionController extends ChangeNotifier {
   void _clearTimelineItems() {
     _timeline.clear();
     _timelineItemIds.clear();
+    _codexOperationalGroupEntriesBySession.clear();
   }
 
   void _replaceTimelineItems(List<TimelineItem> items) {
@@ -7853,24 +8866,72 @@ class SessionController extends ChangeNotifier {
     _timelineItemIds.add(item.id);
   }
 
-  void _appendTimelineItem(
+  void _insertTimelineItem(TimelineItem item) {
+    final index = _timelineInsertionIndex(item);
+    _timeline.insert(index, item);
+    _timelineItemIds.add(item.id);
+  }
+
+  int _timelineInsertionIndex(TimelineItem item) {
+    if (item.animateBody || _timeline.isEmpty) {
+      return _timeline.length;
+    }
+    if (!_timeline.last.timestamp.isAfter(item.timestamp)) {
+      return _timeline.length;
+    }
+    for (var index = _timeline.length - 1; index >= 0; index--) {
+      if (!_timeline[index].timestamp.isAfter(item.timestamp)) {
+        return index + 1;
+      }
+    }
+    return 0;
+  }
+
+  bool _appendTimelineItem(
     TimelineItem item, {
     bool emitNotifications = true,
+    bool suppressUnmatchedAssistantReplay = false,
   }) {
     if (!_shouldKeepTimelineItem(item)) {
-      return;
+      return false;
     }
     if (_timelineItemIds.contains(item.id)) {
-      return;
+      return false;
+    }
+    if (_reconcileRestoredAssistantTimelineItem(
+      item,
+      emitNotifications: emitNotifications,
+    )) {
+      return true;
+    }
+    if (_isLiveAssistantReplayTailOfRestoredItem(item)) {
+      return false;
+    }
+    if (_isOlderRestoredAssistantReplayOfNewerItem(item)) {
+      return false;
+    }
+    if (suppressUnmatchedAssistantReplay) {
+      if (_reconcileUnmatchedRestoredAssistantTimelineItem(
+        item,
+        emitNotifications: emitNotifications,
+      )) {
+        return true;
+      }
+      if (_isUnmatchedRestoredAssistantReplay(item)) {
+        return false;
+      }
+    }
+    if (_reconcileUserAttachmentTimelineItem(item)) {
+      return true;
     }
     if (_isDuplicateUserTimelineItem(item)) {
-      return;
+      return false;
     }
     if (_isDuplicateAssistantTimelineItem(item)) {
-      return;
+      return false;
     }
     if (_isDuplicateRestoredTimelineItem(item)) {
-      return;
+      return false;
     }
     if (_shouldMergeIntoPreviousTimelineItem(item)) {
       final previous = _timeline.removeLast();
@@ -7900,13 +8961,254 @@ class SessionController extends ChangeNotifier {
           preserveExistingAssistantReply: true,
         );
       }
-      return;
+      return true;
     }
-    _timeline.add(item);
-    _timelineItemIds.add(item.id);
+    _insertTimelineItem(item);
     if (emitNotifications) {
       _emitTimelineNotification(item);
     }
+    return true;
+  }
+
+  bool _reconcileRestoredAssistantTimelineItem(
+    TimelineItem item, {
+    required bool emitNotifications,
+  }) {
+    if (!_isRestoredAssistantReplayCandidate(item)) {
+      return false;
+    }
+    final index = _findLiveAssistantReplayIndex(item);
+    if (index == -1) {
+      return false;
+    }
+    final previous = _timeline[index];
+    final previousBody = _normalizeAssistantReplyForDedupe(previous.body);
+    final restoredBody = _normalizeAssistantReplyForDedupe(item.body);
+    if (previousBody.isEmpty || restoredBody.isEmpty) {
+      return false;
+    }
+    if (restoredBody == previousBody || restoredBody.startsWith(previousBody)) {
+      final reconciled = item.copyWith(
+        meta: previous.meta.merge(item.meta),
+        context: item.context ?? previous.context,
+        attachments: _mergeTimelineAttachments(
+          previous.attachments,
+          item.attachments,
+        ),
+        animateBody: false,
+      );
+      _replaceTimelineItemAt(index, reconciled);
+      if (emitNotifications) {
+        _emitTimelineNotification(
+          reconciled,
+          preserveExistingAssistantReply: true,
+        );
+      }
+      return true;
+    }
+    return previousBody.startsWith(restoredBody);
+  }
+
+  bool _isRestoredAssistantReplayCandidate(TimelineItem item) {
+    if (item.animateBody || !_isAssistantReplyTimelineItem(item)) {
+      return false;
+    }
+    return item.body.trim().isNotEmpty;
+  }
+
+  bool _reconcileUnmatchedRestoredAssistantTimelineItem(
+    TimelineItem item, {
+    required bool emitNotifications,
+  }) {
+    if (!_isRestoredAssistantReplayCandidate(item)) {
+      return false;
+    }
+    final index = _findUnmatchedLiveAssistantReplayIndex(item);
+    if (index == -1) {
+      return false;
+    }
+    final previous = _timeline[index];
+    final reconciled = item.copyWith(
+      meta: previous.meta.merge(item.meta),
+      context: item.context ?? previous.context,
+      attachments: _mergeTimelineAttachments(
+        previous.attachments,
+        item.attachments,
+      ),
+      animateBody: false,
+    );
+    _replaceTimelineItemAt(index, reconciled);
+    if (emitNotifications) {
+      _emitTimelineNotification(
+        reconciled,
+        preserveExistingAssistantReply: true,
+      );
+    }
+    return true;
+  }
+
+  int _findUnmatchedLiveAssistantReplayIndex(TimelineItem item) {
+    final restoredBody = _normalizeAssistantReplyForDedupe(item.body);
+    if (restoredBody.isEmpty) {
+      return -1;
+    }
+    var inspected = 0;
+    for (var index = _timeline.length - 1; index >= 0; index--) {
+      if (inspected >= 20) {
+        break;
+      }
+      inspected += 1;
+      final previous = _timeline[index];
+      if (!previous.animateBody || !_isAssistantReplyTimelineItem(previous)) {
+        continue;
+      }
+      if (_hasSameDurableAssistantSource(previous, item)) {
+        continue;
+      }
+      final previousBody = _normalizeAssistantReplyForDedupe(previous.body);
+      if (previousBody.isEmpty) {
+        continue;
+      }
+      if (restoredBody == previousBody ||
+          restoredBody.startsWith(previousBody)) {
+        return index;
+      }
+    }
+    return -1;
+  }
+
+  bool _isUnmatchedRestoredAssistantReplay(TimelineItem item) {
+    if (item.animateBody || !_isAssistantReplyTimelineItem(item)) {
+      return false;
+    }
+    return _normalizeAssistantReplyForDedupe(item.body).isNotEmpty;
+  }
+
+  bool _isLiveAssistantReplayTailOfRestoredItem(TimelineItem item) {
+    if (!item.animateBody || !_isAssistantReplyTimelineItem(item)) {
+      return false;
+    }
+    final liveBody = _normalizeAssistantReplyForDedupe(item.body);
+    if (liveBody.isEmpty) {
+      return false;
+    }
+    var inspected = 0;
+    for (var index = _timeline.length - 1; index >= 0; index--) {
+      if (inspected >= 20) {
+        break;
+      }
+      inspected += 1;
+      final previous = _timeline[index];
+      if (previous.animateBody || !_isAssistantReplyTimelineItem(previous)) {
+        continue;
+      }
+      if (!_hasSameDurableAssistantSource(previous, item)) {
+        continue;
+      }
+      final restoredBody = _normalizeAssistantReplyForDedupe(previous.body);
+      if (_restoredAssistantBodyContainsLiveReplay(
+        restoredBody,
+        liveBody,
+      )) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool _isOlderRestoredAssistantReplayOfNewerItem(TimelineItem item) {
+    if (item.animateBody || !_isAssistantReplyTimelineItem(item)) {
+      return false;
+    }
+    if (!_hasDurableAssistantSource(item)) {
+      return false;
+    }
+    final itemBody = _normalizeAssistantReplyForDedupe(item.body);
+    if (itemBody.isEmpty) {
+      return false;
+    }
+    var inspected = 0;
+    for (var index = _timeline.length - 1; index >= 0; index--) {
+      if (inspected >= 20) {
+        break;
+      }
+      inspected += 1;
+      final previous = _timeline[index];
+      if (!_isAssistantReplyTimelineItem(previous)) {
+        continue;
+      }
+      if (!previous.timestamp.isAfter(item.timestamp)) {
+        continue;
+      }
+      if (_hasSameDurableAssistantSource(previous, item)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool _hasDurableAssistantSource(TimelineItem item) {
+    return item.meta.executionId.trim().isNotEmpty ||
+        item.meta.contextId.trim().isNotEmpty ||
+        item.meta.groupId.trim().isNotEmpty;
+  }
+
+  bool _restoredAssistantBodyContainsLiveReplay(
+    String restoredBody,
+    String liveBody,
+  ) {
+    if (restoredBody.isEmpty || liveBody.isEmpty) {
+      return false;
+    }
+    if (restoredBody == liveBody || restoredBody.endsWith(liveBody)) {
+      return true;
+    }
+    return liveBody.length >= 24 && restoredBody.contains(liveBody);
+  }
+
+  int _findLiveAssistantReplayIndex(TimelineItem item) {
+    var inspected = 0;
+    for (var index = _timeline.length - 1; index >= 0; index--) {
+      if (inspected >= 20) {
+        break;
+      }
+      inspected += 1;
+      final previous = _timeline[index];
+      if (!previous.animateBody || !_isAssistantReplyTimelineItem(previous)) {
+        continue;
+      }
+      if (!_hasSameDurableAssistantSource(previous, item)) {
+        continue;
+      }
+      final previousBody = _normalizeAssistantReplyForDedupe(previous.body);
+      final restoredBody = _normalizeAssistantReplyForDedupe(item.body);
+      if (previousBody == restoredBody ||
+          restoredBody.startsWith(previousBody) ||
+          previousBody.startsWith(restoredBody)) {
+        return index;
+      }
+    }
+    return -1;
+  }
+
+  bool _hasSameDurableAssistantSource(
+    TimelineItem previous,
+    TimelineItem item,
+  ) {
+    final previousExecutionId = previous.meta.executionId.trim();
+    final itemExecutionId = item.meta.executionId.trim();
+    if (previousExecutionId.isNotEmpty &&
+        previousExecutionId == itemExecutionId) {
+      return true;
+    }
+    final previousContextId = previous.meta.contextId.trim();
+    final itemContextId = item.meta.contextId.trim();
+    if (previousContextId.isNotEmpty && previousContextId == itemContextId) {
+      return true;
+    }
+    final previousGroupId = previous.meta.groupId.trim();
+    final itemGroupId = item.meta.groupId.trim();
+    return previousGroupId.isNotEmpty && previousGroupId == itemGroupId;
   }
 
   bool _isDuplicateUserTimelineItem(TimelineItem item) {
@@ -7986,6 +9288,9 @@ class SessionController extends ChangeNotifier {
   }
 
   bool _isAssistantReplyTimelineItem(TimelineItem item) {
+    if (item.kind == 'thinking' || item.kind == 'user') {
+      return false;
+    }
     final body = item.body.trim();
     if (body.isEmpty) {
       return false;
@@ -8002,6 +9307,9 @@ class SessionController extends ChangeNotifier {
   bool _shouldMergeTimelineBodies(TimelineItem previous, TimelineItem item) {
     if (previous.kind == 'codex_tool_group' ||
         item.kind == 'codex_tool_group') {
+      return false;
+    }
+    if (previous.kind == 'thinking' || item.kind == 'thinking') {
       return false;
     }
     if (_continuesMarkdownLink(previous.body, item.body)) {
@@ -8065,6 +9373,10 @@ class SessionController extends ChangeNotifier {
     if (next.isEmpty) {
       return previous;
     }
+    final deduped = _dedupeMergedTimelineBodies(previous, next);
+    if (deduped != null) {
+      return deduped;
+    }
     if (_continuesMarkdownLink(previous, next)) {
       return '$previous$next';
     }
@@ -8081,6 +9393,193 @@ class SessionController extends ChangeNotifier {
     return '$previous$next';
   }
 
+  String? _dedupeMergedTimelineBodies(String previous, String next) {
+    final previousTrimmed = previous.trim();
+    final nextTrimmed = next.trim();
+    if (previousTrimmed.isEmpty || nextTrimmed.isEmpty) {
+      return null;
+    }
+    if (previousTrimmed == nextTrimmed) {
+      return previous;
+    }
+    if (nextTrimmed.startsWith(previousTrimmed)) {
+      return _restoreOuterWhitespace(next, nextTrimmed);
+    }
+    if (previousTrimmed.startsWith(nextTrimmed)) {
+      return previous;
+    }
+    final normalizedPrevious = _normalizeAssistantReplyForDedupe(previous);
+    final normalizedNext = _normalizeAssistantReplyForDedupe(next);
+    if (normalizedNext == normalizedPrevious) {
+      return previous;
+    }
+    if (normalizedNext.startsWith(normalizedPrevious)) {
+      return next;
+    }
+    final overlap = _timelineBodyOverlapLength(previous, next);
+    if (overlap > 0) {
+      return previous + next.substring(overlap);
+    }
+    return null;
+  }
+
+  String _restoreOuterWhitespace(String next, String nextTrimmed) {
+    final leading = RegExp(r'^\s*').stringMatch(next) ?? '';
+    final trailing = RegExp(r'\s*$').stringMatch(next) ?? '';
+    if (leading.isNotEmpty || trailing.isNotEmpty) {
+      return '$leading$nextTrimmed$trailing';
+    }
+    return next;
+  }
+
+  String _normalizeAssistantReplyForDedupe(String value) {
+    return value.trim().split(RegExp(r'\s+')).where((part) {
+      return part.isNotEmpty;
+    }).join(' ');
+  }
+
+  bool _reconcileUserAttachmentTimelineItem(TimelineItem item) {
+    if (item.kind != 'user' || item.attachments.isEmpty) {
+      return false;
+    }
+    var inspected = 0;
+    for (var index = _timeline.length - 1;
+        index >= 0 && inspected < 12;
+        index--) {
+      final previous = _timeline[index];
+      inspected++;
+      if (!_isEquivalentUserAttachmentItem(previous, item)) {
+        continue;
+      }
+      _replaceTimelineItemAt(
+        index,
+        item.copyWith(
+          attachments: item.attachments,
+          animateBody: previous.animateBody && item.animateBody,
+        ),
+      );
+      return true;
+    }
+    return false;
+  }
+
+  bool _isEquivalentUserAttachmentItem(
+    TimelineItem previous,
+    TimelineItem item,
+  ) {
+    if (previous.kind != 'user') {
+      return false;
+    }
+    final previousBody = _normalizeUserAttachmentBody(previous.body);
+    final itemBody = _normalizeUserAttachmentBody(item.body);
+    if (previousBody != itemBody) {
+      return false;
+    }
+    if (previous.attachments.isEmpty || item.attachments.isEmpty) {
+      return false;
+    }
+    if (_timelineAttachmentKeys(previous.attachments)
+        .intersection(_timelineAttachmentKeys(item.attachments))
+        .isNotEmpty) {
+      return true;
+    }
+    if (_timelineAttachmentFingerprints(previous.attachments)
+        .intersection(_timelineAttachmentFingerprints(item.attachments))
+        .isNotEmpty) {
+      return true;
+    }
+    return _hasMatchingImageAttachmentPayload(
+      previous.attachments,
+      item.attachments,
+    );
+  }
+
+  Set<String> _timelineAttachmentKeys(List<TimelineAttachment> attachments) {
+    return attachments
+        .map(_mediaPreviewKey)
+        .where((key) => key.trim().isNotEmpty)
+        .toSet();
+  }
+
+  Set<String> _timelineAttachmentFingerprints(
+    List<TimelineAttachment> attachments,
+  ) {
+    final fingerprints = <String>{};
+    for (final attachment in attachments) {
+      final fingerprint = _timelineAttachmentFingerprint(attachment);
+      if (fingerprint.isNotEmpty) {
+        fingerprints.add(fingerprint);
+      }
+    }
+    return fingerprints;
+  }
+
+  String _timelineAttachmentFingerprint(TimelineAttachment attachment) {
+    final name = attachment.displayName.trim().toLowerCase();
+    final mimeType = attachment.mimeType.trim().toLowerCase();
+    if (name.isEmpty && mimeType.isEmpty && attachment.size <= 0) {
+      return '';
+    }
+    return '$name|$mimeType|${attachment.size}';
+  }
+
+  bool _hasMatchingImageAttachmentPayload(
+    List<TimelineAttachment> previous,
+    List<TimelineAttachment> next,
+  ) {
+    for (final left in previous) {
+      for (final right in next) {
+        if (!left.isImage || !right.isImage) {
+          continue;
+        }
+        if (left.size <= 0 || left.size != right.size) {
+          continue;
+        }
+        final leftMime = left.mimeType.trim().toLowerCase();
+        final rightMime = right.mimeType.trim().toLowerCase();
+        if (leftMime.isNotEmpty &&
+            rightMime.isNotEmpty &&
+            leftMime == rightMime) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  String _normalizeUserAttachmentBody(String value) {
+    final withoutInjectedList = value.replaceAll(
+      RegExp(
+        r'\n*Attached local image files:\s*(?:\n-\s+[^\n]+)+',
+        caseSensitive: false,
+      ),
+      '',
+    );
+    return withoutInjectedList.trim().split(RegExp(r'\s+')).where((part) {
+      return part.isNotEmpty;
+    }).join(' ');
+  }
+
+  int _timelineBodyOverlapLength(String previous, String next) {
+    final maxOverlap =
+        previous.length < next.length ? previous.length : next.length;
+    for (var length = maxOverlap; length > 0; length--) {
+      final candidate = next.substring(0, length);
+      if (previous.endsWith(candidate) &&
+          _isSafeTimelineBodyOverlap(candidate)) {
+        return length;
+      }
+    }
+    return 0;
+  }
+
+  bool _isSafeTimelineBodyOverlap(String value) {
+    if (value.length >= 4) {
+      return true;
+    }
+    return RegExp(r'^[\s.,!?;:，。！？；：]+$').hasMatch(value);
+  }
+
   List<TimelineAttachment> _mergeTimelineAttachments(
     List<TimelineAttachment> previous,
     List<TimelineAttachment> next,
@@ -8093,11 +9592,22 @@ class SessionController extends ChangeNotifier {
     }
     final merged = <TimelineAttachment>[];
     final seen = <String>{};
+    final seenFingerprints = <String>{};
     for (final attachment in [...previous, ...next]) {
       final key = _mediaPreviewKey(attachment);
-      if (key.isEmpty || seen.add(key)) {
-        merged.add(attachment);
+      final fingerprint = _timelineAttachmentFingerprint(attachment);
+      if (key.isNotEmpty && !seen.add(key)) {
+        continue;
       }
+      if (key.isEmpty &&
+          fingerprint.isNotEmpty &&
+          !seenFingerprints.add(fingerprint)) {
+        continue;
+      }
+      if (key.isNotEmpty && fingerprint.isNotEmpty) {
+        seenFingerprints.add(fingerprint);
+      }
+      merged.add(attachment);
     }
     return merged;
   }
@@ -8395,15 +9905,65 @@ class SessionController extends ChangeNotifier {
     if (content.isEmpty) {
       return;
     }
-    _pushTimelineItem(
-      TimelineItem(
-        id: 'thinking-${thinking.timestamp.microsecondsSinceEpoch}',
-        kind: 'thinking',
-        timestamp: thinking.timestamp,
-        body: content,
-        meta: thinking.runtimeMeta,
-      ),
+    final item = TimelineItem(
+      id: _thinkingTimelineItemId(thinking.runtimeMeta, thinking.timestamp),
+      kind: 'thinking',
+      timestamp: thinking.timestamp,
+      body: content,
+      meta: thinking.runtimeMeta,
     );
+    if (_upsertThinkingTimelineItem(item)) {
+      notifyListeners();
+      return;
+    }
+    _pushTimelineItem(item);
+  }
+
+  String _thinkingTimelineItemId(RuntimeMeta meta, DateTime timestamp) {
+    final contextId = meta.contextId.trim();
+    if (contextId.isNotEmpty) {
+      return 'thinking-$contextId';
+    }
+    return 'thinking-${timestamp.microsecondsSinceEpoch}';
+  }
+
+  String _thinkingHistoryTimelineItemId(
+    HistoryLogEntry entry,
+    RuntimeMeta meta,
+    DateTime timestamp,
+  ) {
+    final contextId = meta.contextId.trim();
+    if (contextId.isNotEmpty) {
+      return 'thinking-$contextId';
+    }
+    return 'thinking-history-${timestamp.microsecondsSinceEpoch}-${_stableTimelineHash(_historyLogEntryKey(entry))}';
+  }
+
+  String _stableTimelineHash(String value) {
+    var hash = 0x811c9dc5;
+    for (var index = 0; index < value.length; index++) {
+      hash ^= value.codeUnitAt(index);
+      hash = (hash * 0x01000193) & 0xffffffff;
+    }
+    return hash.toRadixString(16).padLeft(8, '0');
+  }
+
+  bool _upsertThinkingTimelineItem(TimelineItem item) {
+    if (item.id.trim().isEmpty) {
+      return false;
+    }
+    for (var index = _timeline.length - 1; index >= 0; index--) {
+      final previous = _timeline[index];
+      if (previous.kind != 'thinking' || previous.id != item.id) {
+        continue;
+      }
+      _replaceTimelineItemAt(
+        index,
+        item.copyWith(animateBody: previous.animateBody || item.animateBody),
+      );
+      return true;
+    }
+    return false;
   }
 
   String _sanitizeAiBootstrapLogMessage(String message, RuntimeMeta meta) {
@@ -8566,8 +10126,16 @@ class SessionController extends ChangeNotifier {
         looksLikeSessionBootstrapCommand(message)) {
       return false;
     }
+    if (_isAssistantSource(meta.source)) {
+      return true;
+    }
     return _looksLikeAssistantReplyAllowingSoftTerminal(message) ||
         _looksLikeTrustedShortAssistantReply(message);
+  }
+
+  bool _isAssistantSource(String source) {
+    final normalized = source.trim().toLowerCase();
+    return normalized == 'claude/assistant' || normalized == 'codex/assistant';
   }
 
   String _timelineAiEngine(RuntimeMeta meta) {
@@ -9982,18 +11550,46 @@ class SessionController extends ChangeNotifier {
         (message.contains('heartbeat') || step.contains('heartbeat'));
   }
 
+  void _handleHealthPong(PongEvent pong) {
+    final pingId = pong.pingId.trim();
+    if (pingId.isEmpty || pingId != _pendingHealthPingId) {
+      return;
+    }
+    _pendingHealthPingId = '';
+    _missedHealthPongs = 0;
+  }
+
+  void _resetHealthPingState() {
+    _pendingHealthPingId = '';
+    _missedHealthPongs = 0;
+  }
+
   void _startConnectionHealthMonitor() {
     _connectionHealthTimer?.cancel();
     _connectionHealthTimer = Timer.periodic(_connectionHealthInterval, (_) {
       if (!_connected || _connecting || !_autoReconnectEnabled) {
         return;
       }
-      final lastSeen = _lastServerEventAt;
-      if (lastSeen != null &&
-          DateTime.now().difference(lastSeen) > _connectionSilenceTimeout) {
-        unawaited(_service.disconnect());
+      if (_pendingHealthPingId.isNotEmpty) {
+        _missedHealthPongs += 1;
+        if (_missedHealthPongs >= _maxMissedHealthPongs) {
+          unawaited(_service.disconnect());
+          _handleUnexpectedSocketDisconnect(
+              'Backend health pong timeout, reconnecting...');
+          return;
+        }
+        return;
+      }
+      final pingId = 'health-${++_connectionPingSequence}';
+      _pendingHealthPingId = pingId;
+      if (!_service.send({
+        'action': 'ping',
+        'sessionId': _selectedSessionId.trim(),
+        'pingId': pingId,
+        'ts': DateTime.now().millisecondsSinceEpoch,
+      })) {
         _handleUnexpectedSocketDisconnect(
-            'Connection timed out, reconnecting...');
+            'Backend health ping send failed, reconnecting...');
         return;
       }
       if (_config.connectionMode == ConnectionMode.auto.name &&
@@ -10001,11 +11597,6 @@ class SessionController extends ChangeNotifier {
           _canAttemptLanReturn()) {
         unawaited(_attemptLanReturn());
       }
-      _service.send({
-        'action': 'ping',
-        'sessionId': _selectedSessionId.trim(),
-        'ts': DateTime.now().millisecondsSinceEpoch,
-      });
     });
   }
 
@@ -10027,18 +11618,6 @@ class SessionController extends ChangeNotifier {
     final previous = _sessionEventCursors[sessionId] ?? 0;
     if (cursor > previous) {
       _sessionEventCursors[sessionId] = cursor;
-      // 同步更新 delta known 的游标，避免轮询重复拉取已收内容
-      final known = _sessionDeltaKnown[sessionId];
-      if (known != null && cursor > known.eventCursor) {
-        _sessionDeltaKnown[sessionId] = SessionDeltaKnown(
-          eventCursor: cursor,
-          logEntryCount: known.logEntryCount,
-          diffCount: known.diffCount,
-          terminalExecutionCount: known.terminalExecutionCount,
-          terminalStdoutLength: known.terminalStdoutLength,
-          terminalStderrLength: known.terminalStderrLength,
-        );
-      }
     }
   }
 
@@ -10338,9 +11917,15 @@ class SessionController extends ChangeNotifier {
       return;
     }
     if (normalizedStream == 'stderr') {
-      _terminalStderr = _appendChunk(_terminalStderr, message);
+      final next = _appendChunkWithByteLength(
+          _terminalStderr, _terminalStderrBytes, message);
+      _terminalStderr = next.text;
+      _terminalStderrBytes = next.bytes;
     } else {
-      _terminalStdout = _appendChunk(_terminalStdout, message);
+      final next = _appendChunkWithByteLength(
+          _terminalStdout, _terminalStdoutBytes, message);
+      _terminalStdout = next.text;
+      _terminalStdoutBytes = next.bytes;
     }
     _appendExecutionOutput(
       executionId,
@@ -10361,10 +11946,43 @@ class SessionController extends ChangeNotifier {
       if (index == -1) {
         _terminalExecutions.add(next);
       } else {
-        _terminalExecutions[index] = next;
+        _terminalExecutions[index] =
+            _mergedTerminalExecution(_terminalExecutions[index], next);
       }
     }
     _syncActiveTerminalExecution();
+  }
+
+  TerminalExecution _mergedTerminalExecution(
+    TerminalExecution current,
+    TerminalExecution next,
+  ) {
+    return TerminalExecution(
+      executionId: next.executionId.trim().isNotEmpty
+          ? next.executionId
+          : current.executionId,
+      command: next.command.trim().isNotEmpty ? next.command : current.command,
+      cwd: next.cwd.trim().isNotEmpty ? next.cwd : current.cwd,
+      source: next.source.trim().isNotEmpty ? next.source : current.source,
+      sourceLabel: next.sourceLabel.trim().isNotEmpty
+          ? next.sourceLabel
+          : current.sourceLabel,
+      contextId:
+          next.contextId.trim().isNotEmpty ? next.contextId : current.contextId,
+      contextTitle: next.contextTitle.trim().isNotEmpty
+          ? next.contextTitle
+          : current.contextTitle,
+      groupId: next.groupId.trim().isNotEmpty ? next.groupId : current.groupId,
+      groupTitle: next.groupTitle.trim().isNotEmpty
+          ? next.groupTitle
+          : current.groupTitle,
+      startedAt: next.startedAt ?? current.startedAt,
+      completedAt: next.completedAt ?? current.completedAt,
+      running: next.running,
+      exitCode: next.exitCode ?? current.exitCode,
+      stdout: next.stdout.isNotEmpty ? next.stdout : current.stdout,
+      stderr: next.stderr.isNotEmpty ? next.stderr : current.stderr,
+    );
   }
 
   void _appendTerminalLogs(Map<String, String> rawTerminalByStream) {
@@ -10372,15 +11990,19 @@ class SessionController extends ChangeNotifier {
     final stderr = rawTerminalByStream['stderr'] ?? '';
     if (stdout.isNotEmpty) {
       _terminalStdout += stdout;
+      _terminalStdoutBytes += _terminalByteLength(stdout);
     }
     if (stderr.isNotEmpty) {
       _terminalStderr += stderr;
+      _terminalStderrBytes += _terminalByteLength(stderr);
     }
   }
 
   void _restoreTerminalLogs(Map<String, String> rawTerminalByStream) {
     _terminalStdout = rawTerminalByStream['stdout'] ?? '';
     _terminalStderr = rawTerminalByStream['stderr'] ?? '';
+    _terminalStdoutBytes = _terminalByteLength(_terminalStdout);
+    _terminalStderrBytes = _terminalByteLength(_terminalStderr);
     _syncActiveTerminalExecution();
   }
 
@@ -10513,6 +12135,18 @@ class SessionController extends ChangeNotifier {
       return chunk;
     }
     return '$original\n$chunk';
+  }
+
+  _TerminalBufferMerge _appendChunkWithByteLength(
+    String original,
+    int originalBytes,
+    String chunk,
+  ) {
+    final appended = original.isEmpty ? chunk : '\n$chunk';
+    return _TerminalBufferMerge(
+      original + appended,
+      originalBytes + _terminalByteLength(appended),
+    );
   }
 
   bool _shouldCaptureTerminalLog(
@@ -11043,3 +12677,10 @@ const Set<String> _codexReasoningEffortOptions = <String>{
   'high',
   'xhigh',
 };
+
+class _TerminalBufferMerge {
+  const _TerminalBufferMerge(this.text, this.bytes);
+
+  final String text;
+  final int bytes;
+}

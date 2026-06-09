@@ -228,6 +228,7 @@ class MobileVcWsService {
             _isRelayE2EEFrame(decoded) &&
             _handleRelayE2EEFrame(
               channel: channel,
+              epoch: epoch,
               frame: decoded,
               state: e2eeState,
               updateState: (next) => e2eeState = next,
@@ -264,11 +265,14 @@ class MobileVcWsService {
                 e2eeState == null) {
               unawaited(() async {
                 try {
+                  _ensureCurrentChannel(channel, epoch);
                   final handshakeKind = await _relayE2EEHandshakeKind(
                     relayPairingSecret: relayPairingSecret,
                   );
+                  _ensureCurrentChannel(channel, epoch);
                   e2eeState = await _startRelayE2EEHandshake(
                     channel: channel,
+                    epoch: epoch,
                     sessionId: relaySessionId,
                     clientId: clientId,
                     kind: handshakeKind,
@@ -339,7 +343,9 @@ class MobileVcWsService {
           },
         );
       } catch (_) {
-        await disconnect();
+        if (_isCurrentChannel(channel, epoch)) {
+          await disconnect();
+        }
         rethrow;
       }
     }
@@ -471,6 +477,16 @@ class MobileVcWsService {
     _connectionEpoch++;
     await previousSubscription?.cancel();
     await previousChannel?.sink.close();
+  }
+
+  bool _isCurrentChannel(WebSocketChannel channel, int epoch) {
+    return epoch == _connectionEpoch && _channel == channel;
+  }
+
+  void _ensureCurrentChannel(WebSocketChannel channel, int epoch) {
+    if (!_isCurrentChannel(channel, epoch)) {
+      throw StateError('Relay connection was replaced');
+    }
   }
 
   bool send(Map<String, dynamic> payload) {
@@ -858,6 +874,7 @@ class MobileVcWsService {
 
   Future<_RelayE2eeHandshakeState> _startRelayE2EEHandshake({
     required WebSocketChannel channel,
+    required int epoch,
     required String sessionId,
     required String clientId,
     required String kind,
@@ -896,7 +913,9 @@ class MobileVcWsService {
       deviceId: deviceIdentity?.fullFingerprintHex ?? '',
       deviceIdentityPublicKey: deviceIdentity?.publicKey ?? const <int>[],
     );
+    _ensureCurrentChannel(channel, epoch);
     updateState(state);
+    _ensureCurrentChannel(channel, epoch);
     channel.sink.add(jsonEncode(hello.toJson()));
     return state;
   }
@@ -912,6 +931,7 @@ class MobileVcWsService {
 
   bool _handleRelayE2EEFrame({
     required WebSocketChannel channel,
+    required int epoch,
     required Map<String, dynamic> frame,
     required _RelayE2eeHandshakeState? state,
     required void Function(_RelayE2eeHandshakeState) updateState,
@@ -922,6 +942,7 @@ class MobileVcWsService {
     if (type == relayFrameAgentE2eeHello) {
       unawaited(_completeRelayE2EEProof(
         channel: channel,
+        epoch: epoch,
         pending: state,
         frame: frame,
         updateState: updateState,
@@ -952,12 +973,13 @@ class MobileVcWsService {
             pending.input == null) {
           throw StateError('Relay E2EE 握手路由不匹配');
         }
+        _ensureCurrentChannel(channel, epoch);
         _relayE2eeState = pending.markComplete();
         if (_relayE2eeState!.kind == relayE2eeHandshakeKindPairing) {
           _queueRelayDeviceRegister(
             channel: channel,
             state: _relayE2eeState!,
-            epoch: _connectionEpoch,
+            epoch: epoch,
           );
         }
         if (!complete.isCompleted) {
@@ -978,6 +1000,7 @@ class MobileVcWsService {
 
   Future<void> _completeRelayE2EEProof({
     required WebSocketChannel channel,
+    required int epoch,
     required _RelayE2eeHandshakeState? pending,
     required Map<String, dynamic> frame,
     required void Function(_RelayE2eeHandshakeState) updateState,
@@ -987,6 +1010,7 @@ class MobileVcWsService {
       if (pending == null) {
         throw StateError('Relay E2EE 握手状态不存在');
       }
+      _ensureCurrentChannel(channel, epoch);
       final agentHello = RelayE2eeAgentHelloFrame.fromJson(frame);
       if (!pending.matches(
         agentHello.sessionId,
@@ -1036,6 +1060,7 @@ class MobileVcWsService {
         throw StateError('Relay E2EE 节点签名验证失败');
       }
       final proofFrame = await _relayE2EEProofFrame(pending, transcript);
+      _ensureCurrentChannel(channel, epoch);
       final next = pending.copyWith(
         input: input,
         trafficKeys: await RelayE2eeHandshake.deriveTrafficKeys(
@@ -1045,7 +1070,9 @@ class MobileVcWsService {
           input: input,
         ),
       );
+      _ensureCurrentChannel(channel, epoch);
       updateState(next);
+      _ensureCurrentChannel(channel, epoch);
       channel.sink.add(jsonEncode(proofFrame.toJson()));
     } catch (error, stackTrace) {
       if (!complete.isCompleted) {
@@ -1144,6 +1171,9 @@ class MobileVcWsService {
         _events.add(_mapper.mapEvent(relayEvent));
       }
     }).catchError((Object error, StackTrace stackTrace) {
+      if (!_isCurrentChannel(channel, epoch)) {
+        return;
+      }
       final code = error is StateError && error.message.contains('replay')
           ? 'e2ee_replay_detected'
           : 'e2ee_decrypt_failed';
@@ -1183,6 +1213,9 @@ class MobileVcWsService {
       }
       channel.sink.add(jsonEncode(frame));
     }).catchError((Object error, StackTrace stackTrace) {
+      if (!_isCurrentChannel(channel, epoch)) {
+        return;
+      }
       _events.add(ErrorEvent(
         timestamp: DateTime.now(),
         sessionId: (payload['sessionId'] ?? '').toString(),
@@ -1226,6 +1259,9 @@ class MobileVcWsService {
       }
       channel.sink.add(jsonEncode(frame));
     }).catchError((Object error, StackTrace stackTrace) {
+      if (!_isCurrentChannel(channel, epoch)) {
+        return;
+      }
       _events.add(ErrorEvent(
         timestamp: DateTime.now(),
         sessionId: '',

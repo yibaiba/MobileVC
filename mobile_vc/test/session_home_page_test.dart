@@ -403,30 +403,32 @@ void main() {
   testWidgets('顶部连接路径使用紧凑标识避免挤压标题', (tester) async {
     final service = _FakeMobileVcWsService();
     final controller = SessionController(service: service);
-    addTearDown(controller.disposeController);
+    try {
+      await controller.saveConfig(const AppConfig(
+        connectionMode: 'relay',
+        relayUrl: 'wss://relay.example.test',
+        relaySessionId: 'rs_test',
+        relayPairingSecret: 'pair_secret',
+        relayPairingExpiresAt: 4102444800,
+      ));
+      await controller.connect();
 
-    await controller.saveConfig(const AppConfig(
-      connectionMode: 'relay',
-      relayUrl: 'wss://relay.example.test',
-      relaySessionId: 'rs_test',
-      relayPairingSecret: 'pair_secret',
-      relayPairingExpiresAt: 4102444800,
-    ));
-    await controller.connect();
+      await tester.pumpWidget(
+        MaterialApp(
+          home: SessionHomePage(controller: controller),
+        ),
+      );
+      await _pumpFrames(tester);
 
-    await tester.pumpWidget(
-      MaterialApp(
-        home: SessionHomePage(controller: controller),
-      ),
-    );
-    await _pumpFrames(tester);
-
-    expect(
-      find.byKey(const ValueKey('connection-transport-label')),
-      findsOneWidget,
-    );
-    expect(find.text('R'), findsOneWidget);
-    expect(find.text('Relay'), findsNothing);
+      expect(
+        find.byKey(const ValueKey('connection-transport-label')),
+        findsOneWidget,
+      );
+      expect(find.text('R'), findsOneWidget);
+      expect(find.text('Relay'), findsNothing);
+    } finally {
+      await controller.disposeController();
+    }
   });
 }
 

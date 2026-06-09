@@ -177,10 +177,11 @@ func ApplyEventToProjection(snapshot data.ProjectionSnapshot, event any) (data.P
 		}
 		if IsVisibleAssistantReplyLog(e) {
 			snapshot.Controller.State = ControllerStateIdle
-			snapshot.LogEntries = removeSupersededAssistantLogEntry(
-				snapshot.LogEntries,
-				e,
-			)
+			if merged, ok := mergeAssistantReplyLogEntry(snapshot.LogEntries, e, context, phase); ok {
+				snapshot.LogEntries = merged
+				return snapshot, true
+			}
+			snapshot.LogEntries = removeSupersededAssistantLogEntry(snapshot.LogEntries, e)
 			snapshot.LogEntries = append(snapshot.LogEntries, data.SnapshotLogEntry{Kind: "markdown", Message: e.Message, Timestamp: e.Timestamp.Format(time.RFC3339), Stream: e.Stream, ExecutionID: e.ExecutionID, Phase: phase, ExitCode: e.ExitCode, Context: context, Attachments: TimelineAttachmentsFromText(e.Message, "assistant_path")})
 		} else {
 			previousIndex := len(snapshot.LogEntries) - 1
@@ -219,6 +220,25 @@ func ApplyEventToProjection(snapshot data.ProjectionSnapshot, event any) (data.P
 				appendExecutionStream(item, stream, strings.TrimLeft(e.Message, "\r"))
 			})
 		}
+		return snapshot, true
+	case protocol.ThinkingEvent:
+		msg := strings.TrimSpace(e.Content)
+		if msg == "" {
+			return snapshot, false
+		}
+		entry := data.SnapshotLogEntry{
+			Kind:        "thinking",
+			Message:     msg,
+			Text:        msg,
+			Timestamp:   e.Timestamp.Format(time.RFC3339Nano),
+			ExecutionID: e.ExecutionID,
+			Context:     thinkingSnapshotContextFromEvent(e),
+		}
+		if merged, ok := upsertThinkingLogEntry(snapshot.LogEntries, entry); ok {
+			snapshot.LogEntries = merged
+			return snapshot, true
+		}
+		snapshot.LogEntries = append(snapshot.LogEntries, entry)
 		return snapshot, true
 	case protocol.ErrorEvent:
 		ctx := &data.SnapshotContext{ID: firstNonEmptyString(e.ContextID, fmt.Sprintf("error:%s", e.Timestamp.Format(time.RFC3339Nano))), Message: e.Message, Stack: e.Stack, Code: e.Code, TargetPath: firstNonEmptyString(e.TargetPath, e.RuntimeMeta.TargetPath), RelatedStep: e.Step, Command: e.Command, Timestamp: e.Timestamp.Format(time.RFC3339), Title: firstNonEmptyString(e.ContextTitle, e.Message)}
@@ -530,6 +550,105 @@ func logSnapshotContextFromEvent(event protocol.LogEvent) *data.SnapshotContext 
 		SkillName:   skillName,
 		ExecutionID: event.ExecutionID,
 	}
+}
+
+func thinkingSnapshotContextFromEvent(event protocol.ThinkingEvent) *data.SnapshotContext {
+	source := strings.TrimSpace(event.Source)
+	skillName := strings.TrimSpace(event.SkillName)
+	contextID := strings.TrimSpace(event.ContextID)
+	return &data.SnapshotContext{
+		ID:          firstNonEmptyString(contextID, fmt.Sprintf("thinking:%s", event.Timestamp.Format(time.RFC3339Nano))),
+		Type:        "thinking",
+		Message:     strings.TrimSpace(event.Content),
+		Title:       firstNonEmptyString(event.ContextTitle, "思考过程"),
+		Timestamp:   event.Timestamp.Format(time.RFC3339Nano),
+		Source:      source,
+		SkillName:   skillName,
+		ExecutionID: event.ExecutionID,
+	}
+}
+
+func upsertThinkingLogEntry(entries []data.SnapshotLogEntry, entry data.SnapshotLogEntry) ([]data.SnapshotLogEntry, bool) {
+	contextID := ""
+	if entry.Context != nil {
+		contextID = strings.TrimSpace(entry.Context.ID)
+	}
+	if contextID == "" {
+		return entries, false
+	}
+	for index := len(entries) - 1; index >= 0; index-- {
+		current := entries[index]
+		if current.Kind != "thinking" || current.Context == nil {
+			continue
+		}
+		if strings.TrimSpace(current.Context.ID) != contextID {
+			continue
+		}
+		next := append([]data.SnapshotLogEntry(nil), entries...)
+		next[index] = entry
+		return next, true
+	}
+	return entries, false
+}
+
+func mergeAssistantReplyLogEntry(entries []data.SnapshotLogEntry, event protocol.LogEvent, context *data.SnapshotContext, phase string) ([]data.SnapshotLogEntry, bool) {
+	if len(entries) == 0 || strings.TrimSpace(event.Message) == "" {
+		return entries, false
+	}
+	index := len(entries) - 1
+	entry := entries[index]
+	if !sameAssistantReplyRun(entry, event) {
+		return entries, false
+	}
+	merged := entry
+	merged.Message = mergeAssistantReplyText(merged.Message, event.Message)
+	merged.Text = ""
+	merged.Timestamp = event.Timestamp.Format(time.RFC3339)
+	merged.Phase = phase
+	merged.ExitCode = event.ExitCode
+	if merged.Context == nil && context != nil {
+		merged.Context = context
+	}
+	merged.Attachments = TimelineAttachmentsFromText(merged.Message, "assistant_path")
+	next := append([]data.SnapshotLogEntry(nil), entries...)
+	next[index] = merged
+	return next, true
+}
+
+func sameAssistantReplyRun(entry data.SnapshotLogEntry, event protocol.LogEvent) bool {
+	if entry.Kind != "markdown" {
+		return false
+	}
+	if strings.TrimSpace(entry.Stream) != strings.TrimSpace(event.Stream) {
+		return false
+	}
+	entryExecutionID := strings.TrimSpace(entry.ExecutionID)
+	eventExecutionID := strings.TrimSpace(event.ExecutionID)
+	if entryExecutionID != "" || eventExecutionID != "" {
+		return entryExecutionID != "" && entryExecutionID == eventExecutionID
+	}
+	entrySource := ""
+	if entry.Context != nil {
+		entrySource = strings.TrimSpace(entry.Context.Source)
+	}
+	eventSource := strings.TrimSpace(event.Source)
+	return entrySource != "" && entrySource == eventSource
+}
+
+func mergeAssistantReplyText(previous string, next string) string {
+	if previous == "" {
+		return next
+	}
+	if next == "" || previous == next {
+		return previous
+	}
+	if strings.HasPrefix(next, previous) {
+		return next
+	}
+	if strings.HasSuffix(previous, next) {
+		return previous
+	}
+	return previous + next
 }
 
 func removeSupersededAssistantLogEntry(entries []data.SnapshotLogEntry, event protocol.LogEvent) []data.SnapshotLogEntry {

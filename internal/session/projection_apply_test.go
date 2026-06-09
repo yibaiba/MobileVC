@@ -665,6 +665,210 @@ func TestApplyEventToProjection_LogVisibleAssistantReply(t *testing.T) {
 	}
 }
 
+func TestApplyEventToProjection_PersistsAndUpsertsThinkingEvent(t *testing.T) {
+	base := protocol.Event{
+		Type:      protocol.EventTypeThinking,
+		SessionID: "s1",
+		Timestamp: time.Now(),
+		RuntimeMeta: protocol.RuntimeMeta{
+			Engine:      "codex",
+			Source:      "codex/reasoning-summary",
+			ExecutionID: "turn-1",
+			ContextID:   "codex-reasoning:turn-1:reasoning-1",
+		},
+	}
+	snapshot, applied := ApplyEventToProjection(data.ProjectionSnapshot{}, protocol.ThinkingEvent{
+		Event:   base,
+		Content: "正在定位",
+	})
+	if !applied {
+		t.Fatal("expected first thinking event applied")
+	}
+	snapshot, applied = ApplyEventToProjection(snapshot, protocol.ThinkingEvent{
+		Event:   base,
+		Content: "正在定位\n\n准备修复",
+	})
+	if !applied {
+		t.Fatal("expected second thinking event applied")
+	}
+	if len(snapshot.LogEntries) != 1 {
+		t.Fatalf("expected one upserted thinking entry, got %+v", snapshot.LogEntries)
+	}
+	entry := snapshot.LogEntries[0]
+	if entry.Kind != "thinking" || entry.Message != "正在定位\n\n准备修复" {
+		t.Fatalf("unexpected thinking entry: %+v", entry)
+	}
+	if entry.ExecutionID != "turn-1" {
+		t.Fatalf("expected thinking execution id, got %+v", entry)
+	}
+	if entry.Context == nil {
+		t.Fatal("expected thinking context")
+	}
+	if entry.Context.ID != "codex-reasoning:turn-1:reasoning-1" ||
+		entry.Context.Type != "thinking" ||
+		entry.Context.Source != "codex/reasoning-summary" ||
+		entry.Context.ExecutionID != "turn-1" {
+		t.Fatalf("unexpected thinking context: %+v", entry.Context)
+	}
+}
+
+func TestApplyEventToProjection_PersistsContextlessThinkingWithStableContext(t *testing.T) {
+	firstTimestamp := time.Date(2026, 1, 1, 0, 0, 0, 100, time.UTC)
+	secondTimestamp := firstTimestamp.Add(200 * time.Nanosecond)
+	snapshot, applied := ApplyEventToProjection(data.ProjectionSnapshot{}, protocol.ThinkingEvent{
+		Event: protocol.Event{
+			Type:      protocol.EventTypeThinking,
+			SessionID: "s1",
+			Timestamp: firstTimestamp,
+		},
+		Content: "第一段思考",
+	})
+	if !applied {
+		t.Fatal("expected first contextless thinking event applied")
+	}
+	snapshot, applied = ApplyEventToProjection(snapshot, protocol.ThinkingEvent{
+		Event: protocol.Event{
+			Type:      protocol.EventTypeThinking,
+			SessionID: "s1",
+			Timestamp: secondTimestamp,
+		},
+		Content: "第二段思考",
+	})
+	if !applied {
+		t.Fatal("expected second contextless thinking event applied")
+	}
+	if len(snapshot.LogEntries) != 2 {
+		t.Fatalf("expected two distinct thinking entries, got %+v", snapshot.LogEntries)
+	}
+	firstEntry := snapshot.LogEntries[0]
+	secondEntry := snapshot.LogEntries[1]
+	if firstEntry.Kind != "thinking" || secondEntry.Kind != "thinking" {
+		t.Fatalf("expected thinking entries, got %+v", snapshot.LogEntries)
+	}
+	if firstEntry.Context == nil || secondEntry.Context == nil {
+		t.Fatalf("expected context for both thinking entries: %+v", snapshot.LogEntries)
+	}
+	if firstEntry.Context.ID == "" || secondEntry.Context.ID == "" {
+		t.Fatalf("expected non-empty context ids: %+v %+v", firstEntry.Context, secondEntry.Context)
+	}
+	if firstEntry.Context.ID == secondEntry.Context.ID {
+		t.Fatalf("expected distinct context ids, got %q", firstEntry.Context.ID)
+	}
+	if firstEntry.Timestamp != firstTimestamp.Format(time.RFC3339Nano) ||
+		secondEntry.Timestamp != secondTimestamp.Format(time.RFC3339Nano) {
+		t.Fatalf("expected RFC3339Nano timestamps, got %+v", snapshot.LogEntries)
+	}
+}
+
+func TestApplyEventToProjection_MergesStreamingAssistantReplyByExecutionID(t *testing.T) {
+	base := protocol.Event{
+		Type:        "log",
+		SessionID:   "s1",
+		Timestamp:   time.Now(),
+		RuntimeMeta: protocol.RuntimeMeta{Engine: "codex", Source: "codex/assistant", ExecutionID: "turn-1"},
+	}
+	snapshot, applied := ApplyEventToProjection(data.ProjectionSnapshot{}, protocol.LogEvent{
+		Event:   base,
+		Message: "Tip :",
+		Stream:  "stdout",
+	})
+	if !applied {
+		t.Fatal("expected first assistant chunk applied")
+	}
+	snapshot, applied = ApplyEventToProjection(snapshot, protocol.LogEvent{
+		Event:   base,
+		Message: " hello world",
+		Stream:  "stdout",
+	})
+	if !applied {
+		t.Fatal("expected second assistant chunk applied")
+	}
+	if len(snapshot.LogEntries) != 1 {
+		t.Fatalf("expected one merged markdown entry, got %+v", snapshot.LogEntries)
+	}
+	if got := snapshot.LogEntries[0].Message; got != "Tip : hello world" {
+		t.Fatalf("unexpected merged assistant reply: %q", got)
+	}
+}
+
+func TestApplyEventToProjection_MergesStreamingAssistantReplyWithoutInventingSpaces(t *testing.T) {
+	base := protocol.Event{
+		Type:        "log",
+		SessionID:   "s1",
+		Timestamp:   time.Now(),
+		RuntimeMeta: protocol.RuntimeMeta{Engine: "codex", Source: "codex/assistant", ExecutionID: "turn-token-split"},
+	}
+	snapshot, _ := ApplyEventToProjection(data.ProjectionSnapshot{}, protocol.LogEvent{
+		Event:   base,
+		Message: "hello wo",
+		Stream:  "stdout",
+	})
+	snapshot, _ = ApplyEventToProjection(snapshot, protocol.LogEvent{
+		Event:   base,
+		Message: "rld",
+		Stream:  "stdout",
+	})
+	if len(snapshot.LogEntries) != 1 {
+		t.Fatalf("expected one merged markdown entry, got %+v", snapshot.LogEntries)
+	}
+	if got := snapshot.LogEntries[0].Message; got != "hello world" {
+		t.Fatalf("unexpected merged assistant reply: %q", got)
+	}
+}
+
+func TestApplyEventToProjection_MergesStreamingAssistantReplyCJKWithoutSpace(t *testing.T) {
+	base := protocol.Event{
+		Type:        "log",
+		SessionID:   "s1",
+		Timestamp:   time.Now(),
+		RuntimeMeta: protocol.RuntimeMeta{Engine: "codex", Source: "codex/assistant", ExecutionID: "turn-cjk"},
+	}
+	snapshot, _ := ApplyEventToProjection(data.ProjectionSnapshot{}, protocol.LogEvent{
+		Event:   base,
+		Message: "已经定位",
+		Stream:  "stdout",
+	})
+	snapshot, _ = ApplyEventToProjection(snapshot, protocol.LogEvent{
+		Event:   base,
+		Message: "到根因",
+		Stream:  "stdout",
+	})
+	if len(snapshot.LogEntries) != 1 {
+		t.Fatalf("expected one merged markdown entry, got %+v", snapshot.LogEntries)
+	}
+	if got := snapshot.LogEntries[0].Message; got != "已经定位到根因" {
+		t.Fatalf("unexpected merged assistant reply: %q", got)
+	}
+}
+
+func TestApplyEventToProjection_DoesNotMergeAssistantReplyAcrossExecutionID(t *testing.T) {
+	base := protocol.Event{
+		Type:      "log",
+		SessionID: "s1",
+		Timestamp: time.Now(),
+		RuntimeMeta: protocol.RuntimeMeta{
+			Engine:      "codex",
+			Source:      "codex/assistant",
+			ExecutionID: "turn-1",
+		},
+	}
+	snapshot, _ := ApplyEventToProjection(data.ProjectionSnapshot{}, protocol.LogEvent{
+		Event:   base,
+		Message: "first turn",
+		Stream:  "stdout",
+	})
+	next := base
+	next.RuntimeMeta.ExecutionID = "turn-2"
+	snapshot, _ = ApplyEventToProjection(snapshot, protocol.LogEvent{
+		Event:   next,
+		Message: "second turn",
+		Stream:  "stdout",
+	})
+	if len(snapshot.LogEntries) != 2 {
+		t.Fatalf("expected separate markdown entries, got %+v", snapshot.LogEntries)
+	}
+}
+
 func TestApplyEventToProjection_UnknownEvent(t *testing.T) {
 	type customEvent struct{}
 	_, applied := ApplyEventToProjection(data.ProjectionSnapshot{}, customEvent{})

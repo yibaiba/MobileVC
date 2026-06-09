@@ -37,6 +37,25 @@ func (r *chunkReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
+func installBlockingFakeClaude(t *testing.T) {
+	t.Helper()
+	dir := t.TempDir()
+	if runtime.GOOS == "windows" {
+		path := filepath.Join(dir, "claude.cmd")
+		script := "@echo off\r\n:loop\r\nset /p line=\r\nif errorlevel 1 exit /b 0\r\nping -n 2 127.0.0.1 >nul\r\ngoto loop\r\n"
+		if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+			t.Fatalf("write fake claude: %v", err)
+		}
+	} else {
+		path := filepath.Join(dir, "claude")
+		script := "#!/bin/sh\ntrap 'exit 0' TERM INT\nwhile IFS= read -r _line; do sleep 1; done\n"
+		if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+			t.Fatalf("write fake claude: %v", err)
+		}
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
 func TestPtyRunnerPromptAndInput(t *testing.T) {
 	runner := NewPtyRunner()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -373,6 +392,7 @@ func TestPtyRunnerLazyStartIgnoresEmptyFirstInput(t *testing.T) {
 }
 
 func TestPtyRunnerSuppressesLazyStreamExitNoiseAfterClose(t *testing.T) {
+	installBlockingFakeClaude(t)
 	runner := NewPtyRunner()
 	runner.mu.Lock()
 	runner.lazyStart = true
@@ -775,6 +795,57 @@ func TestPtyRunnerSuppressesDuplicateResultAfterAssistantText(t *testing.T) {
 	}
 }
 
+func TestPtyRunnerClaudeThinkingEventsCarryStableContextID(t *testing.T) {
+	runner := NewPtyRunner()
+	runner.pendingReq = ExecRequest{RuntimeMeta: protocol.RuntimeMeta{Engine: "claude"}}
+	var events []any
+	sink := func(event any) { events = append(events, event) }
+
+	envelope, err := json.Marshal(map[string]any{
+		"type":       "assistant",
+		"session_id": "claude-session-1",
+		"message": map[string]any{
+			"content": []map[string]any{
+				{
+					"type": "thinking",
+					"text": "第一段思考",
+				},
+				{
+					"type": "thinking",
+					"text": "第二段思考",
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal assistant envelope: %v", err)
+	}
+
+	runner.readClaudeStreamJSON(context.Background(), strings.NewReader(string(envelope)+"\n"), "s-thinking", sink)
+
+	var thinking []protocol.ThinkingEvent
+	for _, event := range events {
+		if v, ok := event.(protocol.ThinkingEvent); ok {
+			thinking = append(thinking, v)
+		}
+	}
+	if len(thinking) != 2 {
+		t.Fatalf("expected two thinking events, got %#v", thinking)
+	}
+	firstID := strings.TrimSpace(thinking[0].ContextID)
+	secondID := strings.TrimSpace(thinking[1].ContextID)
+	if firstID == "" || secondID == "" {
+		t.Fatalf("expected context ids on thinking events: %#v", thinking)
+	}
+	if firstID == secondID {
+		t.Fatalf("expected distinct context ids, got %q", firstID)
+	}
+	if !strings.HasPrefix(firstID, "claude-thinking:claude-session-1:") ||
+		!strings.HasPrefix(secondID, "claude-thinking:claude-session-1:") {
+		t.Fatalf("unexpected context ids: %q %q", firstID, secondID)
+	}
+}
+
 func TestPtyRunnerEmitsReadyPromptAfterResult(t *testing.T) {
 	runner := NewPtyRunner()
 	var events []any
@@ -971,6 +1042,7 @@ func TestPtyRunnerCatalogAuthoringEmitsStructuredEvent(t *testing.T) {
 }
 
 func TestPtyRunnerClaudeStreamSuppressesExitNoiseAfterClose(t *testing.T) {
+	installBlockingFakeClaude(t)
 	runner := NewPtyRunner()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -980,8 +1052,12 @@ func TestPtyRunnerClaudeStreamSuppressesExitNoiseAfterClose(t *testing.T) {
 	go func() {
 		errCh <- runner.runClaudeStream(ctx, ExecRequest{
 			SessionID: "s-close-stream",
-			Command:   "claude --print --output-format stream-json --input-format stream-json --permission-prompt-tool stdio",
-			Mode:      ModePTY,
+			Command: shellTestCommand(
+				"sh -c 'while IFS= read -r _line; do sleep 1; done' sh",
+				"while ($null -ne ($line = [Console]::In.ReadLine())) { Start-Sleep -Seconds 1 }",
+				"cmd /C more >nul",
+			),
+			Mode: ModePTY,
 		}, ".", func(event any) {
 			eventsCh <- event
 		})
@@ -2152,6 +2228,18 @@ func TestCodexAppSessionStreamsAssistantDeltasBeforePromptWithoutDuplicateFinalT
 	}
 	app.setThreadID("thread-123")
 
+	started, err := json.Marshal(map[string]any{
+		"threadId": "thread-123",
+		"turn": map[string]any{
+			"id":     "turn-1",
+			"status": "in_progress",
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal started: %v", err)
+	}
+	app.handleNotification(codexRPCMessage{Method: "turn/started", Params: started})
+
 	for _, delta := range []string{"T", "ip", " : ", "hello", " world"} {
 		params, err := json.Marshal(map[string]any{
 			"threadId": "thread-123",
@@ -2211,22 +2299,444 @@ done:
 	if len(logs) < 1 {
 		t.Fatalf("expected streamed assistant logs, got %#v", logs)
 	}
-	finalMessage := logs[len(logs)-1].Message
-	if finalMessage != "Tip : hello world" {
-		t.Fatalf("unexpected final streamed log message: %q", finalMessage)
+	if logs[0].Message != "Tip : " {
+		t.Fatalf("expected first assistant chunk before completion, got %#v", logs)
+	}
+	combined := strings.Join(logMessages(logs), "")
+	if combined != "Tip : hello world" {
+		t.Fatalf("unexpected combined streamed log message: %q from %#v", combined, logs)
 	}
 	countFinal := 0
 	for _, log := range logs {
 		if log.Message == "Tip : hello world" {
 			countFinal++
 		}
+		if log.Source != "codex/assistant" {
+			t.Fatalf("expected codex assistant source on streamed log, got %#v", log.RuntimeMeta)
+		}
+		if log.ExecutionID != "turn-1" {
+			t.Fatalf("expected turn id execution key on streamed log, got %#v", log.RuntimeMeta)
+		}
 	}
-	if countFinal != 1 {
-		t.Fatalf("expected final assistant text once, got %d occurrences in %#v", countFinal, logs)
+	if countFinal != 0 {
+		t.Fatalf("did not expect completed full text after streamed chunks, got %d occurrences in %#v", countFinal, logs)
 	}
 	if len(prompts) != 1 || prompts[0].ResumeSessionID != "thread-123" {
 		t.Fatalf("expected invisible continue prompt with thread id, got %#v", prompts)
 	}
+}
+
+func TestCodexAppSessionKeepsAssistantTurnIDForLateCompletedText(t *testing.T) {
+	runner := NewPtyRunner()
+	eventsCh := make(chan any, 8)
+	app := &codexAppSession{
+		runner:    runner,
+		sessionID: "s-codex-late-completed",
+		sink:      func(event any) { eventsCh <- event },
+	}
+	app.setThreadID("thread-123")
+
+	started, err := json.Marshal(map[string]any{
+		"threadId": "thread-123",
+		"turn": map[string]any{
+			"id":     "turn-1",
+			"status": "in_progress",
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal started: %v", err)
+	}
+	app.handleNotification(codexRPCMessage{Method: "turn/started", Params: started})
+
+	delta, err := json.Marshal(map[string]any{
+		"threadId": "thread-123",
+		"turnId":   "turn-1",
+		"itemId":   "item-1",
+		"delta":    "Tip :",
+	})
+	if err != nil {
+		t.Fatalf("marshal delta: %v", err)
+	}
+	app.handleNotification(codexRPCMessage{Method: "item/agentMessage/delta", Params: delta})
+
+	completedTurn, err := json.Marshal(map[string]any{
+		"threadId": "thread-123",
+		"turn": map[string]any{
+			"id":     "turn-1",
+			"status": "completed",
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal completed turn: %v", err)
+	}
+	app.handleNotification(codexRPCMessage{Method: "turn/completed", Params: completedTurn})
+
+	completedItem, err := json.Marshal(map[string]any{
+		"threadId": "thread-123",
+		"turnId":   "turn-1",
+		"item": map[string]any{
+			"type": "agentMessage",
+			"text": "Tip : hello world",
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal completed item: %v", err)
+	}
+	app.handleNotification(codexRPCMessage{Method: "item/completed", Params: completedItem})
+
+	var logs []protocol.LogEvent
+	for {
+		select {
+		case event := <-eventsCh:
+			if log, ok := event.(protocol.LogEvent); ok {
+				logs = append(logs, log)
+			}
+		default:
+			if len(logs) != 2 {
+				t.Fatalf("expected streamed chunk plus completed suffix, got %#v", logs)
+			}
+			if logs[0].Message != "Tip :" || logs[1].Message != " hello world" {
+				t.Fatalf("unexpected late completed stream logs: %#v", logMessages(logs))
+			}
+			for _, log := range logs {
+				if log.ExecutionID != "turn-1" {
+					t.Fatalf("expected late completed log to keep turn execution id, got %#v", log.RuntimeMeta)
+				}
+				if log.Source != "codex/assistant" {
+					t.Fatalf("expected codex assistant source, got %#v", log.RuntimeMeta)
+				}
+			}
+			return
+		}
+	}
+}
+
+func TestCodexAppSessionDoesNotDropRepeatedAssistantDeltaChunk(t *testing.T) {
+	runner := NewPtyRunner()
+	eventsCh := make(chan any, 8)
+	app := &codexAppSession{
+		runner:    runner,
+		sessionID: "s-codex-repeated-delta",
+		sink:      func(event any) { eventsCh <- event },
+	}
+	app.setThreadID("thread-123")
+
+	started, err := json.Marshal(map[string]any{
+		"threadId": "thread-123",
+		"turn": map[string]any{
+			"id":     "turn-1",
+			"status": "in_progress",
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal started: %v", err)
+	}
+	app.handleNotification(codexRPCMessage{Method: "turn/started", Params: started})
+
+	for _, delta := range []string{"hello world", " hello world"} {
+		params, err := json.Marshal(map[string]any{
+			"threadId": "thread-123",
+			"turnId":   "turn-1",
+			"itemId":   "item-1",
+			"delta":    delta,
+		})
+		if err != nil {
+			t.Fatalf("marshal delta: %v", err)
+		}
+		app.handleNotification(codexRPCMessage{Method: "item/agentMessage/delta", Params: params})
+	}
+
+	var logs []protocol.LogEvent
+	for {
+		select {
+		case event := <-eventsCh:
+			if log, ok := event.(protocol.LogEvent); ok {
+				logs = append(logs, log)
+			}
+		default:
+			if len(logs) != 2 {
+				t.Fatalf("expected both repeated assistant chunks, got %#v", logMessages(logs))
+			}
+			if got := strings.Join(logMessages(logs), ""); got != "hello world hello world" {
+				t.Fatalf("unexpected repeated assistant chunks: %q from %#v", got, logMessages(logs))
+			}
+			return
+		}
+	}
+}
+
+func TestCodexAppSessionPreservesAssistantChunkNewlineBoundary(t *testing.T) {
+	runner := NewPtyRunner()
+	eventsCh := make(chan any, 8)
+	app := &codexAppSession{
+		runner:    runner,
+		sessionID: "s-codex-newline-delta",
+		sink:      func(event any) { eventsCh <- event },
+	}
+	app.setThreadID("thread-123")
+
+	started, err := json.Marshal(map[string]any{
+		"threadId": "thread-123",
+		"turn": map[string]any{
+			"id":     "turn-1",
+			"status": "in_progress",
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal started: %v", err)
+	}
+	app.handleNotification(codexRPCMessage{Method: "turn/started", Params: started})
+
+	for _, delta := range []string{"hello\n", "world"} {
+		params, err := json.Marshal(map[string]any{
+			"threadId": "thread-123",
+			"turnId":   "turn-1",
+			"itemId":   "item-1",
+			"delta":    delta,
+		})
+		if err != nil {
+			t.Fatalf("marshal delta: %v", err)
+		}
+		app.handleNotification(codexRPCMessage{Method: "item/agentMessage/delta", Params: params})
+	}
+
+	completed, err := json.Marshal(map[string]any{
+		"threadId": "thread-123",
+		"turn": map[string]any{
+			"id":     "turn-1",
+			"status": "completed",
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal completed turn: %v", err)
+	}
+	app.handleNotification(codexRPCMessage{Method: "turn/completed", Params: completed})
+
+	var logs []protocol.LogEvent
+	for {
+		select {
+		case event := <-eventsCh:
+			if log, ok := event.(protocol.LogEvent); ok {
+				logs = append(logs, log)
+			}
+		default:
+			if len(logs) != 2 {
+				t.Fatalf("expected both newline assistant chunks, got %#v", logMessages(logs))
+			}
+			if got := strings.Join(logMessages(logs), ""); got != "hello\nworld" {
+				t.Fatalf("unexpected newline assistant chunks: %q from %#v", got, logMessages(logs))
+			}
+			return
+		}
+	}
+}
+
+func TestCodexAppSessionEmitsReasoningSummaryThinkingEvents(t *testing.T) {
+	eventsCh := make(chan any, 8)
+	app := &codexAppSession{
+		runner:    NewPtyRunner(),
+		sessionID: "s-codex-reasoning-summary",
+		sink:      func(event any) { eventsCh <- event },
+	}
+	app.setThreadID("thread-123")
+	app.setActiveTurnID("turn-1")
+
+	for _, step := range []struct {
+		method string
+		params map[string]any
+	}{
+		{
+			method: "item/reasoning/summaryTextDelta",
+			params: map[string]any{
+				"threadId":     "thread-123",
+				"turnId":       "turn-1",
+				"itemId":       "reasoning-1",
+				"summaryIndex": 0,
+				"delta":        "checking",
+			},
+		},
+		{
+			method: "item/reasoning/summaryTextDelta",
+			params: map[string]any{
+				"threadId":     "thread-123",
+				"turnId":       "turn-1",
+				"itemId":       "reasoning-1",
+				"summaryIndex": 0,
+				"delta":        " ",
+			},
+		},
+		{
+			method: "item/reasoning/summaryTextDelta",
+			params: map[string]any{
+				"threadId":     "thread-123",
+				"turnId":       "turn-1",
+				"itemId":       "reasoning-1",
+				"summaryIndex": 0,
+				"delta":        "context",
+			},
+		},
+		{
+			method: "item/reasoning/summaryPartAdded",
+			params: map[string]any{
+				"threadId":     "thread-123",
+				"turnId":       "turn-1",
+				"itemId":       "reasoning-1",
+				"summaryIndex": 1,
+			},
+		},
+		{
+			method: "item/reasoning/summaryTextDelta",
+			params: map[string]any{
+				"threadId":     "thread-123",
+				"turnId":       "turn-1",
+				"itemId":       "reasoning-1",
+				"summaryIndex": 1,
+				"delta":        "准备修复",
+			},
+		},
+	} {
+		raw, err := json.Marshal(step.params)
+		if err != nil {
+			t.Fatalf("marshal reasoning event: %v", err)
+		}
+		app.handleNotification(codexRPCMessage{Method: step.method, Params: raw})
+	}
+
+	var thinking []protocol.ThinkingEvent
+	for {
+		select {
+		case event := <-eventsCh:
+			if item, ok := event.(protocol.ThinkingEvent); ok {
+				thinking = append(thinking, item)
+			}
+		default:
+			if len(thinking) != 3 {
+				t.Fatalf("expected three cumulative thinking events, got %#v", thinking)
+			}
+			last := thinking[len(thinking)-1]
+			if last.Content != "checking context\n\n准备修复" {
+				t.Fatalf("unexpected reasoning summary content: %q", last.Content)
+			}
+			if last.Engine != "codex" || last.Source != "codex/reasoning-summary" {
+				t.Fatalf("expected codex reasoning metadata, got %#v", last.RuntimeMeta)
+			}
+			if last.ExecutionID != "turn-1" {
+				t.Fatalf("expected turn execution id, got %#v", last.RuntimeMeta)
+			}
+			if last.ContextID != "codex-reasoning:turn-1:reasoning-1" {
+				t.Fatalf("expected stable reasoning context id, got %#v", last.RuntimeMeta)
+			}
+			return
+		}
+	}
+}
+
+func TestCodexAppSessionCompletedReasoningRecoversAndDedupesSummary(t *testing.T) {
+	eventsCh := make(chan any, 8)
+	app := &codexAppSession{
+		runner:    NewPtyRunner(),
+		sessionID: "s-codex-reasoning-completed",
+		sink:      func(event any) { eventsCh <- event },
+	}
+	app.setThreadID("thread-123")
+	app.setActiveTurnID("turn-1")
+
+	streaming, err := json.Marshal(map[string]any{
+		"threadId":     "thread-123",
+		"turnId":       "turn-1",
+		"itemId":       "reasoning-1",
+		"summaryIndex": 0,
+		"delta":        "正在定位",
+	})
+	if err != nil {
+		t.Fatalf("marshal streaming: %v", err)
+	}
+	app.handleNotification(codexRPCMessage{Method: "item/reasoning/summaryTextDelta", Params: streaming})
+
+	completedSame, err := json.Marshal(map[string]any{
+		"threadId": "thread-123",
+		"turnId":   "turn-1",
+		"item": map[string]any{
+			"type": "reasoning",
+			"id":   "reasoning-1",
+			"summary": []map[string]any{
+				{"text": "正在定位"},
+			},
+			"content": []map[string]any{
+				{"text": "raw hidden chain"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal completed same: %v", err)
+	}
+	app.handleNotification(codexRPCMessage{Method: "item/completed", Params: completedSame})
+
+	completedRicher, err := json.Marshal(map[string]any{
+		"threadId": "thread-123",
+		"turnId":   "turn-1",
+		"item": map[string]any{
+			"type": "reasoning",
+			"id":   "reasoning-1",
+			"summary": []map[string]any{
+				{"text": "正在定位"},
+				{"text": "准备修复"},
+			},
+			"content": []map[string]any{
+				{"text": "raw hidden chain"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal completed richer: %v", err)
+	}
+	app.handleNotification(codexRPCMessage{Method: "item/completed", Params: completedRicher})
+
+	rawDelta, err := json.Marshal(map[string]any{
+		"threadId":     "thread-123",
+		"turnId":       "turn-1",
+		"itemId":       "reasoning-1",
+		"contentIndex": 0,
+		"delta":        "raw hidden chain",
+	})
+	if err != nil {
+		t.Fatalf("marshal raw delta: %v", err)
+	}
+	app.handleNotification(codexRPCMessage{Method: "item/reasoning/textDelta", Params: rawDelta})
+
+	var thinking []protocol.ThinkingEvent
+	for {
+		select {
+		case event := <-eventsCh:
+			if item, ok := event.(protocol.ThinkingEvent); ok {
+				thinking = append(thinking, item)
+			}
+		default:
+			if len(thinking) != 2 {
+				t.Fatalf("expected streaming plus richer completed thinking, got %#v", thinking)
+			}
+			if thinking[0].Content != "正在定位" {
+				t.Fatalf("unexpected streaming content: %#v", thinking)
+			}
+			if thinking[1].Content != "正在定位\n\n准备修复" {
+				t.Fatalf("unexpected completed content: %#v", thinking)
+			}
+			for _, item := range thinking {
+				if strings.Contains(item.Content, "raw hidden") {
+					t.Fatalf("raw reasoning content leaked into thinking event: %#v", item)
+				}
+			}
+			return
+		}
+	}
+}
+
+func logMessages(logs []protocol.LogEvent) []string {
+	messages := make([]string, 0, len(logs))
+	for _, log := range logs {
+		messages = append(messages, log.Message)
+	}
+	return messages
 }
 
 func TestCodexAppSessionEmitsHookAIStatus(t *testing.T) {

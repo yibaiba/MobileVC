@@ -279,8 +279,14 @@ class _SessionListTile extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final sourceLabel = _sourceLabel(item);
+    final nativeLabel = sessionNativeSourceLabel(item);
     final preview = sessionDisplayPreview(item);
-    final title = preview.isNotEmpty ? preview : sessionDisplayTitle(item);
+    final title = nativeLabel.isNotEmpty
+        ? nativeLabel
+        : preview.isNotEmpty
+            ? preview
+            : sessionDisplayTitle(item);
+    final subtitle = nativeLabel.isNotEmpty ? sessionDisplaySubtitle(item) : '';
     final timestampLabel = _timestampLabel(item);
     return Card(
       child: ListTile(
@@ -294,6 +300,18 @@ class _SessionListTile extends StatelessWidget {
                 mainAxisSize: MainAxisSize.min,
                 children: [
                   Text(title, maxLines: 2, overflow: TextOverflow.ellipsis),
+                  if (subtitle.isNotEmpty) ...[
+                    const SizedBox(height: 4),
+                    Text(
+                      subtitle,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                            color:
+                                Theme.of(context).colorScheme.onSurfaceVariant,
+                          ),
+                    ),
+                  ],
                   if (timestampLabel.isNotEmpty) ...[
                     const SizedBox(height: 4),
                     Text(
@@ -308,7 +326,8 @@ class _SessionListTile extends StatelessWidget {
                 ],
               ),
             ),
-            if (sourceLabel.isNotEmpty) _SourceBadge(item: item),
+            if (sourceLabel.isNotEmpty && sourceLabel != title)
+              _SourceBadge(item: item),
           ],
         ),
         subtitle: null,
@@ -324,7 +343,7 @@ class _SessionListTile extends StatelessWidget {
                 child: Icon(Icons.check_circle, size: 18),
               ),
             IconButton(
-              tooltip: _canDeleteSession(item) ? '删除会话' : '不能删除电脑端原生会话',
+              tooltip: _canDeleteSession(item) ? '删除此会话' : '不能删除电脑端原生会话',
               onPressed: () {
                 if (!_canDeleteSession(item)) {
                   _showDeleteUnavailable(context, item);
@@ -528,16 +547,14 @@ bool _matchesFilter(SessionSummary item, _SessionProviderFilter filter) {
 }
 
 _SessionProviderFilter? _sessionEngine(SessionSummary item) {
-  final source = item.source.trim().toLowerCase();
-  final runtimeSource = item.runtime.source.trim().toLowerCase();
+  switch (sessionNativeSource(item)) {
+    case 'codex-native':
+      return _SessionProviderFilter.codex;
+    case 'claude-native':
+      return _SessionProviderFilter.claude;
+  }
   final engine = item.runtime.engine.trim().toLowerCase();
   final command = item.runtime.command.trim().toLowerCase();
-  if (source == 'codex-native' || runtimeSource == 'codex-native') {
-    return _SessionProviderFilter.codex;
-  }
-  if (source == 'claude-native' || runtimeSource == 'claude-native') {
-    return _SessionProviderFilter.claude;
-  }
   if (engine == 'codex' || command == 'codex' || command.startsWith('codex ')) {
     return _SessionProviderFilter.codex;
   }
@@ -577,26 +594,13 @@ String _projectLabel(String path) {
 }
 
 bool _canDeleteSession(SessionSummary item) {
-  final source = item.source.trim().toLowerCase();
-  final runtimeSource = item.runtime.source.trim().toLowerCase();
-  if (source == 'codex-native' ||
-      source == 'claude-native' ||
-      runtimeSource == 'codex-native' ||
-      runtimeSource == 'claude-native') {
-    return false;
-  }
-  final ownership = item.ownership.trim().toLowerCase();
-  if (ownership == 'codex-native' || ownership == 'claude-native') {
-    return false;
-  }
-  if (ownership == 'mobilevc') {
+  if (sessionIsMobileVcOwned(item)) {
     return true;
   }
-  return !item.external &&
-      source != 'codex-native' &&
-      source != 'claude-native' &&
-      runtimeSource != 'codex-native' &&
-      runtimeSource != 'claude-native';
+  if (sessionNativeSource(item).isNotEmpty) {
+    return false;
+  }
+  return !item.external;
 }
 
 void _showDeleteUnavailable(BuildContext context, SessionSummary item) {
@@ -608,33 +612,7 @@ void _showDeleteUnavailable(BuildContext context, SessionSummary item) {
 }
 
 String _sourceLabel(SessionSummary item) {
-  final source = item.source.trim().toLowerCase();
-  final ownership = item.ownership.trim().toLowerCase();
-  final runtimeSource = item.runtime.source.trim().toLowerCase();
-  if (source == 'claude-native' || runtimeSource == 'claude-native') {
-    return '电脑 Claude';
-  }
-  if (item.external ||
-      source == 'codex-native' ||
-      runtimeSource == 'codex-native') {
-    return '电脑 Codex';
-  }
-  if (source == 'mobilevc' ||
-      ownership == 'mobilevc' ||
-      runtimeSource == 'mobilevc') {
-    return 'MobileVC';
-  }
-  switch (_sessionEngine(item)) {
-    case _SessionProviderFilter.codex:
-      return 'Codex';
-    case _SessionProviderFilter.claude:
-      return 'Claude';
-    case _SessionProviderFilter.gemini:
-      return 'Gemini';
-    case _SessionProviderFilter.all:
-    case null:
-      return '';
-  }
+  return sessionSourceLabel(item);
 }
 
 String _timestampLabel(SessionSummary item) {

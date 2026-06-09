@@ -6,6 +6,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"mobilevc/internal/data"
 	"mobilevc/internal/protocol"
 	"mobilevc/internal/session"
 )
@@ -15,15 +16,18 @@ const defaultRuntimeSessionPendingLimit = 512
 const defaultRuntimeSessionSinkBufferSize = 1024
 
 type runtimeSession struct {
-	mu                  sync.RWMutex
-	service             *session.Service
-	listeners           map[string]func(any)
-	releaseTimer        *time.Timer
-	pendingCursor       int64
-	pendingEvents       []any
-	lastOutputAt        time.Time
-	lastClientMessageAt time.Time
-	clientActions       map[string]time.Time
+	mu                   sync.RWMutex
+	service              *session.Service
+	listeners            map[string]func(any)
+	releaseTimer         *time.Timer
+	pendingCursor        int64
+	pendingEvents        []any
+	lastOutputAt         time.Time
+	lastClientMessageAt  time.Time
+	clientActions        map[string]time.Time
+	latestProjection     data.ProjectionSnapshot
+	projectionGeneration uint64
+	latestProjectionSet  bool
 
 	persistedCursor atomic.Int64
 
@@ -42,6 +46,31 @@ func newRuntimeSession(service *session.Service) *runtimeSession {
 		pendingEvents: make([]any, 0, defaultRuntimeSessionPendingLimit),
 		clientActions: make(map[string]time.Time),
 	}
+}
+
+func (s *runtimeSession) updateLatestProjection(snapshot data.ProjectionSnapshot) data.ProjectionSnapshot {
+	if s == nil {
+		return cloneProjectionSnapshot(snapshot)
+	}
+	normalized := cloneProjectionSnapshot(session.NormalizeProjectionSnapshot(snapshot))
+	s.mu.Lock()
+	s.projectionGeneration++
+	s.latestProjection = normalized
+	s.latestProjectionSet = true
+	s.mu.Unlock()
+	return cloneProjectionSnapshot(normalized)
+}
+
+func (s *runtimeSession) latestProjectionSnapshot() (data.ProjectionSnapshot, uint64, bool) {
+	if s == nil {
+		return data.ProjectionSnapshot{}, 0, false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if !s.latestProjectionSet {
+		return data.ProjectionSnapshot{}, s.projectionGeneration, false
+	}
+	return cloneProjectionSnapshot(s.latestProjection), s.projectionGeneration, true
 }
 
 func (s *runtimeSession) setListener(id string, listener func(any)) {
@@ -73,6 +102,13 @@ func (s *runtimeSession) emit(event any) {
 	s.lastOutputAt = time.Now()
 	s.mu.Unlock()
 
+	s.emitToListeners(event)
+}
+
+func (s *runtimeSession) emitToListeners(event any) {
+	if s == nil || event == nil {
+		return
+	}
 	s.mu.RLock()
 	listeners := make([]func(any), 0, len(s.listeners))
 	for _, listener := range s.listeners {
@@ -98,11 +134,13 @@ func (s *runtimeSession) EnsureBufferedSinkWithProcessor(processor func(any)) fu
 		s.sinkFn = processor
 	}
 	if s.sinkCh == nil {
-		s.sinkCh = make(chan any, defaultRuntimeSessionSinkBufferSize)
-		s.sinkDone = make(chan struct{})
+		ch := make(chan any, defaultRuntimeSessionSinkBufferSize)
+		done := make(chan struct{})
+		s.sinkCh = ch
+		s.sinkDone = done
 		go func() {
-			defer close(s.sinkDone)
-			for event := range s.sinkCh {
+			defer close(done)
+			for event := range ch {
 				s.emitBufferedEvent(event)
 			}
 		}()
@@ -110,19 +148,6 @@ func (s *runtimeSession) EnsureBufferedSinkWithProcessor(processor func(any)) fu
 	return func(event any) {
 		if event == nil {
 			return
-		}
-		if s.listenerCount() == 0 {
-			s.sinkMu.Lock()
-			processor := s.sinkFn
-			closed := s.sinkClosed
-			s.sinkMu.Unlock()
-			if closed {
-				return
-			}
-			if processor != nil {
-				processor(event)
-				return
-			}
 		}
 		s.sinkMu.Lock()
 		ch := s.sinkCh
@@ -461,19 +486,34 @@ func (r *runtimeSessionRegistry) Release(sessionID, listenerID string, cleanupIf
 			entry.releaseTimer = nil
 		}
 		r.mu.Unlock()
-		entry.service.Cleanup()
-		if r.onCleanup != nil {
-			r.onCleanup(sessionID)
-		}
+		r.cleanupEntry(sessionID, entry)
 		return
 	}
 	if entry.releaseTimer != nil {
 		entry.releaseTimer.Stop()
 	}
-	entry.releaseTimer = time.AfterFunc(r.releaseAfter, func() {
-		r.cleanupIfOrphaned(sessionID, entry)
-	})
+	r.scheduleOrphanCleanupLocked(sessionID, entry)
 	r.mu.Unlock()
+}
+
+func (r *runtimeSessionRegistry) CleanupSession(sessionID string) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return
+	}
+	r.mu.Lock()
+	entry, ok := r.sessions[sessionID]
+	if !ok {
+		r.mu.Unlock()
+		return
+	}
+	delete(r.sessions, sessionID)
+	if entry.releaseTimer != nil {
+		entry.releaseTimer.Stop()
+		entry.releaseTimer = nil
+	}
+	r.mu.Unlock()
+	r.cleanupEntry(sessionID, entry)
 }
 
 func (r *runtimeSessionRegistry) cleanupIfOrphaned(sessionID string, target *runtimeSession) {
@@ -488,14 +528,24 @@ func (r *runtimeSessionRegistry) cleanupIfOrphaned(sessionID string, target *run
 		r.mu.Unlock()
 		return
 	}
+	if current.service != nil && current.service.IsRunning() {
+		r.scheduleOrphanCleanupLocked(sessionID, current)
+		r.mu.Unlock()
+		return
+	}
 	delete(r.sessions, sessionID)
 	current.releaseTimer = nil
 	r.mu.Unlock()
-	current.shutdownSink()
-	current.service.Cleanup()
-	if r.onCleanup != nil {
-		r.onCleanup(sessionID)
+	r.cleanupEntry(sessionID, current)
+}
+
+func (r *runtimeSessionRegistry) scheduleOrphanCleanupLocked(sessionID string, entry *runtimeSession) {
+	if entry == nil {
+		return
 	}
+	entry.releaseTimer = time.AfterFunc(r.releaseAfter, func() {
+		r.cleanupIfOrphaned(sessionID, entry)
+	})
 }
 
 func (r *runtimeSessionRegistry) CleanupAll() {
@@ -515,13 +565,22 @@ func (r *runtimeSessionRegistry) CleanupAll() {
 	}
 	r.mu.Unlock()
 	for i, entry := range entries {
-		entry.shutdownSink()
-		if entry.service != nil {
-			entry.service.Cleanup()
+		if i < len(sessionIDs) {
+			r.cleanupEntry(sessionIDs[i], entry)
 		}
-		if r.onCleanup != nil && i < len(sessionIDs) {
-			r.onCleanup(sessionIDs[i])
-		}
+	}
+}
+
+func (r *runtimeSessionRegistry) cleanupEntry(sessionID string, entry *runtimeSession) {
+	if entry == nil {
+		return
+	}
+	entry.shutdownSink()
+	if entry.service != nil {
+		entry.service.Cleanup()
+	}
+	if r.onCleanup != nil {
+		r.onCleanup(sessionID)
 	}
 }
 

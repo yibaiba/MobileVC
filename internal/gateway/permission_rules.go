@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"time"
 
@@ -11,32 +12,71 @@ import (
 )
 
 func emitPermissionRuleList(emit func(any), sessionStore data.Store, ctx context.Context, sessionID string) {
-	if sessionStore == nil {
-		emit(protocol.NewErrorEvent(sessionID, "session store unavailable", ""))
-		return
-	}
-	sessionEnabled := true
-	sessionRules := []protocol.PermissionRule{}
-	if strings.TrimSpace(sessionID) != "" {
-		record, err := sessionStore.GetSession(ctx, sessionID)
-		if err == nil {
-			record.Projection = session.NormalizeProjectionSnapshot(record.Projection)
-			sessionEnabled = record.Projection.PermissionRulesEnabled
-			sessionRules = toProtocolPermissionRules(record.Projection.PermissionRules)
-		}
-	}
-	persistentSnapshot, err := sessionStore.GetPermissionRuleSnapshot(ctx)
+	events, err := buildPermissionRuleListEvents(sessionStore, ctx, sessionID)
 	if err != nil {
 		emit(protocol.NewErrorEvent(sessionID, err.Error(), ""))
 		return
 	}
-	emit(protocol.NewPermissionRuleListResultEvent(
+	for _, event := range events {
+		emit(event)
+	}
+}
+
+func buildPermissionRuleListEvents(sessionStore data.Store, ctx context.Context, sessionID string) ([]any, error) {
+	if sessionStore == nil {
+		return nil, fmt.Errorf("session store unavailable")
+	}
+	sessionEnabled := true
+	sessionRules := []protocol.PermissionRule{}
+	if strings.TrimSpace(sessionID) != "" {
+		ruleStore, ok := sessionStore.(data.SessionPermissionRuleStore)
+		if !ok {
+			return nil, fmt.Errorf("session permission rule store unavailable")
+		}
+		snapshot, err := ruleStore.GetSessionPermissionRuleSnapshot(ctx, sessionID)
+		if err == nil {
+			sessionEnabled = snapshot.Enabled
+			sessionRules = toProtocolPermissionRules(snapshot.Items)
+		} else {
+			return nil, err
+		}
+	}
+	persistentSnapshot, err := sessionStore.GetPermissionRuleSnapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return []any{protocol.NewPermissionRuleListResultEvent(
 		sessionID,
 		sessionEnabled,
 		persistentSnapshot.Enabled,
 		sessionRules,
 		toProtocolPermissionRules(persistentSnapshot.Items),
-	))
+	)}, nil
+}
+
+func saveSessionPermissionRules(ctx context.Context, sessionStore data.Store, sessionID string, mutate func(data.SessionPermissionRuleSnapshot) data.SessionPermissionRuleSnapshot) error {
+	if sessionStore == nil {
+		return fmt.Errorf("session store unavailable")
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return fmt.Errorf("session ID is required")
+	}
+	ruleStore, ok := sessionStore.(data.SessionPermissionRuleStore)
+	if !ok {
+		return fmt.Errorf("session permission rule store unavailable")
+	}
+	snapshot, err := ruleStore.GetSessionPermissionRuleSnapshot(ctx, sessionID)
+	if err != nil {
+		return err
+	}
+	snapshot.SessionID = sessionID
+	if mutate != nil {
+		snapshot = mutate(snapshot)
+	}
+	snapshot.SessionID = sessionID
+	_, err = ruleStore.SaveSessionPermissionRuleSnapshot(ctx, snapshot)
+	return err
 }
 
 func toProtocolPermissionRules(items []data.PermissionRule) []protocol.PermissionRule {
@@ -150,6 +190,14 @@ func maybeAutoApplyPermissionEvent(
 	if sessionStore == nil {
 		return false, nil
 	}
+	var ruleStore data.SessionPermissionRuleStore
+	if strings.TrimSpace(sessionID) != "" {
+		store, ok := sessionStore.(data.SessionPermissionRuleStore)
+		if !ok {
+			return false, fmt.Errorf("session permission rule store unavailable")
+		}
+		ruleStore = store
+	}
 	var (
 		message string
 		meta    protocol.RuntimeMeta
@@ -172,9 +220,13 @@ func maybeAutoApplyPermissionEvent(
 	}
 	projection := session.NormalizeProjectionSnapshot(data.ProjectionSnapshot{})
 	if strings.TrimSpace(sessionID) != "" {
-		if record, err := sessionStore.GetSession(ctx, sessionID); err == nil {
-			projection = session.NormalizeProjectionSnapshot(record.Projection)
+		snapshot, err := ruleStore.GetSessionPermissionRuleSnapshot(ctx, sessionID)
+		if err != nil {
+			return false, err
 		}
+		projection.PermissionRulesEnabled = snapshot.Enabled
+		projection.PermissionRules = append([]data.PermissionRule(nil), snapshot.Items...)
+		projection = session.NormalizeProjectionSnapshot(projection)
 	}
 	controller := service.ControllerSnapshot()
 	matchCtx := session.PermissionContextFromPrompt(message, meta, projection, controller)
@@ -186,10 +238,14 @@ func maybeAutoApplyPermissionEvent(
 				return false, err
 			}
 			if strings.TrimSpace(sessionID) != "" {
-				if record, err := sessionStore.GetSession(ctx, sessionID); err == nil {
-					record.Projection = session.NormalizeProjectionSnapshot(record.Projection)
-					record.Projection.PermissionRules = session.MarkPermissionRuleMatched(record.Projection.PermissionRules, rule.ID)
-					_, _ = sessionStore.SaveProjection(ctx, sessionID, record.Projection)
+				projection.PermissionRules = session.MarkPermissionRuleMatched(projection.PermissionRules, rule.ID)
+				snapshot := data.SessionPermissionRuleSnapshot{
+					SessionID: sessionID,
+					Enabled:   projection.PermissionRulesEnabled,
+					Items:     projection.PermissionRules,
+				}
+				if _, err := ruleStore.SaveSessionPermissionRuleSnapshot(ctx, snapshot); err != nil {
+					return false, err
 				}
 			}
 			emit(protocol.NewPermissionAutoAppliedEvent(sessionID, rule.ID, string(rule.Scope), rule.Summary, "已按会话权限规则自动允许"))
@@ -213,7 +269,9 @@ func maybeAutoApplyPermissionEvent(
 		return false, err
 	}
 	persistentSnapshot.Items = session.MarkPermissionRuleMatched(persistentSnapshot.Items, rule.ID)
-	_ = sessionStore.SavePermissionRuleSnapshot(ctx, persistentSnapshot)
+	if err := sessionStore.SavePermissionRuleSnapshot(ctx, persistentSnapshot); err != nil {
+		return false, err
+	}
 	emit(protocol.NewPermissionAutoAppliedEvent(sessionID, rule.ID, string(rule.Scope), rule.Summary, "已按长期权限规则自动允许"))
 	emitPermissionRuleList(emit, sessionStore, ctx, sessionID)
 	return true, nil

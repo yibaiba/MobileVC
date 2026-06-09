@@ -98,6 +98,7 @@ func newClaudeStreamCommand(ctx context.Context, command string, resumeSessionID
 		args = appendPermissionMode(args, permissionMode)
 		cmd := exec.CommandContext(ctx, nodeEntry, args...)
 		cmd.Env = shellEnvironment(spec, command)
+		isolateCommandProcessGroup(cmd)
 		hideCommandWindow(cmd)
 		return cmd
 	}
@@ -108,6 +109,7 @@ func newClaudeStreamCommand(ctx context.Context, command string, resumeSessionID
 	preparedCommand = appendPermissionModeToCommand(preparedCommand, permissionMode)
 	cmd := exec.CommandContext(ctx, spec.path, append(spec.args, preparedCommand)...)
 	cmd.Env = shellEnvironment(spec, command)
+	isolateCommandProcessGroup(cmd)
 	hideCommandWindow(cmd)
 	return cmd
 }
@@ -138,6 +140,7 @@ func newClaudePromptCommand(ctx context.Context, command string, prompt string, 
 		args = append(args, prompt)
 		cmd := exec.CommandContext(ctx, nodeEntry, args...)
 		cmd.Env = shellEnvironment(spec, command)
+		isolateCommandProcessGroup(cmd)
 		hideCommandWindow(cmd)
 		return cmd
 	}
@@ -154,6 +157,7 @@ func newClaudePromptCommand(ctx context.Context, command string, prompt string, 
 	}
 	cmd := exec.CommandContext(ctx, spec.path, append(spec.args, preparedCommand)...)
 	cmd.Env = shellEnvironment(spec, command)
+	isolateCommandProcessGroup(cmd)
 	hideCommandWindow(cmd)
 	return cmd
 }
@@ -164,6 +168,7 @@ func newCodexAppServerCommand(ctx context.Context, command string) *exec.Cmd {
 	if runtime.GOOS != "windows" {
 		cmd := exec.CommandContext(ctx, launch.executable, "app-server", "--listen", "stdio://")
 		cmd.Env = shellEnvironmentWithPath(spec, command, launch.pathEnv)
+		isolateCommandProcessGroup(cmd)
 		return cmd
 	}
 
@@ -182,6 +187,7 @@ func newCodexAppServerCommand(ctx context.Context, command string) *exec.Cmd {
 
 	cmd := exec.CommandContext(ctx, launch.executable, "app-server", "--listen", "stdio://")
 	cmd.Env = shellEnvironmentWithPath(spec, command, launch.pathEnv)
+	isolateCommandProcessGroup(cmd)
 	hideCommandWindow(cmd)
 	return cmd
 }

@@ -3,6 +3,10 @@ import '../../data/models/session_models.dart';
 import 'claude_model_utils.dart';
 
 String sessionDisplayTitle(SessionSummary item) {
+  final nativeLabel = sessionNativeSourceLabel(item);
+  if (nativeLabel.isNotEmpty) {
+    return nativeLabel;
+  }
   final runtime = _displayRuntime(item);
   final candidates = <String?>[
     _visibleSessionTitle(item.title),
@@ -25,6 +29,7 @@ String sessionDisplayTitle(SessionSummary item) {
 
 String sessionDisplayPreview(SessionSummary item) {
   final runtime = _displayRuntime(item);
+  final nativeLabel = sessionNativeSourceLabel(item);
   final candidates = <String?>[
     _visibleSessionPreview(item.lastPreview),
     _visibleSessionPreview(runtime.contextTitle),
@@ -34,7 +39,7 @@ String sessionDisplayPreview(SessionSummary item) {
     _basename(runtime.targetPath),
   ];
   for (final candidate in candidates) {
-    if (candidate != null && candidate.isNotEmpty) {
+    if (candidate != null && candidate.isNotEmpty && candidate != nativeLabel) {
       return candidate;
     }
   }
@@ -47,6 +52,7 @@ String sessionDisplaySubtitle(SessionSummary item) {
   final title = sessionDisplayTitle(item);
   final candidates = <String?>[
     _visibleSessionText(item.lastPreview),
+    _visibleSessionTitle(item.title),
     _visibleSessionText(runtime.targetTitle),
     _visibleSessionText(runtime.contextTitle),
     _visibleSessionText(runtime.command),
@@ -66,6 +72,34 @@ String sessionDisplaySubtitle(SessionSummary item) {
     return cwd;
   }
   return item.id == title ? '' : item.id;
+}
+
+String sessionSourceLabel(SessionSummary item) {
+  final nativeLabel = sessionNativeSourceLabel(item);
+  if (nativeLabel.isNotEmpty) {
+    return nativeLabel;
+  }
+  final source = item.source.trim().toLowerCase();
+  final ownership = item.ownership.trim().toLowerCase();
+  final runtimeSource = item.runtime.source.trim().toLowerCase();
+  if (source == 'mobilevc' ||
+      ownership == 'mobilevc' ||
+      runtimeSource == 'mobilevc') {
+    return 'MobileVC';
+  }
+  final engine = _sessionEngineLabel(_displayRuntime(item));
+  return engine;
+}
+
+String sessionNativeSourceLabel(SessionSummary item) {
+  final source = sessionNativeSource(item);
+  if (source == 'claude-native') {
+    return '电脑 Claude';
+  }
+  if (source == 'codex-native') {
+    return '电脑 Codex';
+  }
+  return '';
 }
 
 String sessionRuntimeSummary(RuntimeMeta runtime) {
@@ -156,6 +190,58 @@ bool looksLikeSessionBootstrapCommand(String text) {
       lower.contains(' --permission-mode ') ||
       lower.contains(' --approval-mode ') ||
       lower.contains(' --dangerously-skip-permissions');
+}
+
+String sessionNativeSource(SessionSummary item) {
+  if (sessionIsMobileVcOwned(item)) {
+    return '';
+  }
+  final source = item.source.trim().toLowerCase();
+  if (source == 'codex-native' || source == 'claude-native') {
+    return source;
+  }
+  final id = item.id.trim().toLowerCase();
+  if (id.startsWith('codex-thread:')) {
+    return 'codex-native';
+  }
+  if (id.startsWith('claude-session:')) {
+    return 'claude-native';
+  }
+  final engine = item.runtime.engine.trim().toLowerCase();
+  final command = item.runtime.command.trim().toLowerCase();
+  if (item.external &&
+      (engine == 'codex' ||
+          command == 'codex' ||
+          command.startsWith('codex '))) {
+    return 'codex-native';
+  }
+  if (item.external &&
+      (engine == 'claude' ||
+          command == 'claude' ||
+          command.startsWith('claude '))) {
+    return 'claude-native';
+  }
+  final runtimeSource = item.runtime.source.trim().toLowerCase();
+  if (runtimeSource == 'codex-native' || runtimeSource == 'claude-native') {
+    return runtimeSource;
+  }
+  final ownership = item.ownership.trim().toLowerCase();
+  if (ownership == 'codex-native' || ownership == 'claude-native') {
+    return ownership;
+  }
+  if (item.external) {
+    return 'codex-native';
+  }
+  return '';
+}
+
+bool sessionIsMobileVcOwned(SessionSummary item) {
+  final source = item.source.trim().toLowerCase();
+  final runtimeSource = item.runtime.source.trim().toLowerCase();
+  final ownership = item.ownership.trim().toLowerCase();
+  return source == 'mobilevc' ||
+      runtimeSource == 'mobilevc' ||
+      ownership == 'mobilevc';
 }
 
 String? _visibleSessionText(String text) {

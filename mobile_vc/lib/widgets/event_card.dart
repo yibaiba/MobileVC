@@ -16,6 +16,8 @@ class EventCard extends StatefulWidget {
     this.mediaPreviewKeyFor,
     this.onOpenAttachment,
     this.onRequestMediaPreview,
+    this.onAnimatedBodyProgress,
+    this.collapseThinkingByDefault = false,
   });
 
   final TimelineItem item;
@@ -24,6 +26,8 @@ class EventCard extends StatefulWidget {
   final String Function(TimelineAttachment attachment)? mediaPreviewKeyFor;
   final ValueChanged<TimelineAttachment>? onOpenAttachment;
   final ValueChanged<TimelineAttachment>? onRequestMediaPreview;
+  final VoidCallback? onAnimatedBodyProgress;
+  final bool collapseThinkingByDefault;
 
   @override
   State<EventCard> createState() => _EventCardState();
@@ -31,10 +35,14 @@ class EventCard extends StatefulWidget {
 
 class _EventCardState extends State<EventCard> {
   bool _selectionMode = false;
+  late bool _thinkingCollapsed;
+  bool _thinkingManuallyToggled = false;
 
   @override
   void initState() {
     super.initState();
+    _thinkingCollapsed =
+        widget.item.kind == 'thinking' && widget.collapseThinkingByDefault;
     _requestMissingAttachmentPreviews();
   }
 
@@ -43,6 +51,14 @@ class _EventCardState extends State<EventCard> {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.item.id != widget.item.id) {
       _selectionMode = false;
+      _thinkingManuallyToggled = false;
+      _thinkingCollapsed =
+          widget.item.kind == 'thinking' && widget.collapseThinkingByDefault;
+    } else if (widget.item.kind == 'thinking' &&
+        oldWidget.collapseThinkingByDefault !=
+            widget.collapseThinkingByDefault &&
+        !_thinkingManuallyToggled) {
+      _thinkingCollapsed = widget.collapseThinkingByDefault;
     }
     _requestMissingAttachmentPreviews();
   }
@@ -88,6 +104,7 @@ class _EventCardState extends State<EventCard> {
     final isMarkdown = widget.item.kind == 'markdown';
     final isCompaction = widget.item.kind == 'compaction';
     final isCodexToolGroup = widget.item.kind == 'codex_tool_group';
+    final isThinking = widget.item.kind == 'thinking';
 
     if (isCompaction) {
       return _CompactionMarker(item: widget.item);
@@ -99,6 +116,19 @@ class _EventCardState extends State<EventCard> {
         child: ConstrainedBox(
           constraints: const BoxConstraints(maxWidth: 760),
           child: _CodexToolGroupCard(item: widget.item, style: style),
+        ),
+      );
+    }
+
+    if (isThinking) {
+      return Align(
+        alignment: Alignment.centerLeft,
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 760),
+          child: _wrapWithLongPress(
+            context,
+            _buildThinkingCard(context, style),
+          ),
         ),
       );
     }
@@ -347,6 +377,7 @@ class _EventCardState extends State<EventCard> {
             plain: true,
             useSelectionArea: _selectionMode,
             selectable: _selectionMode,
+            onProgress: widget.onAnimatedBodyProgress,
           );
     return SelectionArea(
       contextMenuBuilder: _buildSelectionAreaContextMenu,
@@ -425,6 +456,102 @@ class _EventCardState extends State<EventCard> {
         ),
       ],
     );
+  }
+
+  Widget _buildThinkingCard(BuildContext context, _EventCardStyle style) {
+    final scheme = Theme.of(context).colorScheme;
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        key: const ValueKey('thinkingToggle'),
+        onTap: _selectionMode ? null : _toggleThinkingCollapsed,
+        borderRadius: BorderRadius.circular(style.radius),
+        child: Ink(
+          decoration: BoxDecoration(
+            color: style.background,
+            borderRadius: BorderRadius.circular(style.radius),
+            border: Border.all(color: style.border),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    _LeadingBadge(item: widget.item, style: style),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            widget.item.title.isEmpty
+                                ? _titleForKind(widget.item.kind)
+                                : widget.item.title,
+                            style: Theme.of(context)
+                                .textTheme
+                                .labelLarge
+                                ?.copyWith(
+                                  fontWeight: FontWeight.w800,
+                                  color: style.titleColor,
+                                ),
+                          ),
+                          if (_thinkingCollapsed)
+                            Text(
+                              _collapsedThinkingPreview(widget.item.body),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: Theme.of(context)
+                                  .textTheme
+                                  .bodySmall
+                                  ?.copyWith(color: style.subtitleColor),
+                            ),
+                        ],
+                      ),
+                    ),
+                    Icon(
+                      _thinkingCollapsed
+                          ? Icons.expand_more_rounded
+                          : Icons.expand_less_rounded,
+                      color: scheme.onSurfaceVariant,
+                    ),
+                  ],
+                ),
+                if (!_thinkingCollapsed && widget.item.body.isNotEmpty) ...[
+                  const SizedBox(height: 8),
+                  _BodyContent(
+                    item: widget.item,
+                    style: style,
+                    selectable: _selectionMode,
+                    contextMenuBuilder: _buildEditableContextMenu,
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _toggleThinkingCollapsed() {
+    setState(() {
+      _thinkingManuallyToggled = true;
+      _thinkingCollapsed = !_thinkingCollapsed;
+    });
+  }
+
+  String _collapsedThinkingPreview(String body) {
+    final text = body.trim().replaceAll(RegExp(r'\s+'), ' ');
+    if (text.isEmpty) {
+      return '已折叠';
+    }
+    final runeCount = text.runes.length;
+    if (runeCount <= 48) {
+      return text;
+    }
+    return '${String.fromCharCodes(text.runes.take(48))}...';
   }
 
   Widget _buildEditableContextMenu(
@@ -1061,6 +1188,7 @@ class _TypewriterMarkdown extends StatefulWidget {
     this.plain = false,
     this.useSelectionArea = false,
     this.selectable = false,
+    this.onProgress,
   });
 
   final TimelineItem item;
@@ -1068,12 +1196,14 @@ class _TypewriterMarkdown extends StatefulWidget {
   final bool plain;
   final bool useSelectionArea;
   final bool selectable;
+  final VoidCallback? onProgress;
 
   @override
   State<_TypewriterMarkdown> createState() => _TypewriterMarkdownState();
 }
 
 class _TypewriterMarkdownState extends State<_TypewriterMarkdown> {
+  static const Duration _typingTick = Duration(milliseconds: 48);
   static final Map<String, String> _revealedTextCache = <String, String>{};
 
   Timer? _timer;
@@ -1084,10 +1214,9 @@ class _TypewriterMarkdownState extends State<_TypewriterMarkdown> {
   void initState() {
     super.initState();
     _lastBody = widget.item.body;
-    final cached = _revealedTextCache[widget.item.id];
+    final cached = _revealedPrefixFor(widget.item.id, widget.item.body);
     if (cached != null && cached.isNotEmpty) {
-      _visibleText =
-          cached.length > widget.item.body.length ? widget.item.body : cached;
+      _visibleText = cached;
     } else {
       _visibleText = _initialVisibleText(widget.item.body);
       _revealedTextCache[widget.item.id] = _visibleText;
@@ -1102,16 +1231,22 @@ class _TypewriterMarkdownState extends State<_TypewriterMarkdown> {
         oldWidget.item.body != widget.item.body) {
       _timer?.cancel();
       final previousBody = _lastBody;
+      final sameItem = oldWidget.item.id == widget.item.id;
       _lastBody = widget.item.body;
-      final cached = _revealedTextCache[widget.item.id] ?? '';
+      final cached = _revealedPrefixFor(widget.item.id, widget.item.body) ?? '';
       if (cached.isNotEmpty) {
-        _visibleText =
-            cached.length > widget.item.body.length ? widget.item.body : cached;
-      } else if (widget.item.body.startsWith(previousBody) &&
-          _visibleText.isNotEmpty) {
-        if (_visibleText.length > widget.item.body.length) {
-          _visibleText = widget.item.body;
+        _visibleText = cached;
+        if (sameItem &&
+            widget.item.body.startsWith(previousBody) &&
+            _visibleText.length < previousBody.length) {
+          _visibleText = previousBody;
         }
+      } else if (sameItem &&
+          widget.item.body.startsWith(previousBody) &&
+          _visibleText.isNotEmpty) {
+        _visibleText = previousBody.length > widget.item.body.length
+            ? widget.item.body
+            : previousBody;
       } else {
         _visibleText = _initialVisibleText(widget.item.body);
       }
@@ -1155,29 +1290,51 @@ class _TypewriterMarkdownState extends State<_TypewriterMarkdown> {
       _revealedTextCache[widget.item.id] = target;
       return;
     }
-    _timer = Timer.periodic(const Duration(milliseconds: 16), (timer) {
+    _timer = Timer.periodic(_typingTick, (timer) {
       if (!mounted) {
         timer.cancel();
         return;
       }
       final current = _visibleText.length;
       final remaining = target.length - current;
-      final step = remaining > 80
-          ? 8
-          : remaining > 40
-              ? 5
-              : remaining > 20
-                  ? 3
-                  : 1;
+      final step = _typingStep(remaining);
       final next = (current + step).clamp(0, target.length);
       setState(() {
         _visibleText = target.substring(0, next);
         _revealedTextCache[widget.item.id] = _visibleText;
       });
+      _notifyProgressIfNeeded();
       if (next >= target.length) {
         timer.cancel();
       }
     });
+  }
+
+  int _typingStep(int remaining) {
+    if (remaining > 1200) {
+      return 96;
+    }
+    if (remaining > 600) {
+      return 64;
+    }
+    if (remaining > 240) {
+      return 40;
+    }
+    if (remaining > 80) {
+      return 24;
+    }
+    if (remaining > 24) {
+      return 12;
+    }
+    return remaining > 6 ? 4 : 1;
+  }
+
+  void _notifyProgressIfNeeded() {
+    final onProgress = widget.onProgress;
+    if (onProgress == null) {
+      return;
+    }
+    onProgress();
   }
 
   String _initialVisibleText(String body) {
@@ -1185,6 +1342,18 @@ class _TypewriterMarkdownState extends State<_TypewriterMarkdown> {
       return '';
     }
     return body.substring(0, 1);
+  }
+
+  String? _revealedPrefixFor(String itemId, String body) {
+    final cached = _revealedTextCache[itemId];
+    if (cached == null || cached.isEmpty) {
+      return null;
+    }
+    if (!body.startsWith(cached)) {
+      _revealedTextCache.remove(itemId);
+      return null;
+    }
+    return cached;
   }
 }
 

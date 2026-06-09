@@ -12,6 +12,16 @@ const List<PromptOption> _permissionPromptOptions = <PromptOption>[
   PromptOption(value: 'deny', label: '拒绝'),
 ];
 
+class ChatTimelineDiagnostics {
+  int childIndexMapBuilds = 0;
+  int reviewAnchorFullScans = 0;
+
+  void reset() {
+    childIndexMapBuilds = 0;
+    reviewAnchorFullScans = 0;
+  }
+}
+
 class ChatTimeline extends StatefulWidget {
   const ChatTimeline({
     super.key,
@@ -44,6 +54,7 @@ class ChatTimeline extends StatefulWidget {
     this.onReviewDecision,
     this.onAcceptAll,
     this.onPromptSubmit,
+    this.diagnostics,
   });
 
   final List<TimelineItem> items;
@@ -75,6 +86,7 @@ class ChatTimeline extends StatefulWidget {
   final ValueChanged<String>? onReviewDecision;
   final VoidCallback? onAcceptAll;
   final ValueChanged<String>? onPromptSubmit;
+  final ChatTimelineDiagnostics? diagnostics;
 
   @override
   State<ChatTimeline> createState() => _ChatTimelineState();
@@ -82,17 +94,25 @@ class ChatTimeline extends StatefulWidget {
 
 class _ChatTimelineState extends State<ChatTimeline> {
   final ScrollController _scrollController = ScrollController();
-  int _lastCount = 0;
-  List<TimelineItem>? _anchorItemsRef;
+  int _lastItemCount = 0;
+  int _lastResolvedItemCount = 0;
+  String _lastBottomItemLayoutKey = '';
+  String _lastTimelineHistoryKey = '';
+  String _lastFirstItemId = '';
+  String _lastLastItemId = '';
+  bool _scrollToBottomScheduled = false;
   int _anchorItemsLength = -1;
   String _anchorDiffKey = '';
+  String _anchorItemsKey = '';
   int _cachedReviewAnchorIndex = -1;
+  String _childIndexCacheKey = '';
+  Map<String, int> _childIndexByKey = const <String, int>{};
 
   @override
   void initState() {
     super.initState();
     _scrollController.addListener(_handleScroll);
-    _lastCount = widget.items.length;
+    _rememberTimelineState(widget.items);
     if (widget.items.isNotEmpty) {
       _scrollToBottomAfterFrame();
     }
@@ -121,72 +141,130 @@ class _ChatTimelineState extends State<ChatTimeline> {
   @override
   void didUpdateWidget(covariant ChatTimeline oldWidget) {
     super.didUpdateWidget(oldWidget);
-    final currentCount = widget.items.length +
-        ((widget.pendingInteraction?.hasVisiblePrompt == true ||
-                widget.pendingPrompt?.hasVisiblePrompt == true)
-            ? 1
-            : 0);
-    final previousCount = oldWidget.items.length +
-        ((oldWidget.pendingInteraction?.hasVisiblePrompt == true ||
-                oldWidget.pendingPrompt?.hasVisiblePrompt == true)
-            ? 1
-            : 0);
-    final switchedHistory = _timelineHistoryKey(widget.items) !=
-        _timelineHistoryKey(oldWidget.items);
+    final previousItemCount = _lastItemCount;
+    final previousResolvedItemCount = _lastResolvedItemCount;
+    final previousBottomItemLayoutKey = _lastBottomItemLayoutKey;
+    final previousHistoryKey = _lastTimelineHistoryKey;
+    final previousFirstItemId = _lastFirstItemId;
+    final previousLastItemId = _lastLastItemId;
+    final currentHistoryKey = _timelineHistoryKey(widget.items);
+    final currentLayout = _currentResolvedTimelineLayout();
+    final switchedHistory = currentHistoryKey != previousHistoryKey;
     final switchedSession =
         widget.sessionId.trim() != oldWidget.sessionId.trim();
-    final addedOlderItems = widget.items.length > oldWidget.items.length &&
+    final addedOlderItems = widget.items.length > previousItemCount &&
         widget.items.isNotEmpty &&
-        oldWidget.items.isNotEmpty &&
-        widget.items.last.id == oldWidget.items.last.id &&
-        widget.items.first.id != oldWidget.items.first.id;
+        previousItemCount > 0 &&
+        widget.items.last.id == previousLastItemId &&
+        widget.items.first.id != previousFirstItemId;
     if (!addedOlderItems &&
-        (currentCount > previousCount ||
-            widget.items.length > _lastCount ||
+        (currentLayout.itemCount > previousResolvedItemCount ||
+            currentLayout.bottomItemLayoutKey != previousBottomItemLayoutKey ||
+            widget.items.length > previousItemCount ||
             switchedHistory ||
             switchedSession)) {
       _scrollToBottomAfterFrame();
     }
-    _lastCount = widget.items.length;
+    _rememberTimelineState(widget.items);
+  }
+
+  void _rememberTimelineState(List<TimelineItem> items) {
+    final currentLayout = _currentResolvedTimelineLayout();
+    _lastItemCount = items.length;
+    _lastResolvedItemCount = currentLayout.itemCount;
+    _lastBottomItemLayoutKey = currentLayout.bottomItemLayoutKey;
+    _lastTimelineHistoryKey = _timelineHistoryKey(items);
+    _lastFirstItemId = items.isEmpty ? '' : items.first.id;
+    _lastLastItemId = items.isEmpty ? '' : items.last.id;
+  }
+
+  _TimelineLayoutSnapshot _currentResolvedTimelineLayout() {
+    final visiblePrompt = _visiblePrompt();
+    final visiblePlanQuestion = _visiblePlanQuestion();
+    final reviewAnchorIndex = _cachedReviewAnchorIndexFor(widget.items);
+    final extraItems = _extraTimelineItems(
+      reviewAnchorIndex: reviewAnchorIndex,
+      visiblePrompt: visiblePrompt,
+      visiblePromptMessage: _visiblePromptMessage(visiblePrompt),
+      visiblePlanQuestion: visiblePlanQuestion,
+    );
+    final itemCount = _resolvedItemCount(
+      reviewAnchorIndex: reviewAnchorIndex,
+      extraItems: extraItems,
+    );
+    if (itemCount == 0) {
+      return const _TimelineLayoutSnapshot(
+        itemCount: 0,
+        bottomItemLayoutKey: '',
+      );
+    }
+    final bottomItem = _timelineItemAt(
+      itemCount - 1,
+      reviewAnchorIndex: reviewAnchorIndex,
+      extraItems: extraItems,
+    );
+    return _TimelineLayoutSnapshot(
+      itemCount: itemCount,
+      bottomItemLayoutKey: _timelineBottomLayoutFingerprint(
+        bottomItem,
+        visiblePrompt: visiblePrompt,
+        visiblePlanQuestion: visiblePlanQuestion,
+      ),
+    );
   }
 
   void _scrollToBottomAfterFrame() {
+    if (_scrollToBottomScheduled) {
+      return;
+    }
+    _scrollToBottomScheduled = true;
     WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) {
+        _scrollToBottomScheduled = false;
+        return;
+      }
       _jumpToBottom();
-      WidgetsBinding.instance.addPostFrameCallback((_) => _jumpToBottom());
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _scrollToBottomScheduled = false;
+        if (!mounted) {
+          return;
+        }
+        _jumpToBottom();
+      });
     });
   }
 
   void _jumpToBottom() {
+    if (!mounted) {
+      return;
+    }
     if (!_scrollController.hasClients) {
       return;
     }
     _scrollController.jumpTo(_scrollController.position.maxScrollExtent);
   }
 
+  void _handleAnimatedBodyProgress() {
+    if (!_isNearBottom()) {
+      return;
+    }
+    _scrollToBottomAfterFrame();
+  }
+
+  bool _isNearBottom() {
+    if (!_scrollController.hasClients) {
+      return true;
+    }
+    final position = _scrollController.position;
+    final distance = position.maxScrollExtent - position.pixels;
+    return distance <= 96;
+  }
+
   @override
   Widget build(BuildContext context) {
-    final promptCandidate = widget.shouldShowReviewChoices
-        ? null
-        : (widget.pendingInteraction?.hasVisiblePrompt == true
-            ? widget.pendingInteraction
-            : (widget.pendingPrompt?.hasVisiblePrompt == true
-                ? widget.pendingPrompt
-                : null));
-    final visiblePrompt = promptCandidate is PromptRequestEvent &&
-            _shouldHidePassiveReadyPrompt(promptCandidate)
-        ? null
-        : promptCandidate is InteractionRequestEvent &&
-                _shouldHidePassiveReadyInteraction(promptCandidate)
-            ? null
-            : promptCandidate;
-    final visiblePlanQuestion =
-        widget.shouldShowPlanChoices ? widget.pendingPlanQuestion : null;
-    final visiblePromptMessage = visiblePrompt is InteractionRequestEvent
-        ? visiblePrompt.message
-        : visiblePrompt is PromptRequestEvent
-            ? visiblePrompt.message
-            : '';
+    final visiblePrompt = _visiblePrompt();
+    final visiblePlanQuestion = _visiblePlanQuestion();
+    final visiblePromptMessage = _visiblePromptMessage(visiblePrompt);
     final reviewAnchorIndex = _cachedReviewAnchorIndexFor(widget.items);
     final extraItems = _extraTimelineItems(
       reviewAnchorIndex: reviewAnchorIndex,
@@ -211,56 +289,91 @@ class _ChatTimelineState extends State<ChatTimeline> {
           reviewAnchorIndex: reviewAnchorIndex,
           extraItems: extraItems,
         );
+        final collapseThinkingByDefault = _shouldCollapseThinkingByDefault(
+          index,
+          reviewAnchorIndex: reviewAnchorIndex,
+          extraItems: extraItems,
+          resolvedItemCount: resolvedItemCount,
+        );
+        final itemKey = ValueKey<String>(_timelineChildKey(item));
         if (item.kind == 'file_diff') {
-          return const SizedBox.shrink();
+          return KeyedSubtree(
+            key: itemKey,
+            child: const SizedBox.shrink(),
+          );
         }
         if (item.kind == 'review_summary') {
-          return _ReviewSummaryCard(
-            diff: item.context,
-            reviewGroup: widget.activeReviewGroup,
-            pendingDiffCount: widget.pendingDiffCount,
-            pendingReviewGroupCount: widget.pendingReviewGroupCount,
-            isManualReviewMode: widget.isManualReviewMode,
-            isAutoAcceptMode: widget.isAutoAcceptMode,
-            shouldShowReviewChoices: widget.shouldShowReviewChoices,
-            onOpenDiff: widget.onOpenDiff,
-            onReviewDecision: widget.onReviewDecision,
-            onAcceptAll: widget.onAcceptAll,
+          return KeyedSubtree(
+            key: itemKey,
+            child: _ReviewSummaryCard(
+              diff: item.context,
+              reviewGroup: widget.activeReviewGroup,
+              pendingDiffCount: widget.pendingDiffCount,
+              pendingReviewGroupCount: widget.pendingReviewGroupCount,
+              isManualReviewMode: widget.isManualReviewMode,
+              isAutoAcceptMode: widget.isAutoAcceptMode,
+              shouldShowReviewChoices: widget.shouldShowReviewChoices,
+              onOpenDiff: widget.onOpenDiff,
+              onReviewDecision: widget.onReviewDecision,
+              onAcceptAll: widget.onAcceptAll,
+            ),
           );
         }
         if ((item.kind == 'prompt_request' ||
                 item.kind == 'interaction_request') &&
             visiblePrompt != null) {
-          return visiblePrompt is InteractionRequestEvent
-              ? _InteractionRequestCard(
-                  interaction: visiblePrompt,
-                  onSubmit: widget.onPromptSubmit,
-                )
-              : _PromptRequestCard(
-                  prompt: visiblePrompt as PromptRequestEvent,
-                  onSubmit: widget.onPromptSubmit,
-                );
-        }
-        if (item.kind == 'plan_request' && visiblePlanQuestion != null) {
-          return _PlanQuestionCard(
-            question: visiblePlanQuestion,
-            progressLabel: widget.pendingPlanProgressLabel,
-            onSubmit: widget.onPromptSubmit,
+          return KeyedSubtree(
+            key: itemKey,
+            child: visiblePrompt is InteractionRequestEvent
+                ? _InteractionRequestCard(
+                    interaction: visiblePrompt,
+                    onSubmit: widget.onPromptSubmit,
+                  )
+                : _PromptRequestCard(
+                    prompt: visiblePrompt as PromptRequestEvent,
+                    onSubmit: widget.onPromptSubmit,
+                  ),
           );
         }
-        return EventCard(
-          item: item,
-          mediaPreviewStates: widget.mediaPreviewStates,
-          onOpenAttachment: widget.onOpenAttachment,
-          onRequestMediaPreview: widget.onRequestMediaPreview,
-          onTap: () {
-            if (item.kind == 'runtime_info_result') {
-              widget.onOpenRuntimeInfo?.call();
-            } else if (item.kind == 'fs_read_result') {
-              widget.onOpenFile?.call();
-            }
-          },
+        if (item.kind == 'plan_request' && visiblePlanQuestion != null) {
+          return KeyedSubtree(
+            key: itemKey,
+            child: _PlanQuestionCard(
+              question: visiblePlanQuestion,
+              progressLabel: widget.pendingPlanProgressLabel,
+              onSubmit: widget.onPromptSubmit,
+            ),
+          );
+        }
+        return KeyedSubtree(
+          key: itemKey,
+          child: EventCard(
+            item: item,
+            collapseThinkingByDefault: collapseThinkingByDefault,
+            mediaPreviewStates: widget.mediaPreviewStates,
+            onOpenAttachment: widget.onOpenAttachment,
+            onRequestMediaPreview: widget.onRequestMediaPreview,
+            onAnimatedBodyProgress: _handleAnimatedBodyProgress,
+            onTap: () {
+              if (item.kind == 'runtime_info_result') {
+                widget.onOpenRuntimeInfo?.call();
+              } else if (item.kind == 'fs_read_result') {
+                widget.onOpenFile?.call();
+              }
+            },
+          ),
         );
+      },
+      findChildIndexCallback: (key) {
+        if (key is! ValueKey<String>) {
+          return null;
+        }
+        final itemIndex = _timelineChildIndexForKey(
+          key.value,
+          reviewAnchorIndex: reviewAnchorIndex,
+          extraItems: extraItems,
+        );
+        return itemIndex == null ? null : itemIndex * 2;
       },
       separatorBuilder: (_, __) => const SizedBox(height: 12),
       itemCount: resolvedItemCount,
@@ -307,6 +420,39 @@ class _ChatTimelineState extends State<ChatTimeline> {
     return items;
   }
 
+  AppEvent? _visiblePrompt() {
+    final promptCandidate = widget.shouldShowReviewChoices
+        ? null
+        : (widget.pendingInteraction?.hasVisiblePrompt == true
+            ? widget.pendingInteraction
+            : (widget.pendingPrompt?.hasVisiblePrompt == true
+                ? widget.pendingPrompt
+                : null));
+    if (promptCandidate is PromptRequestEvent &&
+        _shouldHidePassiveReadyPrompt(promptCandidate)) {
+      return null;
+    }
+    if (promptCandidate is InteractionRequestEvent &&
+        _shouldHidePassiveReadyInteraction(promptCandidate)) {
+      return null;
+    }
+    return promptCandidate;
+  }
+
+  PlanQuestion? _visiblePlanQuestion() {
+    return widget.shouldShowPlanChoices ? widget.pendingPlanQuestion : null;
+  }
+
+  String _visiblePromptMessage(AppEvent? visiblePrompt) {
+    if (visiblePrompt is InteractionRequestEvent) {
+      return visiblePrompt.message;
+    }
+    if (visiblePrompt is PromptRequestEvent) {
+      return visiblePrompt.message;
+    }
+    return '';
+  }
+
   int _resolvedItemCount({
     required int reviewAnchorIndex,
     required List<TimelineItem> extraItems,
@@ -338,6 +484,39 @@ class _ChatTimelineState extends State<ChatTimeline> {
       return widget.items[index];
     }
     return extraItems[index - widget.items.length];
+  }
+
+  bool _shouldCollapseThinkingByDefault(
+    int index, {
+    required int reviewAnchorIndex,
+    required List<TimelineItem> extraItems,
+    required int resolvedItemCount,
+  }) {
+    final item = _timelineItemAt(
+      index,
+      reviewAnchorIndex: reviewAnchorIndex,
+      extraItems: extraItems,
+    );
+    if (item.kind != 'thinking') {
+      return false;
+    }
+    for (var nextIndex = index + 1;
+        nextIndex < resolvedItemCount;
+        nextIndex++) {
+      final next = _timelineItemAt(
+        nextIndex,
+        reviewAnchorIndex: reviewAnchorIndex,
+        extraItems: extraItems,
+      );
+      if (_isVisibleAssistantResult(next)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool _isVisibleAssistantResult(TimelineItem item) {
+    return item.kind == 'markdown' && item.body.trim().isNotEmpty;
   }
 
   TimelineItem _reviewSummaryItem(TimelineItem? anchor) {
@@ -385,19 +564,41 @@ class _ChatTimelineState extends State<ChatTimeline> {
 
   int _cachedReviewAnchorIndexFor(List<TimelineItem> items) {
     final activeDiffKey = _diffKey(widget.activeReviewDiff);
-    if (identical(_anchorItemsRef, items) &&
-        _anchorItemsLength == items.length &&
-        _anchorDiffKey == activeDiffKey) {
+    if (activeDiffKey.isEmpty) {
+      _anchorItemsLength = items.length;
+      _anchorItemsKey = '';
+      _anchorDiffKey = '';
+      _cachedReviewAnchorIndex = -1;
+      return -1;
+    }
+    final itemsKey = _reviewAnchorItemsKey(items);
+    if (_anchorItemsLength == items.length &&
+        _anchorItemsKey == itemsKey &&
+        _anchorDiffKey == activeDiffKey &&
+        _cachedReviewAnchorStillMatches(items)) {
       return _cachedReviewAnchorIndex;
     }
-    _anchorItemsRef = items;
     _anchorItemsLength = items.length;
+    _anchorItemsKey = itemsKey;
     _anchorDiffKey = activeDiffKey;
     _cachedReviewAnchorIndex = _reviewAnchorIndex(items);
     return _cachedReviewAnchorIndex;
   }
 
+  String _reviewAnchorItemsKey(List<TimelineItem> items) {
+    if (items.isEmpty) {
+      return '0';
+    }
+    return [
+      items.length.toString(),
+      _timelineChildKey(items.first),
+      _timelineChildKey(items.last),
+      _timelineLayoutFingerprint(items.last),
+    ].join('\n');
+  }
+
   int _reviewAnchorIndex(List<TimelineItem> items) {
+    widget.diagnostics?.reviewAnchorFullScans++;
     if (widget.activeReviewDiff == null) {
       return -1;
     }
@@ -415,6 +616,22 @@ class _ChatTimelineState extends State<ChatTimeline> {
       }
     }
     return items.isEmpty ? -1 : items.length - 1;
+  }
+
+  bool _cachedReviewAnchorStillMatches(List<TimelineItem> items) {
+    if (_cachedReviewAnchorIndex == -1) {
+      return true;
+    }
+    if (_cachedReviewAnchorIndex < 0 ||
+        _cachedReviewAnchorIndex >= items.length) {
+      return false;
+    }
+    final item = items[_cachedReviewAnchorIndex];
+    if (item.kind != 'file_diff' || item.context == null) {
+      return false;
+    }
+    final activeDiff = widget.activeReviewDiff;
+    return activeDiff != null && _sameDiff(item.context!, activeDiff);
   }
 
   bool _sameDiff(HistoryContext left, HistoryContext right) {
@@ -438,7 +655,248 @@ class _ChatTimelineState extends State<ChatTimeline> {
     if (items.isEmpty) {
       return '';
     }
-    return '${items.first.id}\n${items.last.id}\n${items.length}';
+    return '${items.first.id}\n${_timelineLayoutFingerprint(items.last)}\n${items.length}';
+  }
+
+  String _timelineLayoutFingerprint(TimelineItem item) {
+    return [
+      item.id,
+      item.kind,
+      item.title.hashCode,
+      item.body.length,
+      item.body.hashCode,
+      item.status.hashCode,
+      item.trigger.hashCode,
+      item.attachments.length,
+      item.codexSteps.length,
+    ].join('\n');
+  }
+
+  String _timelineBottomLayoutFingerprint(
+    TimelineItem item, {
+    required AppEvent? visiblePrompt,
+    required PlanQuestion? visiblePlanQuestion,
+  }) {
+    if (item.kind == 'prompt_request' && visiblePrompt is PromptRequestEvent) {
+      return [
+        _timelineLayoutFingerprint(item),
+        visiblePrompt.blockingKind,
+        visiblePrompt.isPermission,
+        _promptOptionsLayoutKey(
+          visiblePrompt.isPermission
+              ? _permissionPromptOptions
+              : visiblePrompt.options,
+        ),
+      ].join('\n');
+    }
+    if (item.kind == 'interaction_request' &&
+        visiblePrompt is InteractionRequestEvent) {
+      return [
+        _timelineLayoutFingerprint(item),
+        visiblePrompt.kind,
+        visiblePrompt.title,
+        visiblePrompt.blockingKind,
+        visiblePrompt.isPermission,
+        _interactionActionsLayoutKey(
+          visiblePrompt.isPermission
+              ? const <InteractionAction>[]
+              : visiblePrompt.actions,
+        ),
+        _promptOptionsLayoutKey(
+          visiblePrompt.isPermission
+              ? _permissionPromptOptions
+              : visiblePrompt.options,
+        ),
+      ].join('\n');
+    }
+    if (item.kind == 'plan_request' && visiblePlanQuestion != null) {
+      return [
+        _timelineLayoutFingerprint(item),
+        visiblePlanQuestion.id,
+        visiblePlanQuestion.title,
+        visiblePlanQuestion.message,
+        widget.pendingPlanProgressLabel,
+        _promptOptionsLayoutKey(visiblePlanQuestion.options),
+      ].join('\n');
+    }
+    if (item.kind == 'review_summary') {
+      return [
+        _timelineLayoutFingerprint(item),
+        widget.pendingReviewGroupCount,
+        widget.isManualReviewMode,
+        widget.isAutoAcceptMode,
+        widget.shouldShowReviewChoices,
+        _reviewGroupLayoutKey(widget.activeReviewGroup),
+      ].join('\n');
+    }
+    return _timelineLayoutFingerprint(item);
+  }
+
+  String _promptOptionsLayoutKey(List<PromptOption> options) {
+    return [
+      options.length,
+      for (final option in options) '${option.value}|${option.displayText}',
+    ].join('\n');
+  }
+
+  String _interactionActionsLayoutKey(List<InteractionAction> actions) {
+    return [
+      actions.length,
+      for (final action in actions)
+        [
+          action.id,
+          action.displayLabel,
+          action.variant,
+          action.value,
+          action.decision,
+          action.needsInput,
+          action.destructive,
+        ].join('|'),
+    ].join('\n');
+  }
+
+  String _reviewGroupLayoutKey(ReviewGroup? group) {
+    if (group == null) {
+      return '';
+    }
+    return [
+      group.id,
+      group.title,
+      group.pendingCount,
+      group.files.length,
+      for (final file in group.files)
+        [
+          file.id,
+          file.path,
+          file.title,
+          file.pendingReview,
+          file.reviewStatus,
+        ].join('|'),
+    ].join('\n');
+  }
+
+  String _timelineChildKey(TimelineItem item) {
+    return [
+      item.kind,
+      item.id,
+    ].join(':');
+  }
+
+  int? _timelineChildIndexForKey(
+    String childKey, {
+    required int reviewAnchorIndex,
+    required List<TimelineItem> extraItems,
+  }) {
+    final indexes = _timelineChildIndexByKey(
+      reviewAnchorIndex: reviewAnchorIndex,
+      extraItems: extraItems,
+    );
+    final cachedIndex = indexes[childKey];
+    if (cachedIndex != null &&
+        _timelineIndexMatchesChildKey(
+          cachedIndex,
+          childKey,
+          reviewAnchorIndex: reviewAnchorIndex,
+          extraItems: extraItems,
+        )) {
+      return cachedIndex;
+    }
+    final rebuilt = _rebuildTimelineChildIndexByKey(
+      reviewAnchorIndex: reviewAnchorIndex,
+      extraItems: extraItems,
+    );
+    final rebuiltIndex = rebuilt[childKey];
+    if (rebuiltIndex != null &&
+        _timelineIndexMatchesChildKey(
+          rebuiltIndex,
+          childKey,
+          reviewAnchorIndex: reviewAnchorIndex,
+          extraItems: extraItems,
+        )) {
+      return rebuiltIndex;
+    }
+    return null;
+  }
+
+  Map<String, int> _timelineChildIndexByKey({
+    required int reviewAnchorIndex,
+    required List<TimelineItem> extraItems,
+  }) {
+    final cacheKey = _timelineChildIndexCacheKey(
+      reviewAnchorIndex: reviewAnchorIndex,
+      extraItems: extraItems,
+    );
+    if (_childIndexCacheKey == cacheKey) {
+      return _childIndexByKey;
+    }
+    return _rebuildTimelineChildIndexByKey(
+      reviewAnchorIndex: reviewAnchorIndex,
+      extraItems: extraItems,
+      cacheKey: cacheKey,
+    );
+  }
+
+  Map<String, int> _rebuildTimelineChildIndexByKey({
+    required int reviewAnchorIndex,
+    required List<TimelineItem> extraItems,
+    String? cacheKey,
+  }) {
+    final resolvedItemCount = _resolvedItemCount(
+      reviewAnchorIndex: reviewAnchorIndex,
+      extraItems: extraItems,
+    );
+    final indexes = <String, int>{};
+    for (var index = 0; index < resolvedItemCount; index++) {
+      final item = _timelineItemAt(
+        index,
+        reviewAnchorIndex: reviewAnchorIndex,
+        extraItems: extraItems,
+      );
+      indexes[_timelineChildKey(item)] = index;
+    }
+    widget.diagnostics?.childIndexMapBuilds++;
+    _childIndexCacheKey = cacheKey ??
+        _timelineChildIndexCacheKey(
+          reviewAnchorIndex: reviewAnchorIndex,
+          extraItems: extraItems,
+        );
+    _childIndexByKey = indexes;
+    return indexes;
+  }
+
+  bool _timelineIndexMatchesChildKey(
+    int index,
+    String childKey, {
+    required int reviewAnchorIndex,
+    required List<TimelineItem> extraItems,
+  }) {
+    final resolvedItemCount = _resolvedItemCount(
+      reviewAnchorIndex: reviewAnchorIndex,
+      extraItems: extraItems,
+    );
+    if (index < 0 || index >= resolvedItemCount) {
+      return false;
+    }
+    final item = _timelineItemAt(
+      index,
+      reviewAnchorIndex: reviewAnchorIndex,
+      extraItems: extraItems,
+    );
+    return _timelineChildKey(item) == childKey;
+  }
+
+  String _timelineChildIndexCacheKey({
+    required int reviewAnchorIndex,
+    required List<TimelineItem> extraItems,
+  }) {
+    return [
+      widget.items.length,
+      widget.items.isEmpty ? '' : _timelineChildKey(widget.items.first),
+      widget.items.isEmpty ? '' : _timelineChildKey(widget.items.last),
+      reviewAnchorIndex,
+      extraItems.length,
+      for (final item in extraItems) _timelineChildKey(item),
+    ].join('\n');
   }
 
   bool _shouldHidePassiveReadyPrompt(PromptRequestEvent prompt) {
@@ -500,6 +958,16 @@ class _ChatTimelineState extends State<ChatTimeline> {
   String _promptRequestTitle(PromptRequestEvent prompt) {
     return prompt.isPermission ? '授权确认' : '等待输入';
   }
+}
+
+class _TimelineLayoutSnapshot {
+  const _TimelineLayoutSnapshot({
+    required this.itemCount,
+    required this.bottomItemLayoutKey,
+  });
+
+  final int itemCount;
+  final String bottomItemLayoutKey;
 }
 
 class _InteractionRequestCard extends StatelessWidget {

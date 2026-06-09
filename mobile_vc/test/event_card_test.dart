@@ -31,6 +31,118 @@ void main() {
     expect(markdown.selectable, isFalse);
   });
 
+  testWidgets('markdown typewriter advances when same item body extends',
+      (tester) async {
+    final baseItem = TimelineItem(
+      id: 'stream-md-1',
+      kind: 'markdown',
+      timestamp: DateTime(2026, 4, 4, 12),
+      body: '正在生成回复。',
+    );
+    final expandedItem = baseItem.copyWith(
+      body: '正在生成回复。新增内容应该立即参与布局刷新。',
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: EventCard(item: baseItem),
+        ),
+      ),
+    );
+    await tester.pump(const Duration(milliseconds: 80));
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: EventCard(item: expandedItem),
+        ),
+      ),
+    );
+
+    final markdown = tester.widget<MarkdownBody>(find.byType(MarkdownBody));
+    expect(markdown.data, startsWith(baseItem.body));
+
+    await tester.pump(const Duration(milliseconds: 80));
+    final advanced = tester.widget<MarkdownBody>(find.byType(MarkdownBody));
+    expect(advanced.data.length, greaterThan(baseItem.body.length));
+  });
+
+  testWidgets('markdown typewriter drops stale cache when same id body changes',
+      (tester) async {
+    final baseItem = TimelineItem(
+      id: 'stream-md-cache',
+      kind: 'markdown',
+      timestamp: DateTime(2026, 4, 4, 12),
+      body: '第一段正在生成的回复内容。',
+    );
+    final replacementItem = baseItem.copyWith(
+      body: '完全不同的新回复内容。',
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: EventCard(item: baseItem),
+        ),
+      ),
+    );
+    await tester.pump(const Duration(milliseconds: 80));
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: EventCard(item: replacementItem),
+        ),
+      ),
+    );
+
+    final markdown = tester.widget<MarkdownBody>(find.byType(MarkdownBody));
+    expect(markdown.data, isNot(startsWith('第一段')));
+    expect(replacementItem.body, startsWith(markdown.data));
+  });
+
+  testWidgets('markdown typewriter batches progress callbacks for long replies',
+      (tester) async {
+    var progressCalls = 0;
+    final longBody = List<String>.generate(
+      80,
+      (index) => '第 $index 行 live assistant 输出需要减少 markdown 重建。',
+    ).join('\n');
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SingleChildScrollView(
+            child: EventCard(
+              item: TimelineItem(
+                id: 'stream-md-batched',
+                kind: 'markdown',
+                timestamp: DateTime(2026, 4, 4, 12),
+                body: longBody,
+              ),
+              onAnimatedBodyProgress: () => progressCalls++,
+            ),
+          ),
+        ),
+      ),
+    );
+
+    for (var i = 0; i < 5; i++) {
+      await tester.pump(const Duration(milliseconds: 16));
+    }
+
+    expect(progressCalls, lessThanOrEqualTo(2));
+    final callsAfterFirstChunk = progressCalls;
+    await tester.pump(const Duration(milliseconds: 16));
+    expect(progressCalls, lessThanOrEqualTo(callsAfterFirstChunk + 1));
+
+    await tester.pump(const Duration(seconds: 3));
+    final markdown = tester.widget<MarkdownBody>(find.byType(MarkdownBody));
+    expect(markdown.data, longBody);
+    expect(progressCalls, lessThan(80));
+  });
+
   testWidgets('compaction marker renders loading state', (tester) async {
     await tester.pumpWidget(
       MaterialApp(
@@ -142,6 +254,139 @@ void main() {
     expect(detail, contains('exit 0'));
     expect(find.text('工具调用 (1)'), findsOneWidget);
     expect(find.text('工具输出 (1)'), findsOneWidget);
+  });
+
+  testWidgets('thinking card collapses by default and expands on tap',
+      (tester) async {
+    const detail = 'DETAIL_SEGMENT_COLLAPSED_BY_DEFAULT';
+    const body = '第一段思考内容会比较长，用来确认折叠状态只显示预览。第二段内容应该在展开之后才可见。'
+        '\n\n$detail';
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: EventCard(
+            item: TimelineItem(
+              id: 'thinking-1',
+              kind: 'thinking',
+              timestamp: DateTime(2026, 4, 4, 12),
+              body: body,
+            ),
+            collapseThinkingByDefault: true,
+          ),
+        ),
+      ),
+    );
+
+    expect(find.text('思考过程'), findsOneWidget);
+    expect(find.textContaining(detail), findsNothing);
+    expect(find.byIcon(Icons.expand_more_rounded), findsOneWidget);
+
+    await tester.tap(find.byKey(const ValueKey('thinkingToggle')));
+    await tester.pumpAndSettle();
+
+    expect(find.textContaining(detail), findsOneWidget);
+    expect(find.byIcon(Icons.expand_less_rounded), findsOneWidget);
+  });
+
+  testWidgets('thinking card stays expanded when default collapse is false',
+      (tester) async {
+    const body = '这是仍在进行中的思考内容，结果出现前应该默认展开。';
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: EventCard(
+            item: TimelineItem(
+              id: 'thinking-expanded',
+              kind: 'thinking',
+              timestamp: DateTime(2026, 4, 4, 12),
+              body: body,
+            ),
+          ),
+        ),
+      ),
+    );
+
+    expect(find.text(body), findsOneWidget);
+    expect(find.byIcon(Icons.expand_less_rounded), findsOneWidget);
+  });
+
+  testWidgets('thinking card auto-collapses when default changes',
+      (tester) async {
+    const detail = 'DETAIL_SEGMENT_AUTO_COLLAPSE';
+    const body = '同一条思考内容在后续助手结果出现后应该自动折叠。'
+        '\n\n$detail';
+    final item = TimelineItem(
+      id: 'thinking-auto-collapse',
+      kind: 'thinking',
+      timestamp: DateTime(2026, 4, 4, 12),
+      body: body,
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: EventCard(item: item),
+        ),
+      ),
+    );
+
+    expect(find.textContaining(detail), findsOneWidget);
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: EventCard(
+            item: item,
+            collapseThinkingByDefault: true,
+          ),
+        ),
+      ),
+    );
+
+    expect(find.textContaining(detail), findsNothing);
+    expect(find.byIcon(Icons.expand_more_rounded), findsOneWidget);
+  });
+
+  testWidgets('thinking manual expansion survives rebuild for same item',
+      (tester) async {
+    const body = '用户手动展开后，即使同一条思考继续刷新，也不应该被默认折叠重新收起。';
+    final item = TimelineItem(
+      id: 'thinking-manual-toggle',
+      kind: 'thinking',
+      timestamp: DateTime(2026, 4, 4, 12),
+      body: body,
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: EventCard(
+            item: item,
+            collapseThinkingByDefault: true,
+          ),
+        ),
+      ),
+    );
+
+    await tester.tap(find.byKey(const ValueKey('thinkingToggle')));
+    await tester.pumpAndSettle();
+    expect(find.text(body), findsOneWidget);
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: EventCard(
+            item: item.copyWith(body: '$body\n新增摘要片段。'),
+            collapseThinkingByDefault: true,
+          ),
+        ),
+      ),
+    );
+
+    expect(find.textContaining('新增摘要片段'), findsOneWidget);
+    expect(find.byIcon(Icons.expand_less_rounded), findsOneWidget);
   });
 
   testWidgets('user message renders attachment metadata', (tester) async {

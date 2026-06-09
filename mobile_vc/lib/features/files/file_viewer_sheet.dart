@@ -177,19 +177,7 @@ class _FileViewerSheetState extends State<FileViewerSheet> {
     final fileType = result == null ? null : fileTypeInfoFor(result.title);
     final diff = widget.reviewDiff;
     final activeGroup = _activeGroup();
-    final groupDiffs = _groupDiffs(activeGroup);
-    final modeLabel = widget.isDiffMode ? '待审核改动' : '文件内容';
     final bottomInset = MediaQuery.of(context).viewInsets.bottom;
-    final multiPending = groupDiffs.length > 1;
-    final multiGroup = widget.reviewGroups.length > 1;
-    final prompt = widget.pendingPrompt;
-    final interaction = widget.pendingInteraction;
-    final showPermissionBar =
-        widget.shouldShowPermissionChoices && !widget.shouldShowReviewChoices;
-    final showMarkdownToggle = _isMarkdown(result) && !widget.isDiffMode;
-    final showEditControls = result?.isText == true &&
-        !widget.isDiffMode &&
-        result?.path.isNotEmpty == true;
     return SafeArea(
       top: false,
       child: AnimatedPadding(
@@ -289,6 +277,44 @@ class _FileViewerSheetState extends State<FileViewerSheet> {
                           : _buildFileContent(context, result),
             ),
             const SizedBox(height: 8),
+            _buildActionPanel(
+              context,
+              maxHeight: MediaQuery.sizeOf(context).height * 0.58,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildActionPanel(
+    BuildContext context, {
+    required double maxHeight,
+  }) {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    final result = widget.file;
+    final fileType = result == null ? null : fileTypeInfoFor(result.title);
+    final diff = widget.reviewDiff;
+    final activeGroup = _activeGroup();
+    final groupDiffs = _groupDiffs(activeGroup);
+    final modeLabel = widget.isDiffMode ? '待审核改动' : '文件内容';
+    final multiPending = groupDiffs.length > 1;
+    final multiGroup = widget.reviewGroups.length > 1;
+    final prompt = widget.pendingPrompt;
+    final interaction = widget.pendingInteraction;
+    final showPermissionBar =
+        widget.shouldShowPermissionChoices && !widget.shouldShowReviewChoices;
+    final showMarkdownToggle = _isMarkdown(result) && !widget.isDiffMode;
+    final showEditControls = result?.isText == true &&
+        !widget.isDiffMode &&
+        result?.path.isNotEmpty == true;
+    return ConstrainedBox(
+      constraints: BoxConstraints(maxHeight: maxHeight.clamp(180, 420)),
+      child: SingleChildScrollView(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
             SingleChildScrollView(
               scrollDirection: Axis.horizontal,
               child: Row(

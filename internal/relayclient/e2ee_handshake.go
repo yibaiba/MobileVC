@@ -179,6 +179,17 @@ func (h *agentE2EEHandshakeHandler) trafficKeys(handshakeID string) (*e2ee.Traff
 	return completed.keys, ok
 }
 
+func (h *agentE2EEHandshakeHandler) resetHandshakes() {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.pending = map[string]pendingHandshake{}
+	h.completed = map[string]completedHandshake{}
+}
+
 func (h *agentE2EEHandshakeHandler) completedDeviceID(handshakeID string) string {
 	if h == nil {
 		return ""
