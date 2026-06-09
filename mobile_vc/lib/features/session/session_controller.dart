@@ -7873,6 +7873,10 @@ class SessionController extends ChangeNotifier {
       entries.clear();
       return;
     }
+    if (_shouldSuppressIsolatedCodexNativeCompletionGroup(entries)) {
+      entries.clear();
+      return;
+    }
     final accepted = _appendTimelineItem(item, emitNotifications: false);
     if (accepted) {
       _rememberCodexNativeOperationalGroupEntries(
@@ -8006,6 +8010,9 @@ class SessionController extends ChangeNotifier {
     if (!hasSeenEntry && !_isTrailingCodexNativeCompletionGroup(entries)) {
       return -1;
     }
+    final canCrossVisibleContent = _isTrailingCodexNativeCompletionGroup(
+      entries,
+    );
     var inspected = 0;
     for (var index = _timeline.length - 1; index >= 0; index--) {
       if (inspected >= 20) {
@@ -8016,7 +8023,7 @@ class SessionController extends ChangeNotifier {
       if (item.kind == 'codex_tool_group') {
         return index;
       }
-      if (_hasVisibleTimelineContent(item)) {
+      if (_hasVisibleTimelineContent(item) && !canCrossVisibleContent) {
         return -1;
       }
     }
@@ -8045,6 +8052,35 @@ class SessionController extends ChangeNotifier {
           return false;
       }
     });
+  }
+
+  bool _shouldSuppressIsolatedCodexNativeCompletionGroup(
+    List<HistoryLogEntry> entries,
+  ) {
+    if (!_isTrailingCodexNativeCompletionGroup(entries)) {
+      return false;
+    }
+    final latestEntryAt = _latestHistoryLogEntryTimestamp(entries);
+    if (latestEntryAt == null) {
+      return false;
+    }
+    return _timeline.any((item) =>
+        _isAssistantReplyTimelineItem(item) &&
+        item.timestamp.isAfter(latestEntryAt));
+  }
+
+  DateTime? _latestHistoryLogEntryTimestamp(List<HistoryLogEntry> entries) {
+    DateTime? latest;
+    for (final entry in entries) {
+      final timestamp = _historyLogEntryTimestamp(entry);
+      if (timestamp == null) {
+        continue;
+      }
+      if (latest == null || timestamp.isAfter(latest)) {
+        latest = timestamp;
+      }
+    }
+    return latest;
   }
 
   String _codexNativeOperationalSummary(List<HistoryLogEntry> entries) {
@@ -8719,6 +8755,27 @@ class SessionController extends ChangeNotifier {
     _timelineItemIds.add(item.id);
   }
 
+  void _insertTimelineItem(TimelineItem item) {
+    final index = _timelineInsertionIndex(item);
+    _timeline.insert(index, item);
+    _timelineItemIds.add(item.id);
+  }
+
+  int _timelineInsertionIndex(TimelineItem item) {
+    if (item.animateBody || _timeline.isEmpty) {
+      return _timeline.length;
+    }
+    if (!_timeline.last.timestamp.isAfter(item.timestamp)) {
+      return _timeline.length;
+    }
+    for (var index = _timeline.length - 1; index >= 0; index--) {
+      if (!_timeline[index].timestamp.isAfter(item.timestamp)) {
+        return index + 1;
+      }
+    }
+    return 0;
+  }
+
   bool _appendTimelineItem(
     TimelineItem item, {
     bool emitNotifications = true,
@@ -8736,6 +8793,9 @@ class SessionController extends ChangeNotifier {
       return true;
     }
     if (_isLiveAssistantReplayTailOfRestoredItem(item)) {
+      return false;
+    }
+    if (_isOlderRestoredAssistantReplayOfNewerItem(item)) {
       return false;
     }
     if (_reconcileUserAttachmentTimelineItem(item)) {
@@ -8780,8 +8840,7 @@ class SessionController extends ChangeNotifier {
       }
       return true;
     }
-    _timeline.add(item);
-    _timelineItemIds.add(item.id);
+    _insertTimelineItem(item);
     if (emitNotifications) {
       _emitTimelineNotification(item);
     }
@@ -8860,6 +8919,34 @@ class SessionController extends ChangeNotifier {
         restoredBody,
         liveBody,
       )) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool _isOlderRestoredAssistantReplayOfNewerItem(TimelineItem item) {
+    if (item.animateBody || !_isAssistantReplyTimelineItem(item)) {
+      return false;
+    }
+    final itemBody = _normalizeAssistantReplyForDedupe(item.body);
+    if (itemBody.isEmpty) {
+      return false;
+    }
+    var inspected = 0;
+    for (var index = _timeline.length - 1; index >= 0; index--) {
+      if (inspected >= 20) {
+        break;
+      }
+      inspected += 1;
+      final previous = _timeline[index];
+      if (!_isAssistantReplyTimelineItem(previous)) {
+        continue;
+      }
+      if (!previous.timestamp.isAfter(item.timestamp)) {
+        continue;
+      }
+      if (_hasSameDurableAssistantSource(previous, item)) {
         return true;
       }
     }
