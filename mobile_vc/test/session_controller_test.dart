@@ -13659,6 +13659,215 @@ Flutter 打出来的 app-release.apk 在 mobile_vc/build/ 下，是 ignored 构�
       expect(group.body, contains('- **functions.exec_command**'));
     });
 
+    test('session_delta 补完成状态时更新 Codex 原生操作组而不是重复追加', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      const started = HistoryLogEntry(
+        kind: 'system',
+        message: 'task started',
+        timestamp: '2026-05-27T05:21:01Z',
+        context: HistoryContext(
+          source: 'codex-native',
+          type: 'codex_task',
+          status: 'started',
+        ),
+      );
+      const toolCall = HistoryLogEntry(
+        kind: 'system',
+        message: '调用 shell',
+        timestamp: '2026-05-27T05:21:02Z',
+        context: HistoryContext(
+          source: 'codex-native',
+          type: 'codex_tool_call',
+          tool: 'functions.exec_command',
+        ),
+      );
+      const completed = HistoryLogEntry(
+        kind: 'system',
+        message: 'task completed',
+        timestamp: '2026-05-27T05:21:03Z',
+        context: HistoryContext(
+          source: 'codex-native',
+          type: 'codex_task',
+          status: 'completed',
+        ),
+      );
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        logEntries: const [started, toolCall],
+        latest: const SessionDeltaKnown(eventCursor: 2, logEntryCount: 2),
+        resumeRuntimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+      ));
+      await _flushEvents();
+
+      expect(
+        controller.timeline.where((item) => item.kind == 'codex_tool_group'),
+        hasLength(1),
+      );
+
+      service.emit(SessionDeltaEvent(
+        timestamp: _timestamp.add(const Duration(seconds: 1)),
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'session_delta'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        base: const SessionDeltaKnown(eventCursor: 2, logEntryCount: 2),
+        latest: const SessionDeltaKnown(eventCursor: 3, logEntryCount: 3),
+        appendLogEntries: const [started, toolCall, completed],
+        resumeRuntimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+      ));
+      await _flushEvents();
+
+      final groups = controller.timeline
+          .where((item) => item.kind == 'codex_tool_group')
+          .toList(growable: false);
+      expect(groups, hasLength(1));
+      expect(groups.single.codexSteps, contains('Codex 任务已完成'));
+      expect(groups.single.body, contains('## 工具调用 (1)'));
+      expect(groups.single.body, contains('## 任务状态 (2)'));
+      expect('## 工具调用'.allMatches(groups.single.body), hasLength(1));
+      expect(
+        controller.timeline.map((item) => item.kind).toList(),
+        ['codex_tool_group'],
+      );
+    });
+
+    test('session_delta 只补 completed 时保留已有 Codex 原生操作细节', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      const toolCall = HistoryLogEntry(
+        kind: 'system',
+        message: '调用 shell',
+        timestamp: '2026-05-27T05:22:02Z',
+        context: HistoryContext(
+          source: 'codex-native',
+          type: 'codex_tool_call',
+          tool: 'functions.exec_command',
+          command: '{"cmd":"sed -n \'1,20p\' lib/main.dart"}',
+        ),
+      );
+      const completed = HistoryLogEntry(
+        kind: 'system',
+        message: 'task completed',
+        timestamp: '2026-05-27T05:22:03Z',
+        context: HistoryContext(
+          source: 'codex-native',
+          type: 'codex_task',
+          status: 'completed',
+        ),
+      );
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        logEntries: const [toolCall],
+        latest: const SessionDeltaKnown(eventCursor: 1, logEntryCount: 1),
+        resumeRuntimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+      ));
+      await _flushEvents();
+
+      service.emit(SessionDeltaEvent(
+        timestamp: _timestamp.add(const Duration(seconds: 1)),
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'session_delta'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        base: const SessionDeltaKnown(eventCursor: 1, logEntryCount: 1),
+        latest: const SessionDeltaKnown(eventCursor: 2, logEntryCount: 2),
+        appendLogEntries: const [completed],
+        resumeRuntimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+      ));
+      await _flushEvents();
+
+      final groups = controller.timeline
+          .where((item) => item.kind == 'codex_tool_group')
+          .toList(growable: false);
+      expect(groups, hasLength(1));
+      expect(groups.single.codexSteps, contains('正在读取 main.dart'));
+      expect(groups.single.codexSteps, contains('Codex 任务已完成'));
+      expect(groups.single.body, contains('## 工具调用 (1)'));
+      expect(groups.single.body, contains('## 任务状态 (1)'));
+    });
+
+    test('session_delta 新一轮 Codex 原生工具调用不会并入上一组', () async {
+      final service = _FakeMobileVcWsService();
+      final controller = SessionController(service: service);
+      await controller.initialize();
+      addTearDown(controller.disposeController);
+
+      const firstToolCall = HistoryLogEntry(
+        kind: 'system',
+        message: 'read first file',
+        timestamp: '2026-05-27T05:23:01Z',
+        context: HistoryContext(
+          source: 'codex-native',
+          type: 'codex_tool_call',
+          tool: 'functions.exec_command',
+          command: '{"cmd":"cat lib/first.dart"}',
+        ),
+      );
+      const secondToolCall = HistoryLogEntry(
+        kind: 'system',
+        message: 'read second file',
+        timestamp: '2026-05-27T05:24:01Z',
+        context: HistoryContext(
+          source: 'codex-native',
+          type: 'codex_tool_call',
+          tool: 'functions.exec_command',
+          command: '{"cmd":"cat lib/second.dart"}',
+        ),
+      );
+
+      await controller.connect();
+      service.emit(SessionHistoryEvent(
+        timestamp: _timestamp,
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'session_history'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        logEntries: const [firstToolCall],
+        latest: const SessionDeltaKnown(eventCursor: 1, logEntryCount: 1),
+        resumeRuntimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+      ));
+      await _flushEvents();
+
+      service.emit(SessionDeltaEvent(
+        timestamp: _timestamp.add(const Duration(seconds: 1)),
+        sessionId: 'session-current',
+        runtimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+        raw: const {'type': 'session_delta'},
+        summary: const SessionSummary(id: 'session-current', title: '当前会话'),
+        base: const SessionDeltaKnown(eventCursor: 1, logEntryCount: 1),
+        latest: const SessionDeltaKnown(eventCursor: 2, logEntryCount: 2),
+        appendLogEntries: const [secondToolCall],
+        resumeRuntimeMeta: const RuntimeMeta(command: 'codex', engine: 'codex'),
+      ));
+      await _flushEvents();
+
+      final groups = controller.timeline
+          .where((item) => item.kind == 'codex_tool_group')
+          .toList(growable: false);
+      expect(groups, hasLength(2));
+      expect(groups.first.codexSteps, contains('正在读取 first.dart'));
+      expect(groups.last.codexSteps, contains('正在读取 second.dart'));
+    });
+
     test('普通运行时事件游标不会提前标记 session_delta 已追上', () async {
       final service = _FakeMobileVcWsService();
       final controller = SessionController(service: service);

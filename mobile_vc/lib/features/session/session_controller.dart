@@ -415,6 +415,9 @@ class SessionController extends ChangeNotifier {
   final Set<String> _requestedMediaPreviewKeys = <String>{};
   final Map<String, Set<String>> _visibleHistoryLogEntryKeys =
       <String, Set<String>>{};
+  final Map<String, Map<String, List<HistoryLogEntry>>>
+      _codexOperationalGroupEntriesBySession =
+      <String, Map<String, List<HistoryLogEntry>>>{};
   final Map<String, int> _historyLogEntryStartBySession = <String, int>{};
   final Map<String, int> _historyLogEntryTotalBySession = <String, int>{};
   final Set<String> _historyPageRequestsInFlight = <String>{};
@@ -7862,8 +7865,21 @@ class SessionController extends ChangeNotifier {
       return;
     }
     final item = _codexNativeOperationalTimelineItem(entries, resumeMeta);
+    if (_reconcileCodexNativeOperationalGroup(
+      sessionId,
+      entries,
+      item,
+    )) {
+      entries.clear();
+      return;
+    }
     final accepted = _appendTimelineItem(item, emitNotifications: false);
     if (accepted) {
+      _rememberCodexNativeOperationalGroupEntries(
+        sessionId,
+        item.id,
+        entries,
+      );
       for (final entry in entries) {
         _rememberVisibleHistoryLogEntry(sessionId, entry);
       }
@@ -7894,6 +7910,141 @@ class SessionController extends ChangeNotifier {
       codexSteps: visibleSteps,
       animateBody: false,
     );
+  }
+
+  bool _reconcileCodexNativeOperationalGroup(
+    String sessionId,
+    List<HistoryLogEntry> entries,
+    TimelineItem next,
+  ) {
+    final existingIndex = _findCodexNativeOperationalGroupIndex(
+      sessionId,
+      entries,
+    );
+    if (existingIndex == -1) {
+      return false;
+    }
+    final previous = _timeline[existingIndex];
+    final mergedEntries = _mergedCodexNativeOperationalEntries(
+      sessionId,
+      previous.id,
+      entries,
+    );
+    final merged = _codexNativeOperationalTimelineItem(
+      mergedEntries,
+      previous.meta.merge(next.meta),
+    );
+    _replaceTimelineItemAt(
+      existingIndex,
+      merged.copyWith(
+        id: previous.id,
+        meta: previous.meta.merge(next.meta),
+        attachments: _mergeTimelineAttachments(
+          previous.attachments,
+          next.attachments,
+        ),
+        animateBody: false,
+      ),
+    );
+    _rememberCodexNativeOperationalGroupEntries(
+      sessionId,
+      previous.id,
+      mergedEntries,
+    );
+    for (final entry in entries) {
+      _rememberVisibleHistoryLogEntry(sessionId, entry);
+    }
+    return true;
+  }
+
+  List<HistoryLogEntry> _mergedCodexNativeOperationalEntries(
+    String sessionId,
+    String groupId,
+    List<HistoryLogEntry> entries,
+  ) {
+    final existing = _codexOperationalGroupEntriesBySession[sessionId.trim()]
+            ?[groupId] ??
+        const <HistoryLogEntry>[];
+    final merged = <HistoryLogEntry>[];
+    final seen = <String>{};
+    for (final entry in [...existing, ...entries]) {
+      final key = _historyLogEntryKey(entry);
+      if (key.isNotEmpty && !seen.add(key)) {
+        continue;
+      }
+      merged.add(entry);
+    }
+    return _sortedHistoryLogEntries(merged);
+  }
+
+  void _rememberCodexNativeOperationalGroupEntries(
+    String sessionId,
+    String groupId,
+    List<HistoryLogEntry> entries,
+  ) {
+    final normalizedSessionId = sessionId.trim();
+    if (normalizedSessionId.isEmpty || groupId.isEmpty) {
+      return;
+    }
+    _codexOperationalGroupEntriesBySession.putIfAbsent(normalizedSessionId,
+            () => <String, List<HistoryLogEntry>>{})[groupId] =
+        List<HistoryLogEntry>.from(entries);
+  }
+
+  int _findCodexNativeOperationalGroupIndex(
+    String sessionId,
+    List<HistoryLogEntry> entries,
+  ) {
+    final visibleKeys = _visibleHistoryLogEntryKeys[sessionId.trim()];
+    if (visibleKeys == null || visibleKeys.isEmpty) {
+      return -1;
+    }
+    final hasSeenEntry = entries.any((entry) {
+      final key = _historyLogEntryKey(entry);
+      return key.isNotEmpty && visibleKeys.contains(key);
+    });
+    if (!hasSeenEntry && !_isTrailingCodexNativeCompletionGroup(entries)) {
+      return -1;
+    }
+    var inspected = 0;
+    for (var index = _timeline.length - 1; index >= 0; index--) {
+      if (inspected >= 20) {
+        break;
+      }
+      inspected += 1;
+      final item = _timeline[index];
+      if (item.kind == 'codex_tool_group') {
+        return index;
+      }
+      if (_hasVisibleTimelineContent(item)) {
+        return -1;
+      }
+    }
+    return -1;
+  }
+
+  bool _isTrailingCodexNativeCompletionGroup(List<HistoryLogEntry> entries) {
+    if (entries.isEmpty) {
+      return false;
+    }
+    return entries.every((entry) {
+      final context = entry.context;
+      if (context == null || context.source.trim() != 'codex-native') {
+        return false;
+      }
+      final type = context.type.trim();
+      final status = context.status.trim().toLowerCase();
+      switch (type) {
+        case 'codex_task':
+          return status == 'completed' ||
+              status == 'aborted' ||
+              status == 'failed';
+        case 'codex_patch':
+          return status.isNotEmpty;
+        default:
+          return false;
+      }
+    });
   }
 
   String _codexNativeOperationalSummary(List<HistoryLogEntry> entries) {
@@ -8550,6 +8701,7 @@ class SessionController extends ChangeNotifier {
   void _clearTimelineItems() {
     _timeline.clear();
     _timelineItemIds.clear();
+    _codexOperationalGroupEntriesBySession.clear();
   }
 
   void _replaceTimelineItems(List<TimelineItem> items) {
