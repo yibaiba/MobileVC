@@ -7347,6 +7347,9 @@ class SessionController extends ChangeNotifier {
     final appendLogEntries = _sortedHistoryLogEntries(delta.appendLogEntries);
     final shouldApplyAppendLogEntries =
         !_isStaleDeltaAppendForCurrentKnown(delta);
+    final suppressAssistantReplayUntilUserAfter = shouldApplyAppendLogEntries
+        ? _deltaAssistantReplaySuppressCutoff(appendLogEntries)
+        : null;
     if (delta.sessionId.trim().isNotEmpty) {
       _sessionDeltaKnown[delta.sessionId.trim()] = delta.latest;
     }
@@ -7356,6 +7359,8 @@ class SessionController extends ChangeNotifier {
           ? appendLogEntries
           : const <HistoryLogEntry>[],
       delta.resumeRuntimeMeta,
+      suppressAssistantReplayUntilUserAfter:
+          suppressAssistantReplayUntilUserAfter,
     );
     for (final diff in delta.upsertDiffs) {
       _mergeRecentDiff(diff);
@@ -7800,11 +7805,96 @@ class SessionController extends ChangeNotifier {
     return false;
   }
 
+  DateTime? _deltaAssistantReplaySuppressCutoff(
+    List<HistoryLogEntry> entries,
+  ) {
+    final currentAssistantAt = _latestVisibleAssistantReplyForCurrentTurnAt();
+    if (currentAssistantAt == null) {
+      return null;
+    }
+    var hasCompletionStatus = false;
+    var hasAssistantReplay = false;
+    for (final entry in entries) {
+      if (_isUserHistoryBoundaryAfterAssistant(entry, currentAssistantAt)) {
+        break;
+      }
+      if (_isCodexNativeCompletionStatusHistoryEntry(entry)) {
+        hasCompletionStatus = true;
+        continue;
+      }
+      if (_isAssistantHistoryLogEntry(entry)) {
+        hasAssistantReplay = true;
+      }
+    }
+    return hasCompletionStatus && hasAssistantReplay
+        ? currentAssistantAt
+        : null;
+  }
+
+  bool _isUserHistoryLogEntry(HistoryLogEntry entry) {
+    return entry.kind.trim().toLowerCase() == 'user';
+  }
+
+  bool _isUserHistoryBoundaryAfterAssistant(
+    HistoryLogEntry entry,
+    DateTime currentAssistantAt,
+  ) {
+    if (!_isUserHistoryLogEntry(entry)) {
+      return false;
+    }
+    final entryAt = _historyLogEntryTimestamp(entry)?.toLocal();
+    return entryAt == null || entryAt.isAfter(currentAssistantAt.toLocal());
+  }
+
+  DateTime? _latestVisibleAssistantReplyForCurrentTurnAt() {
+    DateTime? latestUserAt;
+    DateTime? latestAssistantAt;
+    for (final item in _timeline) {
+      if (item.kind == 'user' && _hasVisibleTimelineContent(item)) {
+        if (latestUserAt == null || item.timestamp.isAfter(latestUserAt)) {
+          latestUserAt = item.timestamp;
+        }
+        continue;
+      }
+      if (_isAssistantReplyTimelineItem(item)) {
+        if (latestAssistantAt == null ||
+            item.timestamp.isAfter(latestAssistantAt)) {
+          latestAssistantAt = item.timestamp;
+        }
+      }
+    }
+    if (latestAssistantAt == null) {
+      return null;
+    }
+    if (latestUserAt != null && !latestAssistantAt.isAfter(latestUserAt)) {
+      return null;
+    }
+    return latestAssistantAt;
+  }
+
+  bool _isAssistantHistoryLogEntry(HistoryLogEntry entry) {
+    final body = _restoredHistoryBody(entry).trim();
+    if (body.isEmpty || entry.kind == 'thinking') {
+      return false;
+    }
+    if (entry.kind == 'markdown') {
+      return true;
+    }
+    final context = entry.context;
+    final type = context?.type.trim().toLowerCase() ?? '';
+    if (type == 'assistant') {
+      return true;
+    }
+    final source = context?.source.trim().toLowerCase() ?? '';
+    return source == 'codex/assistant' || source == 'claude/assistant';
+  }
+
   void _appendHistoryTimelineEntry(
     String sessionId,
     HistoryLogEntry entry,
-    RuntimeMeta resumeMeta,
-  ) {
+    RuntimeMeta resumeMeta, {
+    bool suppressUnmatchedAssistantReplay = false,
+  }) {
     if (_isVisibleHistoryLogEntry(sessionId, entry)) {
       return;
     }
@@ -7823,7 +7913,11 @@ class SessionController extends ChangeNotifier {
       _rememberVisibleHistoryLogEntry(sessionId, entry);
       return;
     }
-    final accepted = _appendTimelineItem(item, emitNotifications: false);
+    final accepted = _appendTimelineItem(
+      item,
+      emitNotifications: false,
+      suppressUnmatchedAssistantReplay: suppressUnmatchedAssistantReplay,
+    );
     if (accepted) {
       _rememberVisibleHistoryLogEntry(sessionId, entry);
     }
@@ -7832,11 +7926,18 @@ class SessionController extends ChangeNotifier {
   void _appendHistoryTimelineEntries(
     String sessionId,
     List<HistoryLogEntry> entries,
-    RuntimeMeta resumeMeta,
-  ) {
+    RuntimeMeta resumeMeta, {
+    DateTime? suppressAssistantReplayUntilUserAfter,
+  }) {
     final pendingCodexOps = <HistoryLogEntry>[];
+    var suppressUnmatchedAssistantReplay =
+        suppressAssistantReplayUntilUserAfter != null;
+    var hasPassedCompletionStatus = false;
     for (final entry in entries) {
       if (_isCodexNativeOperationalHistoryEntry(entry)) {
+        if (_isCodexNativeCompletionStatusHistoryEntry(entry)) {
+          hasPassedCompletionStatus = true;
+        }
         if (!_isVisibleHistoryLogEntry(sessionId, entry)) {
           pendingCodexOps.add(entry);
         }
@@ -7847,7 +7948,15 @@ class SessionController extends ChangeNotifier {
         pendingCodexOps,
         resumeMeta,
       );
-      _appendHistoryTimelineEntry(sessionId, entry, resumeMeta);
+      if (hasPassedCompletionStatus && _isUserHistoryLogEntry(entry)) {
+        suppressUnmatchedAssistantReplay = false;
+      }
+      _appendHistoryTimelineEntry(
+        sessionId,
+        entry,
+        resumeMeta,
+        suppressUnmatchedAssistantReplay: suppressUnmatchedAssistantReplay,
+      );
     }
     _flushCodexNativeOperationalGroup(
       sessionId,
@@ -8034,24 +8143,26 @@ class SessionController extends ChangeNotifier {
     if (entries.isEmpty) {
       return false;
     }
-    return entries.every((entry) {
-      final context = entry.context;
-      if (context == null || context.source.trim() != 'codex-native') {
+    return entries.every(_isCodexNativeCompletionStatusHistoryEntry);
+  }
+
+  bool _isCodexNativeCompletionStatusHistoryEntry(HistoryLogEntry entry) {
+    final context = entry.context;
+    if (context == null || context.source.trim() != 'codex-native') {
+      return false;
+    }
+    final type = context.type.trim();
+    final status = context.status.trim().toLowerCase();
+    switch (type) {
+      case 'codex_task':
+        return status == 'completed' ||
+            status == 'aborted' ||
+            status == 'failed';
+      case 'codex_patch':
+        return status.isNotEmpty;
+      default:
         return false;
-      }
-      final type = context.type.trim();
-      final status = context.status.trim().toLowerCase();
-      switch (type) {
-        case 'codex_task':
-          return status == 'completed' ||
-              status == 'aborted' ||
-              status == 'failed';
-        case 'codex_patch':
-          return status.isNotEmpty;
-        default:
-          return false;
-      }
-    });
+    }
   }
 
   bool _shouldSuppressIsolatedCodexNativeCompletionGroup(
@@ -8779,6 +8890,7 @@ class SessionController extends ChangeNotifier {
   bool _appendTimelineItem(
     TimelineItem item, {
     bool emitNotifications = true,
+    bool suppressUnmatchedAssistantReplay = false,
   }) {
     if (!_shouldKeepTimelineItem(item)) {
       return false;
@@ -8797,6 +8909,17 @@ class SessionController extends ChangeNotifier {
     }
     if (_isOlderRestoredAssistantReplayOfNewerItem(item)) {
       return false;
+    }
+    if (suppressUnmatchedAssistantReplay) {
+      if (_reconcileUnmatchedRestoredAssistantTimelineItem(
+        item,
+        emitNotifications: emitNotifications,
+      )) {
+        return true;
+      }
+      if (_isUnmatchedRestoredAssistantReplay(item)) {
+        return false;
+      }
     }
     if (_reconcileUserAttachmentTimelineItem(item)) {
       return true;
@@ -8893,6 +9016,74 @@ class SessionController extends ChangeNotifier {
     return item.body.trim().isNotEmpty;
   }
 
+  bool _reconcileUnmatchedRestoredAssistantTimelineItem(
+    TimelineItem item, {
+    required bool emitNotifications,
+  }) {
+    if (!_isRestoredAssistantReplayCandidate(item)) {
+      return false;
+    }
+    final index = _findUnmatchedLiveAssistantReplayIndex(item);
+    if (index == -1) {
+      return false;
+    }
+    final previous = _timeline[index];
+    final reconciled = item.copyWith(
+      meta: previous.meta.merge(item.meta),
+      context: item.context ?? previous.context,
+      attachments: _mergeTimelineAttachments(
+        previous.attachments,
+        item.attachments,
+      ),
+      animateBody: false,
+    );
+    _replaceTimelineItemAt(index, reconciled);
+    if (emitNotifications) {
+      _emitTimelineNotification(
+        reconciled,
+        preserveExistingAssistantReply: true,
+      );
+    }
+    return true;
+  }
+
+  int _findUnmatchedLiveAssistantReplayIndex(TimelineItem item) {
+    final restoredBody = _normalizeAssistantReplyForDedupe(item.body);
+    if (restoredBody.isEmpty) {
+      return -1;
+    }
+    var inspected = 0;
+    for (var index = _timeline.length - 1; index >= 0; index--) {
+      if (inspected >= 20) {
+        break;
+      }
+      inspected += 1;
+      final previous = _timeline[index];
+      if (!previous.animateBody || !_isAssistantReplyTimelineItem(previous)) {
+        continue;
+      }
+      if (_hasSameDurableAssistantSource(previous, item)) {
+        continue;
+      }
+      final previousBody = _normalizeAssistantReplyForDedupe(previous.body);
+      if (previousBody.isEmpty) {
+        continue;
+      }
+      if (restoredBody == previousBody ||
+          restoredBody.startsWith(previousBody)) {
+        return index;
+      }
+    }
+    return -1;
+  }
+
+  bool _isUnmatchedRestoredAssistantReplay(TimelineItem item) {
+    if (item.animateBody || !_isAssistantReplyTimelineItem(item)) {
+      return false;
+    }
+    return _normalizeAssistantReplyForDedupe(item.body).isNotEmpty;
+  }
+
   bool _isLiveAssistantReplayTailOfRestoredItem(TimelineItem item) {
     if (!item.animateBody || !_isAssistantReplyTimelineItem(item)) {
       return false;
@@ -8929,6 +9120,9 @@ class SessionController extends ChangeNotifier {
     if (item.animateBody || !_isAssistantReplyTimelineItem(item)) {
       return false;
     }
+    if (!_hasDurableAssistantSource(item)) {
+      return false;
+    }
     final itemBody = _normalizeAssistantReplyForDedupe(item.body);
     if (itemBody.isEmpty) {
       return false;
@@ -8951,6 +9145,12 @@ class SessionController extends ChangeNotifier {
       }
     }
     return false;
+  }
+
+  bool _hasDurableAssistantSource(TimelineItem item) {
+    return item.meta.executionId.trim().isNotEmpty ||
+        item.meta.contextId.trim().isNotEmpty ||
+        item.meta.groupId.trim().isNotEmpty;
   }
 
   bool _restoredAssistantBodyContainsLiveReplay(
@@ -9088,7 +9288,7 @@ class SessionController extends ChangeNotifier {
   }
 
   bool _isAssistantReplyTimelineItem(TimelineItem item) {
-    if (item.kind == 'thinking') {
+    if (item.kind == 'thinking' || item.kind == 'user') {
       return false;
     }
     final body = item.body.trim();
